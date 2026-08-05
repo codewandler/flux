@@ -18,8 +18,10 @@ pub(super) fn truncate(s: &str, n: usize) -> String {
 /// trailing note when lines were elided. `full` (from `-v`/`FLUX_VERBOSE`) disables the caps and shows
 /// everything. This affects only what the user sees — the model always receives the full result.
 pub(super) fn tool_preview(s: &str, full: bool) -> String {
-    const MAX_LINES: usize = 40;
-    const MAX_LINE_CHARS: usize = 500;
+    // C-539: the caps are declared beside the TUI's in `toolview::budget` — the surfaces budget
+    // differently on purpose (no expand affordance here), but never drift silently.
+    const MAX_LINES: usize = flux_tui::toolview::budget::CLI_PREVIEW_LINES;
+    const MAX_LINE_CHARS: usize = flux_tui::toolview::budget::CLI_PREVIEW_LINE_CHARS;
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= 1 {
         return if full {
@@ -300,43 +302,46 @@ pub(super) fn result_summary_for(content: &str, tool: &str, verbose: bool) -> St
     let lines: Vec<&str> = content.lines().collect();
     let n = lines.len();
 
-    // Tool-aware previews.
+    // Tool-aware previews. Head counts live in `toolview::budget` (C-539).
+    const READ_HEAD: usize = flux_tui::toolview::budget::CLI_READ_HEAD_LINES;
+    const GREP_HEAD: usize = flux_tui::toolview::budget::CLI_GREP_HEAD_LINES;
+    const GLOB_HEAD: usize = flux_tui::toolview::budget::CLI_GLOB_HEAD_LINES;
     match tool {
         "read" | "read_many" => {
-            // Never dump raw file contents — show a digest: first 3 lines + count.
-            if n <= 3 {
+            // Never dump raw file contents — show a digest: the head lines + count.
+            if n <= READ_HEAD {
                 return lines
                     .iter()
                     .map(|l| truncate(l.trim_end(), 120))
                     .collect::<Vec<_>>()
                     .join("\n    ");
             }
-            let head = lines[..3]
+            let head = lines[..READ_HEAD]
                 .iter()
                 .map(|l| truncate(l.trim_end(), 120))
                 .collect::<Vec<_>>()
                 .join("\n    ");
-            return format!("{head}\n    … ({} more lines; -v for full)", n - 3);
+            return format!("{head}\n    … ({} more lines; -v for full)", n - READ_HEAD);
         }
-        "grep" if n > 3 => {
-            let head = lines[..3]
+        "grep" if n > GREP_HEAD => {
+            let head = lines[..GREP_HEAD]
                 .iter()
                 .map(|l| truncate(l.trim_end(), 120))
                 .collect::<Vec<_>>()
                 .join("\n    ");
             return format!(
                 "{head}\n    … (+{} more match{}; -v for full)",
-                n - 3,
-                if n - 3 == 1 { "" } else { "es" }
+                n - GREP_HEAD,
+                if n - GREP_HEAD == 1 { "" } else { "es" }
             );
         }
-        "glob" if n > 5 => {
-            let head = lines[..5]
+        "glob" if n > GLOB_HEAD => {
+            let head = lines[..GLOB_HEAD]
                 .iter()
                 .map(|l| truncate(l.trim_end(), 120))
                 .collect::<Vec<_>>()
                 .join("\n    ");
-            return format!("{head}\n    … (+{} more; -v for full)", n - 5);
+            return format!("{head}\n    … (+{} more; -v for full)", n - GLOB_HEAD);
         }
         "bash" if n > 1 => {
             // Show the last non-empty line as a quick exit hint.
@@ -769,7 +774,7 @@ impl AgentSink for CliSink {
             self.stop_spinner();
         }
     }
-    fn tool_call(&mut self, name: &str, input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, input: &Value) {
         self.commit();
         self.steps += 1;
         self.iter += 1;
@@ -792,10 +797,15 @@ impl AgentSink for CliSink {
         self.pending = Some((label, std::time::Instant::now()));
         self.pending_timing = None;
     }
-    fn tool_timing(&mut self, _name: &str, timing: &flux_core::OperationTiming) {
+    fn tool_timing(
+        &mut self,
+        _dispatch: DispatchId,
+        _name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
         self.pending_timing = Some(*timing);
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, _dispatch: DispatchId, name: &str, result: &ToolResult) {
         let (label, start) = self
             .pending
             .take()
@@ -1427,14 +1437,14 @@ impl AgentSink for GoalSink {
         std::io::stdout().flush().ok();
         self.text.push_str(t);
     }
-    fn tool_call(&mut self, name: &str, input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, input: &Value) {
         eprintln!(
             "\n{} {}",
             style::blue("→"),
             render_call_label(name, input, verbose())
         );
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, _dispatch: DispatchId, name: &str, result: &ToolResult) {
         let mark = if result.is_error {
             style::red("✗")
         } else {

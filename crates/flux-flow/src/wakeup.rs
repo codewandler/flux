@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use flux_core::{render_knowledge_blocks, ContextBlock, Error, Result};
 use flux_events::{EventStore, PendingWakeup};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 use crate::agent_sink::AgentSink;
@@ -88,7 +88,11 @@ impl WakeupTool {
 
     /// Register `schedule_wakeup` into `registry`.
     pub fn try_register(self, registry: &mut ToolRegistry) -> Result<()> {
-        registry.try_register_from("flux-flow schedule_wakeup operation", Arc::new(self))
+        registry.try_register_from_with_placement(
+            "flux-flow schedule_wakeup operation",
+            Arc::new(self),
+            OperationPlacement::LocalControlPlane,
+        )
     }
 }
 

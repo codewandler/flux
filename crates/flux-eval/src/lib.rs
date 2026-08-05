@@ -41,7 +41,7 @@ pub mod util;
 use std::sync::Arc;
 
 use flux_core::Result;
-use flux_runtime::{Tool, ToolRegistry};
+use flux_runtime::{OperationPlacement, Tool, ToolRegistry};
 
 /// Register the eval / self-improvement ops onto a tool registry (mirrors
 /// [`flux_tools::register_builtins`](https://docs.rs/flux-tools)).
@@ -55,7 +55,7 @@ pub fn register_eval_ops(registry: &mut ToolRegistry) {
 /// Fallibly register the eval/self-improvement pack with one auditable source label.
 pub fn try_register_eval_ops(registry: &mut ToolRegistry) -> Result<()> {
     // Eval substrate.
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-eval self-improvement pack",
         vec![
             Arc::new(ops::EvalRunTool) as Arc<dyn Tool>,
@@ -88,6 +88,7 @@ pub fn try_register_eval_ops(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(release::ChangelogInsertTool),
             Arc::new(release::ReleaseCutTool),
         ],
+        OperationPlacement::NativeSystemOnly,
     )
 }
 

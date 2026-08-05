@@ -575,6 +575,7 @@ impl<'s> Parser<'s> {
                 | "agent"
                 | "channel"
                 | "datasource"
+                | "board"
                 | "trigger"
                 | "journey"
         )

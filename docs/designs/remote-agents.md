@@ -1,6 +1,6 @@
 # Design: Remote agents — run the agent here, land the effects there
 
-**Status:** shipped (v1, port-aware catalog) · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-473](../stories/C-473-remotely-representable-guarded-resources.md) · [C-474](../stories/C-474-selectable-execution-system.md) · [C-475](../stories/C-475-remote-system-https-protocol.md) · [C-476](../stories/C-476-remote-operation-delivery.md) · [C-477](../stories/C-477-execution-placement-and-deployment-guide.md) · [C-478](../stories/C-478-explicit-operation-execution-placement.md) · [C-479](../stories/C-479-plugins-on-the-selected-execution-system.md) · [C-480](../stories/C-480-first-class-remote-system-deployment-profiles.md) · [C-453](../stories/C-453-a-remote-approval-channel.md)
+**Status:** shipped (v1, port-aware catalog) · **Pillar:** Core · **Stories:** [C-436](../stories/C-436-flux-tui-remote.md) · [C-437](../stories/C-437-which-guarantees-travel.md) · [C-438](../stories/C-438-where-do-the-files-live.md) · [C-439](../stories/C-439-trusting-a-remote-substrate.md) · [C-440](../stories/C-440-the-topologies-page.md) · [C-473](../stories/C-473-remotely-representable-guarded-resources.md) · [C-474](../stories/C-474-selectable-execution-system.md) · [C-475](../stories/C-475-remote-system-https-protocol.md) · [C-476](../stories/C-476-remote-operation-delivery.md) · [C-477](../stories/C-477-execution-placement-and-deployment-guide.md) · [C-478](../stories/C-478-explicit-operation-execution-placement.md) · [C-479](../stories/C-479-plugins-on-the-selected-execution-system.md) · [C-480](../stories/C-480-first-class-remote-system-deployment-profiles.md) · [C-453](../stories/C-453-a-remote-approval-channel.md) · [C-463](../stories/C-463-autonomy-postures.md)
 
 ## Why
 
@@ -136,6 +136,44 @@ in it. Which posture that stage runs under is a real choice, and both answers ar
 | **unattended** (`--yes`) | nobody is asked; authorization policy, the fail-closed sandbox floor this surface is pinned to (C-410), and resource budgets constrain instead | high-autonomy work — research, security hardening, long exploration — where stopping at every effect is a broken agent, not a careful one |
 | **remote approval** (`--remote-approval`, C-453) | a human, over the network, per effect | anything whose effects you would want to see before they land |
 | **refuse** (`DenyApprover`) | nothing outside what was pre-authorised runs | a program surface with no operator attached |
+
+### C-463 — the posture vocabulary
+
+**Shipped.** Those three rows were true and unnamed, which is why they read as settings rather than
+as choices. `flux_runtime::AutonomyPosture` names them, and naming is the whole mechanism: the type
+answers *who approves*, *how confined* and *how much* from **one** value, so a caller cannot select
+the first and forget the other two. That was C-444's finding from the SDK side —
+`auto_approve(true)` not implying confinement — and a posture that sets approval without setting
+isolation would be the same mistake with a nicer name.
+
+| posture | approval | relies on | does **not** protect against |
+|---|---|---|---|
+| **supervised** | per effect | a human at a terminal reading each prompt | approval fatigue; nothing confines the run *between* prompts |
+| **bounded-autonomy** | none | policy + fail-closed sandbox, network closed + budgets | an *authorised* effect inside the workspace — the working tree is the blast radius |
+| **exploratory** | none, and interruption is the harm | hard host isolation + wide-but-bounded grants incl. egress + uncapped evidence | exfiltration: egress is open on purpose, so the host is isolated but the data is not |
+| **refusing** | denies everything reaching the gate | nothing beyond what was pre-authorised | anything that never reaches the approval stage (pre-authorised ops; plugin binaries spawned at startup) |
+
+Four argued postures, deliberately **not** an extensible preset scheme: a generator would let an
+operator reassemble the incoherent combination the type exists to remove.
+
+**How the surfaces map onto it.** `--yes` and `auto_approve(true)` are the older spelling of
+`bounded-autonomy` and keep working unchanged — no flag day. C-453's `ServedApprovalPosture` is not a
+parallel vocabulary: `Unattended` **is** `bounded-autonomy`, and `Remote` **is** `supervised` with
+the network as its channel, which is the point the story above makes in prose — a remote approver is
+the supervised posture made reachable, not a default the others deviate from. A surface with no
+terminal (`flux app run <program>`, `flux record`) refuses `supervised` rather than downgrading it,
+and defaults to `refusing`, which is what those surfaces have always installed.
+
+**Two things deliberately do not vary.** Authorization and guarded IO are identical under all four,
+asserted directly (`crates/flux-runtime/tests/autonomy_posture.rs`): the same op is refused by policy
+under every posture even where the approver allows everything, the same workspace escape is refused
+by the guarded `System`, and the same evidence is recorded. Varying the approval stage is choosing a
+posture; varying either of the other two would be a bug. That assertion is what makes the vocabulary
+safe to ship.
+
+⚠ **No posture is presented as degraded, and none is presented as free.** Each states what it relies
+on *and* what it does not protect against, because the first without the second is marketing. The
+public statement is [Safety & approvals](../../website/docs/agent/safety.md).
 
 The hole was not that flux shipped the wrong posture. It was that **a served agent could not choose
 one.** Every approver in the tree was local — `StdinApprover` (a terminal), the TUI's

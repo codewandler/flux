@@ -146,6 +146,39 @@ fn room_for(double: &XmppDouble, tokens: Arc<FakeTokens>, lead: Duration) -> Jaa
     )
 }
 
+#[tokio::test]
+async fn concurrent_initial_joins_construct_exactly_one_session() {
+    let double = XmppDouble::start().await;
+    double.hold_new_connections();
+    let tokens = Arc::new(FakeTokens::with_ttl(Duration::from_secs(3600)));
+    let room = Arc::new(room_for(&double, tokens.clone(), Duration::from_secs(300)));
+
+    let first_room = room.clone();
+    let first = tokio::spawn(async move { first_room.join(&RoomIdentity::agent("first")).await });
+    double.wait_for_connections(1).await;
+
+    let second_room = room.clone();
+    let second =
+        tokio::spawn(async move { second_room.join(&RoomIdentity::agent("second")).await });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        double.connections().len(),
+        1,
+        "the already-joining guard must fire before a second real session is constructed"
+    );
+
+    double.release();
+    let (first, second) = tokio::join!(first, second);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert!(first.is_ok() ^ second.is_ok());
+    let refusal = first.err().or_else(|| second.err()).unwrap().to_string();
+    assert!(refusal.contains("already joined"), "{refusal}");
+    assert_eq!(tokens.minted().len(), 1, "only one session was prepared");
+    assert_eq!(muc_joins(&double), 1, "only one session joined the MUC");
+    room.leave().await.unwrap();
+}
+
 /// Drain the MUC presence replay: the occupant already in the room, and ourselves.
 async fn drain_replay(stream: &mut flux_channels::rooms::RoomStream) {
     for _ in 0..2 {

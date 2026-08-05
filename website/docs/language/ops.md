@@ -253,8 +253,8 @@ behind `flux serve`'s bearer token is not reachable yet.
 the point of a status call.
 
 **Work board operations are not in this catalog**, because they do not exist until a program asks for
-them. A `datasource` with a `board:` kind generates the board operations named after *that
-declaration*, so a board declared as `board` yields `board.list` … `board.record_evidence` while one
+them. A first-class `board` declaration generates the board operations named after *that
+binding*, so a board declared as `board` yields `board.list` … `board.record_evidence` while one
 declared as `queue` yields `queue.list` … `queue.record_evidence`. Nothing is callable without the
 declaration.
 They are documented with the declaration that creates them, in

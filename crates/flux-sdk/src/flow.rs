@@ -43,7 +43,7 @@
 //! ```
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use flux_cognition::{recorded_usage, CognitionPack};
 use flux_core::{Error, Result, Usage};
@@ -63,8 +63,9 @@ use flux_provider::{Provider, RealtimeConfig, RealtimeProvider};
 #[cfg(test)]
 use flux_runtime::ToolContext;
 use flux_runtime::{
-    AllowApprover, Approver, DenyApprover, ExecutionAuthorization, ExecutionEnvironment, Executor,
-    PermissionManager, ResourceLimits, Spawner, Tool, ToolRegistry,
+    Approver, AutonomyPosture, ExecutionAuthorization, ExecutionEnvironment, Executor,
+    PermissionManager, ResourceLimits, SpawnActivity, SpawnActivitySink, Spawner, Tool,
+    ToolRegistry,
 };
 use flux_secret::Redactor;
 use flux_system::sandbox::Sandbox;
@@ -163,6 +164,15 @@ impl FlowClientBuilder {
         self.envelope.auto_approve = yes;
         self
     }
+    /// Name the [`AutonomyPosture`] this client runs under (C-463) — one choice that selects the
+    /// approval stance, the OS-sandbox floor and the resource budget **together**.
+    ///
+    /// See [`ClientBuilder::posture`](crate::ClientBuilder::posture) for the full contract, which is
+    /// identical on both doors.
+    pub fn posture(mut self, posture: AutonomyPosture) -> Self {
+        self.envelope.posture = Some(posture);
+        self
+    }
     /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
     /// allow of [`auto_approve`](Self::auto_approve) and the headless default deny (e.g. a
     /// risk-aware confirm gate). Overrides `auto_approve`. Mirrors flux-orchestrate's
@@ -245,9 +255,12 @@ impl FlowClientBuilder {
         // client's spawns; a bare `System::new` defaults to `Sandbox::disabled()` (no confinement,
         // no `require` enforcement). Unset ⇒ resolve from env (off ⇒ disabled, safe default).
         let sandbox = self.envelope.resolve_sandbox();
-        // C-444: resolved before the envelope is destructured below — silence means the approval
-        // posture decides (autonomous ⇒ bounded), an explicit call is honored verbatim.
+        // C-444/C-463: resolved before the envelope is destructured below — silence means the named
+        // posture decides, an explicit call is honored verbatim.
         let resource_limits = self.envelope.resolve_resource_limits();
+        // Resolved once, here, rather than per executor: the posture chose it, so there is exactly
+        // one place the choice becomes an approver and no second copy to drift from it.
+        let approver = self.envelope.resolve_approver()?;
         let system = Arc::new(System::new(Workspace::new(root.into())?).with_sandbox(sandbox));
         let registry = try_assemble_registry(provider.clone(), self.model.clone())?;
         let store = Arc::new(self.storage.unwrap_or_default().into_flow_store()?);
@@ -263,8 +276,7 @@ impl FlowClientBuilder {
             store,
             allow: self.envelope.allow,
             deny: self.envelope.deny,
-            auto_approve: self.envelope.auto_approve,
-            approver: self.envelope.approver,
+            approver,
             authorization: self.envelope.authorization,
             redactor: self.envelope.redactor,
             resource_limits,
@@ -312,9 +324,11 @@ pub struct FlowClient {
     store: Arc<FlowStore>,
     allow: Vec<String>,
     deny: Vec<String>,
-    auto_approve: bool,
-    /// Custom per-op approval policy (see [`FlowClientBuilder::approver`]); overrides `auto_approve`.
-    approver: Option<Arc<dyn Approver>>,
+    /// The approval policy this client runs, resolved **once** at
+    /// [`build`](FlowClientBuilder::build) from the named [`AutonomyPosture`] (or from an injected
+    /// [`FlowClientBuilder::approver`], which wins). Stored resolved rather than as the settings it
+    /// came from, so a per-run executor cannot re-derive it and reach a different answer.
+    approver: Arc<dyn Approver>,
     /// Mandatory policy and identity profile cloned into every per-run executor.
     authorization: ExecutionAuthorization,
     /// Shared secret scrubber installed on every per-run execution environment.
@@ -414,8 +428,11 @@ impl FlowClient {
     ) -> Result<&mut Self> {
         let tools = crate::plugins::load_tools(&self.system, name, descriptor).await?;
         for tool in tools {
-            self.registry
-                .try_register_from(format!("plugin:{name}"), tool)?;
+            self.registry.try_register_from_with_placement(
+                format!("plugin:{name}"),
+                tool,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )?;
         }
         Ok(self)
     }
@@ -450,9 +467,10 @@ impl FlowClient {
             // C-299: children inherit this client's ceilings, per agent (own concurrency budget) —
             // see `ClientBuilder::resource_limits`.
             .with_resource_limits(self.resource_limits.clone());
-        self.registry.try_register_from(
+        self.registry.try_register_from_with_placement(
             "sdk FlowClient sub-agent task operation",
             Arc::new(TaskTool),
+            flux_runtime::OperationPlacement::LocalControlPlane,
         )?;
         self.spawner = Some(sub_agents.into_spawner(self.system.clone()));
         Ok(self)
@@ -488,9 +506,10 @@ impl FlowClient {
             )
             // C-299: as in `try_with_sub_agents` — children inherit this client's ceilings.
             .with_resource_limits(self.resource_limits.clone());
-        self.registry.try_register_from(
+        self.registry.try_register_from_with_placement(
             "sdk FlowClient sub-agent task operation",
             Arc::new(TaskTool),
+            flux_runtime::OperationPlacement::LocalControlPlane,
         )?;
         self.spawner = Some(
             sub_agents.into_spawner_with_adaptive_policy(self.system.clone(), adaptive_policy),
@@ -800,19 +819,69 @@ impl FlowClient {
         })
     }
 
-    /// `parse` → `analyze` → `execute_with`. Runs
-    /// a **stored** flow per invocation with injected `inputs` and no model round-trip. A failed
-    /// analysis aborts before any side effect (the AST referenced an op the registry doesn't have).
+    /// `parse` → `analyze` → `execute_with`. Runs a **stored** flow per invocation with injected
+    /// `inputs` and no model round-trip. A failed analysis aborts before any side effect (the AST
+    /// referenced an op the registry doesn't have).
     pub async fn run_flow(
         &self,
         text: &str,
         inputs: serde_json::Map<String, Value>,
     ) -> Result<ExecutionResult> {
         let ast = self.parse(text)?;
-        if let Err(diags) = self.analyze(&ast) {
+        if let Err(diags) = self.analyze_seeded(&ast, inputs.keys().cloned()) {
             return Err(Error::Other(format!("analyze: {}", join_diags(&diags))));
         }
         self.execute_with(&ast, inputs).await
+    }
+
+    /// The observable shared-flow counterpart of [`run_flow`](Self::run_flow).
+    ///
+    /// Parsing, seeded analysis, input isolation, execution, and the returned [`ExecutionResult`] are
+    /// identical to the buffered path. In addition to top-level operation events, the owned shared
+    /// sink receives correlated [`SpawnActivity`] observations from `task(...)` children. This is the
+    /// host seam used by built-in flow surfaces such as `flux review`; it does not add a second
+    /// execution path and every operation still traverses [`Executor::dispatch`].
+    pub async fn run_flow_with_sink(
+        &self,
+        text: &str,
+        inputs: serde_json::Map<String, Value>,
+        sink: Arc<Mutex<dyn AgentSink>>,
+    ) -> Result<ExecutionResult> {
+        let ast = self.parse(text)?;
+        if let Err(diags) = self.analyze_seeded(&ast, inputs.keys().cloned()) {
+            return Err(Error::Other(format!("analyze: {}", join_diags(&diags))));
+        }
+
+        let store = FlowStore::in_memory()?;
+        for (name, value) in &inputs {
+            store
+                .seed(&self.session_id, &SymbolName(name.clone()), value)
+                .map_err(|error| Error::Other(error.to_string()))?;
+        }
+        let executor = self.build_executor();
+        executor
+            .context()
+            .set_spawn_activity_sink(Arc::new(FlowSinkSpawnActivity(sink.clone())));
+        let mut shared = flux_flow::loop_host::SharedSink::new(sink);
+        let mut tee = TeeSink {
+            consumer: &mut shared,
+            collect: Collector::default(),
+        };
+        let outcome = execute_kernel(
+            &store,
+            &executor,
+            &self.session_id,
+            ExecutionProgram::Flow(&ast),
+            &self.composites,
+            &mut tee,
+        )
+        .await?;
+        let names = std::mem::take(&mut tee.collect.0.tool_calls);
+        finish_outcome(
+            outcome,
+            ExecSink { tool_calls: names },
+            recorded_usage(&executor.evidence()),
+        )
     }
 
     /// Build a fresh [`Executor`] over a clone of the assembled registry (the safety envelope every
@@ -849,16 +918,11 @@ impl FlowClient {
 
     fn build_executor(&self) -> Executor {
         let perms = PermissionManager::from_rules(&self.allow, &self.deny);
-        let approver: Arc<dyn Approver> = match &self.approver {
-            Some(custom) => custom.clone(),
-            None if self.auto_approve => Arc::new(AllowApprover),
-            None => Arc::new(DenyApprover),
-        };
         let mut environment = ExecutionEnvironment::new(
             self.system.clone(),
             self.registry.clone(),
             perms,
-            approver,
+            self.approver.clone(),
             self.authorization.clone(),
         )
         .with_redactor(self.redactor.clone())
@@ -874,6 +938,19 @@ impl FlowClient {
         // `execute_streamed` moves it into `tokio::spawn`; Tokio task-locals do not propagate to a
         // new task. Outside a parent turn the snapshot is empty, preserving one-shot behavior.
         environment.inherit_runtime_turn().into_executor()
+    }
+}
+
+/// Bridges a top-level SDK flow's correlated child activity into the same owned sink as its direct
+/// operation events. The sink decides how much of the typed observation is safe to project.
+struct FlowSinkSpawnActivity(Arc<Mutex<dyn AgentSink>>);
+
+impl SpawnActivitySink for FlowSinkSpawnActivity {
+    fn emit(&self, activity: SpawnActivity) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observation(&activity.to_observation());
     }
 }
 
@@ -964,7 +1041,7 @@ struct ExecSink {
 }
 
 impl AgentSink for ExecSink {
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
         self.tool_calls.push(name.to_string());
     }
 }
@@ -1011,6 +1088,7 @@ mod tests {
     use async_trait::async_trait;
     use flux_core::{Chunk, Result as CoreResult};
     use flux_provider::{ChunkStream, Request};
+    use flux_runtime::AllowApprover;
     use serde_json::json;
     use std::sync::Mutex;
 
@@ -1603,7 +1681,7 @@ mod tests {
         #[derive(Default)]
         struct Calls(Vec<String>);
         impl AgentSink for Calls {
-            fn tool_call(&mut self, name: &str, _input: &Value) {
+            fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
                 self.0.push(name.to_string());
             }
         }
@@ -1628,6 +1706,81 @@ mod tests {
         assert_eq!(sink.0, vec!["echo_args"]);
         assert_eq!(result.tool_calls, sink.0);
         assert!(result.result.contains("live"));
+    }
+
+    /// C-530 failing-first: the high-level flow-run convenience must expose both direct operation
+    /// events and the correlated child channel. Before `run_flow_with_sink`, `run_flow` buffered the
+    /// entire execution and a top-level SDK host never installed a child reporter.
+    #[tokio::test]
+    async fn run_flow_with_sink_forwards_direct_and_child_activity() {
+        #[derive(Default)]
+        struct Seen {
+            calls: Arc<Mutex<Vec<String>>>,
+            children: Arc<Mutex<Vec<u64>>>,
+        }
+        impl AgentSink for Seen {
+            fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
+                self.calls.lock().unwrap().push(name.to_string());
+            }
+            fn observation(&mut self, observation: &flux_evidence::Observation) {
+                if let Some(activity) = SpawnActivity::from_observation(observation) {
+                    self.children.lock().unwrap().push(activity.spawn_id);
+                }
+            }
+        }
+
+        struct EmitsChildActivity;
+        #[async_trait]
+        impl Tool for EmitsChildActivity {
+            fn spec(&self) -> flux_spec::ToolSpec {
+                flux_spec::ToolSpec::read_only(
+                    "emit_child_activity",
+                    "test the flow-run child activity bridge",
+                    json!({"type": "object"}),
+                )
+            }
+            async fn execute(&self, ctx: &ToolContext, _params: Value) -> CoreResult<ToolResult> {
+                let reporter = ctx
+                    .spawn_activity_sink()
+                    .expect("observed flow run installs the child reporter");
+                reporter.emit(SpawnActivity {
+                    spawn_id: 7,
+                    role: "review-test".into(),
+                    child_session_id: "s_child".into(),
+                    parent_session: ctx.session_id(),
+                    depth: 1,
+                    event: flux_runtime::SpawnActivityEvent::Finished {
+                        usage: None,
+                        is_error: false,
+                    },
+                });
+                Ok(ToolResult::ok("done"))
+            }
+        }
+
+        let mut client = FlowClient::builder()
+            .auto_approve(true)
+            .build(MockProvider::one("noop"), temp_root("run-flow-sink"))
+            .unwrap();
+        client.register_op(Arc::new(EmitsChildActivity));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let children = Arc::new(Mutex::new(Vec::new()));
+        let sink: Arc<Mutex<dyn AgentSink>> = Arc::new(Mutex::new(Seen {
+            calls: calls.clone(),
+            children: children.clone(),
+        }));
+        let result = client
+            .run_flow_with_sink(
+                "flow observed(input: String)\n  return emit_child_activity({})\n",
+                one_input("input", json!("seeded")),
+                sink,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), vec!["emit_child_activity"]);
+        assert_eq!(*children.lock().unwrap(), vec![7]);
+        assert_eq!(result.tool_calls, vec!["emit_child_activity"]);
     }
 
     /// A consumer-injected approver (`FlowClientBuilder::approver`) — not the `auto_approve`
@@ -2354,10 +2507,15 @@ flow main
             results: Vec<String>,
         }
         impl AgentSink for RecordSink {
-            fn tool_call(&mut self, name: &str, _input: &Value) {
+            fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
                 self.calls.push(name.to_string());
             }
-            fn tool_result(&mut self, name: &str, _result: &ToolResult) {
+            fn tool_result(
+                &mut self,
+                _dispatch: flux_core::DispatchId,
+                name: &str,
+                _result: &ToolResult,
+            ) {
                 self.results.push(name.to_string());
             }
         }

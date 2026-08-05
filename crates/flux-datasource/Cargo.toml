@@ -4,7 +4,7 @@ edition.workspace = true
 # PROTOCOL LINE (C-143), not the flux workspace version: Declaration travels in a plugin manifest,
 # so a plugin built against 1.x keeps resolving across flux releases. Moves only when the
 # wire vocabulary changes — scripts/cut-release.sh never touches it.
-version = "1.3.0"
+version = "1.4.0"
 license.workspace = true
 repository.workspace = true
 description = "flux datasource schema: records, entity declarations, and retrieval (search/get/list/relation) types — the shared contract between the knowledge index (flux-capabilities) and integration plugins (flux-plugin)"

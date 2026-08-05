@@ -311,6 +311,13 @@ trait EventBackend: Send + Sync {
         ev: NewEvent,
         expected_seq: i64,
     ) -> Result<Option<StoredEvent>>;
+    /// Append only while the stream's newest event of any kind is still `expected_seq`.
+    fn append_if_stream_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>>;
     fn load_stream(&self, stream: &str, after_seq: Option<i64>) -> Result<Vec<StoredEvent>>;
     fn load_by_kind(&self, stream: &str, kind: &str) -> Result<Vec<StoredEvent>>;
     fn conversation_delta(&self, stream: &str, after_seq: i64) -> Result<Vec<StoredEvent>>;
@@ -794,6 +801,21 @@ impl EventStore {
     ) -> Result<Option<StoredEvent>> {
         self.backend()
             .append_if_conversation_head(stream, ev, expected_seq)
+    }
+
+    /// Append an event only if the stream's newest event of any kind is still `expected_seq`.
+    ///
+    /// This is the compare-and-append primitive for app-defined event projections such as session
+    /// boards. The comparison and append share the backend's write transaction/critical section;
+    /// `Ok(None)` means a concurrent writer advanced the stream and nothing was appended.
+    pub fn append_if_stream_head(
+        &self,
+        stream: &str,
+        ev: NewEvent,
+        expected_seq: i64,
+    ) -> Result<Option<StoredEvent>> {
+        self.backend()
+            .append_if_stream_head(stream, ev, expected_seq)
     }
 
     /// Append several events to a stream atomically (all-or-nothing, consecutive seqs).
@@ -2457,6 +2479,28 @@ mod tests {
         assert_eq!(store.conversation(&id).unwrap().len(), 1);
     }
 
+    fn stream_head_compare_and_append_is_atomic_for_custom_projections(store: &EventStore) {
+        let id = store.create_session("m").unwrap();
+        let head = store.head_seq(&id).unwrap();
+        let first = NewEvent::new(EventKind::Custom {
+            name: "test.projection".into(),
+            payload: serde_json::json!({"revision": 1}),
+        });
+        assert!(store
+            .append_if_stream_head(&id, first, head)
+            .unwrap()
+            .is_some());
+        let stale = NewEvent::new(EventKind::Custom {
+            name: "test.projection".into(),
+            payload: serde_json::json!({"revision": 2}),
+        });
+        assert!(store
+            .append_if_stream_head(&id, stale, head)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.load_by_kind(&id, "custom").unwrap().len(), 1);
+    }
+
     // --- D-02: tenant/agent context envelope ---
 
     fn context_round_trips_on_stored_events_and_summaries(store: &EventStore) {
@@ -3733,6 +3777,7 @@ mod tests {
         ephemeral_case!(append_is_transactional_and_sequences_monotonically);
         ephemeral_case!(run_events_and_turn_telemetry_share_the_log);
         ephemeral_case!(idempotent_append_with_a_stable_id);
+        ephemeral_case!(stream_head_compare_and_append_is_atomic_for_custom_projections);
         ephemeral_case!(context_round_trips_on_stored_events_and_summaries);
         ephemeral_case!(accounts_are_isolated_in_scoped_reads);
         ephemeral_case!(single_tenant_session_has_empty_context);
@@ -3907,6 +3952,7 @@ mod tests {
         sqlite_case!(append_is_transactional_and_sequences_monotonically);
         sqlite_case!(run_events_and_turn_telemetry_share_the_log);
         sqlite_case!(idempotent_append_with_a_stable_id);
+        sqlite_case!(stream_head_compare_and_append_is_atomic_for_custom_projections);
         sqlite_case!(context_round_trips_on_stored_events_and_summaries);
         sqlite_case!(accounts_are_isolated_in_scoped_reads);
         sqlite_case!(single_tenant_session_has_empty_context);
@@ -4422,6 +4468,7 @@ mod tests {
         pg_case!(append_is_transactional_and_sequences_monotonically);
         pg_case!(run_events_and_turn_telemetry_share_the_log);
         pg_case!(idempotent_append_with_a_stable_id);
+        pg_case!(stream_head_compare_and_append_is_atomic_for_custom_projections);
         pg_case!(context_round_trips_on_stored_events_and_summaries);
         pg_case!(accounts_are_isolated_in_scoped_reads);
         pg_case!(single_tenant_session_has_empty_context);

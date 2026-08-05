@@ -68,9 +68,21 @@ A project can also carry `.flux/config.toml`, `.flux/flows/`, `.flux/agents/`, `
 and definitions are not copied into `~/.flux`, and flux does not walk upward to find a parent
 repository.
 
+Board and fleet workflows add project/workspace-owned state:
+
+| Path | What it is |
+|---|---|
+| `docs/stories/` plus planning documents | a Track repository board; story files remain authoritative and only the marked index region is generated |
+| configured board `root` | Markdown execution-board item files; session boards instead use the selected `events.db` |
+| `.flux/fleet.toml` | fleet repositories, board bindings, gates, templates, limits and fences |
+| `.flux/fleet/state.json` | folded durable worker, wave, handoff, review and gate state |
+| `.flux/fleet/events.ndjson` | append-only redacted fleet activity and coordinator notes |
+| `.flux/fleet/worktrees/` | default local integration/story worktrees; configuration may select another root |
+
 `flux --store <dir> …` relocates that invocation's `events.db` and `flow.db`; it exports the same
 choice as `FLUX_STORE_DIR` to child flux processes. It does not relocate credentials, endpoints,
-plugins, project files, or the global store read by `flux usage`.
+plugins, repository/workspace boards, `.flux/fleet*`, project files, or the global store read by
+`flux usage`.
 
 Do not delete an open SQLite database to troubleshoot it. The safest clean-room test is a new store:
 
@@ -82,6 +94,20 @@ If you intentionally reset persistent history, stop every flux process and back 
 together with any `-wal` and `-shm` sidecars first. Removing `events.db` loses sessions and memory;
 removing `flow.db` separately loses flow-engine state. See
 [Storage & persistence](./reference/storage.md) for relocation, retention, and backend details.
+
+For fleet recovery, inspect before deleting or recreating anything:
+
+```bash
+flux fleet validate --output json
+flux fleet status --output json
+flux fleet worktrees --output json
+flux fleet inspect activity --limit 100 --output json
+flux fleet resume --output json
+```
+
+The ledger can reconstruct supervisor state, but it cannot recover uncommitted source from a deleted
+worker worktree. Preserve active worktrees and their Git refs until the wave is applied, cancelled,
+or deliberately abandoned.
 
 ## The server refuses to start
 
@@ -149,9 +175,13 @@ permissive `[permissions] allow` rule and inside an already-approved action batc
 that was not visible in the approved batch prompts again at dispatch. This is intentional and
 covered by tests; see [Safety & approvals](./agent/safety.md).
 
-Passing `--yes` auto-approves every admitted step, including destructive ones, but does not widen a
-policy, app, or agent ceiling. Use it only in trusted, non-interactive contexts (CI, the server
-daemon).
+`--yes` (that is, `--posture bounded-autonomy`) auto-approves every admitted step, including
+destructive ones, but does not widen a policy, app, or agent ceiling. It is a posture rather than a
+bypass: what constrains the run instead of the prompt is authorization policy, a fail-closed OS
+sandbox with the network closed, and resource budgets. What it does not protect against is an
+*authorised* effect inside the workspace, so run it where losing the working tree is survivable. See
+[Autonomy is a posture](./agent/safety.md#autonomy-is-a-posture) for the four postures and what each
+one leans on.
 
 ## My context keeps getting compacted
 
@@ -249,6 +279,33 @@ its resolver state somewhere else, adding that path (or the directory `/etc/reso
 into) to `[sandbox] writable` is *not* the fix — instead file it as a gap; the built-in re-bind
 list is what needs extending. As a workaround, a static `/etc/resolv.conf` (not a symlink into
 `/run`) resolves fine because the whole filesystem is visible read-only.
+
+## A room-media sidecar joins, publishes, and carries no audio
+
+The sidecar starts, the handshake completes, publishing reports success, and the level probe reads
+zero. Nothing errors. The cause is usually not the sidecar or the room — it is the same `/run` mask
+as above. The PulseAudio/PipeWire socket lives at `/run/user/<uid>/pulse/native`, the sandbox
+replaces `/run` with a tmpfs, and **no argv value can name a path the confinement removed**. Passing
+`--audio-server unix:/run/user/1000/pulse/native` is necessary and not sufficient.
+
+Grant the socket's directory back — this is required, not optional, whenever the sandbox is on:
+
+```toml
+[sandbox]
+enabled = true
+writable = ["/run/user/1000/pulse"]   # `id -u` gives the uid
+```
+
+Unlike the resolver case above, `[sandbox] writable` *is* the supported fix here: the audio socket is
+your own runtime state, not a distro path flux should be re-binding for you. `writable` emits a
+read-write bind, which is what `connect(2)` on a unix socket needs, and it is applied after the mask.
+
+Two things make this diagnosable rather than silent. A `writable` path under `/run` that does not
+exist is refused at startup instead of being created — a wrong uid is the common typo, and an empty
+directory bound over the mask would look applied and still reach nothing. And a sidecar that reports
+`routing_error` in its handshake has that reason quoted verbatim in flux's refusal to publish, so the
+error names the masked socket. See
+[Reaching a host socket on purpose](./security/os-sandbox.md#reaching-a-host-socket-on-purpose).
 
 ## Related docs
 

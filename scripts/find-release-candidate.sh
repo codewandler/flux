@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 # Print the newest successful, unexpired release-candidate run for an exact commit, or nothing.
+#
+# C-355: a candidate is only promotable if its receipt exists AND the run still holds exactly the
+# seven expected `artifacts-*` uploads, unexpired. "At least five build-local artifacts" was the old
+# rule; it accepted a run with a sixth, an extra, or a differently named target upload, which is
+# precisely the ambiguity the v3 receipt exists to remove. The canonical closure is read from
+# scripts/candidate_artifacts.py so there is one list, not two.
 set -euo pipefail
 
 usage() {
@@ -11,6 +17,7 @@ usage() {
 REPO=$1
 COMMIT=$2
 GH_CLI=${GH_CLI:-gh}
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 if ! [[ "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
   echo "error: invalid GitHub repository: $REPO" >&2
@@ -20,6 +27,8 @@ if ! [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "error: candidate lookup requires a full lowercase 40-hex SHA" >&2
   exit 1
 fi
+
+EXPECTED_JSON=$("$ROOT/scripts/release-candidate.sh" names | jq -R . | jq -s .)
 
 # GitHub applies all three filters server-side. The explicit receipt and artifact-state checks below
 # then ensure a successful run still owns a complete, unexpired promotion source.
@@ -33,13 +42,13 @@ while IFS= read -r run_id; do
     echo "error: GitHub returned an invalid candidate run ID" >&2
     exit 1
   fi
-  artifacts_json=$("$GH_CLI" api --method GET \
-    "repos/$REPO/actions/runs/$run_id/artifacts" -F per_page=100)
-  if jq -e '
-    [.artifacts[] | select(.expired == false) | .name] as $names
-    | ($names | index("release-candidate-receipt")) != null
-      and ($names | index("artifacts-build-global")) != null
-      and ([$names[] | select(startswith("artifacts-build-local-"))] | length) >= 5
+  # Paginate: a run with many uploads must not silently present a partial inventory as complete.
+  artifacts_json=$("$GH_CLI" api --paginate \
+    "repos/$REPO/actions/runs/$run_id/artifacts?per_page=100" --jq '.artifacts[]' | jq -s '{artifacts: .}')
+  if jq -e --argjson expected "$EXPECTED_JSON" '
+    [.artifacts[] | select(.expired == false) | .name] as $live
+    | ($live | index("release-candidate-receipt")) != null
+      and (([$live[] | select(startswith("artifacts-"))] | sort) == ($expected | sort))
   ' >/dev/null <<<"$artifacts_json"; then
     echo "$run_id"
     exit 0

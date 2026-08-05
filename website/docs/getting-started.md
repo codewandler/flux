@@ -134,6 +134,12 @@ This requires Rust 1.87 or newer (`rustup update stable`):
 cargo install --git https://github.com/codewandler/flux --package flux-cli
 ```
 
+From a Flux checkout, `task install` verifies the workspace and installs both `flux` and
+`flux-lsp`. It also requires Python 3.10+ as a pre-Cargo build-ownership helper. The default launcher
+is selected automatically on Linux, macOS and Windows; set `PYTHON=<executable>` only to override
+it. An operator-selected `CARGO_TARGET_DIR` stays reusable, and concurrent `task clean` refuses
+while an install is building.
+
 ### Verify and update
 
 On Linux or macOS, verify which executable and release you are using:
@@ -191,8 +197,14 @@ flux auth status
 
 Every operation crosses the same [safety envelope](./agent/safety.md). Evidence reads are pre-allowed;
 writes and commands are captured into an action batch and prompt; destructive effects remain forced
-through approval. `--yes` auto-approves every admitted action, including destructive ones, but never
-widens policy, app, or agent ceilings. Reserve it for trusted automation.
+through approval.
+
+Who answers that prompt is a named [autonomy posture](./agent/safety.md#autonomy-is-a-posture), and
+the default (`supervised`) is you. `--yes` — the older spelling of `--posture bounded-autonomy` —
+answers every admitted action instead, including destructive ones, and takes a fail-closed OS
+sandbox with the network closed plus resource budgets in exchange. It never widens policy, app, or
+agent ceilings. Authorization, guarded IO and the evidence trail are identical under every
+posture.
 
 ## Run a stored Flux-Lang flow
 

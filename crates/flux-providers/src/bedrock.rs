@@ -540,6 +540,19 @@ impl Credential for BedrockCredential {
         let creds = self.fresh_creds().await?;
         sign_v4(rb, &creds, self.model_id.clone())
     }
+
+    fn is_terminal_http_error(&self, status: u16, body: &str) -> bool {
+        if status != 400 && status != 429 {
+            return false;
+        }
+        let compact: String = body
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect();
+        compact.contains("servicequotaexceededexception")
+            || compact.contains("servicequotaexceeded")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1814,6 +1827,24 @@ mod tests {
             cred.endpoint(),
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/us.anthropic.claude-sonnet-4-6/invoke-with-response-stream"
         );
+    }
+
+    #[test]
+    fn service_quota_marker_is_terminal_but_throttling_exception_is_not() {
+        let cred = BedrockCredential {
+            model_id: "us.anthropic.claude-sonnet-4-6".to_string(),
+            region: "us-east-1".to_string(),
+            creds: Mutex::new(Some(example_creds())),
+            resolver: Arc::new(EnvStaticResolver),
+        };
+        assert!(cred.is_terminal_http_error(
+            429,
+            r#"{"__type":"ServiceQuotaExceededException","message":"Service quota exceeded"}"#,
+        ));
+        assert!(!cred.is_terminal_http_error(
+            429,
+            r#"{"__type":"ThrottlingException","message":"Too many requests"}"#,
+        ));
     }
 
     // -- resolve_model --------------------------------------------------------------------------

@@ -1,22 +1,30 @@
-# Publishes the reusable Flux closure (the 34 `codewandler-flux-*` crates) to crates.io
-# when a version tag `vX.Y.Z` is pushed — alongside the binary `Release` workflow (release.yml).
+# Publishes the reusable Flux closure (the 34 `codewandler-flux-*` crates) to crates.io when an
+# exact version tag `vX.Y.Z` is pushed — alongside the binary `Release` workflow (release.yml).
+#
+# AUTHORITY (C-354): publication is reachable from one event and one step.
+#
+#   * The only trigger is a push of an exact `v[0-9]+.[0-9]+.[0-9]+` tag. There is no
+#     `workflow_dispatch`: a manual run from a branch would publish whatever that branch contains,
+#     under a version nobody tagged. A failed publish resumes by re-running THIS run (the script is
+#     idempotent and skips what is already live), which keeps the event, the ref and the commit
+#     exactly as they were.
+#   * `validate` is secret-free: checkout, toolchain and the tag/workspace version agreement.
+#   * `publish` is a separate job, and `CARGO_REGISTRY_TOKEN`
+#     is named only in the `env:` of the single step that runs `scripts/publish-crates-io.sh`. It
+#     is not a workflow env, not a job env, and unreadable by the validation job.
 #
 # REQUIRED SECRET: `CARGO_REGISTRY_TOKEN` — a crates.io API token (https://crates.io/settings/tokens)
-# from an account that can publish the `codewandler-flux-*` names. Set it at
-# Settings → Secrets and variables → Actions on the `codewandler/flux` repo. Without it this job
-# fails fast with a clear message and nothing is published.
+# from an account that can publish the `codewandler-flux-*` names, configured as an Actions secret.
+# Without it the publish step fails fast with a clear message and nothing is published.
 #
-# Idempotent: a crate@version already on crates.io is skipped, so a failed run can be re-run (or the
-# tag re-pushed) to resume. The publish order lives in scripts/publish-crates-io.sh.
+# Idempotent: a crate@version already on crates.io is skipped. The publish order lives in
+# scripts/publish-crates-io.sh.
 name: crates.io
 
 on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
-  # Manual trigger to resume a publish (e.g. after a crates.io new-crate rate-limit) from the current
-  # branch, so an updated scripts/publish-crates-io.sh is used. Idempotent, so it skips what's live.
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,27 +34,29 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
+  # Everything that can be decided without a credential is decided before one is requested.
+  validate:
+    name: validate the tagged workspace version
     runs-on: ubuntu-22.04
-    env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      - name: Check the publish token is configured
-        run: |
-          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is not set. Add it under Settings → Secrets and variables → Actions (a crates.io token that can publish the codewandler-flux-* crates)."
-            exit 1
-          fi
+        with:
+          persist-credentials: false
 
       - name: Install Rust (stable)
         run: rustup toolchain install stable --profile minimal --no-self-update
 
+      # GitHub's tag filter is a glob; this is the exact SemVer narrowing. A name that merely looks
+      # version-ish never becomes publishable by matching `v*`.
       - name: Verify the tag matches the workspace version
-        if: startsWith(github.ref, 'refs/tags/')
         run: |
           tag="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::$GITHUB_REF_NAME is not an exact vX.Y.Z release tag"
+            exit 1
+          fi
           wsver=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
           echo "tag=$tag workspace=$wsver"
           if [ "$tag" != "$wsver" ]; then
@@ -54,5 +64,35 @@ jobs:
             exit 1
           fi
 
+      # Resolution is the half of packaging that can fail without a credential: a lockfile that no
+      # longer matches the tagged manifests would otherwise be discovered by `cargo publish`, after
+      # the token is already in the environment.
+      - name: Resolve the tagged closure without a registry credential
+        run: cargo metadata --locked --format-version 1 >/dev/null
+
+  publish:
+    name: publish the closure to crates.io
+    needs: validate
+    runs-on: ubuntu-22.04
+    # Tag-only publication credentials live on their consuming step, never in a workflow or job env.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      # The one step that holds the registry token. Nothing before it can read the secret, and
+      # nothing after it needs to.
       - name: Publish the closure to crates.io
-        run: bash scripts/publish-crates-io.sh
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN}" ]; then
+            echo '::error::CARGO_REGISTRY_TOKEN is not configured as an Actions secret (a crates.io token that can publish the codewandler-flux-* crates).'
+            exit 1
+          fi
+          bash scripts/publish-crates-io.sh

@@ -26,9 +26,10 @@
 
 ## The LLM is not the runtime
 
-The model never becomes the execution engine, and never authors executable code. It declares intent,
-explores through exact provider-native operation schemas, and proposes literal actions. An authored
-Flux-Lang loop and a deterministic Rust runtime own everything after that.
+The model never becomes the execution engine. It may author Flux-Lang source, declare intent,
+explore through exact provider-native operation schemas, and propose literal actions, but authored
+text is inert until it is parsed and analysed. Only an explicitly requested run enters the
+deterministic Rust runtime, where authorization, approval and guarded IO own every effect.
 
 ```text
 request → typed intent → scoped exploration → action batch → approval → guarded execution
@@ -110,7 +111,12 @@ reviewed tag instead.
 </details>
 
 From a clone: `cargo build --release` → `target/release/flux`, or `task install` for `flux` and
-`flux-lsp` together. Plugin packs ship separately as `plugins-v*`.
+`flux-lsp` together. `task install` requires Python 3.10+ before Cargo starts (`python3`, then
+`python` on Linux/macOS; `python`, then `py -3` on Windows). It preserves an absolute or
+workspace-relative `CARGO_TARGET_DIR`, holds shared ownership of that reusable target for the whole
+verification/install sequence, and refuses concurrent `task clean` rather than risking live
+compiler output. Set `PYTHON=<executable>` only when the platform's standard launcher is not the
+desired interpreter. Plugin packs ship separately as `plugins-v*`.
 
 ## Quickstart
 
@@ -150,7 +156,7 @@ Effects are local by default. To keep the model, runtime and approval UI on your
 process and network effects land in a separately administered workspace, select the remote mode with
 `flux tui --remote https://worker.example:8790`. The remote side is an authenticated TLS service;
 setup, trust boundaries and the deliberate no-sync rule are covered in the
-[topologies guide](https://codewandler.github.io/flux/topologies#local-runtime-remote-system).
+[topologies guide](https://codewandler.github.io/flux/docs/topologies#local-runtime-remote-system).
 
 ## Safety and execution model
 
@@ -268,13 +274,44 @@ let out = client.run("Summarize the README").await?;
 println!("{}", out.text);
 ```
 
+## Exchange integrations
+
+Flux can mount the connected, granted operations of one Exchange Service Account into each agent
+turn. The environment setup below is a transitional C-503 compatibility seam for the embedded
+client, not the managed Linux-local Milestone 1 onboarding contract. C-509 replaces it there with an
+Exchange-owned handoff directly into secure storage; independently provisioned remote Exchange use
+retains this configured origin/bearer on every Flux target until secure remote provisioning is
+separately contracted. For that temporary seam, configure the origin and bearer in the host environment:
+
+```bash
+export FLUX_EXCHANGE_URL=https://exchange.example.com
+export FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN=fxsa_...
+flux
+```
+
+Flux refreshes the account's effective catalogue between turns and sends operation inputs to the
+bound Exchange origin. In this transitional seam the token is startup configuration, never a tool
+argument. Exchange retains
+tenant, connection, credential, grant and runtime authority. If Exchange is absent or unavailable,
+its operations disappear while Flux's language, agent loop and core tools remain available.
+Bearer transport requires HTTPS except for an origin that resolves entirely to loopback, which is
+reserved for local development.
+One-shot `invoke` is the shipped slice; subscriptions, streaming, cancellation frames, terminal
+lifecycle and leases remain future lifecycle work.
+
 ## Plugin packs
 
 Official integrations — GitLab, Slack, Kubernetes, SQL and more — currently ship as a signed native
-plugin pack. The accepted migration makes each one a connector with a declared runtime, runnable
-locally or through Exchange; the stdio plugin protocol may remain as one generic runtime while the
-vendor-specific Flux plugin crates retire after parity. The current release index is
-minisign-checked and every archive hash is verified before install.
+plugin pack. This is temporary compatibility behavior: the current release index is
+minisign-checked and every archive hash is verified before install, so the commands below remain the
+supported way to use those integrations today.
+
+The accepted migration makes Flux's embedded Exchange client the only future official integration
+path. Its Service Account catalogue and one-shot invocation binding now ship. Exchange executes
+connector-declared runtimes; Flux itself executes no connector runtime and has no official fallback.
+Each adapter retires only after its Exchange replacement passes frozen parity evidence, then C-506
+removes the plugin protocol, host, installer, signed pack and release artifacts. Flux remains useful
+without Exchange for its language, agent loop and core tools.
 
 ```bash
 flux plugin install gitlab
@@ -310,9 +347,11 @@ default, and a non-loopback bind without `FLUX_SERVER_TOKEN` is **rejected at st
 [Flux-Lang](https://codewandler.github.io/flux/docs/language/overview) ·
 [editor setup](https://codewandler.github.io/flux/docs/language/editors) ·
 [SDK](https://codewandler.github.io/flux/docs/sdk/overview) ·
-[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins)
+[plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins) ·
+[team presentation](https://codewandler.github.io/flux/presentation)
 
-In-repo: [`docs/architecture.md`](docs/architecture.md) · [`docs/vision.md`](docs/vision.md) ·
+In-repo: [`docs/README.md`](docs/README.md) (the docs map) ·
+[`docs/architecture.md`](docs/architecture.md) · [`docs/vision.md`](docs/vision.md) ·
 [`docs/usage.md`](docs/usage.md) (command surface map)
 
 ## Contributing

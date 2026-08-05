@@ -381,16 +381,37 @@ pub enum IntentBehavior {
     NetworkFetch,
     NetworkConnect,
     BrowserNavigate,
+    Unknown,
+    Operation,
+    Gate,
 }
 
 /// The concrete target of an intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum IntentTarget {
-    Path { path: String },
-    Url { url: String },
-    Process { command: String },
-    Browser { url: String },
+    Path {
+        path: String,
+    },
+    Url {
+        url: String,
+    },
+    Process {
+        command: String,
+    },
+    Browser {
+        url: String,
+    },
+    Operation {
+        name: String,
+        effects: Vec<Effect>,
+        /// Analyzer-derived semantic consequences such as money movement or external sends.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        semantic_effects: Vec<FlowEffect>,
+    },
+    Gate {
+        name: String,
+    },
 }
 
 /// The role the target plays.
@@ -400,6 +421,8 @@ pub enum IntentRole {
     ReadTarget,
     WriteTarget,
     ProcessCommand,
+    Operation,
+    Gate,
 }
 
 /// How sure we are the intent will actually occur.
@@ -419,6 +442,77 @@ pub struct Intent {
     pub certainty: IntentCertainty,
 }
 
+impl Intent {
+    /// Render this intent as a stable, user-facing approval subject line for one gate.
+    ///
+    /// The mapping is intentionally conservative: unknown/unsupported behavior-target combinations are
+    /// rendered as a tagged fallback rather than dropped, so approval presentation cannot silently
+    /// lose intent facts.
+    pub fn approval_subject(&self) -> String {
+        match (&self.behavior, &self.target) {
+            (IntentBehavior::CommandExecution, IntentTarget::Process { command }) => {
+                format!("process.exec → $ {command}")
+            }
+            (IntentBehavior::FilesystemWrite, IntentTarget::Path { path }) => {
+                format!("filesystem.write → {path}")
+            }
+            (IntentBehavior::FilesystemRead, IntentTarget::Path { path }) => {
+                format!("filesystem.read → {path}")
+            }
+            (IntentBehavior::NetworkFetch, IntentTarget::Url { url }) => {
+                format!("network.fetch → {url}")
+            }
+            (IntentBehavior::NetworkConnect, IntentTarget::Url { url }) => {
+                format!("network.connect → {url}")
+            }
+            (IntentBehavior::BrowserNavigate, IntentTarget::Browser { url }) => {
+                format!("browser.navigate → {url}")
+            }
+            (
+                IntentBehavior::Operation,
+                IntentTarget::Operation {
+                    name,
+                    effects,
+                    semantic_effects,
+                },
+            ) => {
+                if effects.is_empty() && semantic_effects.is_empty() {
+                    format!("operation {name}")
+                } else {
+                    let mut details = Vec::new();
+                    if !effects.is_empty() {
+                        details.push(
+                            effects
+                                .iter()
+                                .map(|effect| format!("{effect:?}"))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                    }
+                    if !semantic_effects.is_empty() {
+                        details.push(format!(
+                            "semantic: {}",
+                            semantic_effects
+                                .iter()
+                                .map(|effect| effect.tag())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    format!("operation {name} ({})", details.join("; "))
+                }
+            }
+            (IntentBehavior::Unknown, IntentTarget::Operation { name, .. }) => {
+                format!("operation {name} (unknown)")
+            }
+            (IntentBehavior::Gate, IntentTarget::Gate { name }) => format!("gate.{name}"),
+            (behavior, target) => {
+                format!("unsupported intent shape: {behavior:?} + {target:?}")
+            }
+        }
+    }
+}
+
 /// The set of intents a tool invocation will (or may) perform — the runtime's pre-execution
 /// risk signal for approval gating.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,16 +529,51 @@ impl IntentSet {
         self.intents.push(intent);
     }
 
-    /// True if any intent writes to the filesystem, executes a command, or is destructive-shaped.
+    /// True if any intent is mutation-bearing according to canonical consequence logic.
     pub fn is_mutating(&self) -> bool {
-        self.intents.iter().any(|i| {
-            matches!(
-                i.behavior,
-                IntentBehavior::FilesystemWrite
-                    | IntentBehavior::CommandExecution
-                    | IntentBehavior::NetworkConnect
-            )
+        self.intents.iter().any(|i| match (&i.behavior, &i.target) {
+            (IntentBehavior::Unknown, _) => true,
+            (IntentBehavior::CommandExecution, _) => true,
+            (IntentBehavior::FilesystemWrite, _) => true,
+            (IntentBehavior::NetworkConnect, _) => true,
+            (IntentBehavior::BrowserNavigate, _) => true,
+            (
+                IntentBehavior::Operation,
+                IntentTarget::Operation {
+                    effects,
+                    semantic_effects,
+                    ..
+                },
+            ) => Self::is_operation_mutating(effects, semantic_effects),
+            _ => false,
         })
+    }
+
+    /// The canonical conservative mutation rule for operation effects:
+    /// * empty known set is pure
+    /// * Read/FileSystem/Network-only effects are non-consequential (Network only with Read)
+    /// * any other effect combination is mutating
+    fn is_operation_mutating(effects: &[Effect], semantic_effects: &[FlowEffect]) -> bool {
+        let mut read = false;
+        let mut network = false;
+
+        for effect in effects.iter().copied().chain(
+            semantic_effects
+                .iter()
+                .filter_map(|effect| effect.lower().0),
+        ) {
+            match effect {
+                Effect::Read => read = true,
+                Effect::Filesystem => {}
+                Effect::Network => network = true,
+                _ => return true,
+            }
+        }
+
+        semantic_effects
+            .iter()
+            .any(|effect| effect.is_consequential())
+            || (network && !read)
     }
 
     /// True if any process-execution intent targets a command matching a destructive heuristic
@@ -629,5 +758,154 @@ mod tests {
             certainty: IntentCertainty::Certain,
         });
         assert!(!set.is_mutating());
+    }
+
+    #[test]
+    fn browser_navigation_is_rendered_with_browser_target() {
+        let intent = Intent {
+            behavior: IntentBehavior::BrowserNavigate,
+            target: IntentTarget::Browser {
+                url: "https://example.com".into(),
+            },
+            role: IntentRole::WriteTarget,
+            certainty: IntentCertainty::Certain,
+        };
+        assert_eq!(
+            intent.approval_subject(),
+            "browser.navigate → https://example.com"
+        );
+    }
+
+    #[test]
+    fn unknown_shape_intents_are_rendered_conservatively() {
+        let intent = Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Operation {
+                name: "mismatch".into(),
+                effects: vec![Effect::Process],
+                semantic_effects: Vec::new(),
+            },
+            role: IntentRole::Operation,
+            certainty: IntentCertainty::Certain,
+        };
+        assert!(intent
+            .approval_subject()
+            .contains("unsupported intent shape"));
+    }
+
+    #[test]
+    fn command_execution_is_mutating() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::CommandExecution,
+            target: IntentTarget::Process {
+                command: "bash -lc \"echo hi\"".into(),
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(set.is_mutating());
+    }
+
+    #[test]
+    fn filesystem_write_is_mutating() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::FilesystemWrite,
+            target: IntentTarget::Path {
+                path: "/tmp/out.txt".into(),
+            },
+            role: IntentRole::WriteTarget,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(set.is_mutating());
+    }
+
+    #[test]
+    fn network_connect_is_mutating() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::NetworkConnect,
+            target: IntentTarget::Url {
+                url: "https://example.com".into(),
+            },
+            role: IntentRole::ProcessCommand,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(set.is_mutating());
+    }
+
+    #[test]
+    fn operation_target_network_only_is_mutating() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::Operation,
+            target: IntentTarget::Operation {
+                name: "api.ping".into(),
+                effects: vec![Effect::Network],
+                semantic_effects: Vec::new(),
+            },
+            role: IntentRole::Operation,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(set.is_mutating());
+    }
+
+    #[test]
+    fn operation_target_read_network_is_not_mutating() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::Operation,
+            target: IntentTarget::Operation {
+                name: "api.fetch".into(),
+                effects: vec![Effect::Read, Effect::Network],
+                semantic_effects: Vec::new(),
+            },
+            role: IntentRole::Operation,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(!set.is_mutating());
+    }
+
+    #[test]
+    fn operation_semantic_money_is_visible_and_mutating_without_a_host_effect() {
+        let mut set = IntentSet::new();
+        set.push(Intent {
+            behavior: IntentBehavior::Operation,
+            target: IntentTarget::Operation {
+                name: "payments.charge".into(),
+                effects: Vec::new(),
+                semantic_effects: vec![FlowEffect::Money],
+            },
+            role: IntentRole::Operation,
+            certainty: IntentCertainty::Certain,
+        });
+        assert!(set.is_mutating());
+        assert_eq!(
+            set.intents[0].approval_subject(),
+            "operation payments.charge (semantic: money)"
+        );
+    }
+
+    #[test]
+    fn old_operation_intent_payload_defaults_semantic_effects() {
+        let intent: Intent = serde_json::from_value(serde_json::json!({
+            "behavior": "operation",
+            "target": {
+                "type": "operation",
+                "name": "files.read",
+                "effects": ["read", "filesystem"]
+            },
+            "role": "operation",
+            "certainty": "certain"
+        }))
+        .unwrap();
+        let IntentTarget::Operation {
+            semantic_effects, ..
+        } = intent.target
+        else {
+            panic!("operation target changed shape");
+        };
+        assert!(semantic_effects.is_empty());
     }
 }

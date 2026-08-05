@@ -61,7 +61,7 @@ rust-version = "1.87"
 # crates.io. Keep these versions in lockstep with `[workspace.package].version` on every release (see
 # crates/flux-sdk/PUBLISHING.md). Crates NOT in the closure stay path-only — they are not published.
 flux-core = { package = "codewandler-flux-core", version = "0.55.0", path = "crates/flux-core" }
-flux-policy = { package = "codewandler-flux-policy", version = "1", path = "crates/flux-policy" }
+flux-policy = { package = "codewandler-flux-policy", version = "2", path = "crates/flux-policy" }
 # `1.2`, not `1`: `flux-plugin`'s credential boundary (C-312) calls `Redactor::credential_shape` and
 # the now-public `names_a_secret`/`is_opaque_material`, which do not exist before 1.2.0. A bare `1`
 # lets a downstream consumer resolve 1.0.x and fail to compile the published crate.
@@ -99,7 +99,7 @@ flux-auth = { package = "codewandler-flux-auth", version = "0.55.0", path = "cra
 # (which picks the newest 1.x); it bites exactly the trees that already hold a lockfile pinning
 # 1.0.0 — i.e. every existing downstream host. Measured against 0.41.0 from flux-connectors' C-192.
 flux-evidence = { package = "codewandler-flux-evidence", version = "1.1", path = "crates/flux-evidence" }
-flux-datasource = { package = "codewandler-flux-datasource", version = "1", path = "crates/flux-datasource" }
+flux-datasource = { package = "codewandler-flux-datasource", version = "1.4", path = "crates/flux-datasource" }
 flux-a2a = { package = "codewandler-flux-a2a", version = "0.55.0", path = "crates/flux-a2a" }
 flux-pg = { package = "codewandler-flux-pg", version = "0.55.0", path = "crates/flux-pg" }
 flux-server = { package = "codewandler-flux-server", version = "0.55.0", path = "crates/flux-server" }
@@ -147,13 +147,10 @@ eventsource-stream = "0.2"
 # so precedence is declared once at the arg instead of hand-rolled in each handler.
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
-# Held at 0.29/0.28 (range reqs so `task deps:upgrade` skips them): markdown-ratatui
-# (codewandler/markdown, git-pinned below in flux-markdown) requires ratatui ^0.29 — bumping here
-# would split ratatui into two incompatible versions at the flux-markdown seam. crossterm must
-# match ratatui's backend, and flux-tui's ansi-to-tui 7 tracks ratatui 0.29. Lift all three
-# together once codewandler/markdown moves to ratatui 0.30.
-ratatui = ">=0.29, <0.30"
-crossterm = ">=0.28, <0.29"
+# Keep ratatui and crossterm on the same backend generation. The first-party markdown renderer
+# pinned by flux-markdown and flux-tui's ansi-to-tui dependency both target ratatui 0.30.
+ratatui = "0.30"
+crossterm = "0.29"
 toml = "1.1"
 cargo_metadata = "0.23.1"
 syn = { version = "3", features = ["full", "visit"] }

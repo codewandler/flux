@@ -672,6 +672,9 @@ pub struct OpenAiCred {
     /// `Some` only for codex (C-159): the sticky-routing echo — [`Credential::apply`] replays the
     /// stored token, [`Credential::observe_response_headers`] refreshes it from each response.
     pub(crate) turn_state: Option<TurnStateSlot>,
+    /// Provider-specific body classifier. OpenAI, codex, and ollama share this credential shape
+    /// but not their quota semantics, so the composing adapter supplies the policy explicitly.
+    pub(crate) terminal_error: fn(u16, &str) -> bool,
 }
 
 #[async_trait]
@@ -731,6 +734,34 @@ impl Credential for OpenAiCred {
             *slot.lock().expect("turn-state lock") = Some(token.to_string());
         }
     }
+
+    fn is_terminal_http_error(&self, status: u16, body: &str) -> bool {
+        (self.terminal_error)(status, body)
+    }
+}
+
+/// OpenAI API-key quota exhaustion. Per-minute 429s do not carry these billing markers and keep
+/// the generic retry path; `insufficient_quota` and the hard-limit messages require operator
+/// action and therefore surface immediately.
+fn openai_terminal_error(status: u16, body: &str) -> bool {
+    if status != 429 {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    [
+        "insufficient_quota",
+        "billing_hard_limit_reached",
+        "exceeded your current quota",
+        "check your plan and billing details",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+/// Ollama is local and defines no account quota/credit error shape. Keeping an explicit classifier
+/// here documents that even a local server's bare 429 remains transient.
+fn ollama_terminal_error(_status: u16, _body: &str) -> bool {
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -748,6 +779,7 @@ pub fn openai_api(api_key: impl Into<String>) -> NativeProvider {
             extra: Vec::new(),
             send_account_id: false,
             turn_state: None,
+            terminal_error: openai_terminal_error,
         }),
     )
 }
@@ -799,6 +831,7 @@ pub fn ollama_api() -> NativeProvider {
             extra: Vec::new(),
             send_account_id: false,
             turn_state: None,
+            terminal_error: ollama_terminal_error,
         }),
     )
 }
@@ -1318,6 +1351,18 @@ mod tests {
         let tool = msgs.iter().find(|m| m["role"] == "tool").unwrap();
         assert_eq!(tool["tool_call_id"], "tc_1");
         assert_eq!(tool["content"], "file body");
+    }
+
+    #[test]
+    fn api_quota_marker_is_terminal_but_bare_throttling_is_not() {
+        assert!(openai_terminal_error(
+            429,
+            r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+        ));
+        assert!(!openai_terminal_error(
+            429,
+            r#"{"error":{"type":"rate_limit"}}"#
+        ));
     }
 
     /// The Chat codec never projects tool schemas — the registered schema is the host contract and
@@ -1949,6 +1994,7 @@ mod tests {
             extra: Vec::new(),
             send_account_id: true,
             turn_state: None,
+            terminal_error: openai_terminal_error,
         };
         let rb = reqwest::Client::new().post(cred.endpoint());
         let err = cred

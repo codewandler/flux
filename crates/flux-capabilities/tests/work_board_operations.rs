@@ -183,16 +183,16 @@ fn every_mutating_operation_reports_a_concrete_permission_subject() {
             "{op} must not report a wildcard subject, got `{subject}`"
         );
         let expected = if op == "board.create" {
-            "board/item/new".to_string()
+            "board:board/item/new".to_string()
         } else {
-            "board/item/PROJ-42".to_string()
+            "board:board/item/PROJ-42".to_string()
         };
         assert_eq!(subject, &expected, "{op} subject");
 
         assert_eq!(
             tool.authority_requirements(&mutating_params(op, "PROJ-42"), &subjects)
                 .unwrap(),
-            vec![AuthorityRequirement::datasource_write(expected)],
+            vec![AuthorityRequirement::board_write(expected)],
             "{op} authority"
         );
     }
@@ -201,7 +201,7 @@ fn every_mutating_operation_reports_a_concrete_permission_subject() {
     let transition = operation(&registry, "board.transition");
     assert_eq!(
         transition.permission_subjects(&json!({"id": "OTHER-9", "to": "claimed"})),
-        vec!["board/item/OTHER-9"]
+        vec!["board:board/item/OTHER-9"]
     );
 
     // `create` has no id before the call, so it reports a *deliberately distinct* subject a policy
@@ -209,15 +209,15 @@ fn every_mutating_operation_reports_a_concrete_permission_subject() {
     let create = operation(&registry, "board.create");
     assert_eq!(
         create.permission_subjects(&json!({"title": "x"})),
-        vec!["board/item/new"]
+        vec!["board:board/item/new"]
     );
     // Known and accepted: an item whose id is literally `new` shares `create`'s subject. The story
     // mandates `<domain>/item/new`, and no id-independent subject can avoid this. It is a
-    // *narrowing* collision — granting `board/item/new` grants creation plus mutation of one
+    // *narrowing* collision — granting `board:board/item/new` grants creation plus mutation of one
     // oddly-named item — not a widening one, so it cannot reach an item a grant did not name.
     assert_eq!(
         transition.permission_subjects(&json!({"id": "new", "to": "claimed"})),
-        vec!["board/item/new"]
+        vec!["board:board/item/new"]
     );
 }
 
@@ -236,7 +236,7 @@ fn a_mutating_call_with_no_usable_id_still_reports_a_concrete_subject() {
             let subjects = tool.permission_subjects(&params);
             assert_eq!(
                 subjects,
-                vec!["board/item/<unresolved>"],
+                vec!["board:board/item/<unresolved>"],
                 "{op} with {params}"
             );
             assert!(!subjects[0].contains('*'), "{op} with {params}");
@@ -248,50 +248,56 @@ fn a_mutating_call_with_no_usable_id_still_reports_a_concrete_subject() {
 fn the_read_operations_are_scoped_to_the_item_they_touch() {
     let registry = registry();
     let list = operation(&registry, "board.list");
-    assert_eq!(list.permission_subjects(&json!({})), vec!["board/item"]);
     assert_eq!(
-        list.authority_requirements(&json!({}), &["board/item".to_string()])
+        list.permission_subjects(&json!({})),
+        vec!["board:board/item"]
+    );
+    assert_eq!(
+        list.authority_requirements(&json!({}), &["board:board/item".to_string()])
             .unwrap(),
-        vec![AuthorityRequirement::datasource_read("board/item")]
+        vec![AuthorityRequirement::board_read("board:board/item")]
     );
 
     let get = operation(&registry, "board.get");
     assert_eq!(
         get.permission_subjects(&json!({"id": "PROJ-42"})),
-        vec!["board/item/PROJ-42"]
+        vec!["board:board/item/PROJ-42"]
     );
     assert_eq!(
         get.authority_requirements(
             &json!({"id": "PROJ-42"}),
-            &["board/item/PROJ-42".to_string()]
+            &["board:board/item/PROJ-42".to_string()]
         )
         .unwrap(),
-        vec![AuthorityRequirement::datasource_read("board/item/PROJ-42")]
+        vec![AuthorityRequirement::board_read("board:board/item/PROJ-42")]
     );
 
     // C-236: `query` pages the whole board like `list`; `comments` touches one item like `get`.
     let query = operation(&registry, "board.query");
-    assert_eq!(query.permission_subjects(&json!({})), vec!["board/item"]);
+    assert_eq!(
+        query.permission_subjects(&json!({})),
+        vec!["board:board/item"]
+    );
     assert_eq!(
         query
-            .authority_requirements(&json!({}), &["board/item".to_string()])
+            .authority_requirements(&json!({}), &["board:board/item".to_string()])
             .unwrap(),
-        vec![AuthorityRequirement::datasource_read("board/item")]
+        vec![AuthorityRequirement::board_read("board:board/item")]
     );
 
     let comments = operation(&registry, "board.comments");
     assert_eq!(
         comments.permission_subjects(&json!({"id": "PROJ-42"})),
-        vec!["board/item/PROJ-42"]
+        vec!["board:board/item/PROJ-42"]
     );
     assert_eq!(
         comments
             .authority_requirements(
                 &json!({"id": "PROJ-42"}),
-                &["board/item/PROJ-42".to_string()]
+                &["board:board/item/PROJ-42".to_string()]
             )
             .unwrap(),
-        vec![AuthorityRequirement::datasource_read("board/item/PROJ-42")]
+        vec![AuthorityRequirement::board_read("board:board/item/PROJ-42")]
     );
 }
 

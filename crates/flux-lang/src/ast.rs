@@ -101,6 +101,7 @@ pub fn is_reserved_word(name: &str) -> bool {
             | "agent"
             | "channel"
             | "datasource"
+            | "board"
             | "trigger"
             | "journey"
             | "do"

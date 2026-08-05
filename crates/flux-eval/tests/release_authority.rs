@@ -69,21 +69,6 @@ where
     code.lines().position(predicate)
 }
 
-fn code_line_indices<F>(code: &str, predicate: F) -> Vec<usize>
-where
-    F: Fn(&str) -> bool,
-{
-    code.lines()
-        .enumerate()
-        .filter_map(|(index, line)| predicate(line).then_some(index))
-        .collect()
-}
-
-fn is_git_push_line(line: &str) -> bool {
-    let line = line.trim_start();
-    line.starts_with("git push") || line.starts_with("git_with_release_token push")
-}
-
 /// Every operation `examples/release.flux` calls. Collected from the serialized AST rather than a
 /// hand-written match, so a new node kind cannot hide a call from this check.
 fn ops_called_by_release_flux() -> BTreeSet<String> {
@@ -472,102 +457,41 @@ fn the_release_branch_is_the_automatic_apply_trigger() {
     );
 }
 
-/// The cut commit is first staged on a versioned candidate ref. `main` does not move until that
-/// exact SHA has a successful candidate and a matching receipt; the irreversible tag comes last.
-/// This avoids leaving main in a cut-but-unpublishable state when a platform build fails, and keeps
-/// the build-once ordering documented by `cut-release.sh`.
+/// The cut reaches protected main only through a normal green PR. The resulting new canonical SHA,
+/// not the local cut/tag or release-branch SHA, is then the candidate and one-time PAT tag target.
 #[test]
 fn the_release_workflow_prepares_an_exact_sha_candidate_before_pushing_the_tag() {
     let code = release_flow_workflow_code();
-
-    let versioned_candidate_ref = code.contains("release-candidates/v")
-        || (code.contains("TAG=\"v$VERSION\"")
-            && code.contains("CANDIDATE_BRANCH=\"release-candidates/$TAG\""));
+    let stages = [
+        "release_gh pr create",
+        "wait_for_ci || fail",
+        "release_gh pr merge",
+        "git/ref/heads/main",
+        "merged main does not contain the exact cut diff",
+        "\"$MERGED_SHA:$CANDIDATE_REF\"",
+        "scripts/release-candidate.sh verify",
+        "git mktag",
+        "git_with_release_token push \"$PUSH_URL\" \"$tag_object:$TAG_REF\"",
+        "wait_for_exact_run release.yml",
+        "wait_for_exact_run crates-io.yml",
+        "scripts/verify-github-release.sh --repo \"$GITHUB_REPOSITORY\" \"$TAG\"",
+        "scripts/check-release-tags.sh --repo \"$GITHUB_REPOSITORY\"",
+        "\":$CANDIDATE_REF\"",
+    ];
+    let indexes = stages
+        .iter()
+        .map(|stage| {
+            code.find(stage)
+                .unwrap_or_else(|| panic!("promotion is missing stage `{stage}`"))
+        })
+        .collect::<Vec<_>>();
     assert!(
-        versioned_candidate_ref,
-        "the cut must be staged at refs/heads/release-candidates/v$version before main moves"
+        indexes.windows(2).all(|pair| pair[0] < pair[1]),
+        "PR, merged-main candidate, PAT tag, exact runs, public/latest audit and cleanup must remain ordered: {indexes:?}"
     );
-    let candidate_ref_push = code_line_index(&code, |line| {
-        is_git_push_line(line)
-            && (line.contains("release-candidates/v")
-                || line.to_ascii_lowercase().contains("candidate_ref"))
-    });
-    let main_push = code_line_index(&code, |line| {
-        is_git_push_line(line)
-            && (line.contains("HEAD:main")
-                || line.contains("refs/heads/main")
-                || line.trim_end().ends_with(" origin main"))
-    });
-    let candidate_dispatch =
-        code_line_index(&code, |line| line.contains("gh workflow run release.yml"));
-    let run_watches = code_line_indices(&code, |line| line.contains("gh run watch"));
-    let candidate_wait = run_watches.first().copied();
-    let release_wait = run_watches
-        .last()
-        .copied()
-        .filter(|_| run_watches.len() >= 2);
-    let exact_candidate = code_line_index(&code, |line| {
-        line.contains("scripts/find-release-candidate.sh")
-            && line.to_ascii_lowercase().contains("sha")
-    });
-    let receipt_verify = code_line_index(&code, |line| {
-        line.contains("scripts/release-candidate.sh verify")
-    });
-    let tag_push = code_line_index(&code, |line| {
-        is_git_push_line(line)
-            && line.to_ascii_lowercase().contains("tag")
-            && !line.contains("HEAD:main")
-            && !line.trim_end().ends_with(" origin main")
-    });
-    let public_verify = code_line_index(&code, |line| {
-        line.contains("scripts/verify-github-release.sh")
-            && !line.contains("--staged")
-            && line.to_ascii_lowercase().contains("tag")
-    });
-
-    let ordered = match (
-        candidate_ref_push,
-        candidate_dispatch,
-        candidate_wait,
-        exact_candidate,
-        receipt_verify,
-        main_push,
-        tag_push,
-        release_wait,
-        public_verify,
-    ) {
-        (
-            Some(candidate_ref),
-            Some(dispatch),
-            Some(candidate_wait),
-            Some(candidate),
-            Some(receipt),
-            Some(main),
-            Some(tag),
-            Some(release_wait),
-            Some(public_verify),
-        ) => {
-            candidate_ref < dispatch
-                && dispatch < candidate_wait
-                && candidate_wait < candidate
-                && candidate < receipt
-                && receipt < main
-                && main < tag
-                && tag < release_wait
-                && release_wait < public_verify
-        }
-        _ => false,
-    };
-    assert!(
-        ordered,
-        "release-flow.yml must perform, in order: stage the cut at the versioned candidate ref; \
-         dispatch and wait for release.yml; select the exact-SHA candidate and verify its receipt; \
-         advance main; push the tag; wait for its Release workflow; verify the public Release. \
-         Found indexes: candidate_ref={candidate_ref_push:?}, dispatch={candidate_dispatch:?}, \
-         candidate_wait={candidate_wait:?}, exact={exact_candidate:?}, receipt={receipt_verify:?}, \
-         main={main_push:?}, tag={tag_push:?}, release_wait={release_wait:?}, \
-         public_verify={public_verify:?}"
-    );
+    assert!(!code.contains("HEAD:main") && !code.contains("--admin"));
+    assert!(code.contains("[ -n \"${RELEASE_TOKEN:-}\" ]"));
+    assert!(code.contains("[ -z \"${PROMOTION_TOKEN:-}\" ]"));
     assert!(
         code.contains("git rev-list -n1") && code.contains("^{}"),
         "the promotion path must resolve the annotated tag to its commit and use that exact SHA as \
@@ -614,7 +538,9 @@ fn automated_release_gates_the_exact_candidate_once_before_promotion() {
     let flow = workflow_code("release-flow.yml");
     let release = release_workflow_code();
     let cut = non_comment_source(repo_root().join("scripts/cut-release.sh"));
-    let receipt_helper = non_comment_source(repo_root().join("scripts/release-candidate.sh"));
+    // Since C-355 the receipt format lives in one place, so that the writer, the verifier and the
+    // promotion consumer cannot drift apart.
+    let receipt_helper = non_comment_source(repo_root().join("scripts/candidate_artifacts.py"));
 
     assert!(
         flow.contains("FLUX_RELEASE_CANDIDATE_OWNS_GATE"),
@@ -642,9 +568,67 @@ fn automated_release_gates_the_exact_candidate_once_before_promotion() {
         "release.yml must validate the candidate ref, run the full gate, and only then write its receipt; indexes: validate={validate:?}, gate={gate:?}, receipt={receipt:?}"
     );
     assert!(
-        receipt_helper.contains("gate=mandatory-full-v1")
-            && receipt_helper.contains("gate_commit=$COMMIT"),
+        receipt_helper.contains(r#"GATE = "mandatory-full-v1""#)
+            && receipt_helper.contains(r#"f"gate={GATE}""#)
+            && receipt_helper.contains(r#"f"gate_commit={commit}""#),
         "the immutable candidate receipt must say which exact SHA earned the mandatory full gate"
+    );
+    assert!(
+        receipt_helper.contains(r#"SCHEMA = "flux-release-candidate-v3""#),
+        "the candidate receipt must be v3: v2 binds no artifact identities or digests (C-355)"
+    );
+}
+
+/// C-355. The receipt authenticates the bytes, not just the run: the tag run must consume the
+/// promotion source by immutable artifact ID through the verifying consumer, never by re-globbing
+/// `artifacts-*` from the candidate run and trusting the download action's merge.
+#[test]
+fn the_tag_run_consumes_the_candidate_bytes_through_the_receipt() {
+    let release = release_workflow_code();
+    let verify = code_line_index(&release, |line| {
+        line.contains("Verify and safely assemble the receipt-bound candidate bytes")
+    });
+    let fetch = code_line_index(&release, |line| {
+        line.contains("scripts/release-candidate.sh fetch")
+    });
+    let dist_host = code_line_index(&release, |line| line.contains("dist host "));
+    let staged = code_line_index(&release, |line| {
+        line.contains("verify-github-release.sh --staged")
+    });
+    assert!(
+        matches!((verify, fetch, dist_host, staged),
+            (Some(verify), Some(fetch), Some(host), Some(staged))
+                if verify < fetch && fetch < host && host < staged),
+        "release.yml must verify and safely extract the receipt-bound bytes before `dist host` and \
+         the staged asset check; found verify={verify:?}, fetch={fetch:?}, host={dist_host:?}, \
+         staged={staged:?}"
+    );
+
+    let consumer = non_comment_source(repo_root().join("scripts/candidate_artifacts.py"));
+    for stage in [
+        "_check_metadata(record, metadata, run_id)",
+        "_check_raw_bytes(record, raw)",
+        "_check_zip_structure(record, raw_path)",
+        "safe_extract(raw_path, namespaces / record.name, taken)",
+    ] {
+        assert!(
+            consumer.contains(stage),
+            "the promotion consumer must keep its `{stage}` stage"
+        );
+    }
+    let order = [
+        "_check_metadata(record, metadata, run_id)",
+        "raw = downloader.download(record.identifier)",
+        "_check_raw_bytes(record, raw)",
+        "raw_path.write_bytes(raw)",
+        "_check_zip_structure(record, raw_path)",
+        "safe_extract(raw_path, namespaces / record.name, taken)",
+    ]
+    .map(|stage| consumer.find(stage).expect("consumer stage exists"));
+    assert!(
+        order.windows(2).all(|pair| pair[0] < pair[1]),
+        "identity, then raw-byte digest, then ZIP structure, then namespaced extraction — hashing \
+         after opening the archive authenticates a parse of the bytes, not the bytes: {order:?}"
     );
 }
 
@@ -732,25 +716,91 @@ fn release_flow_installs_the_locked_docs_toolchain_before_running_flux() {
     );
 }
 
-/// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`. The
-/// release and crates.io workflows are tag-push-triggered, so this workflow needs a separately
-/// configured push credential; otherwise a green auto-cut silently publishes nothing.
+/// C-559 deliberately removes the unconfigured App and GitHub Environments from the release path.
+/// Keep this as a whole-inventory assertion: a future release workflow must not quietly restore a
+/// settings dependency that canonical `main` cannot satisfy.
 #[test]
-fn the_tag_push_uses_a_credential_that_can_trigger_the_publication_workflows() {
-    let code = release_flow_workflow_code();
+fn release_workflows_require_no_app_or_environment_settings() {
+    for name in [
+        "release.yml",
+        "release-flow.yml",
+        "release-plugins.yml",
+        "crates-io.yml",
+    ] {
+        let workflow = workflow_code(name);
+        for forbidden in [
+            "PROMOTION_APP_ID",
+            "PROMOTION_APP_PRIVATE_KEY",
+            "scripts/mint-promotion-token.sh",
+            "environment: release-control",
+            "environment: release",
+        ] {
+            assert!(
+                !workflow.contains(forbidden),
+                "{name} still depends on removed release setting `{forbidden}`"
+            );
+        }
+    }
     assert!(
-        code.contains("secrets.RELEASE_TOKEN"),
-        "release-flow.yml must use a non-GITHUB_TOKEN credential for its main/tag pushes; refs \
-         pushed with GITHUB_TOKEN do not trigger release.yml or crates-io.yml"
+        !repo_root().join("scripts/mint-promotion-token.sh").exists(),
+        "App-token minting must be removed with the App settings"
+    );
+}
+
+/// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`, so the
+/// promotion path needs a separately configured credential; otherwise a green auto-cut silently
+/// publishes nothing. C-559 uses the existing repository `RELEASE_TOKEN` only on the host-owned
+/// promotion step and keeps the ambient token limited to Actions dispatch and observation.
+#[test]
+fn promotion_uses_the_step_scoped_release_token_outside_the_model_job() {
+    let workflow = workflow_code("release-flow.yml");
+    assert_eq!(
+        workflow.matches("secrets.RELEASE_TOKEN").count(),
+        1,
+        "release-flow.yml must pass RELEASE_TOKEN to exactly the host-owned promotion step"
     );
     assert!(
-        code.contains("actions: write") && code.contains("contents: read"),
-        "the workflow token needs Actions write to dispatch/watch the candidate, while repository \
-         contents stay read-only because RELEASE_TOKEN alone moves refs"
+        workflow.contains("actions: write") && workflow.contains("contents: read"),
+        "the controller needs Actions write to dispatch/watch the candidate, while repository \
+         contents stay read-only because only the step-scoped PAT moves refs"
     );
     assert!(
-        !code.contains("contents: write"),
-        "do not give GITHUB_TOKEN contents write: RELEASE_TOKEN is the narrowly configured, \
-         trigger-capable credential for main and tag pushes"
+        !workflow.contains("contents: write"),
+        "do not give GITHUB_TOKEN contents write: RELEASE_TOKEN is the trigger-capable credential"
+    );
+
+    // The model half of the workflow must not be able to reach the promotion identity, which is a
+    // statement about the job boundary rather than about the file.
+    let cut_job = workflow
+        .split("\n  release-control:")
+        .next()
+        .expect("release-flow.yml must contain a release-control job");
+    for credential in ["PROMOTION_TOKEN", "RELEASE_TOKEN"] {
+        assert!(
+            !cut_job.contains(credential),
+            "the model/smoke/scribe/cut job must not reference {credential}"
+        );
+    }
+
+    let promoter = non_comment_source(repo_root().join("scripts/promote-release-flow.sh"));
+    for required in [
+        "RELEASE_CAN_PUSH=$(release_gh api",
+        "git_with_release_token push \"$PUSH_URL\" \"$CUT_SHA:$CUT_REF\"",
+        "release_gh pr create",
+        "release_gh pr merge",
+        "git_with_release_token push \"$PUSH_URL\" \"$MERGED_SHA:$CANDIDATE_REF\"",
+        "git_with_release_token push \"$PUSH_URL\" \"$tag_object:$TAG_REF\"",
+    ] {
+        assert!(
+            promoter.contains(required),
+            "promotion helper is missing RELEASE_TOKEN boundary `{required}`"
+        );
+    }
+    assert!(
+        promoter.contains("actions_gh workflow run")
+            && !promoter.contains("actions_gh pr create")
+            && !promoter.contains("actions_gh pr merge")
+            && !promoter.contains("actions_gh api -X"),
+        "ambient GITHUB_TOKEN may dispatch/observe Actions, never mutate refs or pull requests"
     );
 }

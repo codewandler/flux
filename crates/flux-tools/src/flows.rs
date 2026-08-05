@@ -4,10 +4,11 @@
 //! (global — the `@global_flows` named root the CLI registers), plus the legacy
 //! `.flux/ops` / `@global_ops` dirs, kept readable during the ops→flows unification.
 //! `flow_list` enumerates them (flows *and* composite ops, with descriptions + params);
-//! `flow_run` runs either a named stored flow or a workspace-relative `.flux` path in the CURRENT
-//! session through the engine's depth-guarded authored flow host. Path-addressed source is reread
-//! for every call; both forms inherit the approval + IO envelope, provider, session, and current
-//! operation catalog while holding no engine state of their own.
+//! `flow_run` runs a named stored flow, a workspace-relative `.flux` path, or Flux source supplied
+//! directly as an inline program in the CURRENT session through the engine's depth-guarded authored
+//! flow host. Path-addressed source is reread for every call; all forms inherit the approval + IO
+//! envelope, provider, session, and current operation catalog while holding no engine state of their
+//! own.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use serde_json::Value;
 use flux_core::{Error, Result};
 use flux_lang::ast::{DraftAst, Node, Param};
 use flux_lang::program::Module;
-use flux_runtime::{LoopHost, Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{LoopHost, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 use flux_system::{PathAccess, System};
 
@@ -193,12 +194,13 @@ impl StoredFlowCatalog {
 /// Register the flow discovery/run pack. `flow_run` needs the model-in-the-loop host for nested
 /// authored execution and remains model-facing.
 pub fn try_register_flows(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools stored-flow pack",
         vec![
             Arc::new(FlowListTool) as Arc<dyn Tool>,
             Arc::new(FlowRunTool),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 
@@ -348,16 +350,21 @@ struct FlowRunInput {
     #[serde(default)]
     name: Option<String>,
     /// A workspace-relative `.flux` file path, read afresh for this call (e.g.
-    /// "examples/review.flux"). Exactly one of `name` or `path` is required.
+    /// "examples/review.flux").
     #[serde(default)]
     path: Option<String>,
+    /// Flux-Lang source supplied directly for this call. Exactly one of `name`, `path`, or
+    /// `inline_program` is required.
+    #[serde(default)]
+    inline_program: Option<String>,
     /// Optional JSON object of inputs bound as `$key` before the run (seeded as literal binds; a
     /// flow-local bind shadows them).
     #[serde(default)]
     inputs: Option<Value>,
 }
 
-/// `flow_run(name | path, inputs?) -> Outcome + route receipt` — run a flow in this session.
+/// `flow_run(name | path | inline_program, inputs?) -> Outcome + route receipt` — run a flow in this
+/// session.
 struct FlowRunTool;
 
 #[async_trait]
@@ -366,19 +373,19 @@ impl Tool for FlowRunTool {
         ToolSpec {
             name: "flow_run".into(),
             description:
-                "Run a Flux-Lang flow by exactly one address: `name` selects a stored flow \
-                          under .flux/flows or ~/.flux/flows; `path` selects a workspace-relative \
-                          .flux file such as examples/review.flux and rereads it on every call. \
-                          `inputs` are bound as `$key` before the run. The flow executes in the \
-                          current session through the same approval + IO envelope, is revalidated \
-                          against the current live operation catalog, and returns an Outcome with \
-                          a route receipt; bounded by a reentry-depth cap. Discover stored names \
-                          with flow_list."
+                "Run a Flux-Lang flow by exactly one address: `name` selects a stored flow under \
+                 .flux/flows or ~/.flux/flows; `path` selects a workspace-relative .flux file such \
+                 as examples/review.flux and rereads it on every call; `inline_program` parses Flux \
+                 source supplied directly in the request. `inputs` are bound as `$key` before the \
+                 run. The flow executes in the current session through the same approval + IO \
+                 envelope, is revalidated against the current live operation catalog, and returns \
+                 an Outcome with a route receipt; bounded by a reentry-depth cap. Discover stored \
+                 names with flow_list."
                     .into(),
             input_schema: flux_spec::tool_input_schema::<FlowRunInput>(),
             output_schema: None,
-            // Resolving either address reads Flux source; every inner operation still declares and
-            // gates its own effects independently when the authored flow re-enters the loop host.
+            // Stored addresses read Flux source; every inner operation still declares and gates its
+            // own effects independently when the authored flow re-enters the loop host.
             effects: vec![Effect::Read, Effect::Filesystem],
             risk: Risk::Medium,
             idempotency: Idempotency::NonIdempotent,
@@ -402,9 +409,13 @@ impl Tool for FlowRunTool {
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let args: FlowRunInput = crate::parse_params(params, "flow_run")?;
         let resolved = resolve_flow(ctx, &args).await?;
-        let resolved_path = resolved.path;
+        let resolved_path = resolved.resolved_path;
         let mut ast = resolved.ast;
-        let flow_name = ast.name.clone().unwrap_or_else(|| basename(&resolved_path));
+        let flow_name = ast
+            .name
+            .clone()
+            .or_else(|| resolved_path.as_deref().map(basename))
+            .unwrap_or_else(|| "inline".into());
         let mut seeded_input_keys = Vec::new();
 
         // Preserve the agent tool's existing compatibility semantics: arbitrary input keys are
@@ -453,14 +464,39 @@ impl Tool for FlowRunTool {
     }
 }
 
-async fn resolve_flow(ctx: &ToolContext, args: &FlowRunInput) -> Result<ResolvedStoredFlow> {
-    match (args.name.as_deref(), args.path.as_deref()) {
-        (Some(name), None) => StoredFlowCatalog::load(ctx.system().as_ref())
-            .resolve(name)
-            .map_err(|e| Error::Other(format!("flow_run: {e}"))),
-        (None, Some(path)) => resolve_workspace_flow_path(ctx.system().as_ref(), path).await,
+struct ResolvedFlowAddress {
+    resolved_path: Option<String>,
+    ast: DraftAst,
+}
+
+async fn resolve_flow(ctx: &ToolContext, args: &FlowRunInput) -> Result<ResolvedFlowAddress> {
+    match (
+        args.name.as_deref(),
+        args.path.as_deref(),
+        args.inline_program.as_deref(),
+    ) {
+        (Some(name), None, None) => {
+            let resolved = StoredFlowCatalog::load(ctx.system().as_ref())
+                .resolve(name)
+                .map_err(|e| Error::Other(format!("flow_run: {e}")))?;
+            Ok(ResolvedFlowAddress {
+                resolved_path: Some(resolved.path),
+                ast: resolved.ast,
+            })
+        }
+        (None, Some(path), None) => {
+            let resolved = resolve_workspace_flow_path(ctx.system().as_ref(), path).await?;
+            Ok(ResolvedFlowAddress {
+                resolved_path: Some(resolved.path),
+                ast: resolved.ast,
+            })
+        }
+        (None, None, Some(source)) => Ok(ResolvedFlowAddress {
+            resolved_path: None,
+            ast: parse_runnable_flow(source, "`inline_program`")?,
+        }),
         _ => Err(Error::Other(
-            "flow_run: provide exactly one of `name` or `path`".into(),
+            "flow_run: provide exactly one of `name`, `path`, or `inline_program`".into(),
         )),
     }
 }
@@ -488,21 +524,7 @@ async fn resolve_workspace_flow_path(system: &System, path: &str) -> Result<Reso
         .read_file(&resolved_path)
         .await
         .map_err(|e| Error::Other(format!("flow_run: read {resolved_path}: {e}")))?;
-    let module = Module::parse_str(&source)
-        .map_err(|e| Error::Other(format!("flow_run: parse {resolved_path}: {e}")))?;
-    let ast = match module {
-        Module::Flow(ast) => ast,
-        Module::Program(program) => match (program.flows.as_slice(), program.journeys.as_slice()) {
-            ([flow], []) => flow.clone(),
-            ([], [journey]) => journey.flow.clone(),
-            _ => {
-                return Err(Error::Other(format!(
-                    "flow_run: `{resolved_path}` needs a bare flow or a module with exactly one \
-                     flow/journey"
-                )))
-            }
-        },
-    };
+    let ast = parse_runnable_flow(&source, &resolved_path)?;
     Ok(ResolvedStoredFlow {
         path: resolved_path,
         source,
@@ -510,6 +532,25 @@ async fn resolve_workspace_flow_path(system: &System, path: &str) -> Result<Reso
     })
 }
 
+fn parse_runnable_flow(source: &str, label: &str) -> Result<DraftAst> {
+    let module = Module::parse_str(source)
+        .map_err(|e| Error::Other(["flow_run: parse ", label, ": ", &e.to_string()].concat()))?;
+    match module {
+        Module::Flow(ast) => Ok(ast),
+        Module::Program(program) => match (program.flows.as_slice(), program.journeys.as_slice()) {
+            ([flow], []) => Ok(flow.clone()),
+            ([], [journey]) => Ok(journey.flow.clone()),
+            _ => Err(Error::Other(
+                [
+                    "flow_run: ",
+                    label,
+                    " needs a bare flow or a module with exactly one flow/journey",
+                ]
+                .concat(),
+            )),
+        },
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,23 +757,68 @@ mod tests {
         assert_eq!(asts[1]["name"], "updated");
     }
 
+    /// Inline source is a third address form: it is parsed without filesystem IO, lowered through the
+    /// same authored-flow host, and identified explicitly in the route receipt.
+    #[tokio::test]
+    async fn flow_run_executes_an_inline_program() {
+        let (_temp, system) = fixture();
+        let host = Arc::new(CapturingLoopHost::default());
+        let ctx = flow_run_context(system, host.clone());
+
+        let result = FlowRunTool
+            .execute(
+                &ctx,
+                serde_json::json!({
+                    "inline_program": "flow inline_shape\n  return {ok: true}\n",
+                    "inputs": {"answer": 42},
+                }),
+            )
+            .await
+            .expect("inline program should run");
+        let result: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(
+            result["route"],
+            serde_json::json!({
+                "operation": "flow_run",
+                "resolved_path": null,
+                "flow_name": "inline_shape",
+                "seeded_input_keys": ["answer"],
+            })
+        );
+
+        let asts = host.asts.lock().unwrap();
+        assert_eq!(asts.len(), 1);
+        assert_eq!(asts[0]["name"], "inline_shape");
+    }
+
     /// A path is an alternative address, never a second ambiguous selector. The exact-one rule is
     /// checked before filesystem IO so malformed model output cannot accidentally run a name.
     #[tokio::test]
-    async fn flow_run_requires_exactly_one_of_name_or_path() {
+    async fn flow_run_requires_exactly_one_address() {
         let (_temp, system) = fixture();
         let host = Arc::new(CapturingLoopHost::default());
         let ctx = flow_run_context(system, host);
         for input in [
             serde_json::json!({}),
             serde_json::json!({"name": "saved", "path": "examples/saved.flux"}),
+            serde_json::json!({
+                "name": "saved",
+                "inline_program": "flow saved\n  return null\n"
+            }),
+            serde_json::json!({
+                "path": "examples/saved.flux",
+                "inline_program": "flow saved\n  return null\n"
+            }),
         ] {
             let error = FlowRunTool
                 .execute(&ctx, input)
                 .await
                 .unwrap_err()
                 .to_string();
-            assert!(error.contains("exactly one of `name` or `path`"), "{error}");
+            assert!(
+                error.contains("exactly one of `name`, `path`, or `inline_program`"),
+                "{error}"
+            );
         }
     }
 

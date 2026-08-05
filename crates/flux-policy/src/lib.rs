@@ -144,6 +144,7 @@ pub enum ResourceKind {
     Network,
     Connection,
     Datasource,
+    Board,
     Secret,
     Host,
     Provider,
@@ -410,6 +411,11 @@ pub fn default_local_grants() -> AuthorizationPolicy {
                     Action::from("flow.write_db"),
                 ],
                 vec![ResourceRef::any(ResourceKind::Datasource)],
+                false,
+            ),
+            grant(
+                vec![Action::from("board.read"), Action::from("board.write")],
+                vec![ResourceRef::any(ResourceKind::Board)],
                 false,
             ),
             grant(

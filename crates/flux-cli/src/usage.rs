@@ -19,6 +19,9 @@ use clap::{Args, ValueEnum};
 use flux_capabilities::harness::{
     self, HarnessEnv, HarnessKind, HarnessLocation, JsonlLine, ScanBudget,
 };
+use flux_capabilities::usage_observatory::{
+    CostCell, CostSourceCell, CostStatus, ProviderAttribution, TimePrecision, UsageFact,
+};
 use flux_core::{CostSource, PricingTable, Usage};
 use flux_events::{EventKind, EventStore, StoredEvent};
 use serde::Serialize;
@@ -163,17 +166,7 @@ struct UsageSection {
     include_in_combined: bool,
 }
 
-#[derive(Clone, Debug)]
-struct UsageRecord {
-    harness: HarnessKind,
-    session_id: String,
-    model: String,
-    started_at_ms: Option<i64>,
-    ended_at_ms: Option<i64>,
-    usage: Usage,
-    cost: Option<CostCell>,
-    cost_status: CostStatus,
-}
+type UsageRecord = UsageFact;
 
 #[derive(Clone, Debug)]
 struct SessionRecord {
@@ -225,58 +218,6 @@ struct UsageRow {
     usage: Usage,
     cost: Option<CostCell>,
     unpriced: BTreeMap<CostStatus, u64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CostCell {
-    usd: f64,
-    subscription: bool,
-    source: CostSourceCell,
-    status: CostStatus,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CostSourceCell {
-    Reported,
-    Estimated,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum CostStatus {
-    Reported,
-    EstimatedTable,
-    SubscriptionEquivalent,
-    UnpricedUnknownModel,
-    UnpricedMissingUsage,
-}
-
-impl CostStatus {
-    fn as_str(self) -> &'static str {
-        match self {
-            CostStatus::Reported => "reported",
-            CostStatus::EstimatedTable => "estimated_table",
-            CostStatus::SubscriptionEquivalent => "subscription_equivalent",
-            CostStatus::UnpricedUnknownModel => "unpriced_unknown_model",
-            CostStatus::UnpricedMissingUsage => "unpriced_missing_usage",
-        }
-    }
-
-    fn short_reason(self) -> &'static str {
-        match self {
-            CostStatus::Reported => "reported",
-            CostStatus::EstimatedTable => "table",
-            CostStatus::SubscriptionEquivalent => "sub",
-            CostStatus::UnpricedUnknownModel => "unknown model",
-            CostStatus::UnpricedMissingUsage => "missing usage",
-        }
-    }
-
-    fn is_unpriced(self) -> bool {
-        matches!(
-            self,
-            CostStatus::UnpricedUnknownModel | CostStatus::UnpricedMissingUsage
-        )
-    }
 }
 
 struct RowFold {
@@ -359,6 +300,11 @@ impl RowFold {
                     CostStatus::Reported
                 } else {
                     CostStatus::EstimatedTable
+                },
+                basis: if self.all_reported {
+                    "provider_reported"
+                } else {
+                    "pricing_table"
                 },
             }),
             unpriced,
@@ -1870,10 +1816,19 @@ fn usage_record(
     UsageRecord {
         harness,
         session_id,
+        raw_model: model.clone(),
+        canonical_model: flux_core::canonical_model_parts(&model).1.to_string(),
+        provider: ProviderAttribution::Unknown,
         model,
         started_at_ms,
         ended_at_ms,
+        precision: if started_at_ms == ended_at_ms {
+            TimePrecision::Call
+        } else {
+            TimePrecision::Bucket
+        },
         usage,
+        calls: 1,
         cost,
         cost_status,
     }
@@ -1904,6 +1859,11 @@ fn price_usage(
                     subscription: money.subscription,
                     source,
                     status,
+                    basis: if source == CostSourceCell::Reported {
+                        "provider_reported"
+                    } else {
+                        "pricing_table"
+                    },
                 }),
                 status,
             )

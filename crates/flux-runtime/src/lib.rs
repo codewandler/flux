@@ -37,6 +37,9 @@ pub use limits::{
     DEFAULT_TOOL_CALL_QUEUE_TIMEOUT,
 };
 
+mod posture;
+pub use posture::{ApprovalStance, AutonomyPosture, SandboxFloor};
+
 pub mod context;
 pub mod metadata;
 
@@ -297,7 +300,7 @@ impl std::fmt::Debug for ToolProgressReporter {
 /// or suppresses it. Deliberately not geometry: a slot names *what the region is for*, never how
 /// wide it is or where it starts, so the surface stays free to ignore it entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum PaneSlot {
     Left,
     Right,
@@ -1079,7 +1082,7 @@ pub trait Spawner: Send + Sync {
 /// other, and both already depend on this crate.
 #[async_trait]
 pub trait DispatchLedger: Send + Sync {
-    /// The permission subject one item's record occupies — e.g. `board/item/PROJ-42`.
+    /// The permission subject one item's record occupies — e.g. `board:product/item/PROJ-42`.
     ///
     /// Synchronous and infallible because it runs on the **gating** path, before execution: an op
     /// declaring a write must be able to name what it writes. Implementations must return a
@@ -1777,6 +1780,20 @@ impl AuthorityRequirement {
         )
     }
 
+    pub fn board_read(subject: impl Into<String>) -> Self {
+        Self::new(
+            "board.read",
+            ResourceRef::named(ResourceKind::Board, subject),
+        )
+    }
+
+    pub fn board_write(subject: impl Into<String>) -> Self {
+        Self::new(
+            "board.write",
+            ResourceRef::named(ResourceKind::Board, subject),
+        )
+    }
+
     pub fn network_fetch(subject: impl Into<String>) -> Self {
         Self::new(
             "network.fetch",
@@ -1835,7 +1852,12 @@ impl AuthorityRequirement {
     pub fn is_mutating(&self) -> bool {
         !matches!(
             self.action.0.as_str(),
-            "workspace.read" | "datasource.read" | "host.read" | "secret.read" | "model.invoke"
+            "workspace.read"
+                | "datasource.read"
+                | "board.read"
+                | "host.read"
+                | "secret.read"
+                | "model.invoke"
         )
     }
 
@@ -1898,6 +1920,43 @@ pub trait Tool: Send + Sync {
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult>;
 }
 
+/// Where an operation is valid when the host selects a non-native execution system.
+///
+/// This is compatibility metadata, not authority: every available operation still traverses the
+/// complete authorization, approval, and guarded-IO envelope. Registration APIs that do not name a
+/// placement remain source-compatible and conservatively default to [`NativeSystemOnly`](Self::NativeSystemOnly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationPlacement {
+    /// Runtime/model/session work intentionally performed by the local coordinator and carrying no
+    /// effect that should move to the selected execution substrate.
+    LocalControlPlane,
+    /// Guarded effects are implemented through [`ExecutionSystem`] and land on the operator-selected
+    /// substrate (the native system in local mode, a remote/container/embedder when selected).
+    SelectedExecutionSystem,
+    /// The implementation owns native handles, host state, or an IO path with no execution-system
+    /// port. It is available locally and hidden/refused for every non-native target.
+    NativeSystemOnly,
+}
+
+impl OperationPlacement {
+    /// Complete stable vocabulary, used by public documentation contract tests.
+    pub const ALL: [Self; 3] = [
+        Self::LocalControlPlane,
+        Self::SelectedExecutionSystem,
+        Self::NativeSystemOnly,
+    ];
+
+    /// Stable operator/documentation label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LocalControlPlane => "local-control-plane",
+            Self::SelectedExecutionSystem => "selected-execution-system",
+            Self::NativeSystemOnly => "native-system-only",
+        }
+    }
+}
+
 /// The result of [`ToolRegistry::resolve_disabled`] (C-162): which concrete op names a `[tools]
 /// disable` list resolves to, and which of its patterns matched nothing.
 #[derive(Debug, Clone, Default)]
@@ -1914,6 +1973,10 @@ pub struct ResolvedDisabledOps {
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
     sources: HashMap<String, String>,
+    /// Present only for deliberate declarations. Absence is the compatibility default
+    /// (`NativeSystemOnly`) and remains observable so production catalog censuses can reject an
+    /// accidental omission while downstream/third-party tools stay source-compatible.
+    placements: HashMap<String, OperationPlacement>,
 }
 
 impl ToolRegistry {
@@ -1948,7 +2011,25 @@ impl ToolRegistry {
         source: impl Into<String>,
         tool: Arc<dyn Tool>,
     ) -> Result<()> {
-        let source = source.into();
+        self.try_register_from_declaration(source.into(), tool, None)
+    }
+
+    /// Register one operation with an explicit execution-placement decision.
+    pub fn try_register_from_with_placement(
+        &mut self,
+        source: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        placement: OperationPlacement,
+    ) -> Result<()> {
+        self.try_register_from_declaration(source.into(), tool, Some(placement))
+    }
+
+    fn try_register_from_declaration(
+        &mut self,
+        source: String,
+        tool: Arc<dyn Tool>,
+        placement: Option<OperationPlacement>,
+    ) -> Result<()> {
         let spec = tool.spec();
         let name = spec.name.clone();
         if name.trim().is_empty() {
@@ -1979,7 +2060,10 @@ impl ToolRegistry {
                 ))
             })?;
         self.tools.insert(name.clone(), tool);
-        self.sources.insert(name, source);
+        self.sources.insert(name.clone(), source);
+        if let Some(placement) = placement {
+            self.placements.insert(name, placement);
+        }
         Ok(())
     }
 
@@ -2001,6 +2085,25 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Atomically register a uniformly-placed operation pack.
+    pub fn try_register_all_from_with_placement<I>(
+        &mut self,
+        source: impl Into<String>,
+        tools: I,
+        placement: OperationPlacement,
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = Arc<dyn Tool>>,
+    {
+        let source = source.into();
+        let mut assembled = self.clone();
+        for tool in tools {
+            assembled.try_register_from_with_placement(source.clone(), tool, placement)?;
+        }
+        *self = assembled;
+        Ok(())
+    }
+
     /// Explicitly replace a registered tool, returning the previous handler. Callers must name the
     /// replacement source so the audit/catalog owner is visible; ordinary registration never
     /// overwrites.
@@ -2009,7 +2112,25 @@ impl ToolRegistry {
         source: impl Into<String>,
         tool: Arc<dyn Tool>,
     ) -> Result<Option<Arc<dyn Tool>>> {
-        let source = source.into();
+        self.replace_from_declaration(source.into(), tool, None)
+    }
+
+    /// Explicitly replace an operation and its placement declaration.
+    pub fn replace_from_with_placement(
+        &mut self,
+        source: impl Into<String>,
+        tool: Arc<dyn Tool>,
+        placement: OperationPlacement,
+    ) -> Result<Option<Arc<dyn Tool>>> {
+        self.replace_from_declaration(source.into(), tool, Some(placement))
+    }
+
+    fn replace_from_declaration(
+        &mut self,
+        source: String,
+        tool: Arc<dyn Tool>,
+        placement: Option<OperationPlacement>,
+    ) -> Result<Option<Arc<dyn Tool>>> {
         let spec = tool.spec();
         let name = spec.name.clone();
         if name.trim().is_empty() {
@@ -2026,6 +2147,14 @@ impl ToolRegistry {
                 ))
             })?;
         self.sources.insert(name.clone(), source);
+        match placement {
+            Some(placement) => {
+                self.placements.insert(name.clone(), placement);
+            }
+            None => {
+                self.placements.remove(&name);
+            }
+        }
         Ok(self.tools.insert(name, tool))
     }
 
@@ -2048,7 +2177,8 @@ impl ToolRegistry {
                 .sources
                 .remove(&name)
                 .unwrap_or_else(|| "unknown".to_string());
-            assembled.try_register_from(source, tool)?;
+            let placement = other.placements.remove(&name);
+            assembled.try_register_from_declaration(source, tool, placement)?;
         }
         *self = assembled;
         Ok(())
@@ -2067,6 +2197,7 @@ impl ToolRegistry {
     /// drop `task` so a sub-agent can't spawn further sub-agents).
     pub fn remove(&mut self, name: &str) -> Option<Arc<dyn Tool>> {
         self.sources.remove(name);
+        self.placements.remove(name);
         self.tools.remove(name)
     }
 
@@ -2100,7 +2231,17 @@ impl ToolRegistry {
             .filter(|(name, _)| tools.contains_key(*name))
             .map(|(name, source)| (name.clone(), source.clone()))
             .collect();
-        ToolRegistry { tools, sources }
+        let placements = self
+            .placements
+            .iter()
+            .filter(|(name, _)| tools.contains_key(*name))
+            .map(|(name, placement)| (name.clone(), *placement))
+            .collect();
+        ToolRegistry {
+            tools,
+            sources,
+            placements,
+        }
     }
 
     /// Every registered tool name, sorted (see [`specs`](Self::specs) for why order must be stable).
@@ -2108,6 +2249,45 @@ impl ToolRegistry {
         let mut names: Vec<String> = self.tools.keys().cloned().collect();
         names.sort();
         names
+    }
+
+    /// Deliberately declared placement, or `None` for an unannotated compatibility registration.
+    pub fn declared_placement(&self, name: &str) -> Option<OperationPlacement> {
+        self.placements.get(name).copied()
+    }
+
+    /// Effective placement. Registered-but-unannotated operations conservatively default to
+    /// [`OperationPlacement::NativeSystemOnly`]; unknown names return `None`.
+    pub fn effective_placement(&self, name: &str) -> Option<OperationPlacement> {
+        self.tools.contains_key(name).then(|| {
+            self.declared_placement(name)
+                .unwrap_or(OperationPlacement::NativeSystemOnly)
+        })
+    }
+
+    /// Attach or replace the deliberate placement decision for an already-registered operation.
+    ///
+    /// This supports generated catalogs whose owner returns the derived names only after assembly
+    /// (for example a board schema). Ordinary static packs should prefer the placement-aware
+    /// registration methods so handler and metadata install atomically.
+    pub fn declare_placement(&mut self, name: &str, placement: OperationPlacement) -> Result<()> {
+        if !self.tools.contains_key(name) {
+            return Err(Error::Other(format!(
+                "cannot declare execution placement for unknown operation `{name}`"
+            )));
+        }
+        self.placements.insert(name.to_string(), placement);
+        Ok(())
+    }
+
+    /// Registered operations with no deliberate placement declaration, sorted for stable census
+    /// diagnostics. Production pack tests assert this is empty; third-party compatibility paths do
+    /// not have to opt in and remain native-only remotely.
+    pub fn undeclared_placement_names(&self) -> Vec<String> {
+        self.names()
+            .into_iter()
+            .filter(|name| !self.placements.contains_key(name))
+            .collect()
     }
 
     /// Resolve `[tools] disable` patterns (C-162) against this registry's known op names — an
@@ -2191,6 +2371,16 @@ impl ToolRegistry {
 #[derive(Clone)]
 pub struct LiveToolCatalog {
     latest: Arc<Mutex<Arc<ToolRegistry>>>,
+}
+
+/// A host-owned source that updates the live operation catalogue at a turn boundary.
+///
+/// Implementations may perform IO, but they may only publish through [`LiveToolCatalog`]. The flow
+/// engine awaits this hook after acquiring its single-turn gate and before taking C-318's immutable
+/// generation snapshot, so a refresh can never change the schemas or handlers inside a live turn.
+#[async_trait]
+pub trait CatalogRefresher: Send + Sync {
+    async fn refresh(&self, catalog: &LiveToolCatalog) -> Result<()>;
 }
 
 impl LiveToolCatalog {
@@ -3487,6 +3677,41 @@ pub enum AuthorizeVerdict {
     Deny(String),
 }
 
+/// A surface/dispatch-level reason an otherwise registered operation is unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationUnavailability {
+    /// Operator-authored `[tools] disable` policy matched the operation.
+    DisabledByConfig,
+    /// The selected non-native target is incompatible with the operation's effective placement.
+    IncompatiblePlacement {
+        placement: OperationPlacement,
+        target: String,
+    },
+}
+
+impl OperationUnavailability {
+    /// Placement involved in this refusal, if compatibility (rather than config) caused it.
+    pub fn placement(&self) -> Option<OperationPlacement> {
+        match self {
+            Self::DisabledByConfig => None,
+            Self::IncompatiblePlacement { placement, .. } => Some(*placement),
+        }
+    }
+
+    /// Operator-facing explanation shared by diagnostics and the dispatch gate.
+    pub fn explanation(&self, name: &str) -> String {
+        match self {
+            Self::DisabledByConfig => {
+                format!("`{name}` disabled by config ([tools] disable)")
+            }
+            Self::IncompatiblePlacement { placement, target } => format!(
+                "`{name}` unavailable on selected execution system `{target}`: operation placement `{}` requires the native system",
+                placement.label()
+            ),
+        }
+    }
+}
+
 impl AuthorizeVerdict {
     /// Whether the envelope refused the call outright.
     pub fn is_denied(&self) -> bool {
@@ -3736,12 +3961,48 @@ impl Executor {
         disabled
     }
 
+    /// Every operation hidden from a catalog: config-disabled names plus placement-incompatible
+    /// names for the selected target. This is recalculated for each immutable live-catalog
+    /// generation, so an unannotated late addition is immediately safe by default.
+    pub fn unavailable_ops_for(&self, registry: &ToolRegistry) -> HashSet<String> {
+        registry
+            .names()
+            .into_iter()
+            .filter(|name| self.operation_unavailability_in(registry, name).is_some())
+            .collect()
+    }
+
     fn operation_disabled(&self, name: &str) -> bool {
         self.disabled_ops.contains(name)
             || self
                 .disabled_patterns
                 .iter()
                 .any(|pattern| flux_config::tool_disable_matches(pattern, name))
+    }
+
+    fn non_native_target(&self) -> Option<String> {
+        let identity = self.ctx.execution_system().substrate_identity();
+        (identity.kind != "native" || identity.remotely_reported).then_some(identity.kind)
+    }
+
+    fn operation_unavailability_in(
+        &self,
+        registry: &ToolRegistry,
+        name: &str,
+    ) -> Option<OperationUnavailability> {
+        if self.operation_disabled(name) {
+            return Some(OperationUnavailability::DisabledByConfig);
+        }
+        let target = self.non_native_target()?;
+        let placement = registry.effective_placement(name)?;
+        (placement == OperationPlacement::NativeSystemOnly)
+            .then_some(OperationUnavailability::IncompatiblePlacement { placement, target })
+    }
+
+    /// Explain why the active catalog cannot surface or dispatch `name`.
+    pub fn operation_unavailability(&self, name: &str) -> Option<OperationUnavailability> {
+        let registry = self.active_registry_snapshot();
+        self.operation_unavailability_in(&registry, name)
     }
 
     /// Turn boundary for the op cache (L-54): the engine calls this at the start of every user
@@ -3848,7 +4109,7 @@ impl Executor {
     /// approval. A bare deny or an active `with_tools` miss is knowable before arguments exist and
     /// therefore removes the operation from model context entirely.
     pub fn operation_visible(&self, name: &str) -> bool {
-        if self.operation_disabled(name) {
+        if self.operation_unavailability(name).is_some() {
             return false;
         }
         if self
@@ -4024,6 +4285,16 @@ impl Executor {
         &self.ctx
     }
 
+    /// Whether a pre-tool hook can observe, rewrite, or refuse a concrete dispatch.
+    ///
+    /// Native model-response batching uses this as a conservative scheduling barrier: the
+    /// authorize-only preview intentionally does not run hooks, so a caller cannot prove that a
+    /// hook-rewritten invocation remains approval-insensitive. The live dispatch still runs every
+    /// hook normally; this method only decides whether sibling calls may overlap before then.
+    pub fn has_pre_tool_hooks(&self) -> bool {
+        !self.hooks.is_empty()
+    }
+
     /// The current allow rules (for persistence by the caller).
     pub fn allow_rules(&self) -> Vec<String> {
         self.perms.lock().unwrap().allow_rules()
@@ -4069,7 +4340,13 @@ impl Executor {
         let Some(tool) = registry.get(name) else {
             return AuthorizeVerdict::Deny(format!("unknown tool: {name}"));
         };
-        match self.gate(name, params, tool.as_ref(), GateAudit::DecisionOnly) {
+        match self.gate(
+            &registry,
+            name,
+            params,
+            tool.as_ref(),
+            GateAudit::DecisionOnly,
+        ) {
             Err(reason) => AuthorizeVerdict::Deny(reason),
             Ok(call) => {
                 // Mirrors `dispatch_outcome`'s `approval_sensitive`, minus the evidence-driven
@@ -4108,19 +4385,18 @@ impl Executor {
     /// pure read of the scope stack, and a denial returns before the second check.
     fn gate(
         &self,
+        registry: &ToolRegistry,
         name: &str,
         params: &Value,
         tool: &dyn Tool,
         audit: GateAudit,
     ) -> std::result::Result<GatedCall, String> {
-        // C-162: `[tools] disable` is checked first, unconditionally — before the capability-scope
-        // floor, hooks, policy, or permission rules — so a disabled op is refused the same way
-        // regardless of scope/rules/plan. This is deliberately NOT the authorization boundary (the
-        // policy below still governs everything that isn't disabled); it exists so a cached plan or
-        // a resumed session can't call an op this workspace configured off, even where the policy
-        // would otherwise allow it. Surface-only + defense-in-depth, never a second permission system.
-        if self.operation_disabled(name) {
-            return Err(format!("`{name}` disabled by config ([tools] disable)"));
+        // C-162/C-478: configuration and execution compatibility are availability gates, applied
+        // before scopes, policy, hooks, or approval. They are deliberately not folded into
+        // `PermissionManager` (the ordinary op policy below still governs everything available);
+        // this is the defense-in-depth check that also refuses cached plans and direct calls.
+        if let Some(unavailable) = self.operation_unavailability_in(registry, name) {
+            return Err(unavailable.explanation(name));
         }
         self.cap_scope_gate(name, audit)?;
 
@@ -4294,7 +4570,7 @@ impl Executor {
             perm,
             policy_requires_approval,
             identity,
-        } = match self.gate(name, &params, tool.as_ref(), GateAudit::Live) {
+        } = match self.gate(&registry, name, &params, tool.as_ref(), GateAudit::Live) {
             Ok(call) => call,
             Err(reason) => {
                 return self.finish_dispatch(
@@ -5319,7 +5595,13 @@ mod tests {
     async fn dispatch_evidence_stamps_local_and_remote_substrate_provenance() {
         async fn provenance(ctx: ToolContext) -> (Value, Value) {
             let mut registry = ToolRegistry::new();
-            registry.register(Arc::new(EchoTool));
+            registry
+                .try_register_from_with_placement(
+                    "execution provenance fixture",
+                    Arc::new(EchoTool),
+                    OperationPlacement::SelectedExecutionSystem,
+                )
+                .unwrap();
             let executor = Executor::new(
                 registry,
                 PermissionManager::new(),
@@ -5357,6 +5639,95 @@ mod tests {
         assert_eq!(remote.0["kind"], "loopback/native");
         assert_eq!(remote.0["remotely_reported"], true);
         assert_eq!(remote.1, remote.0, "call and result provenance must agree");
+    }
+
+    /// C-478 failing-first: one outer pack may mix control/native operations with operations whose
+    /// guarded effects use the selected execution system. Remote compatibility follows each
+    /// operation's declaration, never registration order or a blanket decision for the pack.
+    #[tokio::test]
+    async fn remote_placement_filters_and_refuses_each_operation_independently() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .try_register_from_with_placement(
+                "fixture mixed outer pack",
+                Arc::new(CatalogTool("pack.selected")),
+                OperationPlacement::SelectedExecutionSystem,
+            )
+            .unwrap();
+        registry
+            .try_register_from_with_placement(
+                "fixture mixed outer pack",
+                Arc::new(CatalogTool("pack.native")),
+                OperationPlacement::NativeSystemOnly,
+            )
+            .unwrap();
+
+        let native = test_ctx().execution_system();
+        let remote = Arc::new(flux_system::remote::RemoteSystem::loopback(native));
+        let executor = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["pack.selected".into(), "pack.native".into()], &[]),
+            Arc::new(AllowApprover),
+            test_ctx().with_execution_system(remote),
+        );
+
+        assert!(executor.operation_visible("pack.selected"));
+        assert!(!executor.operation_visible("pack.native"));
+        assert_eq!(
+            executor
+                .operation_unavailability("pack.native")
+                .expect("native-only reason")
+                .placement(),
+            Some(OperationPlacement::NativeSystemOnly),
+        );
+        assert_eq!(
+            executor.dispatch("pack.selected", json!({})).await.content,
+            "pack.selected"
+        );
+        let refused = executor.dispatch("pack.native", json!({})).await;
+        assert!(refused.is_error, "native-only dispatch must be refused");
+        assert!(
+            refused.content.contains("native-system-only")
+                && refused.content.contains("loopback/native"),
+            "operator-facing refusal must name placement and selected target: {refused:?}"
+        );
+    }
+
+    /// An unannotated downstream tool remains source-compatible and is conservatively native-only
+    /// for a non-native target. The same declaration still dispatches exactly as before locally.
+    #[tokio::test]
+    async fn unannotated_operation_defaults_native_only_only_for_non_native_targets() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .try_register_from("third-party pack", Arc::new(CatalogTool("third.party")))
+            .unwrap();
+        assert_eq!(
+            registry.effective_placement("third.party"),
+            Some(OperationPlacement::NativeSystemOnly)
+        );
+        assert_eq!(registry.declared_placement("third.party"), None);
+
+        let local = Executor::new(
+            registry.clone(),
+            PermissionManager::from_rules(&["third.party".into()], &[]),
+            Arc::new(AllowApprover),
+            test_ctx(),
+        );
+        assert_eq!(
+            local.dispatch("third.party", json!({})).await.content,
+            "third.party"
+        );
+
+        let native = test_ctx().execution_system();
+        let remote = Arc::new(flux_system::remote::RemoteSystem::loopback(native));
+        let remote = Executor::new(
+            registry,
+            PermissionManager::from_rules(&["third.party".into()], &[]),
+            Arc::new(AllowApprover),
+            test_ctx().with_execution_system(remote),
+        );
+        assert!(!remote.operation_visible("third.party"));
+        assert!(remote.dispatch("third.party", json!({})).await.is_error);
     }
 
     fn test_ctx() -> ToolContext {

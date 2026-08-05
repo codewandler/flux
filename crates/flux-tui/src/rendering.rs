@@ -509,6 +509,20 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         );
     }
 
+    // C-518: the historical observatory is an explicit sibling of C-140's live `/usage` overlay.
+    // Its rows are monochrome-complete text; the active theme supplies presentation only.
+    if let Some(observatory) = &state.observatory {
+        let t = &state.theme;
+        let area = frame.area();
+        let rows = observatory
+            .lines(area.width, area.height)
+            .into_iter()
+            .map(|line| Line::styled(line, t.panel_style()))
+            .collect::<Vec<_>>();
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new(rows).style(t.panel_style()), area);
+    }
+
     // C-140: `/usage` overlay — the turn in progress, per round, from the same per-call data
     // `flux usage` reads offline. The session header shows cumulative totals; the per-round bars are
     // where a mid-turn cache collapse (tool-set churn, TTL expiry) becomes visible AS it happens.

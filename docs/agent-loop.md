@@ -1,5 +1,10 @@
 # The agent loop
 
+> Contributor copy. The user-facing treatment of this loop is
+> [`website/docs/agent/agent-loop.md`](../website/docs/agent/agent-loop.md) — deliberately
+> independent texts over the same behavior, not mirrors; keep both consistent with the shipped
+> tree.
+
 flux's turn loop is an authored Flux-Lang program. `FlowEngine::run_turn_cancellable` only supplies
 the session, cancellation token, provider, operation registry, and safety envelope; the program in
 [`crates/flux-flow/assets/agent-loop.flux`](../crates/flux-flow/assets/agent-loop.flux) owns the

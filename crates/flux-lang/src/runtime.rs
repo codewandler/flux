@@ -17,9 +17,10 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use flux_core::{Error, OperationTiming, Usage};
-use flux_spec::IntentSet;
+use flux_core::{DispatchId, Error, OperationTiming, Usage};
+use flux_spec::{Intent, IntentBehavior, IntentCertainty, IntentRole, IntentSet, IntentTarget};
 
+use crate::analyze::{self, EffectAnnotation};
 use crate::ast::{
     DraftAst, FailureKind, Node, NodeId, PhysicalPlan, RunEvent, Stage, StepId, SymbolName,
     TypeRef, Value, ValueId, Visibility,
@@ -1022,8 +1023,8 @@ enum SinkEvent {
     Text(String),
     Thinking(String),
     Planning(bool),
-    ToolCall(String, serde_json::Value),
-    ToolResult(String, OpOutcome),
+    ToolCall(DispatchId, String, serde_json::Value),
+    ToolResult(DispatchId, String, OpOutcome),
     Observation(flux_evidence::Observation),
     TurnEnd(Option<Usage>),
 }
@@ -1047,8 +1048,8 @@ impl BufferSink {
                 SinkEvent::Text(t) => sink.text_delta(&t),
                 SinkEvent::Thinking(t) => sink.thinking_delta(&t),
                 SinkEvent::Planning(a) => sink.planning(a),
-                SinkEvent::ToolCall(n, i) => sink.tool_call(&n, &i),
-                SinkEvent::ToolResult(n, r) => sink.tool_result(&n, &r),
+                SinkEvent::ToolCall(d, n, i) => sink.tool_call(d, &n, &i),
+                SinkEvent::ToolResult(d, n, r) => sink.tool_result(d, &n, &r),
                 SinkEvent::Observation(o) => sink.observation(&o),
                 SinkEvent::TurnEnd(u) => sink.turn_end(u),
             }
@@ -1066,13 +1067,19 @@ impl FlowSink for BufferSink {
     fn planning(&mut self, active: bool) {
         self.events.push(SinkEvent::Planning(active));
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        self.events
-            .push(SinkEvent::ToolCall(name.to_string(), input.clone()));
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
+        self.events.push(SinkEvent::ToolCall(
+            dispatch,
+            name.to_string(),
+            input.clone(),
+        ));
     }
-    fn tool_result(&mut self, name: &str, result: &OpOutcome) {
-        self.events
-            .push(SinkEvent::ToolResult(name.to_string(), result.clone()));
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &OpOutcome) {
+        self.events.push(SinkEvent::ToolResult(
+            dispatch,
+            name.to_string(),
+            result.clone(),
+        ));
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.events.push(SinkEvent::Observation(o.clone()));
@@ -1098,8 +1105,18 @@ pub async fn execute_flow(
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let fk = flow_key(ast.name.as_deref(), &ast.body);
+    let annotations = analyze::annotate_effects(ast, executor.catalog());
     run_top_level(
-        store, executor, session_id, &ast.body, 0, None, &fk, sink, None,
+        store,
+        executor,
+        session_id,
+        &ast.body,
+        0,
+        None,
+        &fk,
+        sink,
+        None,
+        &annotations,
     )
     .await
 }
@@ -1118,6 +1135,7 @@ pub async fn execute_flow_traced(
     trace: &EditorExecutionTrace,
 ) -> Result<FlowOutcome> {
     let fk = flow_key(ast.name.as_deref(), &ast.body);
+    let annotations = analyze::annotate_effects(ast, executor.catalog());
     run_top_level(
         store,
         executor,
@@ -1128,6 +1146,7 @@ pub async fn execute_flow_traced(
         &fk,
         sink,
         Some(trace),
+        &annotations,
     )
     .await
 }
@@ -1154,7 +1173,18 @@ pub async fn execute_flow_resumable(
     ledger: Option<&ResumeLedger>,
 ) -> Result<FlowOutcome> {
     let fk = flow_key(ast.name.as_deref(), &ast.body);
-    run_top_level_resumable(store, executor, session_id, &ast.body, &fk, ledger, sink).await
+    let annotations = analyze::annotate_effects(ast, executor.catalog());
+    run_top_level_resumable(
+        store,
+        executor,
+        session_id,
+        &ast.body,
+        &fk,
+        ledger,
+        sink,
+        &annotations,
+    )
+    .await
 }
 
 /// The binding symbol of the top-level `await` at `halt_node`, if it binds one — so a resumable
@@ -1243,6 +1273,12 @@ pub async fn resume_flow_named(
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
     let fk = flow_key(name, body);
+    let ast = crate::ast::DraftAst {
+        body: body.to_vec(),
+        name: name.map(|s| s.to_string()),
+        ..Default::default()
+    };
+    let annotations = analyze::annotate_effects(&ast, executor.catalog());
     run_top_level(
         store,
         executor,
@@ -1253,6 +1289,7 @@ pub async fn resume_flow_named(
         &fk,
         sink,
         None,
+        &annotations,
     )
     .await
 }
@@ -1274,6 +1311,7 @@ async fn run_top_level(
     flow_key: &str,
     sink: &mut dyn FlowSink,
     editor_trace: Option<&EditorExecutionTrace>,
+    annotations: &[(String, EffectAnnotation)],
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
     // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
@@ -1374,6 +1412,7 @@ async fn run_top_level(
             budget.clone(),
             editor_trace,
             Some(TraceBody::single("body", i)),
+            annotations,
         )
         .await?;
         // A `return` exits the flow immediately. An explicit `return <expr>` yields that
@@ -1447,6 +1486,7 @@ async fn run_top_level_resumable(
     flow_key: &str,
     ledger: Option<&ResumeLedger>,
     sink: &mut dyn FlowSink,
+    annotations: &[(String, EffectAnnotation)],
 ) -> Result<FlowOutcome> {
     let mut steps = 0usize;
     // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
@@ -1638,7 +1678,7 @@ async fn run_top_level_resumable(
         }
 
         let stmt = stmt_hash16(&body[i]);
-        match exec_body(
+        match exec_body_at(
             store,
             executor,
             session_id,
@@ -1647,6 +1687,9 @@ async fn run_top_level_resumable(
             &mut steps,
             &mut transcript,
             budget.clone(),
+            None,
+            Some(TraceBody::single("body", i)),
+            annotations,
         )
         .await
         {
@@ -1769,6 +1812,11 @@ pub async fn execute_plan(
     plan: &PhysicalPlan,
     sink: &mut dyn FlowSink,
 ) -> Result<FlowOutcome> {
+    let ast = DraftAst {
+        body: body.to_vec(),
+        ..Default::default()
+    };
+    let annotations = analyze::annotate_effects(&ast, executor.catalog());
     let mut steps = 0usize;
     // L-116: ONE loop-iteration budget for this whole flow execution — cloned into every
     // nested body so `repeat`/`each`/`loop` share it instead of each getting a fresh one.
@@ -1787,7 +1835,7 @@ pub async fn execute_plan(
         match stage {
             Stage::Sequential(id) | Stage::ApprovalFence(id) => {
                 let node = node_at(id)?;
-                let (text, _lv, step) = exec_body(
+                let (text, _lv, step) = exec_body_at(
                     store,
                     executor,
                     session_id,
@@ -1796,6 +1844,9 @@ pub async fn execute_plan(
                     &mut steps,
                     &mut transcript,
                     budget.clone(),
+                    None,
+                    Some(TraceBody::single("body", id.0 as usize)),
+                    &annotations,
                 )
                 .await?;
                 last = text;
@@ -1809,12 +1860,13 @@ pub async fn execute_plan(
                     // L-116: each concurrent stage gets a HANDLE to the one execution budget, not a
                     // private counter, so parallel stages cannot multiply past it.
                     let budget = budget.clone();
+                    let annotations = annotations.clone();
                     async move {
                         let node = node_at(id)?;
                         let mut buf = BufferSink::default();
                         let mut s = 0usize;
                         let mut tr: Vec<String> = Vec::new();
-                        let (text, _lv, step) = exec_body(
+                        let (text, _lv, step) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -1823,6 +1875,9 @@ pub async fn execute_plan(
                             &mut s,
                             &mut tr,
                             budget.clone(),
+                            None,
+                            Some(TraceBody::single("body", id.0 as usize)),
+                            &annotations,
                         )
                         .await?;
                         Ok::<_, FlowError>((buf, s, tr, text, step))
@@ -1886,6 +1941,7 @@ pub async fn execute_plan(
 // One recursion seam, and every argument is a distinct piece of execution-scoped state that a
 // nested body must see (store/host/session, the body, the sink, the step count, the transcript, the
 // loop budget). Bundling them into a context struct would only rename the same eight.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn exec_body<'a>(
     store: &'a dyn ValueStore,
@@ -1896,9 +1952,21 @@ fn exec_body<'a>(
     steps: &'a mut usize,
     transcript: &'a mut Vec<String>,
     budget: LoopBudget,
+    trace_body: Option<TraceBody>,
+    annotation_map: &'a [(String, EffectAnnotation)],
 ) -> BodyFuture<'a> {
     exec_body_at(
-        store, executor, session_id, body, sink, steps, transcript, budget, None, None,
+        store,
+        executor,
+        session_id,
+        body,
+        sink,
+        steps,
+        transcript,
+        budget,
+        None,
+        trace_body,
+        annotation_map,
     )
 }
 
@@ -1925,6 +1993,70 @@ impl TraceBody {
     }
 }
 
+fn child_trace(trace_body: &Option<String>, segment: &str) -> Option<TraceBody> {
+    trace_body
+        .as_ref()
+        .map(|t| TraceBody::nested(format!("{t}.{segment}")))
+}
+
+fn collect_confirm_intents(
+    base_path: Option<&str>,
+    annotation_map: &[(String, EffectAnnotation)],
+) -> IntentSet {
+    let mut intents = IntentSet::new();
+    let Some(prefix) = base_path else {
+        return intents;
+    };
+
+    let body_prefix = format!("{prefix}.body");
+    let body_prefix = format!("{body_prefix}[");
+
+    for (path, annotation) in annotation_map {
+        let Some(rest) = path.strip_prefix(&body_prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue;
+        }
+
+        if annotation.known {
+            intents.push(Intent {
+                behavior: IntentBehavior::Operation,
+                target: IntentTarget::Operation {
+                    name: annotation.operation.clone(),
+                    effects: annotation.host_effects.clone(),
+                    semantic_effects: annotation.effects.clone(),
+                },
+                role: IntentRole::Operation,
+                certainty: IntentCertainty::Certain,
+            });
+        } else {
+            intents.push(Intent {
+                behavior: IntentBehavior::Unknown,
+                target: IntentTarget::Operation {
+                    name: annotation.operation.clone(),
+                    effects: Vec::new(),
+                    semantic_effects: Vec::new(),
+                },
+                role: IntentRole::Operation,
+                certainty: IntentCertainty::Potential,
+            });
+        }
+    }
+
+    if intents.intents.is_empty() {
+        intents.push(Intent {
+            behavior: IntentBehavior::Gate,
+            target: IntentTarget::Gate {
+                name: "confirm".into(),
+            },
+            role: IntentRole::Gate,
+            certainty: IntentCertainty::Certain,
+        });
+    }
+    intents
+}
+
 #[allow(clippy::too_many_arguments)]
 fn exec_body_at<'a>(
     store: &'a dyn ValueStore,
@@ -1937,6 +2069,7 @@ fn exec_body_at<'a>(
     budget: LoopBudget,
     editor_trace: Option<&'a EditorExecutionTrace>,
     trace_body: Option<TraceBody>,
+    annotations: &'a [(String, EffectAnnotation)],
 ) -> BodyFuture<'a> {
     Box::pin(async move {
         let mut last = String::new();
@@ -2130,6 +2263,7 @@ fn exec_body_at<'a>(
                         budget.clone(),
                         editor_trace,
                         branch_path,
+                        annotations,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2177,6 +2311,7 @@ fn exec_body_at<'a>(
                             budget.clone(),
                             editor_trace,
                             repeat_path,
+                            annotations,
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -2284,6 +2419,7 @@ fn exec_body_at<'a>(
                             budget.clone(),
                             editor_trace,
                             each_path,
+                            annotations,
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -2409,7 +2545,7 @@ fn exec_body_at<'a>(
                     last_value = prev;
                 }
                 Node::Seq { body: sbody, bind } => {
-                    let (blast, bvid, step) = exec_body(
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -2418,6 +2554,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2536,7 +2675,7 @@ fn exec_body_at<'a>(
                             let mut tr: Vec<String> = Vec::new();
                             let res = exec_body_at(
                                 store, executor, session_id, &b.body, &mut buf, &mut s, &mut tr,
-                                budget, editor_trace, branch_path,
+                                budget, editor_trace, branch_path, annotations,
                             )
                             .await;
                             (b, buf, s, tr, res)
@@ -2596,7 +2735,7 @@ fn exec_body_at<'a>(
                                 tokio::time::sleep(std::time::Duration::from_millis(wait)).await;
                             }
                         }
-                        match exec_body(
+                        match exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -2605,6 +2744,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            child_trace(&node_path, "body"),
+                            annotations,
                         )
                         .await
                         {
@@ -2647,7 +2789,7 @@ fn exec_body_at<'a>(
                     catch,
                     handler,
                 } => {
-                    match exec_body(
+                    match exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -2656,6 +2798,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await
                     {
@@ -2674,7 +2819,7 @@ fn exec_body_at<'a>(
                                     store.put_value(session_id, &Value::String(e.to_string()))?;
                                 bind_existing(store, session_id, cname, &err_vid)?;
                             }
-                            let (hblast, hvid, hstep) = exec_body(
+                            let (hblast, hvid, hstep) = exec_body_at(
                                 store,
                                 executor,
                                 session_id,
@@ -2683,6 +2828,9 @@ fn exec_body_at<'a>(
                                 &mut *steps,
                                 &mut *transcript,
                                 budget.clone(),
+                                None,
+                                child_trace(&node_path, "handler"),
+                                annotations,
                             )
                             .await?;
                             if !hblast.is_empty() {
@@ -2700,14 +2848,14 @@ fn exec_body_at<'a>(
                     risk,
                     body: cbody,
                 } => {
-                    let intents = IntentSet::new();
+                    let intents = collect_confirm_intents(node_path.as_deref(), annotations);
                     let risk_tag = risk.as_deref().unwrap_or("medium");
                     let labelled = format!("[{risk_tag}] {message}");
                     let choice = executor.request_approval(&labelled, &intents).await;
                     if !matches!(choice, ApprovalChoice::Allow) {
                         return Err(FlowError::Core(Error::ConfirmDenied(message.clone())));
                     }
-                    let (blast, bvid, step) = exec_body(
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -2716,6 +2864,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -2743,12 +2894,13 @@ fn exec_body_at<'a>(
                     // scope can still cap dispatches more tightly. L-116: the counter is the flow
                     // execution's shared `budget`, not a local one, so a `loop` nested inside
                     // another loop can no longer multiply past `DEFAULT_MAX_LOOP_ITERATIONS`.
+                    let trace_body = child_trace(&node_path, "body");
                     loop {
                         if std::time::Instant::now() >= deadline {
                             break;
                         }
                         budget.charge("loop")?;
-                        match exec_body(
+                        match exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -2757,6 +2909,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            trace_body.clone(),
+                            annotations,
                         )
                         .await
                         {
@@ -2837,12 +2992,24 @@ fn exec_body_at<'a>(
                                 // L-116: racing branches share the one execution budget (see the
                                 // `parallel` arm) rather than each getting a private counter.
                                 let budget = budget.clone();
+                                let branch_trace = node_path.as_ref().map(|path| {
+                                    TraceBody::nested(format!("{path}.branches[{idx}].body"))
+                                });
                                 async move {
                                     (
                                         idx,
-                                        exec_body(
-                                            store, executor, session_id, &b.body, buf, s, tr,
+                                        exec_body_at(
+                                            store,
+                                            executor,
+                                            session_id,
+                                            &b.body,
+                                            buf,
+                                            s,
+                                            tr,
                                             budget,
+                                            None,
+                                            branch_trace,
+                                            annotations,
                                         )
                                         .await,
                                     )
@@ -2917,7 +3084,7 @@ fn exec_body_at<'a>(
                     // single statement may still overshoot within itself — documented v1.
                     let bucket_key = SymbolName(format!("__throttle_bucket_{tname}"));
                     let mut tvid: Option<ValueId> = None;
-                    for stmt in tbody {
+                    for (i, stmt) in tbody.iter().enumerate() {
                         let now_ms = now_millis();
                         let window_start = now_ms.saturating_sub(*window_ms);
                         let in_window = throttle_bucket_rmw(
@@ -2934,7 +3101,10 @@ fn exec_body_at<'a>(
                             )));
                         }
                         let start = *steps;
-                        let (blast, svid, step) = exec_body(
+                        let stmt_path = node_path
+                            .as_ref()
+                            .map(|path| TraceBody::single(&format!("{path}.body"), i));
+                        let (blast, svid, step) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -2943,6 +3113,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            stmt_path,
+                            annotations,
                         )
                         .await?;
                         let dispatched = (*steps).saturating_sub(start);
@@ -2997,7 +3170,7 @@ fn exec_body_at<'a>(
                         ));
                         continue;
                     }
-                    let (blast, bvid, step) = exec_body(
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3006,6 +3179,9 @@ fn exec_body_at<'a>(
                         steps,
                         transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -3027,7 +3203,7 @@ fn exec_body_at<'a>(
                     }
                     trace_structural(sink, "loop.node", data);
                     if take {
-                        let (blast, bvid, step) = exec_body(
+                        let (blast, bvid, step) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -3036,6 +3212,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            child_trace(&node_path, "body"),
+                            annotations,
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -3100,18 +3279,27 @@ fn exec_body_at<'a>(
                     default,
                 } => {
                     let subj = eval_arg(subject, store, session_id)?;
-                    let mut branch: Option<&[Node]> = None;
-                    let mut matched = false;
-                    for case in cases {
+                    let mut branch_index: Option<usize> = None;
+                    for (case_index, case) in cases.iter().enumerate() {
                         if eval_arg(&case.value, store, session_id)? == subj {
-                            branch = Some(&case.body);
-                            matched = true;
+                            branch_index = Some(case_index);
                             break;
                         }
                     }
-                    let branch = match branch {
-                        Some(b) => b,
-                        None if !default.is_empty() => default.as_slice(),
+                    let matched = branch_index.is_some();
+                    let (branch, branch_trace) = match branch_index {
+                        Some(i) => {
+                            let body = cases
+                                .get(i)
+                                .map_or(default.as_slice(), |case| case.body.as_slice());
+                            let trace = node_path
+                                .as_ref()
+                                .map(|path| TraceBody::nested(format!("{path}.cases[{i}].body")));
+                            (body, trace)
+                        }
+                        None if !default.is_empty() => {
+                            (default.as_slice(), child_trace(&node_path, "default"))
+                        }
                         None => {
                             return Err(FlowError::Runtime(format!(
                                 "`match` had no case for `{}` and no default",
@@ -3133,7 +3321,7 @@ fn exec_body_at<'a>(
                         trace_data["subject"] = serde_json::Value::String(l);
                     }
                     trace_structural(sink, "loop.node", trace_data);
-                    let (blast, bvid, step) = exec_body(
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3142,6 +3330,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        branch_trace,
+                        annotations,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -3178,20 +3369,29 @@ fn exec_body_at<'a>(
                             v => serde_json::to_string(&v).unwrap_or_default(),
                         },
                     };
-                    let branch = cases
-                        .iter()
-                        .find(|c| c.label == label)
-                        .map(|c| c.body.as_slice());
-                    let branch = match branch {
-                        Some(b) => b,
-                        None if !default.is_empty() => default.as_slice(),
-                        None => {
-                            return Err(FlowError::Runtime(format!(
-                                "`route` selector returned `{label}`, which matches no case and there is no default"
-                            )));
+                    let matched_case = cases.iter().enumerate().find_map(|(i, case)| {
+                        if case.label == label {
+                            Some(i)
+                        } else {
+                            None
                         }
+                    });
+                    let branch = matched_case
+                        .and_then(|i| cases.get(i))
+                        .map(|c| c.body.as_slice())
+                        .or_else(|| (!default.is_empty()).then_some(default.as_slice()));
+                    let branch = branch.ok_or_else(|| {
+                        FlowError::Runtime(format!(
+                            "`route` selector returned `{label}`, which matches no case and there is no default"
+                        ))
+                    })?;
+                    let branch_trace = match matched_case {
+                        Some(i) => node_path
+                            .as_ref()
+                            .map(|path| TraceBody::nested(format!("{path}.cases[{i}].body"))),
+                        None => child_trace(&node_path, "default"),
                     };
-                    let (blast, bvid, step) = exec_body(
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3200,6 +3400,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        branch_trace,
+                        annotations,
                     )
                     .await?;
                     if !blast.is_empty() {
@@ -3216,8 +3419,11 @@ fn exec_body_at<'a>(
                     // kept only as a last resort; if every branch errors, the last error propagates.
                     let mut win: Option<(String, Option<ValueId>)> = None;
                     let mut last_err: Option<FlowError> = None;
-                    for b in branches {
-                        match exec_body(
+                    for (branch_index, b) in branches.iter().enumerate() {
+                        let branch_path = node_path.as_ref().map(|path| {
+                            TraceBody::nested(format!("{path}.branches[{branch_index}].body"))
+                        });
+                        match exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -3226,6 +3432,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            branch_path,
+                            annotations,
                         )
                         .await
                         {
@@ -3283,7 +3492,7 @@ fn exec_body_at<'a>(
                     // and audited (the run trace must not silently omit side effects that happened).
                     let res = tokio::time::timeout(dur, async {
                         let mut buf = BufferSink::default();
-                        exec_body(
+                        exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -3292,6 +3501,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            child_trace(&node_path, "body"),
+                            annotations,
                         )
                         .await
                         .map(|(text, lv, step)| (text, lv, step, buf))
@@ -3327,13 +3539,13 @@ fn exec_body_at<'a>(
                     let start = *steps;
                     let cap = *limit as usize;
                     let mut bvid: Option<ValueId> = None;
-                    for stmt in bbody {
+                    for (i, stmt) in bbody.iter().enumerate() {
                         if (*steps).saturating_sub(start) >= cap {
                             return Err(FlowError::Runtime(format!(
                                 "`budget` exceeded: at most {cap} op dispatch(es) allowed in this scope"
                             )));
                         }
-                        let (blast, svid, step) = exec_body(
+                        let (blast, svid, step) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -3342,6 +3554,11 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            node_path
+                                .as_ref()
+                                .map(|path| TraceBody::single(&format!("{path}.body"), i)),
+                            annotations,
                         )
                         .await?;
                         if !blast.is_empty() {
@@ -3370,7 +3587,7 @@ fn exec_body_at<'a>(
                     // the window around its body — even when the body errors or returns early. The pop
                     // runs via `?`-transparent early return below, exactly like `finally` always running.
                     executor.push_cap_scope(tools).await;
-                    let body_res = exec_body(
+                    let body_res = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3379,6 +3596,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await;
                     executor.pop_cap_scope().await;
@@ -3404,7 +3624,7 @@ fn exec_body_at<'a>(
                     // If `acquire` fails the resource was never taken, so `finally` does not run (the
                     // `?` propagates before we reach the body/finally).
                     if let Some(acq) = acquire {
-                        let (_, avid, astep) = exec_body(
+                        let (_, avid, astep) = exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -3413,6 +3633,9 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            child_trace(&node_path, "acquire"),
+                            annotations,
                         )
                         .await?;
                         if let Step::Return(v) = astep {
@@ -3423,7 +3646,7 @@ fn exec_body_at<'a>(
                         }
                     }
                     // Run the body, capturing its outcome so `finally` runs no matter what.
-                    let body_res = exec_body(
+                    let body_res = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3432,10 +3655,13 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await;
                     // Guaranteed cleanup: `finally` always runs — on success, `return`, or error.
-                    let fin_res = exec_body(
+                    let fin_res = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3444,6 +3670,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "finally"),
+                        annotations,
                     )
                     .await;
                     match body_res {
@@ -3465,12 +3694,12 @@ fn exec_body_at<'a>(
                 Node::Saga { steps: ssteps } => {
                     // Run each step in order; after a step succeeds, register its `undo`. If a later
                     // step fails, run the registered undos in reverse (LIFO, best-effort) then propagate.
-                    let mut comps: Vec<&[Node]> = Vec::new();
+                    let mut comps: Vec<(usize, &[Node])> = Vec::new();
                     let mut saga_last = String::new();
                     let mut saga_vid: Option<ValueId> = None;
                     let mut failure: Option<FlowError> = None;
-                    for step in ssteps {
-                        match exec_body(
+                    for (saga_index, step) in ssteps.iter().enumerate() {
+                        match exec_body_at(
                             store,
                             executor,
                             session_id,
@@ -3479,6 +3708,12 @@ fn exec_body_at<'a>(
                             &mut *steps,
                             &mut *transcript,
                             budget.clone(),
+                            None,
+                            Some(TraceBody::nested(format!(
+                                "{}.steps[{saga_index}].body",
+                                node_path.as_ref().map_or_else(String::new, Clone::clone)
+                            ))),
+                            annotations,
                         )
                         .await
                         {
@@ -3494,7 +3729,7 @@ fn exec_body_at<'a>(
                                     return Ok((saga_last, v.clone(), Step::Return(v)));
                                 }
                                 if !step.undo.is_empty() {
-                                    comps.push(&step.undo);
+                                    comps.push((saga_index, &step.undo));
                                 }
                             }
                             Err(be) => {
@@ -3505,8 +3740,8 @@ fn exec_body_at<'a>(
                     }
                     if let Some(be) = failure {
                         // Unwind: compensate completed steps in reverse order, best-effort.
-                        for undo in comps.iter().rev() {
-                            if let Err(ue) = exec_body(
+                        for (undo_index, undo) in comps.iter().rev() {
+                            if let Err(ue) = exec_body_at(
                                 store,
                                 executor,
                                 session_id,
@@ -3515,6 +3750,12 @@ fn exec_body_at<'a>(
                                 &mut *steps,
                                 &mut *transcript,
                                 budget.clone(),
+                                None,
+                                Some(TraceBody::nested(format!(
+                                    "{}.steps[{undo_index}].undo",
+                                    node_path.as_ref().map_or_else(String::new, Clone::clone)
+                                ))),
+                                annotations,
                             )
                             .await
                             {
@@ -3555,7 +3796,7 @@ fn exec_body_at<'a>(
                     }
                     // First run (or no durable store): run the body. An error propagates via `?`
                     // *before* we record, so a failed `once` leaves no record and is retried.
-                    let (blast, bvid, step) = exec_body(
+                    let (blast, bvid, step) = exec_body_at(
                         store,
                         executor,
                         session_id,
@@ -3564,6 +3805,9 @@ fn exec_body_at<'a>(
                         &mut *steps,
                         &mut *transcript,
                         budget.clone(),
+                        None,
+                        child_trace(&node_path, "body"),
+                        annotations,
                     )
                     .await?;
                     if let (Some(name), Some(vid)) = (bind, &bvid) {
@@ -3750,7 +3994,11 @@ async fn run_call(
     // A concise, bounded, allow-listed source label for later model feedback. This deliberately
     // reuses the read/grep-only summary seam rather than dumping arbitrary inputs into context.
     let provenance = op_summary_prefix(op, &input);
-    sink.tool_call(op, &input);
+    // C-531: one id per dispatch, stamped on both ends of this await. Concurrent same-name calls
+    // (C-528's parallel gather batches) interleave their sink events, so the pairing has to travel
+    // with them; a surface that matched on the op name alone cross-attached the results.
+    let dispatch = DispatchId::next();
+    sink.tool_call(dispatch, op, &input);
     let composite = executor.catalog().composite(op);
     let outcome = if let Some(composite) = composite {
         execute_composite_call(store, executor, session_id, &composite, input, bind, sink).await?
@@ -3760,6 +4008,7 @@ async fn run_call(
     // Surface the model-facing VIEW (numbered read, diff, …) to the sink — what the model/user sees.
     // The canonical `outcome.content` remains what control flow and interpolation use.
     sink.tool_result(
+        dispatch,
         op,
         &OpOutcome {
             content: outcome.view.clone(),
@@ -5705,7 +5954,7 @@ mod tests {
             calls: Vec<String>,
         }
         impl FlowSink for RecSink {
-            fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+            fn tool_call(&mut self, _dispatch: DispatchId, name: &str, input: &serde_json::Value) {
                 self.calls.push(format!("{name}:{input}"));
             }
         }
@@ -6138,6 +6387,137 @@ mod tests {
     }
     fn echo(v: &str) -> Node {
         call("echo", vec![flow_lit(json!(v))])
+    }
+    #[derive(Default)]
+    struct IntentCaptureHost {
+        cat: IntentCaptureCatalog,
+        approvals: AtomicUsize,
+        intents: Arc<Mutex<Vec<flux_spec::IntentSet>>>,
+        labels: Arc<Mutex<Vec<String>>>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+    #[derive(Default)]
+    struct IntentCaptureCatalog;
+    impl IntentCaptureCatalog {
+        fn signature(
+            &self,
+            name: &str,
+            required: &[&str],
+            effects: Vec<flux_spec::Effect>,
+        ) -> OpSignature {
+            OpSignature {
+                name: name.into(),
+                description: String::new(),
+                effects,
+                risk: flux_spec::Risk::High,
+                idempotency: flux_spec::Idempotency::NonIdempotent,
+                required_params: required.iter().map(|s| s.to_string()).collect(),
+                optional_params: Vec::new(),
+                param_types: Default::default(),
+                output: TypeRef::Any,
+                semantic_effects: Vec::new(),
+            }
+        }
+    }
+    impl OpCatalog for IntentCaptureCatalog {
+        fn lookup(&self, name: &str) -> Option<OpSignature> {
+            Some(match name {
+                "mutating_task" => self.signature(
+                    name,
+                    &["task"],
+                    vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                ),
+                "write_file" => {
+                    self.signature(name, &["path", "content"], vec![flux_spec::Effect::Write])
+                }
+                "read_file" => self.signature(
+                    name,
+                    &["path"],
+                    vec![flux_spec::Effect::Read, flux_spec::Effect::Filesystem],
+                ),
+                "charge_card" => {
+                    let mut signature = self.signature(name, &[], Vec::new());
+                    signature.semantic_effects = vec![crate::ast::FlowEffect::Money];
+                    signature
+                }
+                "bash" => self.signature(name, &["command"], vec![flux_spec::Effect::Process]),
+                _ => return None,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl OpHost for IntentCaptureHost {
+        async fn dispatch(&self, op: &str, input: serde_json::Value) -> OpOutcome {
+            self.calls.lock().unwrap().push(op.to_string());
+            OpOutcome::ok(format!("{op}({input})"))
+        }
+        fn catalog(&self) -> &dyn OpCatalog {
+            &self.cat
+        }
+        async fn request_approval(
+            &self,
+            label: &str,
+            intents: &flux_spec::IntentSet,
+        ) -> ApprovalChoice {
+            self.approvals.fetch_add(1, Ordering::SeqCst);
+            self.labels.lock().unwrap().push(label.to_string());
+            self.intents.lock().unwrap().push(intents.clone());
+            ApprovalChoice::Allow
+        }
+        fn trim_output(&self, view: String, _op: &str) -> String {
+            view
+        }
+    }
+    impl IntentCaptureHost {
+        fn recorded_intents(&self) -> Vec<flux_spec::IntentSet> {
+            self.intents.lock().unwrap().clone()
+        }
+    }
+    fn expected_known_intent(
+        name: &str,
+        effects: Vec<flux_spec::Effect>,
+        semantic_effects: Vec<crate::ast::FlowEffect>,
+    ) -> flux_spec::IntentSet {
+        let mut intents = flux_spec::IntentSet::new();
+        intents.push(flux_spec::Intent {
+            behavior: flux_spec::IntentBehavior::Operation,
+            target: flux_spec::IntentTarget::Operation {
+                name: name.into(),
+                effects,
+                semantic_effects,
+            },
+            role: flux_spec::IntentRole::Operation,
+            certainty: flux_spec::IntentCertainty::Certain,
+        });
+        intents
+    }
+
+    fn expected_unknown_intent(name: &str) -> flux_spec::IntentSet {
+        let mut intents = flux_spec::IntentSet::new();
+        intents.push(flux_spec::Intent {
+            behavior: flux_spec::IntentBehavior::Unknown,
+            target: flux_spec::IntentTarget::Operation {
+                name: name.into(),
+                effects: Vec::new(),
+                semantic_effects: Vec::new(),
+            },
+            role: flux_spec::IntentRole::Operation,
+            certainty: flux_spec::IntentCertainty::Potential,
+        });
+        intents
+    }
+
+    fn expected_gate_intent() -> flux_spec::IntentSet {
+        let mut intents = flux_spec::IntentSet::new();
+        intents.push(flux_spec::Intent {
+            behavior: flux_spec::IntentBehavior::Gate,
+            target: flux_spec::IntentTarget::Gate {
+                name: "confirm".into(),
+            },
+            role: flux_spec::IntentRole::Gate,
+            certainty: flux_spec::IntentCertainty::Certain,
+        });
+        intents
     }
     async fn run(host: &CfHost, body: Vec<Node>) -> Result<FlowOutcome> {
         let store = MemStore::new();
@@ -8818,6 +9198,201 @@ mod tests {
         assert!(host.marks().is_empty(), "the confirmed body never ran");
     }
 
+    #[tokio::test]
+    async fn confirm_bodyless_uses_pure_gate_intent() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "noop confirm".into(),
+                risk: None,
+                body: vec![],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("bodyless confirm should be allowed");
+
+        assert_eq!(host.recorded_intents(), vec![expected_gate_intent()]);
+    }
+
+    #[tokio::test]
+    async fn confirm_collects_effectful_body_intent_for_known_op() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "mutating task".into(),
+                risk: Some("high".into()),
+                body: vec![call(
+                    "mutating_task",
+                    vec![flow_lit(serde_json::json!("/tmp/worker.sh"))],
+                )],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("known confirm body should execute");
+
+        assert_eq!(
+            host.recorded_intents(),
+            vec![expected_known_intent(
+                "mutating_task",
+                vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                vec![],
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_collects_unknown_op_as_potential_intent() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "unknown call".into(),
+                risk: Some("high".into()),
+                body: vec![call("mystery_op", vec![flow_lit(serde_json::json!("v"))])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        let err = execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown op"));
+        assert_eq!(
+            host.recorded_intents(),
+            vec![expected_unknown_intent("mystery_op")]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_collects_intents_for_real_mutating_file_task() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = crate::parse::parse(
+            "flow f\n  confirm \"ship artifacts\", risk: medium\n    mutating_task(\"/tmp/out.txt\")",
+        )
+        .unwrap();
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("known mutating confirm body should execute");
+        assert_eq!(
+            host.recorded_intents(),
+            vec![expected_known_intent(
+                "mutating_task",
+                vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                vec![],
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirm_preserves_semantic_effects_in_the_approval_intent() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "charge card".into(),
+                risk: Some("critical".into()),
+                body: vec![call("charge_card", vec![])],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("semantic-effect confirm body should execute");
+
+        let expected =
+            expected_known_intent("charge_card", vec![], vec![crate::ast::FlowEffect::Money]);
+        assert!(expected.is_mutating(), "money intent must fail closed");
+        assert_eq!(host.recorded_intents(), vec![expected]);
+    }
+
+    /// A confirm nested under `race` must keep the branch `.body` path so its nested descendants
+    /// still contribute approval intent, not an empty/legacy fallback.
+    #[tokio::test]
+    async fn confirm_in_race_collects_nested_effectful_body_intent() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Race {
+                timeout_ms: 30_000,
+                bind: None,
+                branches: vec![crate::ast::Branch {
+                    name: SymbolName("left".into()),
+                    body: vec![Node::Confirm {
+                        message: "branch confirm".into(),
+                        risk: Some("high".into()),
+                        body: vec![call(
+                            "mutating_task",
+                            vec![flow_lit(serde_json::json!("clean"))],
+                        )],
+                    }],
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("race-confirm body should execute");
+        assert_eq!(
+            host.recorded_intents(),
+            vec![expected_known_intent(
+                "mutating_task",
+                vec![flux_spec::Effect::Process, flux_spec::Effect::LocalSystem],
+                vec![],
+            )]
+        );
+    }
+
+    /// Confirm approval selection in statement-loop constructs (`throttle` body) must include nested
+    /// path descendants, not disappear into empty intent sets.
+    #[tokio::test]
+    async fn confirm_in_throttle_collects_nested_effectful_body_intent() {
+        let host = IntentCaptureHost::default();
+        let store = MemStore::new();
+        let ast = DraftAst {
+            body: vec![Node::Throttle {
+                name: "t1".into(),
+                max: 2,
+                window_ms: 60_000,
+                body: vec![Node::Confirm {
+                    message: "throttle confirm".into(),
+                    risk: Some("medium".into()),
+                    body: vec![call(
+                        "write_file",
+                        vec![
+                            flow_lit(serde_json::json!("/tmp/throttle.txt")),
+                            flow_lit(serde_json::json!("data")),
+                        ],
+                    )],
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut sink = BufferSink::default();
+        execute_flow(&store, &host, "s", &ast, &mut sink)
+            .await
+            .expect("throttle-confirm body should execute");
+        assert_eq!(
+            host.recorded_intents(),
+            vec![expected_known_intent(
+                "write_file",
+                vec![flux_spec::Effect::Write],
+                vec![crate::ast::FlowEffect::WriteFile],
+            )]
+        );
+    }
+
     /// L-21: a host whose envelope **denies** every dispatch (the policy / permission-rule /
     /// approval class, marked via [`OpOutcome::denial`]) — the op never runs. Distinct from `boom`
     /// (an op that runs and fails, which stays retryable).
@@ -9541,7 +10116,7 @@ mod tests {
         assert!(
             sink.events
                 .iter()
-                .any(|ev| matches!(ev, SinkEvent::ToolResult(n, _) if n == "echo")),
+                .any(|ev| matches!(ev, SinkEvent::ToolResult(_, n, _) if n == "echo")),
             "completed branch's buffered sink output was replayed"
         );
         assert!(

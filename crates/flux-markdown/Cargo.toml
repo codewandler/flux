@@ -23,11 +23,11 @@ unicode-width = { version = "0.2", optional = true }
 # Self-dependency trick: enables both render features for this crate's own tests, so a bare
 # `cargo test -p flux-markdown` exercises the render paths without feature flags.
 flux-markdown = { path = ".", package = "codewandler-flux-markdown", features = ["ratatui", "terminal"] }
-# The replaced wrapper crates, kept ONLY as parity oracles for tests (same rev they were pinned to
-# when they were real dependencies). Dev-only — not in the publish closure, ignored by codegate.
-markdown-stream = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
-markdown-ratatui = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
-markdown-terminal = { git = "https://github.com/codewandler/markdown", rev = "35c6db54d7ab12814db738cc019592b83aab6e8a" }
+# The replaced wrapper crates, kept ONLY as parity oracles for tests. Dev-only — not in the publish
+# closure, ignored by codegate. This first-party revision aligns markdown-ratatui with ratatui 0.30.
+markdown-stream = { package = "codewandler-markdown-stream", git = "https://github.com/codewandler/markdown", rev = "ad16fe51f9a98e65037af14f2bcd36c62b252d80" }
+markdown-ratatui = { package = "codewandler-markdown-ratatui", git = "https://github.com/codewandler/markdown", rev = "ad16fe51f9a98e65037af14f2bcd36c62b252d80" }
+markdown-terminal = { package = "codewandler-markdown-terminal", git = "https://github.com/codewandler/markdown", rev = "ad16fe51f9a98e65037af14f2bcd36c62b252d80" }
 
 [features]
 default = []

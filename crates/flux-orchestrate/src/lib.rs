@@ -28,16 +28,17 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use flux_agent::{register_agent_ops, AdaptiveLoopPolicy};
-use flux_core::{Error, Result, Usage};
+use flux_core::{DispatchId, Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::AgentSink;
 use flux_policy::{AuthorizationPolicy, Caller, Trust};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
     active_runtime_turn_context, scope_runtime_turn, ApprovalChoice, Approver,
-    AuthorityRequirement, ExecutionAuthorization, Executor, IdentityCell, PermissionManager,
-    ResourceLimits, SpawnActivity, SpawnActivityEvent, SpawnActivitySink, SpawnOutcome,
-    SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult, SPAWN_CLEANUP_GRACE,
+    AuthorityRequirement, ExecutionAuthorization, Executor, IdentityCell, OperationPlacement,
+    PermissionManager, ResourceLimits, SpawnActivity, SpawnActivityEvent, SpawnActivitySink,
+    SpawnOutcome, SpawnRequest, Spawner, Tool, ToolContext, ToolRegistry, ToolResult,
+    SPAWN_CLEANUP_GRACE,
 };
 use flux_spec::{tool_input_schema, AccessKind, Effect, Idempotency, IntentSet, Risk, ToolSpec};
 use flux_system::System;
@@ -385,20 +386,32 @@ impl Spawner for LocalSpawner {
                         projected_base.remove(&name);
                     }
                     Some(tool) if projected_base.get(&name).is_some() => {
-                        projected_base.replace_from(
-                            adopted.source(&name).unwrap_or("live parent catalog"),
-                            tool,
-                        )?;
+                        let source = adopted.source(&name).unwrap_or("live parent catalog");
+                        match adopted.declared_placement(&name) {
+                            Some(placement) => {
+                                projected_base
+                                    .replace_from_with_placement(source, tool, placement)?;
+                            }
+                            None => {
+                                projected_base.replace_from(source, tool)?;
+                            }
+                        }
                     }
                     Some(_) => {}
                 }
             }
             for name in adopted.names() {
                 if parent_base.get(&name).is_none() && projected_base.get(&name).is_some() {
-                    projected_base.replace_from(
-                        adopted.source(&name).unwrap_or("live parent catalog"),
-                        adopted.get(&name).expect("name came from adopted registry"),
-                    )?;
+                    let source = adopted.source(&name).unwrap_or("live parent catalog");
+                    let tool = adopted.get(&name).expect("name came from adopted registry");
+                    match adopted.declared_placement(&name) {
+                        Some(placement) => {
+                            projected_base.replace_from_with_placement(source, tool, placement)?;
+                        }
+                        None => {
+                            projected_base.replace_from(source, tool)?;
+                        }
+                    }
                 }
             }
         }
@@ -441,9 +454,10 @@ impl Spawner for LocalSpawner {
             // Nested delegation intentionally restores the canonical task handler after role
             // narrowing. Use the explicit replacement seam so an injected same-name handler can
             // never survive silently.
-            registry.replace_from(
+            registry.replace_from_with_placement(
                 "flux-orchestrate canonical nested task operation",
                 Arc::new(TaskTool),
+                OperationPlacement::LocalControlPlane,
             )?;
             let child_base = projected_base.subset(effective_tools.as_deref());
             ctx = ctx.with_spawner(Arc::new(self.at_depth(
@@ -814,7 +828,11 @@ struct TextCollector {
     depth: usize,
     redactor: flux_secret::Redactor,
     next_call_id: u64,
-    pending: std::collections::HashMap<String, Vec<u64>>,
+    /// C-531: the reporter's own `call_id` for every dispatch still in flight, keyed by the
+    /// interpreter's `DispatchId`. It used to be a per-op-name stack popped LIFO on the result,
+    /// which cross-attached two concurrent same-name reads (C-528 admits them) to each other's
+    /// card in the fleet pane. The identity match needs no ordering assumption.
+    pending: std::collections::HashMap<DispatchId, u64>,
     terminal_usage: Option<Usage>,
     cancelled: bool,
     terminal_emitted: bool,
@@ -861,13 +879,6 @@ impl TextCollector {
         }
     }
 
-    fn active_call(&self, name: &str) -> Option<u64> {
-        self.pending
-            .get(name)
-            .and_then(|calls| calls.last())
-            .copied()
-    }
-
     /// Emit exactly one terminal event at the spawner boundary. `AgentSink::turn_end` alone is
     /// insufficient: a timed-out child can finalize its engine turn and still make `spawn` fail.
     fn finish(&mut self, is_error: bool, usage: Option<Usage>) {
@@ -901,17 +912,14 @@ impl AgentSink for TextCollector {
         self.emit(SpawnActivityEvent::Planning { active });
     }
 
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
         self.tool_calls += 1;
         if self.activity.is_none() {
             return;
         }
         self.next_call_id += 1;
         let call_id = self.next_call_id;
-        self.pending
-            .entry(name.to_string())
-            .or_default()
-            .push(call_id);
+        self.pending.insert(dispatch, call_id);
         let mut input = input.clone();
         // Every node kind, keys included — the tree's one total walk (C-323, consolidated in
         // C-338). A registered all-digit credential has no other protection, so a skipped `Number`
@@ -924,8 +932,13 @@ impl AgentSink for TextCollector {
         });
     }
 
-    fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
-        if let Some(call_id) = self.active_call(name) {
+    fn tool_timing(
+        &mut self,
+        dispatch: DispatchId,
+        name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
+        if let Some(&call_id) = self.pending.get(&dispatch) {
             self.emit(SpawnActivityEvent::ToolTiming {
                 call_id,
                 name: name.to_string(),
@@ -934,8 +947,8 @@ impl AgentSink for TextCollector {
         }
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        let Some(call_id) = self.pending.get_mut(name).and_then(Vec::pop) else {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        let Some(call_id) = self.pending.remove(&dispatch) else {
             return;
         };
         // Result content and error text stay inside the child/model transcript. Only the outcome
@@ -4632,11 +4645,16 @@ mod tests {
         let seen = Arc::new(std::sync::Mutex::new(None));
         let execution_seen = Arc::new(std::sync::Mutex::new(None));
         let mut base = ToolRegistry::new();
-        base.register(Arc::new(RootProbe {
-            seen: seen.clone(),
-            execution_seen: Some(execution_seen.clone()),
-            transition_to: child_worktree_root.clone(),
-        }));
+        base.try_register_from_with_placement(
+            "C-100 root probe fixture",
+            Arc::new(RootProbe {
+                seen: seen.clone(),
+                execution_seen: Some(execution_seen.clone()),
+                transition_to: child_worktree_root.clone(),
+            }),
+            OperationPlacement::SelectedExecutionSystem,
+        )
+        .unwrap();
         let mut roles = RoleRegistry::default();
         roles.insert(parse_role(
             "---\ntools: [root_probe]\n---\nYou are a scout.",

@@ -7,8 +7,9 @@ description: "flux, flux-connectors and flux-exchange — what each one is, when
 <!-- BEGIN generated:ecosystem -->
 # Ecosystem
 
-flux is three projects that share one vocabulary. You can use the first on its own forever; the other
-two exist because two specific problems turned out not to belong in an engine.
+flux is three projects that share one vocabulary. The engine, language, agent loop and core tools
+remain useful on their own; official external integrations cross the other two projects because
+their declarations and execution authority do not belong in the engine.
 
 > **Source of truth.** This file is `docs/ecosystem.md`. `website/docs/ecosystem.md` mirrors it inside
 > a generated block; `crates/flux-lang/tests/website_in_sync.rs` fails on drift. Edit it here. The
@@ -16,9 +17,9 @@ two exist because two specific problems turned out not to belong in an engine.
 
 | | What it is | You need it when |
 |---|---|---|
-| **flux** | The engine, the language, the agent. | Always. It is the thing that runs. |
+| **flux** | The engine, the language, the agent, and one embedded Exchange client. | Always. It owns the model loop and core capabilities, not official integration execution. |
 | **flux-connectors** | Every official integration as compiled operations, manifests, a catalogue, and any vendor-specific runtime artifact. | You want reusable integration truth instead of hand-writing every vendor or protocol adapter. |
-| **flux-exchange** | A shared host for tenant credentials, metadata grants, connector invocation, and declared event channels. | You want integration authority or runtime placement managed outside one person's environment. Rich outbound runtimes remain planned work. |
+| **flux-exchange** | The only official integration executor: tenant credentials, grants, connector invocation, runtime lifecycle, and audit. | You want to use an official external integration. Rich outbound runtimes remain planned work. |
 
 > **Dated capability snapshot (checked 2026-08-03).** The connector source reports v0.17.0;
 > Exchange reports v0.16.0. These repositories move independently from flux, so use their linked
@@ -30,7 +31,7 @@ One question each. If you are wondering where something belongs, this is the ans
 
 - **Does it change what happens when an effect executes?** → flux
 - **Is it true of the integration regardless of who runs it?** → flux-connectors
-- **Does it require holding a credential or knowing a tenant?** → flux-exchange
+- **Does it execute an official integration or require its credential or tenant grant?** → flux-exchange
 
 ## flux — the engine
 
@@ -40,7 +41,15 @@ after that. Every effect crosses one chain — authorization → approval → gu
 
 It ships as a CLI and TUI you use daily, an embeddable Rust SDK, and an HTTP server. It knows about
 *kinds* of things — operations, channels, datasources, secrets — and deliberately knows nothing about
-any particular vendor.
+any particular vendor. Its future official-integration surface is one native Exchange client, not a
+connector runtime host.
+
+For data the same split holds. A **datasource** is a named, declared, **read-only** record surface —
+*operations do; datasources know* — with one declared access mode, indexed or live. flux owns the
+published wire vocabulary, the one registry across both modes, and the Flux-Lang declaration
+surface; which vendor entities exist belongs to the connector package, and tenant bindings belong to
+Exchange. The work board is not a datasource — it mutates — and is a first-class flux concept with
+its own declaration, registry, CLI and `board:` authority namespace rather than a `datasource` kind.
 
 ```bash
 flux run "add a test for the parser"
@@ -58,9 +67,9 @@ auth scheme, endpoints, parameters, response shapes. flux-connectors makes that 
 **compiler input**.
 
 You describe a provider once and the build emits typed Flux operations, a capability manifest,
-catalogue entries, and a host Tool pack. A connector can describe **both directions**: the operations
-you call, and the events the vendor sends back. The current catalogue is curated rather than
-automatically ingested from OpenAPI.
+catalogue entries, and runtime declarations consumed by Exchange. A connector can describe **both
+directions**: the operations you call, and the events the vendor sends back. The current catalogue is
+curated rather than automatically ingested from OpenAPI.
 
 ```flux
 op zendesk-ticket-comment-add(ticket_id: Number, body: String, public: Bool) -> Any
@@ -74,35 +83,39 @@ Two properties are worth understanding before you build on it:
 
 - **A connector is compiled, never interpreted.** The TOML is input; the artifact that runs is Flux,
   a real typed language with an analyzer and first-class `retry`, `throttle` and approval gates.
-- **Secrets are host-owned.** A credential never appears in a provider definition or generated
-  Flux. The Tool pack resolves the value, applies the declared authentication scheme, and registers
-  it with the host redactor before asking a caller-supplied `http.request` to dispatch.
+- **Secrets are Exchange-owned.** A credential never appears in a provider definition, generated
+  Flux, the effective Service Account catalogue, or the Flux client. Exchange resolves it and applies
+  the declared authentication scheme behind its authenticated boundary.
 
 A connector describes an external capability reached over a declared protocol. Authentication is
 optional — a public search API is as valid a connector as a paid SaaS product. What makes something a
 connector is that its surface can be *described*.
 
-Generated HTTP is the complete runtime today, not the permanent boundary. Docker, Kubernetes, SQL,
-Prometheus, secret stores, and other rich protocols are migration targets too. Their connectors may
-carry attested vendor-specific binaries or images and select guarded socket, process, container,
-remote, or plugin runtimes. Flux supplies those generic mechanisms; the connector repository owns
-the integration-specific code and declaration.
+Vendor-data **Datasource Definitions** live here for the same reason: which entities a vendor
+exposes and how to read them is true of the integration regardless of who runs it. A connector
+declares its datasource members as projections over its own operations, so every datasource read
+executes as an admitted operation; flux keeps only the wire vocabulary and the consuming seam, and
+Exchange keeps only tenancy and authorization.
+
+Generated HTTP is the complete outbound runtime today, not the permanent boundary. Docker,
+Kubernetes, SQL, Prometheus, secret stores, and other rich protocols are migration targets too.
+Their connectors may carry attested vendor-specific binaries or images and select guarded socket,
+process, container, or temporary framed-stdio runtimes. flux-connectors owns the integration-specific
+code and declaration; Exchange installs and executes it. Flux does neither.
 
 The **published** connector crates open no socket. The repository has a non-published loopback API
-host that proves the pack against real guarded HTTP, but deployment remains the consuming host's
-job. See the [live connector inventory](https://github.com/codewandler/flux-connectors#readme).
+host that proves generated output against real guarded HTTP, but it is test infrastructure rather
+than a Flux deployment path. See the
+[live connector inventory](https://github.com/codewandler/flux-connectors#readme).
 
 ## flux-exchange — the platform
 
-Everything above works on your laptop with credentials in your environment. That stops working the
-moment you want a team to share an integration, an agent to use it unattended, or an auditor to ask
-what happened.
-
-flux-exchange is the deployed answer: **a service that holds tenant credentials and settings, applies
-metadata grants, invokes admitted connector operations, and terminates generated connector socket
-channels.** A human signs in, connects a provider, previews and saves a grant, then can invoke from
-the admin console. Service Accounts can authenticate for unattended calls; rich outbound runtimes
-are not part of that shipped path yet.
+flux-exchange is the only official integration executor: **a service that holds tenant credentials
+and settings, applies metadata grants, invokes admitted connector operations, and terminates declared
+connector channels.** It may run locally for one operator or in a suitably isolated hosted
+deployment; locality does not create a second Flux execution path. A human signs in, connects a
+provider, previews and saves a grant, then can invoke from the admin console. Service Accounts can
+authenticate for unattended calls; rich outbound runtimes are not part of that shipped path yet.
 
 Its designed primary caller is **non-human**, not a human. Humans sign in to wire things up and to see
 what happened; Service Accounts can call admitted operations all day, and future Managed Agents will
@@ -123,8 +136,11 @@ use the same bounded authority. That inverts the usual assumption and shapes the
   durable store keeps only its verifier. `/api/agents` is a bounded compatibility alias for create.
 
 **Still direction:** rich outbound runtime dispatch, webhooks and polls, general hosted channels
-beyond the generated socket slice, general execution records beyond value-free workflow node
-activity, streamed results, leases, isolated per-tenant workers, and installed Apps. The
+beyond the generated socket slice, tenant Datasource bindings with their governed read seam
+(a connector-declared datasource member bound to a connection label; Exchange serves schema/list/get
+through its existing admission gate and never invents retrieval of its own), general execution
+records beyond value-free workflow node activity, streamed results, leases, isolated per-tenant
+workers, and installed Apps. The
 [Exchange inventory](https://github.com/codewandler/flux-exchange#what-exists-today) is authoritative.
 
 **The security property that makes it usable by agents:**
@@ -174,24 +190,24 @@ WebSocket channels are the first hosted rich-protocol slice.
 The runtime is declared by the connector and never chosen by the caller — a caller who can pick the
 runtime is a caller who can pick an effect.
 
-One rule follows from this and is enforced rather than documented: **a locally-executing runtime
-cannot be safely multi-tenant in one process.** Process, container and raw-socket runtimes consume
-the host's own identity and network position. A shared deployment refuses them; a single-tenant one
-serves them. Because the runtime is in the manifest, the service can make that call mechanically.
+One rule follows from this and is enforced rather than documented: **an Exchange runtime that uses
+local host identity cannot be safely multi-tenant in one process.** Process, container and raw-socket
+runtimes consume the host's own identity and network position. A shared deployment refuses them; a
+single-tenant Exchange may serve them. Because the runtime is in the manifest, the service can make
+that call mechanically.
 
 ## How they compose
 
 The three fit together at exactly two seams.
 
-**Locally — flux remains complete without Exchange.** The binary currently runs built-ins and
-installed native plugins through its own safety envelope. The migration replaces those
-vendor-specific plugins with connector bundles behind the same generic guarded runtimes. Flux can
-also read a published connector manifest for the `connector` inbound channel, but today that adapter
-serves only explicitly unsigned webhook bindings and does not auto-install the external outbound Tool pack. See
-[Connector channels](https://codewandler.github.io/flux/docs/channels/connector) for the exact limits.
+**Core Flux — useful without Exchange.** The language, agent loop, SDK and built-in tools remain a
+complete useful product. Today the binary also runs installed native plugins as a temporary
+compatibility path. That does not define the destination: Flux has no local connector runtime and no
+plugin fallback after migration. Its separate `connector` inbound-channel adapter remains a narrow
+current feature rather than an official outbound integration executor. See
+[Connector channels](https://codewandler.github.io/flux/docs/channels/connector) for its exact limits.
 
-**Hosted — Exchange implements HTTP invoke and one subscribe slice of the remote binding.** The family vocabulary has
-two verbs:
+**Official integrations — Exchange only.** The family vocabulary has two verbs:
 
 - **`invoke`** — name an operation, get a result. The exchange resolves the credential and builds the
   request from the operation's own compiled Flux.
@@ -199,15 +215,26 @@ two verbs:
   socket, checks the signature with the credential it owns, and emits typed events a `trigger`
   routes to a journey.
 
-> **Current seam:** Exchange `invoke` is built for signed-in humans and Service Accounts whose tenant
-> has a connection and an admitting grant. Generated socket channels can publish their closed declared event sets to
-> authenticated `/api/subscribe`. General subscribe does not exist beyond that socket slice. Flux
-> itself has no Exchange client binding, the general
-> rich-runtime stream/lease protocol is not built, and a Flux agent cannot mount that route as a
-> connector placement today. The shipped local connector channel is separate and deliberately narrower.
+> **Current seam:** Flux's embedded client authenticates as one Service Account, projects its
+> effective catalogue at turn boundaries, and calls Exchange's one-shot HTTP `invoke` route.
+> Its `FLUX_EXCHANGE_URL` plus `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` environment setup is
+> transitional C-503 compatibility, not the Linux-local Milestone 1 bootstrap. On supported Linux,
+> C-509's final bootstrap uses a separately human-authenticated native management surface for plans,
+> connections, grants and Service Account minting; those routes never join the Service-Account-only
+> runtime client and cannot manage a remote host. Independently provisioned remote Exchange use
+> retains the transitional configured origin/bearer on every Flux target, including Linux, until a
+> separately authenticated remote provisioning contract exists. For managed Linux-local bootstrap,
+> an Exchange-owned direct handoff places the one-time token in secure storage, after which its bytes may exist only in
+> a host-owned resolver and sensitive Authorization transport—not argv, environment, ordinary
+> diagnostics/JSON/configuration, logs, events, session state or model-visible state. Tenant, connection,
+> credential, grant and runtime remain Exchange-owned. Generated socket channels can publish their
+> closed declared event sets to
+> authenticated `/api/subscribe`, but Flux does not yet consume subscribe, streaming, cancellation,
+> terminal lifecycle or leases. Today's native plugin pack remains a temporary compatibility route
+> for adapters that have not completed migration.
 
-**flux never *requires* the exchange.** The local path is complete and stays complete. Trading
-binary-distribution pain for service lock-in would be a bad trade made twice.
+If Exchange is absent or unavailable, official external operations are withdrawn; Flux does not
+change placement or fall back. Core Flux remains useful without Exchange.
 
 ## Embedding the exchange in your own product
 
@@ -235,5 +262,5 @@ decoupled from crate names and your `use flux_sdk::…` imports are unaffected.
 
 - [Concepts](./concepts.md) — the vocabulary all three share
 - [Infrastructure](https://codewandler.github.io/flux/docs/infrastructure) — how the engine's pieces fit at runtime
-- [Plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins) — the current compatibility path and the generic stdio runtime
+- [Plugins](https://codewandler.github.io/flux/docs/plugins/using-plugins) — the temporary compatibility path scheduled for removal
 <!-- END generated:ecosystem -->

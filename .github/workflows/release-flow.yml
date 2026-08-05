@@ -1,15 +1,24 @@
 # The Flux-Lang release cut (C-251, `examples/release.flux`) — flux cutting its own release.
 #
 # A push to the dedicated `release` branch is the deliberate release action. The Flux program cuts
-# locally; the host-owned promotion helper stages that exact commit on a versioned candidate ref,
-# waits for immutable release artifacts, then advances main and pushes the annotated tag. Manual
-# dispatch remains dry by default and never promotes, even when `apply: true` is selected.
+# locally in a credential-free job; a separate narrow controller merges that exact cut into
+# canonical `main` through a normal pull request, stages the merged SHA as a candidate, and creates
+# the annotated tag. Manual dispatch remains dry by default and never promotes, even when
+# `apply: true` is selected.
 #
-# AUTHORITY SPLIT:
-#   * GITHUB_TOKEN has repository contents read + Actions write. It can dispatch and observe the
-#     candidate workflow, but cannot move a ref.
-#   * RELEASE_TOKEN is exposed only to the final host-owned promotion step. Its ref pushes can trigger
-#     the existing tag workflows; GitHub deliberately suppresses those triggers for GITHUB_TOKEN.
+# AUTHORITY SPLIT (C-354). GitHub permissions are job-scoped and secrets can be step-scoped, so the
+# two halves of a release are two jobs, not two steps:
+#
+#   * `cut` runs the model, the live smoke, the scribe and the local transaction. It holds the
+#     selected provider key at STEP scope and NOTHING else: no environment, no GitHub write
+#     permission, no promotion key, no publication credential. It cannot move a ref if it tries.
+#     Its product is a git bundle — the cut commit and its annotated tag as bytes.
+#   * `release-control` is the only job with promotion authority. Exactly one step receives the
+#     existing repository `RELEASE_TOKEN`; that host helper pushes the cut branch, opens the normal
+#     PR to `main`, merges it after the exact head's required `ci`, creates the candidate ref and the
+#     final annotated tag, and performs cleanup. It never pushes to `main` directly or force-pushes
+#     a tag. The ambient `GITHUB_TOKEN` has `contents: read` and is used only to dispatch and observe
+#     the exact candidate/tag workflow runs.
 #   * The Flux program cannot reach source. `examples/release.flux` calls no `bash`, no `proc.run`,
 #     no `write`/`edit`; its only writing op addresses exactly the three release changelogs and its
 #     only process-capable ops have fixed argv for `scripts/check-crate-versions.sh` and
@@ -19,8 +28,8 @@
 # version, has the scribe draft both changelogs, and posts the rendered sections plus the diff it would
 # apply to the job summary — writing nothing. `apply: true` is a full REHEARSAL: it runs the real
 # `scripts/cut-release.sh`, including its default human gate, and proves the cut succeeds — then
-# throws the result away with the runner. Only the automatic push delegates that gate to the exact
-# candidate workflow. Neither manually dispatched mode releases anything.
+# throws the result away with the runner. Only the automatic push hands a bundle to the controller.
+# Neither manually dispatched mode releases anything.
 #
 # Secrets: ANTHROPIC_API_KEY for the direct Haiku default; OPENROUTER_API_KEY for an explicit
 # OpenRouter model override. A manual run without the selected provider's key skips; an automatic
@@ -45,11 +54,13 @@ on:
         type: string
         default: "anthropic/claude-haiku-4-5"
 
+# Read-only by default. `actions: write` is declared on the one job that dispatches and observes the
+# candidate workflow; nothing else in this workflow may inherit it.
 permissions:
   contents: read
-  actions: write
 
 env:
+  CARGO_TARGET_DIR: target
   # `inputs` is empty on a push event, so both values need explicit host-owned defaults. A release
   # branch push always applies; a manual dispatch keeps its selected preview/rehearsal posture.
   RELEASE_APPLY: ${{ github.event_name == 'push' && 'true' || (inputs.apply && 'true' || 'false') }}
@@ -64,16 +75,20 @@ concurrency:
 
 jobs:
   cut:
-    name: "smoke · scribe · ${{ github.event_name == 'push' && 'cut + promote' || (inputs.apply && 'cut (rehearsal)' || 'preview') }}"
+    name: "smoke · scribe · ${{ github.event_name == 'push' && 'cut' || (inputs.apply && 'cut (rehearsal)' || 'preview') }}"
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      promote: ${{ steps.bundle.outputs.promote }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           # `release_plan` runs `git describe --tags` and `check-crate-versions.sh` compares against
           # the previous `v*` tag — both need the full history, not a shallow clone.
           fetch-depth: 0
-          # No ambient checkout credential may be able to move a ref. The promotion helper receives
-          # the trigger-capable PAT explicitly, and only in its own step.
+          # No ambient checkout credential may be able to move a ref. The promotion identity is
+          # minted in a different job entirely.
           persist-credentials: false
 
       - name: Does a model credential exist?
@@ -147,7 +162,7 @@ jobs:
       # The release binary is what both the smoke test and the flow run under, so build it once.
       - name: Build the flux binary
         if: steps.creds.outputs.have_key == 'true'
-        run: cargo build --release --bin flux
+        run: scripts/owned-cargo build --release --bin flux
 
       # A live provider turn against a cheap model. Its failure blocks the cut by ordering: a broken
       # provider path is exactly the class the offline gate cannot see. Legs whose own credential is
@@ -195,28 +210,33 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # Manual runs remain review/rehearsal surfaces. Only the release-branch push enters the
-      # separately authenticated promotion path below.
+      # Manual runs remain review/rehearsal surfaces. Only the release-branch push produces a bundle,
+      # and only a bundle can enter the separately authenticated controller below.
       - name: What happened in this manual run
         if: success() && github.event_name == 'workflow_dispatch'
         run: |
           if [ "$RELEASE_APPLY" = "true" ]; then
-            echo "::notice::Rehearsal only. A commit and an annotated tag were created IN THIS RUNNER and are now gone — this job has no write token and cannot push. To release for real, follow crates/flux-sdk/PUBLISHING.md."
+            echo "::notice::Rehearsal only. A commit and an annotated tag were created IN THIS RUNNER and are now gone — this job has no write token and produces no bundle. To release for real, follow crates/flux-sdk/PUBLISHING.md."
           else
             echo "::notice::Preview only. Nothing was written, committed, or tagged."
           fi
 
-      # Host-owned irreversible half. The helper stages the exact cut commit on
-      # release-candidates/vX.Y.Z, dispatches and verifies its candidate build, then uses the
-      # trigger-capable PAT to advance main and push the tag. It waits for both tag workflows and
-      # verifies the public GitHub Release before returning success.
-      - name: Prepare exact-SHA candidate and promote
+      # The handoff. This job cannot push, so the cut crosses to the controller as immutable bytes:
+      # a git bundle carrying exactly the cut commit and its annotated tag, with the trigger SHA as
+      # the bundle's prerequisite. The controller re-derives every identity from the bundle contents.
+      - name: Bundle the cut for the promotion job
+        id: bundle
         if: success() && github.event_name == 'push' && steps.creds.outputs.have_key == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
-          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-        run: scripts/promote-release-flow.sh
+        run: scripts/bundle-release-cut.sh "$RUNNER_TEMP/release-cut.bundle"
+
+      - name: Upload the cut bundle
+        if: success() && github.event_name == 'push' && steps.creds.outputs.have_key == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-cut-bundle
+          path: ${{ runner.temp }}/release-cut.bundle
+          if-no-files-found: error
+          retention-days: 5
 
       # A missing optional credential may skip a manual preview, but a release-branch push is a
       # declared release action. It must never finish green after silently doing nothing.
@@ -225,3 +245,40 @@ jobs:
         run: |
           echo "::error::${{ steps.creds.outputs.credential_name || 'The selected provider credential' }} is required for an automatic release. Smoke and flow were skipped; no commit or tag was pushed."
           exit 1
+
+  # The irreversible half, and the only core-release job that receives the repository PAT.
+  # It runs no model, builds nothing, signs nothing and publishes nothing.
+  release-control:
+    name: "release-control · merge the cut and promote"
+    needs: cut
+    if: ${{ github.event_name == 'push' && needs.cut.outputs.promote == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      # Repository contents stay read-only for the ambient GITHUB_TOKEN: every ref this job moves is
+      # moved by the step-scoped RELEASE_TOKEN, whose tag push triggers the tag workflows.
+      contents: read
+      # Dispatching and watching the exact candidate run is the one thing the ambient token does.
+      actions: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Collect the cut bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-cut-bundle
+          path: ${{ runner.temp }}/cut
+
+      # The helper stages the exact cut commit on release-cuts/vX.Y.Z, opens the normal PR to main,
+      # waits for that exact head's required `ci`, merges it, and takes the candidate and eventual
+      # tag SHA only from the resulting canonical main commit. The PAT is step-scoped; missing or
+      # unusable authority fails before the first remote mutation.
+      - name: Promote the merged cut to a public release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          RELEASE_CUT_BUNDLE: ${{ runner.temp }}/cut/release-cut.bundle
+        run: scripts/promote-release-flow.sh

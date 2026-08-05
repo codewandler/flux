@@ -75,12 +75,13 @@ different jobs separate:
 | Target | Manage infrastructure | Place guarded effects | Place agent workers | Provision isolation |
 |---|---|---|---|---|
 | Native host | not a separate integration | **ships** — local is the default | **ships** — guarded process workers; externally managed workers exist as a library runtime | **ships** — Bubblewrap on Linux, Seatbelt on macOS |
-| Docker | **ships** — [Docker plugin](./plugins/docker.md), in local mode; connector migration is C-500 | **proposed** — [C-397](https://github.com/codewandler/flux/blob/main/docs/stories/C-397-container-process-backend.md) | **proposed** — [A-124](https://github.com/codewandler/flux/blob/main/docs/stories/A-124-docker-runtime.md) | **BYO remote system** — run the daemon in an operator-supplied container |
-| Kubernetes | **ships** — [Kubernetes plugin](./plugins/kubernetes.md), in local mode; connector migration is C-500 | **BYO remote system** — deploy the daemon in a pod; there is no native pod-per-effect backend | **proposed** — [A-125](https://github.com/codewandler/flux/blob/main/docs/stories/A-125-kubernetes-runtime.md) | **BYO** — the cluster/runtime owns pod isolation |
+| Docker | **ships temporarily** — [Docker plugin](./plugins/docker.md); its future connector executes only through Exchange | **proposed** — [C-397](https://github.com/codewandler/flux/blob/main/docs/stories/C-397-container-process-backend.md) | **proposed** — [A-124](https://github.com/codewandler/flux/blob/main/docs/stories/A-124-docker-runtime.md) | **BYO remote system** — run the daemon in an operator-supplied container |
+| Kubernetes | **ships temporarily** — [Kubernetes plugin](./plugins/kubernetes.md); its future connector executes only through Exchange | **BYO remote system** — deploy the daemon in a pod; there is no native pod-per-effect backend | **proposed** — [A-125](https://github.com/codewandler/flux/blob/main/docs/stories/A-125-kubernetes-runtime.md) | **BYO** — the cluster/runtime owns pod isolation |
 | microVM | no management integration | **BYO remote system** — run the daemon inside the guest | externally managed workers are possible through the runtime port, but not CLI-configurable | **BYO** — Flux does not provision, pool, snapshot, attest, or destroy microVMs |
 
-The Docker and Kubernetes plugins are today's **management integrations**, not placement backends.
-C-500 migrates their vendor-specific surfaces to connectors while preserving that distinction.
+The Docker and Kubernetes plugins are today's temporary **management integrations**, not placement
+backends. C-500 migrates their vendor-specific surfaces to connectors executed through Exchange
+while preserving that distinction.
 Installing one does not make `--remote` send integration calls to that target, and it does not turn
 `fleet.start` into a container or pod scheduler. Conversely, the generic remote-system daemon can run inside a
 container, Kubernetes pod, VM, or microVM without teaching the local runtime how that boundary was
@@ -190,6 +191,19 @@ managed processes and guarded network streams. The TUI keeps the endpoint and th
 workspace in its header for the entire session. Port-aware coding operations are available; tools
 that still own native-only resources are hidden and refused in remote mode, never run on the local
 machine as a fallback.
+
+Operation compatibility comes from one typed declaration on the live catalog:
+
+- **`local-control-plane`** — coordinator work such as model/session/UI control stays local and is
+  valid with either a native or selected remote execution system.
+- **`selected-execution-system`** — guarded effects use the selected system, so they land locally in
+  native mode and on the remote host in remote mode.
+- **`native-system-only`** — the implementation still owns native host state or handles and is
+  hidden and refused whenever a non-native target is selected. An unannotated downstream operation
+  receives this fail-closed classification automatically.
+
+These categories are compatibility metadata, not authorization. Every available operation still
+passes through authorization, approval, and guarded IO.
 
 - **Where your files are:** the **remote workspace is canonical**. Every project-relative read,
   write, discovery operation and process cwd uses that tree. There is **no implicit synchronization**
@@ -376,18 +390,18 @@ has not started.
 **Status: partial**, and early. This is a separate project,
 [flux-exchange](./ecosystem.md), which holds credentials and knows about tenants.
 
-flux itself never needs it. The charter line the ecosystem design enforces:
+Exchange is the only official integration executor. Core Flux remains useful without it for the
+language, agent loop, SDK and built-in tools; official external integrations are unavailable when
+Exchange is unavailable, with no local connector or plugin fallback.
 
-> **flux must never *require* flux-exchange.**
+What exists today (v0.16.0): a loopback service with OIDC sign-in, per-tenant connections and grants,
+canonical Service Account authentication, an HTTP invoke endpoint, durable workflow drafts/runs, and
+supervised generated connector WebSocket channels delivered through authenticated `/api/subscribe`.
+Three facts decide whether you can plan on it:
 
-What exists today (v0.15.0): a loopback service with OIDC sign-in, per-tenant connections and
-grants, file-backed stores, legacy agent-principal minting, an HTTP invoke endpoint, durable workflow
-drafts/runs, and supervised generated connector WebSocket channels delivered through authenticated
-`/api/subscribe`. Three facts decide whether you can plan on it:
-
-- **A minted agent token authenticates nothing yet.** Nothing binds the agent store to the identity
-  port, so a token you hand an agent is refused by every guarded route exactly as an unknown value
-  would be.
+- **Flux embeds the one-shot Exchange client.** With an operator-configured origin and Service
+  Account token, authenticated effective-catalogue operations are mounted at turn boundaries and
+  invoked through Exchange. Subscribe and lifecycle consumption remain later slices.
 - **A multi-tenant deployment refuses to execute on the host.** HTTP is shareable because the effect
   leaves the machine; process spawning, container exec and raw sockets consume the host's own
   identity and filesystem, so a shared deployment serves only HTTP and remote runtimes and refuses

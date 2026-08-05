@@ -18,6 +18,11 @@ permissions:
   contents: read
   actions: read
 
+# release.yml is dist-generated. Re-apply this ownership override after `dist generate`; the
+# structural release/inventory checks reject regeneration that restores an unowned `dist build`.
+env:
+  CARGO_TARGET_DIR: target
+
 # This task will run whenever you push a git tag that looks like a version
 # like "1.0.0", "v0.1.0-prerelease.1", "my-app/0.1.0", "releases/v1.0.0", etc.
 # Various formats will be parsed into a VERSION and an optional PACKAGE_NAME, where
@@ -88,6 +93,23 @@ jobs:
             echo "::error::candidate version $CANDIDATE_VERSION does not match workspace version $workspace_version"
             exit 1
           fi
+      # The candidate ref already points at cut-release.sh's committed transaction. Rebuild the
+      # public website from its lockfile and prove that exact commit owns the matching server
+      # archive before spending release-build time or permitting a candidate receipt.
+      - name: Install pinned website toolchain for the exact candidate
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+      - name: Install pinned website dependencies
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npm ci
+        working-directory: website
+      - name: Embedded documentation matches the exact candidate SHA
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: scripts/build-embedded-docs.sh --check
       - name: Install pinned release-gate toolchain
         if: ${{ github.event_name == 'workflow_dispatch' }}
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -100,15 +122,10 @@ jobs:
       - name: Mandatory full gate for the exact candidate SHA
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: scripts/release-full-gate.sh "$GITHUB_SHA"
-      - name: Check release token is configured
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
-        env:
-          RELEASE_TOKEN_CONFIGURED: ${{ secrets.RELEASE_TOKEN != '' }}
-        run: |
-          if [ "$RELEASE_TOKEN_CONFIGURED" != "true" ]; then
-            echo "::error::RELEASE_TOKEN is required for tag publishes. Configure a fine-grained PAT for this repo with Contents: write; GITHUB_TOKEN has produced HTTP 403 on release creation."
-            exit 1
-          fi
+      # C-354: the plan job does not read RELEASE_TOKEN, not even to test that it is configured.
+      # `secrets.RELEASE_TOKEN != ''` is still a reference to the credential from a job that plans,
+      # builds and holds the model-visible manifest — and its absence is reported by the one job
+      # that actually holds it, in the `release` environment, before anything is published.
       - name: Install dist
         shell: bash
         run: scripts/install-release-tooling.sh
@@ -271,11 +288,20 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - name: Build artifacts
+      - name: Build artifacts (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Build artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          rem release.yml is generated; keep cargo-dist under the same pre-Cargo target lease.
+          scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "%CD%" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          echo dist ran successfully
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -324,7 +350,8 @@ jobs:
       - id: cargo-dist
         shell: bash
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
+          # release.yml is generated; keep cargo-dist under the same pre-Cargo target lease.
+          scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD" -- dist build ${{ needs.plan.outputs.tag-flag }} --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -381,12 +408,19 @@ jobs:
             fi
           done
           [ "$failed" -eq 0 ]
+      # C-355: the receipt binds the seven uploads this run actually produced — name, immutable
+      # database ID, size and GitHub's own SHA-256 — read from the artifacts API (paginated) after
+      # every producer job has succeeded and its upload is final. Identity never comes from a file
+      # inside an archive: a checksum written by the run authenticates neither the transport nor the
+      # API handoff.
       - name: Write exact-SHA candidate receipt
         env:
           VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           scripts/release-candidate.sh write release-candidate.txt \
             "$VERSION" "$GITHUB_SHA" "$GITHUB_RUN_ID"
+          cat release-candidate.txt
       - name: Upload candidate receipt
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -404,7 +438,10 @@ jobs:
           echo "- Candidate run: \`$GITHUB_RUN_ID\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Retention: 14 days; after expiry the tag workflow rebuilds explicitly" >> "$GITHUB_STEP_SUMMARY"
 
-  # Determines if we should publish/announce
+  # Assembles and CHECKS the exact asset set. C-354: this job holds no publication authority at all
+  # — no environment, no write permission, no long-lived secret. Everything it produces is handed to
+  # the two authority-bearing jobs below as an ordinary workflow artifact, so a defect here cannot
+  # reach a signing key, a Release credential or the attestation identity.
   host:
     needs:
       - plan
@@ -417,12 +454,8 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     permissions:
       actions: read
-      attestations: write
-      contents: write
-      id-token: write
+      contents: read
     runs-on: "ubuntu-22.04"
-    outputs:
-      val: ${{ steps.host.outputs.summary }}
     steps:
       # C-412: the first thing this job does is refuse to publish nothing. `if:` above admits
       # `skipped` builds because promoting a prepared candidate legitimately skips them — but with
@@ -468,18 +501,39 @@ jobs:
       - name: Install dist
         shell: bash
         run: scripts/install-release-tooling.sh
-      # A prepared candidate is downloaded by immutable run ID. Without one, these artifacts come
-      # from the current tag run's compatibility builds.
-      - name: Fetch prepared candidate artifacts
+      # C-355 — the trust boundary of the whole build-once flow.
+      #
+      # This used to be `pattern: artifacts-*` with `merge-multiple: true`: the tag run took
+      # whatever uploads happened to match at promotion time, and the merge decided what the
+      # published directory contained. The receipt now names the seven archives by immutable ID,
+      # size and digest; the consumer downloads each one by ID, hashes the RAW response bytes before
+      # opening them, and extracts into a fresh per-record namespace with an extractor that refuses
+      # traversal, absolute/drive/UNC names, control characters, special files, duplicate members
+      # and cross-archive collisions. Only then is the host input assembled.
+      - name: Download the candidate receipt
         if: ${{ needs.resolve-release-candidate.outputs.run-id != '' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
+          name: release-candidate-receipt
+          path: candidate
           run-id: ${{ needs.resolve-release-candidate.outputs.run-id }}
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
+      - name: Verify and safely assemble the receipt-bound candidate bytes
+        if: ${{ needs.resolve-release-candidate.outputs.run-id != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN_ID: ${{ needs.resolve-release-candidate.outputs.run-id }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          scripts/release-candidate.sh verify candidate/release-candidate.txt \
+            "$version" "$GITHUB_SHA" "$CANDIDATE_RUN_ID"
+          scripts/release-candidate.sh fetch candidate/release-candidate.txt \
+            "$RUNNER_TEMP/candidate" --run-id "$CANDIDATE_RUN_ID"
+          mkdir -p target/distrib artifacts
+          cp -a "$RUNNER_TEMP/candidate/merged/." target/distrib/
+          cp -a "$RUNNER_TEMP/candidate/merged/." artifacts/
       - name: Fetch compatibility-build artifacts
         if: ${{ needs.resolve-release-candidate.outputs.run-id == '' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -515,17 +569,8 @@ jobs:
           name: artifacts-dist-manifest
           path: dist-manifest.json
           retention-days: 14
-      # Create a GitHub Release while uploading all files to it
-      - name: "Download prepared GitHub artifacts"
-        if: ${{ needs.resolve-release-candidate.outputs.run-id != '' }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: artifacts-*
-          path: artifacts
-          merge-multiple: true
-          run-id: ${{ needs.resolve-release-candidate.outputs.run-id }}
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
+      # The candidate path already populated `artifacts/` from the verified namespaces above; only
+      # the compatibility rebuild still has anything to download here.
       - name: "Download compatibility-build GitHub artifacts"
         if: ${{ needs.resolve-release-candidate.outputs.run-id == '' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -564,59 +609,127 @@ jobs:
       # attested either.
       - name: Verify the artifact set before publishing
         run: scripts/verify-github-release.sh --staged artifacts
+      # The checked set crosses to the authority-bearing jobs as bytes, not as a job output: the
+      # announcement prose travels inside `artifacts/dist-manifest.json`, which is a release asset
+      # anyway. A job output carrying that prose is silently dropped when it matches a masked
+      # repository secret (C-412), and the two jobs below cannot afford to receive an empty title.
+      #
+      # The name deliberately does NOT start with `artifacts-`: that prefix is the candidate
+      # receipt's closed producer set (C-355).
+      - name: Hand the checked asset set to the publication jobs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # C-354: the attestation identity and nothing else. This job can mint a provenance statement; it
+  # cannot create a Release, publish a crate, move a ref or read any long-lived secret.
+  attest:
+    needs:
+      - plan
+      - host
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+      attestations: write
+      id-token: write
+    steps:
+      - name: Collect the checked asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts
       - name: Attest core release artifacts
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
           subject-path: artifacts/*
+
+  # C-354: the GitHub Release identity and nothing else. `RELEASE_TOKEN` appears once, in the `env`
+  # of the create/upload step. It is not a workflow env, not a job env, and not readable by the
+  # plan, build, hosting or attestation jobs — and it is never used to move a ref, create a tag,
+  # dispatch a workflow or mint another credential.
+  publish-github-release:
+    needs:
+      - plan
+      - host
+      - attest
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Collect the checked asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts
       - name: Create GitHub Release
         env:
-          # Scoped release token: a fine-grained PAT (this repo only, Contents: write) stored as the
-          # `RELEASE_TOKEN` secret, so the release object is created even when the org restricts the
-          # default GITHUB_TOKEN or GitHub App integration from creating releases.
+          # Scoped release token: a fine-grained PAT (this repo only, Contents: write) held by the
+          # repository Actions secret, so the release object is created even when the org restricts
+          # the default GITHUB_TOKEN from creating releases.
           # NOTE: release.yml is cargo-dist-generated — re-apply this override after `dist generate`.
           GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
-          PRERELEASE_FLAG: "${{ fromJson(steps.host.outputs.manifest).announcement_is_prerelease && '--prerelease' || '' }}"
-          ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
-          ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          RELEASE_TAG: "${{ needs.plan.outputs.tag }}"
         run: |
-          # Write and read notes from a file to avoid quoting breaking things
-          echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is not configured as a repository Actions secret. Configure a fine-grained PAT for this repo with Contents and Pull requests write access."
+            exit 1
+          fi
+          # Title and body come from the checked manifest that is already a release asset, so the
+          # announcement prose never has to survive a job output.
+          manifest=artifacts/dist-manifest.json
+          title=$(jq -r '.announcement_title // empty' "$manifest")
+          jq -r '.announcement_github_body // empty' "$manifest" > "$RUNNER_TEMP/notes.txt"
+          [ -n "$title" ] || { echo "::error::the staged dist-manifest.json has no announcement title"; exit 1; }
+          prerelease=""
+          if [ "$(jq -r '.announcement_is_prerelease' "$manifest")" = "true" ]; then
+            prerelease="--prerelease"
+          fi
 
-          tag="${{ needs.plan.outputs.tag }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "Release $tag already exists; refreshing assets with --clobber"
-            gh release upload "$tag" artifacts/* --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; refreshing assets with --clobber"
+            gh release upload "$RELEASE_TAG" artifacts/* --clobber
           else
             for attempt in 1 2 3; do
-              if gh release create "$tag" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*; then
+              if gh release create "$RELEASE_TAG" --target "$RELEASE_COMMIT" $prerelease --title "$title" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*; then
                 break
               fi
-              if gh release view "$tag" >/dev/null 2>&1; then
-                echo "Release $tag exists after create failure; refreshing assets with --clobber"
-                gh release upload "$tag" artifacts/* --clobber
+              if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+                echo "Release $RELEASE_TAG exists after create failure; refreshing assets with --clobber"
+                gh release upload "$RELEASE_TAG" artifacts/* --clobber
                 break
               fi
               if [ "$attempt" -eq 3 ]; then
-                echo "::error::failed to create GitHub Release $tag after $attempt attempts"
+                echo "::error::failed to create GitHub Release $RELEASE_TAG after $attempt attempts"
                 exit 1
               fi
               sleep $((attempt * 15))
             done
           fi
+      # Reading a public Release and its attestations needs no publication credential, so the
+      # verifier runs on the job's own read-only GITHUB_TOKEN.
       - name: Verify GitHub Release
         env:
-          GH_TOKEN: "${{ secrets.RELEASE_TOKEN }}"
+          GH_TOKEN: "${{ github.token }}"
         run: scripts/verify-github-release.sh "${{ needs.plan.outputs.tag }}"
 
   announce:
     needs:
       - plan
-      - host
+      - publish-github-release
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
-    # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && needs.host.result == 'success' }}
+    # The GitHub Release job however must run to completion, no skipping allowed!
+    if: ${{ always() && needs.publish-github-release.result == 'success' }}
     runs-on: "ubuntu-22.04"
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

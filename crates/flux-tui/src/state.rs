@@ -96,6 +96,8 @@ pub struct ChatState {
     pub(super) help_open: bool,
     /// The `/usage` overlay (C-140): this turn's cache accounting, per-round bars, session totals.
     pub(super) usage_open: bool,
+    /// Historical, metadata-only Usage Observatory. `None` preserves the live `/usage` mode.
+    pub(super) observatory: Option<crate::observatory::UsageObservatory>,
     /// Focused transcript entry (Shift-↑/↓ moves it, Esc clears; C-111). Enter toggles the
     /// focused tool card's per-card expansion, `y` yanks the entry via OSC 52.
     pub(super) focused: Option<usize>,

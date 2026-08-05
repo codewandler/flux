@@ -533,10 +533,16 @@ impl AgentSink for Collector {
     fn text_delta(&mut self, t: &str) {
         self.0.text.push_str(t);
     }
-    fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
+    fn tool_call(
+        &mut self,
+        _dispatch: flux_core::DispatchId,
+        name: &str,
+        _input: &serde_json::Value,
+    ) {
         self.0.tool_calls.push(name.to_string());
     }
-    fn tool_result(&mut self, _name: &str, _result: &ToolResult) {}
+    fn tool_result(&mut self, _dispatch: flux_core::DispatchId, _name: &str, _result: &ToolResult) {
+    }
     fn turn_end(&mut self, usage: Option<Usage>) {
         self.0.usage = usage;
     }

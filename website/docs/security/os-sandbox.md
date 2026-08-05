@@ -48,7 +48,10 @@ Policy semantics are the same wherever a backend is active:
   `$TMPDIR`, the toolchain caches (`CARGO_HOME`/`~/.cargo`, `RUSTUP_HOME`/`~/.rustup` — needed
   because `cargo`/`rustup` invocations would otherwise break under confinement), and any
   `[sandbox] writable` extras. Missing configured paths are created as directories before launch and use a
-  required bind; a writable `/` is rejected unless filesystem confinement was explicitly lifted.
+  required bind; a writable `/` is rejected unless filesystem confinement was explicitly lifted. One
+  exception to the create-if-missing rule: a configured path under `/run` is **refused** rather than
+  created, because `/run` is masked (below) and an empty directory bound over the mask would apply
+  cleanly and still reach nothing.
 - **Network**: on or off for the whole process, via a network namespace (Linux) or a Seatbelt
   `(deny network*)` clause (macOS). It defaults open unless the CLI selects its unattended profile;
   that profile defaults closed and requires an explicit setting to open it.
@@ -57,6 +60,28 @@ Policy semantics are the same wherever a backend is active:
   `/dev`, `/proc`, and `/run` mounts, so those mounts remain in force.
 - **Host IPC** (Linux): `/run` is a fresh tmpfs. When networking is open, flux restores only known
   resolver files for DNS; host D-Bus, NetworkManager, and systemd-resolved sockets stay masked.
+
+### Reaching a host socket on purpose
+
+The `/run` mask is unconditional, so a sandboxed process cannot reach *any* socket under `/run` —
+including ones you want it to reach, such as the PulseAudio/PipeWire socket a room-media sidecar
+needs at `/run/user/<uid>/pulse/native`. Passing the path in the program's arguments is not enough:
+no argument can name a path the confinement removed. Grant the directory back explicitly:
+
+```toml
+[sandbox]
+enabled = true
+writable = ["/run/user/1000/pulse"]   # `id -u` gives the uid; grant the directory, not the socket file
+```
+
+`writable` is the right key even though a socket is not "written" in the ordinary sense. It emits a
+read-write bind, and read-write is what a unix socket requires — `connect(2)` takes write permission
+on the socket inode, so a read-only bind would leave the socket visible and unconnectable. The bind
+is applied *after* the `/run` tmpfs, so it re-exposes the host directory through the mask. There is
+no separate "reachability" grant: the bind is the reachability.
+
+Grant the narrowest directory that holds the socket. Granting `/run` or `/run/user/<uid>` wholesale
+hands the sandboxed process the host IPC surface the mask exists to remove.
 
 ## Turning it on
 
@@ -69,10 +94,23 @@ its declared channels until Ctrl-C and its cron/webhook/Slack triggers fire turn
 attached. Those forms refuse startup when no backend is usable. Every other subcommand is classified
 explicitly as *not* one of them, so a new subcommand cannot join the list by accident — the rest of
 `flux plugin …` is management rather than operation invocation and stays on the interactive
-contract. The SDK applies the same rule to the one posture it can classify without an argv: a
-`Client`/`FlowClient` built with `auto_approve(true)` or an injected custom approver resolves to
-`require` with the sandbox network closed, and to autonomous resource ceilings, unless the embedder
-states a sandbox or ceiling of its own — which wins outright. A custom approver is opaque to the SDK:
+contract.
+
+A named [autonomy posture](../agent/safety.md#autonomy-is-a-posture) contributes its own floor as
+well, because confinement is part of the choice rather than a second thing to remember:
+`--posture bounded-autonomy` resolves to `require` with the network **closed**, and
+`--posture exploratory` to `require` with the network **open** — that posture leans on host
+isolation and its evidence trail rather than on destination scope, and egress is what makes research
+and security-hardening work possible at all. `--posture supervised` and `--posture refusing` impose
+no floor of their own. ⚠ `--yes` is the older spelling of `bounded-autonomy` but is *not* read as a
+posture here: it keeps contributing exactly what the surface classification above already gives it,
+so the forms that classification deliberately exempts (`flux tui --yes`, where an operator is
+watching the whole run) are unchanged.
+
+The SDK applies the same rule to the postures it can classify without an argv: a `Client`/`FlowClient`
+built with `posture(..)`, with `auto_approve(true)`, or with an injected custom approver resolves to
+that posture's floor — `require` with the sandbox network closed for the autonomous ones — and to its
+resource ceilings, unless the embedder states a sandbox or ceiling of its own, which wins outright. A custom approver is opaque to the SDK:
 it may prompt a human, but it may also blanket-allow, so silence resolves conservatively. Otherwise
 direct SDK/server embedders receive no automatic posture from `flux-server` and must inject a sandbox
 or export its environment settings. The built-in deny posture defaults to off with networking open
@@ -129,7 +167,7 @@ writable = ["../shared-output"]   # extra writable paths beyond the workspace ro
 | `[sandbox] enabled` | `--sandbox` / `--no-sandbox` | `FLUX_SANDBOX=on\|off\|require` | Turn sandboxing on for spawned processes. |
 | `[sandbox] require` | — | `FLUX_SANDBOX=require` | Fail closed (refuse to spawn) instead of warning when no backend is usable. |
 | `[sandbox] network` | — | `FLUX_SANDBOX_NET` (truthy = open) | Whether sandboxed processes may reach the network. Unset means open unless the CLI selects its unattended profile, where it means closed. |
-| `[sandbox] writable` | — | `FLUX_SANDBOX_WRITABLE` (`:`-separated) | Extra writable paths, beyond the workspace/named/Git roots/tmp/toolchain caches. Missing paths are created as directories; `/` is rejected. |
+| `[sandbox] writable` | — | `FLUX_SANDBOX_WRITABLE` (`:`-separated) | Extra writable paths, beyond the workspace/named/Git roots/tmp/toolchain caches. Missing paths are created as directories; `/` is rejected, and a missing path under the masked `/run` is refused rather than created. Also how a host unix socket is made reachable — see [Reaching a host socket on purpose](#reaching-a-host-socket-on-purpose). |
 | — | — | `FLUX_BWRAP_BIN` | Override which `bwrap` binary is used (Linux). Always resolved to an absolute path. |
 | — | — | `FLUX_SANDBOX_EXEC_BIN` | Override which `sandbox-exec` binary is used (macOS). Always resolved to an absolute path. |
 | — | — | `FLUX_SANDBOXED` | Set by flux on a genuinely-sandboxed child. A nested invocation skips re-wrapping but prominently audits that it is trusting this ambient outer-confinement assertion because it cannot verify the parent boundary itself. |

@@ -319,6 +319,21 @@ pub(super) async fn run_fork(
     flux_events::SessionLog::open(&events, &fork_sid)
         .and_then(|mut log| log.rewrite(history))
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Session boards are app-defined facts in the same stream. A fork inherits their recorded
+    // prefix just like conversation state, then child mutations append only to the child stream.
+    for event in events
+        .load_by_kind(&sid, "custom")
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        if matches!(
+            &event.kind,
+            flux_events::EventKind::Custom { name, .. } if name.starts_with("board.session.")
+        ) {
+            events
+                .append(&fork_sid, flux_events::NewEvent::new(event.kind))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
     drop(events);
 
     let (engine, _session, model_spec, _spawner) =
@@ -953,16 +968,25 @@ pub(super) async fn run_repl(flags: AgentFlags) -> Result<()> {
                     // C-162: `[tools] disable` ops stay registered (dispatch still refuses them),
                     // so mark them here rather than hiding them — a mysteriously-missing op is one
                     // command from an explanation instead of a silent gap in this listing.
-                    let disabled = agent.executor.disabled_ops_for(&registry);
                     let rendered: Vec<String> = names
                         .into_iter()
-                        .map(|name| {
-                            if disabled.contains(&name) {
-                                format!("{name} (disabled by config)")
-                            } else {
-                                name
-                            }
-                        })
+                        .map(
+                            |name| match agent.executor.operation_unavailability(&name) {
+                                Some(flux_runtime::OperationUnavailability::DisabledByConfig) => {
+                                    format!("{name} (disabled by config)")
+                                }
+                                Some(
+                                    flux_runtime::OperationUnavailability::IncompatiblePlacement {
+                                        placement,
+                                        target,
+                                    },
+                                ) => format!(
+                                    "{name} (unavailable: {} on selected target {target})",
+                                    placement.label()
+                                ),
+                                None => name,
+                            },
+                        )
                         .collect();
                     eprintln!("tools: {}", rendered.join(", "));
                 }
@@ -1398,12 +1422,7 @@ pub(super) fn plan_prompt(plan: &flux_runtime::PlanApprovalRequest) -> String {
         ));
     }
     for intent in &plan.intents.intents {
-        if let flux_spec::IntentTarget::Process { command } = &intent.target {
-            lines.push(format!(
-                "process.exec → $ {}",
-                style::yellow(&truncate(command, 80))
-            ));
-        }
+        lines.push(style::yellow(&truncate(&intent.approval_subject(), 80)));
     }
     let mut seen = std::collections::HashSet::new();
     lines.retain(|l| seen.insert(l.clone()));

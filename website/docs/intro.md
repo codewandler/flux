@@ -55,6 +55,9 @@ They are useful when contributing, but they are more detailed and more volatile 
   [model provider](./agent/providers.md), and add [project context](./agent/project-context.md).
 - **Understand execution:** read [Concepts](./concepts.md), [Infrastructure](./infrastructure.md), and
   [The agent loop](./agent/agent-loop.md).
+- **Present flux to your team:** step through the
+  [interactive engineering presentation](/presentation/) — the runtime boundary, a guarded live
+  demo, connectors, and Exchange in about 20 minutes.
 - **Build and integrate an app:** define a [multi-agent program](./agent/programs.md), learn
   [Flux-Lang](./language/overview.md), then connect [channels](./channels/overview.md) or
   [plugins](./plugins/using-plugins.md).

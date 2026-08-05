@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{
     tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
     IntentRole, IntentSet, IntentTarget, Risk, ToolSpec,
@@ -83,7 +83,7 @@ impl Tool for FileStatTool {
         // Count lines only for text files (skip binary sniff — just count \n bytes).
         let line_count = bytes.iter().filter(|&&b| b == b'\n').count();
         let mtime = ctx
-            .system()
+            .execution_system()
             .file_mtime(path)
             .await
             .ok()
@@ -671,18 +671,32 @@ impl Tool for SysInfoTool {
 
 /// Register all extra tools into a registry.
 pub fn try_register_extra(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    let mut assembled = registry.clone();
+    assembled.try_register_all_from_with_placement(
         "flux-tools ambient and filesystem metadata pack",
         vec![
             Arc::new(FileStatTool) as Arc<dyn Tool>,
             Arc::new(PathExistsTool),
-            Arc::new(SqliteQueryTool),
             Arc::new(HomeDirTool),
-            Arc::new(NowTool),
             Arc::new(CwdTool),
+        ],
+        OperationPlacement::SelectedExecutionSystem,
+    )?;
+    assembled.try_register_all_from_with_placement(
+        "flux-tools local ambient metadata pack",
+        vec![Arc::new(NowTool) as Arc<dyn Tool>],
+        OperationPlacement::LocalControlPlane,
+    )?;
+    assembled.try_register_all_from_with_placement(
+        "flux-tools native metadata pack",
+        vec![
+            Arc::new(SqliteQueryTool) as Arc<dyn Tool>,
             Arc::new(SysInfoTool),
         ],
-    )
+        OperationPlacement::NativeSystemOnly,
+    )?;
+    *registry = assembled;
+    Ok(())
 }
 
 /// Compatibility wrapper for pre-fallible pack installers.

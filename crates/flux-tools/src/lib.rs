@@ -38,7 +38,7 @@ use serde_json::Value;
 
 use flux_core::{Error, Result};
 use flux_policy::wildcard_match;
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 
 use flux_spec::{
     tool_input_schema, AccessKind, Effect, Idempotency, Intent, IntentBehavior, IntentCertainty,
@@ -233,7 +233,7 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
     cargo::try_register_cargo(&mut assembled)?;
     toolchains::try_register_toolchains(&mut assembled)?;
     extra::try_register_extra(&mut assembled)?;
-    assembled.try_register_all_from(
+    assembled.try_register_all_from_with_placement(
         "flux-tools core coding pack",
         vec![
             Arc::new(ReadTool) as Arc<dyn Tool>,
@@ -259,13 +259,19 @@ pub fn try_register_builtins(registry: &mut ToolRegistry) -> Result<()> {
             Arc::new(GitUnstageTool),
             Arc::new(GitHunksTool),
             Arc::new(GitStageHunksTool),
-            Arc::new(GitWorktreeEnterTool),
+        ],
+        OperationPlacement::SelectedExecutionSystem,
+    )?;
+    assembled.try_register_all_from_with_placement(
+        "flux-tools native worktree-control pack",
+        vec![
+            Arc::new(GitWorktreeEnterTool) as Arc<dyn Tool>,
             Arc::new(GitWorktreeLeaveTool),
             // C-241: `fleet.isolate` — the per-item worktree the two ops above cannot give, since
-            // they move the caller's own root. Registered with the git family it is built from; its
-            // `fleet.*` siblings are outbound A2A ops and live in `flux-orchestrate`.
+            // they move the caller's own root. Its allocation/rerooting contract is native-only.
             Arc::new(FleetIsolateTool),
         ],
+        OperationPlacement::NativeSystemOnly,
     )?;
     cognition::try_register_cognition(&mut assembled)?;
     // Evidence primitives (`observe`/`evidence`): general-purpose audit ops any flow may use to emit
@@ -1442,7 +1448,7 @@ impl Tool for ProcRunTool {
         let mut argv = vec![program.to_string()];
         argv.extend(proc_args(&params));
         let out = ctx
-            .system()
+            .execution_system()
             .run(&argv, Duration::from_secs(timeout))
             .await?;
         let mut body = String::new();
@@ -3796,7 +3802,7 @@ impl Tool for GitStageHunksTool {
             "-".to_string(),
         ];
         let out = ctx
-            .system()
+            .execution_system()
             .run_with_stdin(&apply, patch.as_bytes(), Duration::from_secs(30))
             .await?;
         if out.exit_code != 0 {
@@ -4560,7 +4566,11 @@ fn reload_restart_hint() -> &'static str {
 
 /// Register extra tools available only in `--dev` mode.
 pub fn try_register_dev_builtins(registry: &mut flux_runtime::ToolRegistry) -> Result<()> {
-    registry.try_register_from("flux-tools developer pack", std::sync::Arc::new(ReloadTool))
+    registry.try_register_from_with_placement(
+        "flux-tools developer pack",
+        std::sync::Arc::new(ReloadTool),
+        OperationPlacement::NativeSystemOnly,
+    )
 }
 
 /// Compatibility wrapper for pre-fallible pack installers.

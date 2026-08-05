@@ -2,7 +2,7 @@
 id: D-238
 title: "The device-routing guard greps only `sidecar.js`, so `page.js` can reintroduce what it forbids"
 pillar: Agent
-status: ready
+status: blocked
 priority: 5
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -54,3 +54,10 @@ not route devices"; the guard is "one file does not mention routing".
   A flux-side device-routing call would breach that split.
 - Related: [D-232](D-232-the-media-sidecar-harness.md),
   [D-235](D-235-argv-alone-does-not-reach-the-audio-server.md).
+
+## Progress
+
+- 2026-08-03: blocked in the dispatched `flux-core-2` wave because its exact source commit
+  `78c565f2a39efc98601e03d3daa3ee5a4f7f553a` does not contain D-232's media-sidecar harness,
+  `room_media_harness.rs`, or the `assets/room-media/` tree this story's acceptance must extend.
+  Implementing a substitute would duplicate the missing prerequisite rather than test its guard.

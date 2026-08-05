@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use flux_core::Result;
-use flux_runtime::{Tool, ToolRegistry};
+use flux_runtime::{OperationPlacement, Tool, ToolRegistry};
 use flux_system::net::PrivateNetAllow;
 
 pub mod browser;
@@ -31,6 +31,7 @@ pub mod condense;
 pub mod crawl;
 pub mod digest;
 mod egress;
+pub mod exchange;
 pub mod fetch;
 pub mod http;
 
@@ -129,12 +130,12 @@ pub fn try_register_web(registry: &mut ToolRegistry, opts: &WebOptions) -> Resul
             .clone()
             .unwrap_or_else(|| "config:web".to_string()),
     };
-    registry.try_register_all_from(
+    let mut assembled = registry.clone();
+    assembled.try_register_all_from_with_placement(
         "flux-web native capability pack",
         vec![
             Arc::new(http::HttpRequestTool::new(opts)) as Arc<dyn Tool>,
             Arc::new(fetch::WebFetchTool::new(opts)),
-            Arc::new(fetch::HtmlToMarkdownTool),
             Arc::new(crawl::WebCrawlTool::new(opts)),
             Arc::new(browser::BrowserOpenTool {
                 registry: registry_ref.clone(),
@@ -153,5 +154,13 @@ pub fn try_register_web(registry: &mut ToolRegistry, opts: &WebOptions) -> Resul
                 registry: registry_ref,
             }),
         ],
-    )
+        OperationPlacement::NativeSystemOnly,
+    )?;
+    assembled.try_register_all_from_with_placement(
+        "flux-web native capability pack",
+        vec![Arc::new(fetch::HtmlToMarkdownTool) as Arc<dyn Tool>],
+        OperationPlacement::LocalControlPlane,
+    )?;
+    *registry = assembled;
+    Ok(())
 }

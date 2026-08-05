@@ -110,7 +110,9 @@ pub use flux_flow::replay::ReplayReport;
 /// [`ToolContext`](tools::ToolContext)/[`ToolResult`](tools::ToolResult) are the dispatch types;
 /// [`ToolRegistry`](tools::ToolRegistry) is what a `register_pack` closure receives.
 pub mod tools {
-    pub use flux_runtime::{tool_fn, FnTool, Tool, ToolContext, ToolRegistry, ToolResult};
+    pub use flux_runtime::{
+        tool_fn, FnTool, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult,
+    };
     pub use flux_spec::{Risk, ToolSpec};
 }
 
@@ -124,6 +126,20 @@ pub mod datasource {
     pub use flux_datasource::live::{
         FilterKey, FilterType, FilterValue, Filters, LiveEntity, LiveSchema, Page, PageRequest,
         Reference, Row,
+    };
+}
+
+/// **Scoped boards.** Pure identities live below the IO boundary; [`ClientBuilder::try_with_board`]
+/// installs one validated execution binding and its complete tool/evidence/permission surface.
+pub mod board {
+    pub use flux_capabilities::{
+        BoardBinding, BoardRegistry, SessionBoard, SessionBoardItem, SessionBoardSnapshot,
+        WorkBoard, WorkBoardSurface,
+    };
+    pub use flux_datasource::board::{
+        BoardBackend, BoardContract, BoardContractError, BoardId, BoardItemCore, BoardProfile,
+        BoardRef, BoardScope, GeneralState, ItemId, PlanningDocumentKind, PlanningDocumentRef,
+        PlanningState,
     };
 }
 
@@ -387,6 +403,16 @@ pub use flux_runtime::{
     AgentCensusRefusal, ConcurrencyRefusal, ResourceLimits, DEFAULT_TOOL_CALL_QUEUE_TIMEOUT,
 };
 
+/// The **autonomy posture** (C-463) — the named choice that selects approval stance, OS-sandbox
+/// floor and resource budget together, so an embedder cannot set one and miss the others.
+///
+/// Pass it to [`ClientBuilder::posture`] or
+/// [`FlowClientBuilder::posture`](flow::FlowClientBuilder::posture). Running without per-effect
+/// approval is a posture on this list, not an absence of one: authorization, guarded IO and the
+/// evidence trail are identical under all four, and what varies is only the single stage of
+/// *authorization → approval → guarded IO* that has a human in it.
+pub use flux_runtime::{ApprovalStance, AutonomyPosture, SandboxFloor};
+
 /// The Rust **embedded DSL** for authoring flows — builder primitives that construct the Flux-Lang
 /// AST. Build a [`flux_lang::ast::DraftAst`] with `dsl::Flow`/`dsl::Block` (loops and control-flow are
 /// first-class), then drive it through [`FlowClient::analyze`] + [`FlowClient::execute`]. Re-exported
@@ -459,6 +485,8 @@ pub struct ClientBuilder {
     ops: Vec<(String, Arc<dyn Tool>)>,
     packs: Vec<RegistryPack>,
     live_surfaces: Vec<flux_capabilities::LiveDatasourceSurface>,
+    board_surfaces: Vec<flux_capabilities::WorkBoardSurface>,
+    boards: flux_capabilities::BoardRegistry,
     sub_agents: Option<SubAgents>,
     sub_agent_adaptive_policy: Option<AdaptiveLoopPolicy>,
     // D-178: `None` ⇒ derive from the storage's durability at `build` (on for durable stores).
@@ -479,6 +507,8 @@ impl Default for ClientBuilder {
             ops: Vec::new(),
             packs: Vec::new(),
             live_surfaces: Vec::new(),
+            board_surfaces: Vec::new(),
+            boards: flux_capabilities::BoardRegistry::new(),
             // Unset ⇒ no `task` tool, no spawner (children off by default).
             sub_agents: None,
             auto_resurrect: None,
@@ -506,6 +536,8 @@ impl ClientBuilder {
             ops: Vec::new(),
             packs: Vec::new(),
             live_surfaces: Vec::new(),
+            board_surfaces: Vec::new(),
+            boards: flux_capabilities::BoardRegistry::new(),
             sub_agents: None,
             sub_agent_adaptive_policy: None,
             auto_resurrect: None,
@@ -578,6 +610,35 @@ impl ClientBuilder {
     /// sandbox and resource-limit decisions remain authoritative. See [`Sandbox`].
     pub fn auto_approve(mut self, yes: bool) -> Self {
         self.envelope.auto_approve = yes;
+        self
+    }
+    /// Name the [`AutonomyPosture`] this client runs under (C-463) — **one** choice that selects the
+    /// approval stance, the OS-sandbox floor and the resource budget together.
+    ///
+    /// This is the door C-444's finding argues for. Approval, confinement and ceilings are not three
+    /// independent settings that happen to be usually set together; they are three questions with
+    /// one answer, and a caller that could set the first alone would be reconstructing the exact
+    /// configuration the SDK was found in. Naming a posture answers all three at once:
+    ///
+    /// - [`Supervised`](AutonomyPosture::Supervised) — a human answers each guarded effect. A library
+    ///   has no approval UI, so this posture requires [`approver`](Self::approver): your channel *is*
+    ///   the posture, and [`build`](Self::build) refuses rather than substituting one.
+    /// - [`BoundedAutonomy`](AutonomyPosture::BoundedAutonomy) — never prompt; authorization policy, a
+    ///   fail-closed sandbox with the network closed and [`ResourceLimits::autonomous`] constrain
+    ///   instead. This is what [`auto_approve(true)`](Self::auto_approve) has always selected.
+    /// - [`Exploratory`](AutonomyPosture::Exploratory) — never prompt, and treat interruption as the
+    ///   harm. Same fail-closed confinement, deliberately wider grants (egress stays open, ceilings
+    ///   are looser) and an uncapped evidence trail.
+    /// - [`Refusing`](AutonomyPosture::Refusing) — refuse every effect reaching the approval stage.
+    ///   The headless default.
+    ///
+    /// Explicit [`with_sandbox`](Self::with_sandbox) and [`resource_limits`](Self::resource_limits)
+    /// calls still win outright: the posture supplies defaults for what you did not state, and never
+    /// overrides what you did. Each posture's [`relies_on`](AutonomyPosture::relies_on) and
+    /// [`does_not_protect_against`](AutonomyPosture::does_not_protect_against) state what it leans on
+    /// and what it leaves to you.
+    pub fn posture(mut self, posture: AutonomyPosture) -> Self {
+        self.envelope.posture = Some(posture);
         self
     }
     /// Inject a custom [`Approver`] the executor consults per op — a policy between the blanket
@@ -660,6 +721,26 @@ impl ClientBuilder {
         self.packs
             .push(Box::new(move |registry| registry.try_extend(prepared)));
         self.live_surfaces.push(surface);
+        Ok(self)
+    }
+
+    /// Install one explicitly scoped execution board as an atomic SDK surface.
+    ///
+    /// Scope, profile and backend are validated independently before the builder is returned.
+    /// Duplicate bindings fail with both source labels. The operation pack, evidence group and
+    /// ambient signal are retained together, so later setters cannot leave a partial board.
+    pub fn try_with_board(
+        mut self,
+        contract: flux_datasource::board::BoardContract,
+        backend: Arc<dyn flux_capabilities::WorkBoard>,
+    ) -> Result<Self> {
+        let domain = contract.id.as_str().to_string();
+        self.boards.register_execution(contract, backend.clone())?;
+        let mut prepared = ToolRegistry::new();
+        let surface = flux_capabilities::try_register_work_board(&mut prepared, &domain, backend)?;
+        self.packs
+            .push(Box::new(move |registry| registry.try_extend(prepared)));
+        self.board_surfaces.push(surface);
         Ok(self)
     }
     /// Attach a subprocess plugin's operations (feature `plugins`) as policy-gated tools. Load them
@@ -972,9 +1053,10 @@ impl ClientBuilder {
         // the catalog AND asked for sub-agents still keeps `task`). The spawner is attached to the
         // dispatch context below.
         if self.sub_agents.is_some() {
-            registry.try_register_from(
+            registry.try_register_from_with_placement(
                 "sdk ClientBuilder sub-agent task operation",
                 Arc::new(TaskTool),
+                flux_runtime::OperationPlacement::LocalControlPlane,
             )?;
         }
         let custom_names: Vec<String> = registry
@@ -982,7 +1064,7 @@ impl ClientBuilder {
             .into_iter()
             .filter(|n| !base_names.contains(n))
             .collect();
-        let approver = self.envelope.resolve_approver();
+        let approver = self.envelope.resolve_approver()?;
 
         let storage = self.storage.unwrap_or_default();
         // D-178: default auto-resurrect on exactly where a crashed turn can survive the process.
@@ -1003,6 +1085,25 @@ impl ClientBuilder {
                 if existing != &surface.group {
                     return Err(flux_core::Error::Other(format!(
                         "live datasource group `{}` conflicts with an existing group declaration",
+                        surface.group.name
+                    )));
+                }
+            } else {
+                spec.groups.push(surface.group);
+            }
+            if !spec.ambient_signals.contains(&surface.ambient_signal) {
+                spec.ambient_signals.push(surface.ambient_signal);
+            }
+        }
+        for surface in self.board_surfaces {
+            if let Some(existing) = spec
+                .groups
+                .iter()
+                .find(|group| group.name == surface.group.name)
+            {
+                if existing != &surface.group {
+                    return Err(flux_core::Error::Other(format!(
+                        "board group `{}` conflicts with an existing group declaration",
                         surface.group.name
                     )));
                 }
@@ -1817,7 +1918,12 @@ mod tests {
             fn text_delta(&mut self, t: &str) {
                 self.deltas.push(t.to_string());
             }
-            fn tool_result(&mut self, name: &str, _result: &flux_runtime::ToolResult) {
+            fn tool_result(
+                &mut self,
+                _dispatch: flux_core::DispatchId,
+                name: &str,
+                _result: &flux_runtime::ToolResult,
+            ) {
                 self.tool_results.push(name.to_string());
             }
         }
@@ -2248,6 +2354,62 @@ mod tests {
         assert!(error.contains("duplicate operation `echo`"));
         assert!(error.contains("custom-pack:alpha"));
         assert!(error.contains("custom-pack:beta"));
+    }
+
+    #[test]
+    fn client_builder_board_installation_is_atomic_and_source_labelled() {
+        use flux_datasource::board::{
+            BoardBackend, BoardContract, BoardId, BoardProfile, BoardScope,
+        };
+
+        let contract = |id: &str, source: &str| BoardContract {
+            id: BoardId::new(id).unwrap(),
+            scope: BoardScope::Repository {
+                repository_id: "repo".into(),
+            },
+            profile: BoardProfile::Execution,
+            backend: BoardBackend::Memory,
+            source: source.into(),
+        };
+        let first: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let second: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let builder = Client::builder()
+            .try_with_board(contract("product", "program.flux:4"), first)
+            .expect("the first board installs as one prepared surface");
+        let error = builder
+            .try_with_board(contract("product", "program.flux:12"), second)
+            .err()
+            .expect("a duplicate binding must fail the all-in-one installation")
+            .to_string();
+        assert!(error.contains("duplicate board `product`"), "{error}");
+        assert!(error.contains("program.flux:4"), "{error}");
+        assert!(error.contains("program.flux:12"), "{error}");
+
+        let board: Arc<dyn flux_capabilities::WorkBoard> =
+            Arc::new(flux_capabilities::MemoryBoard::new());
+        let collision = flux_runtime::tool_fn(
+            flux_spec::ToolSpec::read_only(
+                "product.list",
+                "collides with one generated board operation",
+                serde_json::json!({"type": "object"}),
+            ),
+            |_params| async { Ok(serde_json::Value::Null) },
+        );
+        let error = Client::builder()
+            .try_with_board(contract("product", "program.flux:4"), board)
+            .unwrap()
+            .register_op_from("consumer-pack", collision)
+            .build(Box::new(NeverMock), ".")
+            .err()
+            .expect("a generated board op cannot be partly shadowed")
+            .to_string();
+        assert!(
+            error.contains("duplicate operation `product.list`"),
+            "{error}"
+        );
+        assert!(error.contains("consumer-pack"), "{error}");
     }
 
     #[test]

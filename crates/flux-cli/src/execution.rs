@@ -171,80 +171,119 @@ pub(super) async fn build_doc_index(
     backend
 }
 
-/// The `kind` prefix that names a **board** declaration (A-131).
-///
-/// Naming this was a real decision, not a detail. `markdown` is already taken by the *knowledge*
-/// ingester, and a board backed by markdown files (A-114) is a different port entirely — so board
-/// kinds live in their own namespace: `board:memory` today, `board:markdown` / `board:jira` /
-/// `board:gitlab` as those backends land. Two properties follow, and both are the point:
-///
-/// * `kind = "markdown"` keeps meaning exactly what it has always meant. A knowledge declaration is
-///   never silently promoted to a board, and a board declaration is never silently ingested as
-///   knowledge — the prefix, not a lookup table, decides which port is bound.
-/// * A kind *under* this prefix that names no backend is a hard error, never a fall-through. The
-///   failure mode this closes is a user pointing `kind = "markdown"` at a board file store and
-///   getting a silently wrong, read-only knowledge index instead of a diagnostic.
+/// Legacy board-shaped datasource kinds are recognized only for a migration diagnostic. They never
+/// enter the datasource or board registry.
 const BOARD_KIND_PREFIX: &str = "board:";
 
-/// The board backends bindable from a `datasource` declaration today, for the error message that
-/// names them. `MemoryBoard` is the offline backend A-113 shipped with the port; `MarkdownBoard`
-/// (A-114) is the file-backed one; the issue-tracker-backed ones arrive with their own stories.
-const BOARD_BACKENDS: &str = "markdown | memory";
-
-/// What a Program's `datasource` declarations resolve to: one shared knowledge backend, plus the
-/// work boards declared alongside it.
+/// What a Program's `datasource` declarations resolve to: one shared knowledge backend.
 pub(super) struct ProgramDatasources {
     /// The shared index every `markdown` / `openapi` declaration ingested into, and the backend the
     /// retrieval ops (`search`/`get`/`list`/…) dispatch against.
     pub(super) knowledge: Arc<dyn flux_capabilities::DatasourceBackend>,
-    /// `(domain, backend)` per declared board, in declaration order. The caller installs each with
-    /// [`flux_capabilities::try_register_work_board`], which *derives* the generated op set from the
-    /// port — so an operation added to `WorkBoard` surfaces here with no change to this module.
-    pub(super) boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)>,
 }
 
-/// Resolve one `board:<backend>` declaration into a [`WorkBoard`](flux_capabilities::WorkBoard).
-///
-/// An unrecognized backend names itself and the ones that exist. It is deliberately NOT tolerant:
-/// falling back to the knowledge ingester here would reintroduce exactly the silent, wrong behaviour
-/// [`BOARD_KIND_PREFIX`] exists to prevent.
-///
-/// `root` is the already-resolved, program-relative directory the file-backed backends live under;
-/// `memory` ignores it. `MarkdownBoard` is built with
-/// [`rooted_in`](flux_capabilities::MarkdownBoard::rooted_in) rather than `new`, so the board
-/// **inherits the session's guarded `System`** instead of minting a fresh `Workspace` at an
-/// arbitrary root — a board is a write surface, so it must not be able to widen the sandbox it was
-/// handed.
-fn build_work_board(
-    name: &str,
-    backend: &str,
-    root: &str,
-    system: &System,
-) -> Result<Arc<dyn flux_capabilities::WorkBoard>> {
-    match backend {
-        "memory" => Ok(Arc::new(flux_capabilities::MemoryBoard::new())),
-        "markdown" => Ok(Arc::new(
-            flux_capabilities::MarkdownBoard::rooted_in(system, root).map_err(|e| {
-                anyhow::anyhow!("datasource `{name}` (board:markdown) at `{root}`: {e}")
-            })?,
-        )),
-        "" => Err(anyhow::anyhow!(
-            "datasource `{name}` declares a board but names no backend — write \
-             `kind = \"{BOARD_KIND_PREFIX}markdown\"` (available: {BOARD_BACKENDS})"
-        )),
-        other => Err(anyhow::anyhow!(
-            "datasource `{name}`: unknown board backend `{other}` (available: {BOARD_BACKENDS})"
-        )),
+/// First-class authored boards after typed registry validation. Execution adapters use the shipped
+/// `WorkBoard` port today; future Jira/Trello adapters extend this board seam rather than the
+/// datasource catalogue.
+pub(super) struct ProgramBoards {
+    pub(super) execution: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)>,
+}
+
+fn program_relative_path(program_dir: &std::path::Path, raw: &str) -> String {
+    let path = std::path::Path::new(raw);
+    if path.is_absolute() {
+        raw.to_string()
+    } else {
+        program_dir.join(path).to_string_lossy().into_owned()
     }
+}
+
+/// Resolve first-class `board <name>` declarations through the board registry.
+pub(super) fn build_program_boards(
+    declarations: &[flux_lang::program::BoardDecl],
+    program_dir: &std::path::Path,
+    system: &System,
+) -> Result<ProgramBoards> {
+    use flux_datasource::board::{BoardBackend, BoardContract, BoardId, BoardProfile, BoardScope};
+    use flux_lang::program::{BoardKindDecl, BoardProfileDecl, BoardScopeDecl};
+
+    let mut registry = flux_capabilities::BoardRegistry::new();
+    let mut execution = Vec::new();
+    for declaration in declarations {
+        let scope = match declaration.scope {
+            BoardScopeDecl::Session => BoardScope::Session {
+                session_id: declaration
+                    .session
+                    .clone()
+                    .unwrap_or_else(|| "current".into()),
+            },
+            BoardScopeDecl::Repository => BoardScope::Repository {
+                repository_id: program_relative_path(
+                    program_dir,
+                    declaration.root.as_deref().unwrap_or("."),
+                ),
+            },
+            BoardScopeDecl::Workspace => BoardScope::Workspace {
+                workspace_id: program_relative_path(
+                    program_dir,
+                    declaration.root.as_deref().unwrap_or("."),
+                ),
+            },
+        };
+        let profile = match declaration.profile {
+            BoardProfileDecl::General => BoardProfile::General,
+            BoardProfileDecl::Planning => BoardProfile::Planning,
+            BoardProfileDecl::Execution => BoardProfile::Execution,
+        };
+        let backend = match declaration.kind {
+            BoardKindDecl::Session => BoardBackend::Session,
+            BoardKindDecl::Track => BoardBackend::Track,
+            BoardKindDecl::Markdown => BoardBackend::Markdown,
+            BoardKindDecl::Memory => BoardBackend::Memory,
+            BoardKindDecl::Federated => BoardBackend::Federated,
+        };
+        let contract = BoardContract {
+            id: BoardId::new(&declaration.name)
+                .map_err(|error| anyhow::anyhow!("board `{}`: {error}", declaration.name))?,
+            scope,
+            profile,
+            backend,
+            source: format!("Flux-Lang board `{}`", declaration.name),
+        };
+        let board: Arc<dyn flux_capabilities::WorkBoard> = match declaration.kind {
+            BoardKindDecl::Memory => Arc::new(flux_capabilities::MemoryBoard::new()),
+            BoardKindDecl::Markdown => {
+                let root =
+                    program_relative_path(program_dir, declaration.root.as_deref().unwrap_or("."));
+                Arc::new(
+                    flux_capabilities::MarkdownBoard::rooted_in(system, &root).map_err(
+                        |error| {
+                            anyhow::anyhow!(
+                                "board `{}` (markdown) at `{root}`: {error}",
+                                declaration.name
+                            )
+                        },
+                    )?,
+                )
+            }
+            other => {
+                return Err(anyhow::anyhow!(
+                    "board `{}` backend {other:?} has no authored-program adapter yet",
+                    declaration.name
+                ))
+            }
+        };
+        registry.register_execution(contract, Arc::clone(&board))?;
+        execution.push((declaration.name.clone(), board));
+    }
+    Ok(ProgramBoards { execution })
 }
 
 /// Build a program's declared [`datasource`](flux_lang::program::DatasourceDecl)s — the
 /// `flux app run` counterpart of [`build_doc_index`]'s implicit workspace index.
 ///
-/// The `kind` dispatch is **total**, which is the whole safety property here: a knowledge kind
-/// ingests under its own name by the matching ingester (`markdown` walks a docs directory; `openapi`
-/// reads a JSON spec file), a `board:<backend>` kind binds a write-capable [`WorkBoard`] instead,
-/// and anything else is a clean error. Nothing falls through to a default.
+/// The `kind` dispatch is total: a knowledge kind ingests through its matching adapter, retired
+/// board-shaped kinds return a migration error, and anything else is a clean error.
 pub(super) async fn build_datasources(
     decls: &[flux_lang::program::DatasourceDecl],
     program_dir: &std::path::Path,
@@ -253,35 +292,27 @@ pub(super) async fn build_datasources(
     // A datasource path is relative to the PROGRAM FILE's directory (absolute paths pass through), so
     // `path "./docs"` means "beside the .flux file" regardless of the launch cwd. `program_dir` is a
     // read-only root of `system`, so the resulting absolute path is walkable/readable.
-    fn resolve_ds_path(program_dir: &std::path::Path, raw: &str) -> String {
-        let p = std::path::Path::new(raw);
-        if p.is_absolute() {
-            raw.to_string()
-        } else {
-            program_dir.join(p).to_string_lossy().into_owned()
-        }
-    }
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         datasource_backend(Arc::new(flux_capabilities::MemoryBackend::new()));
-    let mut boards: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for d in decls {
         match d.kind.as_str() {
-            // A board, not a knowledge source. `board` on its own is the shape a bare
-            // `datasource board { … }` lowers to (native text defaults `kind` to the decl name), so
-            // it is routed here to get the "names no backend" diagnostic rather than the generic
-            // unknown-kind one.
             kind if kind == "board" || kind.starts_with(BOARD_KIND_PREFIX) => {
-                let backend = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("").trim();
-                // A board's `path` is program-relative exactly like a knowledge datasource's, so
-                // `path "./board"` means "beside the .flux file" whatever the launch cwd is.
-                let root = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
-                boards.push((
-                    d.name.clone(),
-                    build_work_board(&d.name, backend, &root, system)?,
+                let replacement = kind.strip_prefix(BOARD_KIND_PREFIX).unwrap_or("BACKEND");
+                return Err(anyhow::anyhow!(
+                    "datasource `{}` uses the retired board-as-datasource syntax; replace it with:\n\
+                     board {}\n  scope \"repository\"\n  profile \"execution\"\n  kind {:?}\n  root {:?}",
+                    d.name,
+                    d.name,
+                    if replacement.is_empty() {
+                        "BACKEND"
+                    } else {
+                        replacement
+                    },
+                    d.path.as_deref().unwrap_or(".")
                 ));
             }
             "markdown" => {
-                let base = resolve_ds_path(program_dir, d.path.as_deref().unwrap_or("."));
+                let base = program_relative_path(program_dir, d.path.as_deref().unwrap_or("."));
                 let docs = walk_docs(system, &base, 1000, 200_000).await;
                 flux_capabilities::ingest_markdown(&*backend, &d.name, &docs)
                     .map_err(|e| anyhow::anyhow!("datasource `{}` (markdown): {e}", d.name))?;
@@ -290,7 +321,7 @@ pub(super) async fn build_datasources(
                 let raw = d.path.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("datasource `{}` (openapi) needs a `path`", d.name)
                 })?;
-                let path = resolve_ds_path(program_dir, raw);
+                let path = program_relative_path(program_dir, raw);
                 let text = system
                     .read_file(&path)
                     .await
@@ -303,17 +334,13 @@ pub(super) async fn build_datasources(
             }
             other => {
                 return Err(anyhow::anyhow!(
-                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi | \
-                     {BOARD_KIND_PREFIX}<backend>)",
+                    "datasource `{}` has unknown kind `{other}` (expected markdown | openapi)",
                     d.name
                 ))
             }
         }
     }
-    Ok(ProgramDatasources {
-        knowledge: backend,
-        boards,
-    })
+    Ok(ProgramDatasources { knowledge: backend })
 }
 
 /// Wrap a keyword backend in the semantic (embeddings) backend when built with `--features embeddings`
@@ -790,7 +817,7 @@ impl flux_web::RecordSink for BackendRecordSink {
 pub(super) fn seed_provider_env_secrets(redactor: &flux_secret::Redactor) {
     let secret_refs: Vec<flux_secret::Ref> = flux_credentials::provider_env_keys()
         .iter()
-        .chain(["FLUX_SECRET"].iter())
+        .chain(["FLUX_SECRET", "FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN"].iter())
         .map(|k| flux_secret::Ref::env(*k))
         .collect();
     let declined =
@@ -1083,8 +1110,19 @@ pub(super) const DEFAULT_ALLOW: &[&str] = &[
 /// rather than one executor), so calling this twice would silently fork one configured ceiling of N
 /// into two independent ceilings of N — the top-level agent and its sub-agents would then each get
 /// their own budget instead of counting against the operator's single number.
-pub(super) fn cli_resource_limits(cfg: &flux_config::Config) -> flux_runtime::ResourceLimits {
-    flux_runtime::ResourceLimits::from_config(&cfg.limits)
+pub(super) fn cli_resource_limits(
+    cfg: &flux_config::Config,
+    posture: flux_runtime::AutonomyPosture,
+) -> flux_runtime::ResourceLimits {
+    let configured = flux_runtime::ResourceLimits::from_config(&cfg.limits);
+    if configured.is_unbounded() {
+        // C-463: silence means the posture decides. A posture that never prompts carries a budget
+        // as part of the same choice, because when the prompt is gone the budget is one of the
+        // three things left constraining the run — "unattended *and* unbounded" was the finding.
+        // An operator who wrote a `[limits]` table stated their own ceiling and keeps it verbatim.
+        return posture.budget();
+    }
+    configured
 }
 
 /// Assemble the CLI's shared runtime envelope from already-resolved surface decisions.
@@ -1364,7 +1402,11 @@ pub(super) fn try_register_fleet(
         )),
         Arc::new(flux_orchestrate::FleetStopTool::new(runtime)),
     ];
-    registry.try_register_all_from("flux-cli fleet lifecycle", lifecycle)?;
+    registry.try_register_all_from_with_placement(
+        "flux-cli fleet lifecycle",
+        lifecycle,
+        flux_runtime::OperationPlacement::NativeSystemOnly,
+    )?;
 
     let private_net = fleet_private_net();
     let dispatch = flux_orchestrate::FleetDispatchTool::new(private_net.clone(), None);
@@ -1386,7 +1428,11 @@ pub(super) fn try_register_fleet(
         )),
         Arc::new(flux_orchestrate::FleetCancelTool::new(private_net, None)),
     ];
-    registry.try_register_all_from("flux-cli fleet dispatch", tools)?;
+    registry.try_register_all_from_with_placement(
+        "flux-cli fleet dispatch",
+        tools,
+        flux_runtime::OperationPlacement::LocalControlPlane,
+    )?;
     Ok(())
 }
 
@@ -1480,13 +1526,14 @@ struct ResolvedPermissions {
 
 /// Resolve the permission floor, approver, and pre-tool hooks. Read-only tools are pre-allowed by
 /// default (empty allow-list) so the common case needs no config; network/mutating tools still gate.
-/// A configured allow-list replaces the [`DEFAULT_ALLOW`] default entirely. `--yes` swaps the
-/// interactive approver for auto-allow. Hooks are the observe/modify/deny JS scripts under the
-/// project and user `.flux/hooks/*.js`.
+/// A configured allow-list replaces the [`DEFAULT_ALLOW`] default entirely. The approver comes from
+/// the resolved [`AutonomyPosture`](flux_runtime::AutonomyPosture) — `--yes` is the older spelling
+/// of `bounded-autonomy`, so it still gets the blanket allow. Hooks are the observe/modify/deny JS
+/// scripts under the project and user `.flux/hooks/*.js`.
 fn resolve_permissions(
     cwd: &std::path::Path,
     cfg: &flux_config::Config,
-    flags: &AgentFlags,
+    posture: flux_runtime::AutonomyPosture,
     approver_override: Option<Arc<dyn Approver>>,
 ) -> ResolvedPermissions {
     let mut allow = cfg.permissions.allow.clone();
@@ -1497,10 +1544,15 @@ fn resolve_permissions(
     // C-453: a surface with no terminal chooses its own approver (the served agent's posture). Only
     // the PROMPT differs — the permission floor, hooks and everything downstream are identical, so
     // this cannot be used to widen what a run may do, only to change who is asked.
+    //
+    // C-463: otherwise the posture decides, and the terminal prompt is what it decides *with*. A
+    // `supervised` posture IS `StdinApprover` on this surface; the autonomous ones determine their
+    // own approver and ignore the channel, which is why the same call answers all four.
     let approver: Arc<dyn Approver> = match approver_override {
         Some(approver) => approver,
-        None if flags.yes => Arc::new(AllowApprover),
-        None => Arc::new(StdinApprover),
+        None => posture
+            .approver(Some(Arc::new(StdinApprover)))
+            .expect("a terminal channel is supplied, so every posture resolves"),
     };
     let mut hook_dirs = vec![cwd.join(".flux").join("hooks")];
     if let Some(home) = std::env::var_os("HOME") {
@@ -1543,6 +1595,9 @@ struct EngineParts {
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     /// Host-owned responder installed on interactive surfaces only.
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
+    /// C-503's Exchange effective-catalogue source, absent unless the operator configured both
+    /// origin and Service Account token.
+    catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>>,
 }
 
 /// Capture the session-stable project layers shared by ordinary CLI assembly and `context show`.
@@ -1604,6 +1659,7 @@ async fn assemble_engine(
         model_invoked_skills,
         surface_sink,
         user_interaction,
+        catalog_refresher,
     } = parts;
     let flow = open_flow_store(events.clone())?;
     let spec = AgentSpec {
@@ -1654,6 +1710,9 @@ async fn assemble_engine(
     if let Some(interaction) = user_interaction {
         agent = agent.with_user_interaction(interaction);
     }
+    if let Some(refresher) = catalog_refresher {
+        agent = agent.with_catalog_refresher(refresher);
+    }
     agent.loop_host.set_model_stages(model_stages);
     let env_budget = match std::env::var("FLUX_TURN_TOKEN_BUDGET") {
         Ok(v) => Some(v.trim().parse::<u64>().map_err(|e| {
@@ -1682,6 +1741,13 @@ pub(super) async fn build_agent_with(
     let cfg = flux_runtime::metadata::load_config(&cwd).context("load .flux/config.toml")?;
     // Validate this input-driven expansion bound before provider, plugin, or agent assembly work.
     let max_iterations = agent_max_iterations(flags, &cfg.agent)?;
+    // C-463: the autonomy posture, resolved ONCE here and used for both halves it decides — the
+    // approver (`resolve_permissions`) and the budget (`cli_resource_limits`). Resolving it in one
+    // place is the point of the type: two derivations could disagree, and "approval says one thing,
+    // the budget says another" is precisely the incoherent combination it replaces. Validated this
+    // early so a contradictory `--yes --posture supervised` is refused before any provider,
+    // plugin, or sub-agent assembly happens.
+    let posture = flags.autonomy_posture()?;
     // Role metadata controls the child tool ceiling (omitting tools inherits the parent's catalog),
     // so strict project/user discovery must win over every eager provider failure. If a malformed
     // role were discovered later, a credential/provider error could mask the actionable file path
@@ -1724,7 +1790,6 @@ pub(super) async fn build_agent_with(
         System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
     );
     let selected_execution_system = resolve_selected_execution_system(flags, &system).await?;
-    let remote_mode = selected_execution_system.is_some();
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
@@ -1757,7 +1822,7 @@ pub(super) async fn build_agent_with(
     // sub-agent spawner just below and the top-level environment further down. Resolved once
     // deliberately: a second `cli_resource_limits` call would mint a second semaphore, so the
     // top-level agent's own executors would stop sharing one budget with each other.
-    let resource_limits = cli_resource_limits(&cfg);
+    let resource_limits = cli_resource_limits(&cfg, posture);
 
     // Sub-agent spawner (multi-agent orchestration): the `task` tool delegates to roles, each run
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
@@ -1791,7 +1856,11 @@ pub(super) async fn build_agent_with(
     if flags.dev {
         flux_tools::try_register_dev_builtins(&mut registry)?;
     }
-    registry.try_register_from("flux-cli sub-agent task operation", Arc::new(TaskTool))?;
+    registry.try_register_from_with_placement(
+        "flux-cli sub-agent task operation",
+        Arc::new(TaskTool),
+        flux_runtime::OperationPlacement::LocalControlPlane,
+    )?;
     // C-223/C-305: the `pane.*` vocabulary, surfaced by the presence of a `SurfaceSink` at assembly
     // time — the `[consult] model` precedent, not a `ToolGroup` (there is no `project.signal` for
     // "a human is watching a terminal"). Fail-closed and decided exactly once: a headless `flux
@@ -1804,21 +1873,6 @@ pub(super) async fn build_agent_with(
             .as_ref()
             .map(|interaction| interaction.capabilities()),
     )?;
-    let mut remote_unsupported_ops = std::collections::HashSet::new();
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            [
-                "sqlite_query",
-                "sys_info",
-                "git_worktree_enter",
-                "git_worktree_leave",
-                "fleet.isolate",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        );
-    }
-
     // Model-backed cognition ops (ai.extract/rank/judge/reason, synth, ai.rewrite): the L3
     // CognitionPack, advertised on the real CLI path so a plan can call the model as a typed op.
     // `CognitionPack` needs its own `Arc<dyn Provider>` (the engine's `provider` is moved below), so
@@ -1835,7 +1889,6 @@ pub(super) async fn build_agent_with(
                 None
             }
         };
-    let before_outer_packs = registry.names();
     register_tool_packs(
         &mut registry,
         cog_provider,
@@ -1845,30 +1898,13 @@ pub(super) async fn build_agent_with(
         &canonical_spec,
         &events,
     )?;
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            registry
-                .names()
-                .into_iter()
-                .filter(|name| !before_outer_packs.contains(name)),
-        );
-    }
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
     // backend is also the sink `web.fetch` contributes `web.page` records to (below), so read pages
     // are groundable.
     let backend = build_doc_index(&system).await;
-    let before_datasources = registry.names();
     flux_capabilities::try_register_datasource_ops(&mut registry, backend.clone())?;
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            registry
-                .names()
-                .into_iter()
-                .filter(|name| !before_datasources.contains(name)),
-        );
-    }
 
     // This run's session on the store opened above. `session_override` (L-25's `flow run --resume`)
     // wins outright — it names an already-halted session to continue, distinct from the REPL's own
@@ -1901,7 +1937,6 @@ pub(super) async fn build_agent_with(
             store: events.clone(),
             stream: session_id.clone(),
         });
-        let before_web = registry.names();
         flux_web::try_register_web(
             &mut registry,
             &flux_web::WebOptions {
@@ -1917,17 +1952,8 @@ pub(super) async fn build_agent_with(
                 allowed_secrets: cfg.web.allowed_secrets.clone(),
             },
         )?;
-        if remote_mode {
-            remote_unsupported_ops.extend(
-                registry
-                    .names()
-                    .into_iter()
-                    .filter(|name| !before_web.contains(name)),
-            );
-        }
     }
 
-    let before_integrations = registry.names();
     let integrations = assemble_integrations(
         system.clone(),
         Arc::new(super::app_cmd::WorkspaceSystemSource(
@@ -1943,18 +1969,67 @@ pub(super) async fn build_agent_with(
     .await?;
     let live_plugins = Arc::new(integrations.live_plugins);
     for (source, tool) in integrations.tools {
-        registry.try_register_from(source, tool)?;
-    }
-    if remote_mode {
-        remote_unsupported_ops.extend(
-            registry
-                .names()
-                .into_iter()
-                .filter(|name| !before_integrations.contains(name)),
-        );
+        registry.try_register_from_with_placement(
+            source,
+            tool,
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        )?;
     }
     let plugin_groups = integrations.groups;
     let mut ambient_signals = integrations.ambient_signals;
+
+    // C-503: one native Service Account client, compiled into the Flux binary. The two values are
+    // transitional host startup configuration and never operation/model input; C-509 replaces the
+    // environment bearer only for managed Linux-local bootstrap. Independently provisioned remote
+    // Exchange use retains this seam on every Flux target until secure remote provisioning. A partial or
+    // unavailable binding leaves core Flux intact and advertises no Exchange operation; the
+    // turn-boundary refresher retries and publishes only complete effective generations through
+    // C-318's live catalogue.
+    let catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
+        std::env::var("FLUX_EXCHANGE_URL").ok(),
+        std::env::var("FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN").ok(),
+    ) {
+        (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
+            match flux_web::exchange::ExchangeClient::new(&url, &token, redactor.clone()) {
+                Ok(client) => {
+                    let client = Arc::new(client);
+                    if let Err(error) = client.refresh_registry(&mut registry).await {
+                        eprintln!(
+                            "{}",
+                            style::dim(&format!(
+                                "(Exchange catalogue unavailable at startup: {})",
+                                redactor.redact(&error.to_string())
+                            ))
+                        );
+                    }
+                    Some(Arc::new(flux_web::exchange::ExchangeCatalogRefresher::new(
+                        client,
+                    )))
+                }
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        style::dim(&format!(
+                            "(Exchange binding refused: {})",
+                            redactor.redact(&error.to_string())
+                        ))
+                    );
+                    None
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            eprintln!(
+                "{}",
+                style::dim(
+                    "(Exchange disabled: set both FLUX_EXCHANGE_URL and \
+                     FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN)"
+                )
+            );
+            None
+        }
+    };
     // A-96: the `consult` op's group surfaces only when a target is configured, exactly like the
     // `endpoint` ambient signal above — computed once here from config, never re-probed per turn,
     // so surfacing can't churn the prompt prefix mid-session (A-95).
@@ -2018,7 +2093,7 @@ pub(super) async fn build_agent_with(
         perms,
         approver,
         hooks,
-    } = resolve_permissions(&cwd, &cfg, flags, approver_override);
+    } = resolve_permissions(&cwd, &cfg, posture, approver_override);
 
     let mut environment = assemble_cli_execution_environment(
         system.clone(),
@@ -2055,10 +2130,8 @@ pub(super) async fn build_agent_with(
             ))
         );
     }
-    let mut disabled = disabled_tools.disabled;
-    disabled.extend(remote_unsupported_ops);
     let executor = executor
-        .with_disabled_ops(disabled)
+        .with_disabled_ops(disabled_tools.disabled)
         .with_disabled_patterns(cfg.tools.disable.clone());
     // Record the available toolchain as a startup observation (audit backbone).
     executor.observe(flux_evidence::Observation::new(
@@ -2125,6 +2198,7 @@ pub(super) async fn build_agent_with(
             model_invoked_skills,
             surface_sink,
             user_interaction,
+            catalog_refresher,
         },
         &cwd,
         &cfg,
@@ -2798,7 +2872,9 @@ mod execution_environment_conformance {
 mod fleet_and_board_wiring {
     use super::*;
 
-    use flux_lang::program::DatasourceDecl;
+    use flux_lang::program::{
+        BoardDecl, BoardKindDecl, BoardProfileDecl, BoardScopeDecl, DatasourceDecl,
+    };
     use flux_system::Workspace;
 
     /// A throwaway workspace root. `build_datasources` needs a guarded [`System`] even for a
@@ -2825,33 +2901,42 @@ mod fleet_and_board_wiring {
         }]
     }
 
-    /// A-131 Acceptance 4, the named failing-first test: a Program declaring a board must resolve to
-    /// a `WorkBoard`-backed set of generated ops. Before this story `build_datasources` knew only
-    /// `markdown` and `openapi`, so a board declaration errored as an unknown kind and a board could
-    /// not be named from configuration at all.
+    fn board_decl(name: &str, kind: BoardKindDecl, root: Option<&str>) -> Vec<BoardDecl> {
+        vec![BoardDecl {
+            name: name.into(),
+            scope: BoardScopeDecl::Repository,
+            profile: BoardProfileDecl::Execution,
+            kind,
+            root: root.map(str::to_string),
+            session: None,
+            members: Vec::new(),
+            document_roots: serde_json::Map::new(),
+        }]
+    }
+
+    /// A first-class board resolves through the board registry and never enters the datasource
+    /// catalogue.
     #[tokio::test]
     async fn a_declared_board_binds_a_work_board_instead_of_erroring() {
         let root = temp_root("board-binds");
         let system = System::new(Workspace::new(&root).unwrap());
 
-        let bound = build_datasources(&decl("board", "board:memory"), &root, &system).await;
+        let bound = build_program_boards(
+            &board_decl("board", BoardKindDecl::Memory, Some(".")),
+            &root,
+            &system,
+        );
         assert!(
             bound.is_ok(),
-            "a `board:memory` datasource must bind a WorkBoard, got: {:?}",
+            "a first-class memory board must bind a WorkBoard, got: {:?}",
             bound.as_ref().err().map(ToString::to_string)
         );
         let bound = bound.unwrap();
 
-        // Not ingested as knowledge — the failure mode the board kind namespace exists to prevent.
-        assert!(
-            bound.knowledge.is_empty(),
-            "a board declaration must not be ingested into the knowledge index"
-        );
-
-        // ...and it resolves to a `WorkBoard`-backed set of GENERATED ops, under the decl's name as
+        // It resolves to a `WorkBoard`-backed set of GENERATED ops, under the decl's name as
         // the domain. The expected set is read off the port's own registration rather than listed
         // here, so a board operation added to `WorkBoard` (A-130) is covered without editing this.
-        let [(domain, board)] = <[_; 1]>::try_from(bound.boards).ok().expect("one board");
+        let [(domain, board)] = <[_; 1]>::try_from(bound.execution).ok().expect("one board");
         assert_eq!(domain, "board");
         let mut registry = ToolRegistry::new();
         let surface = flux_capabilities::try_register_work_board(&mut registry, &domain, board)
@@ -2949,12 +3034,9 @@ mod fleet_and_board_wiring {
         );
     }
 
-    /// A-131 Acceptance 5: the wrong board kind fails **loudly**. `markdown` stays the knowledge
-    /// ingester (it is not silently promoted to a board), a bare `board` names no backend, and a
-    /// board backend that does not exist yet is an error rather than a fall-through to knowledge
-    /// ingestion — which is the silent, wrong behaviour this story closes.
+    /// The retired board-as-datasource spelling fails with an exact first-class replacement.
     #[tokio::test]
-    async fn an_unnameable_board_backend_is_a_loud_error() {
+    async fn board_shaped_datasources_are_migration_errors() {
         let root = temp_root("board-loud");
         let system = System::new(Workspace::new(&root).unwrap());
 
@@ -2962,23 +3044,19 @@ mod fleet_and_board_wiring {
             let bound = build_datasources(&decl("board", kind), &root, &system).await;
             assert!(
                 bound.is_err(),
-                "a board kind naming no backend (`{kind}`) must error, not fall through to \
-                 knowledge ingestion"
+                "a retired board datasource (`{kind}`) must not enter either registry"
             );
             let text = bound.err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(text.contains("retired board-as-datasource"), "{text}");
             assert!(
-                text.contains("board"),
-                "the error must name the board kind, got: {text}"
+                text.contains("board board\n  scope \"repository\""),
+                "{text}"
             );
         }
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// `board:markdown` must bind the **durable** backend (A-114), not fall back to the in-process
-    /// one. Failing-first before `build_work_board` gained its `markdown` arm: the declaration was an
-    /// "unknown board backend" error, so no durable board could be named from a Program at all — and
-    /// without one, the design's "restart, sweep, re-derive" claim is untestable, because
-    /// `MemoryBoard`'s storage *is* the process it is supposed to survive.
+    /// A first-class Markdown board binds the durable adapter, not the in-process one.
     ///
     /// Durability is asserted the only way that actually proves it: write through the bound board,
     /// then read the bytes back off the filesystem.
@@ -2989,14 +3067,19 @@ mod fleet_and_board_wiring {
         std::fs::create_dir_all(&board_dir).unwrap();
         let system = System::new(Workspace::new(&root).unwrap());
 
-        let mut decls = decl("board", "board:markdown");
-        decls[0].path = Some("./board".into());
-        let bound = build_datasources(&decls, &root, &system)
-            .await
-            .expect("`board:markdown` must bind a durable board");
-        assert_eq!(bound.boards.len(), 1, "one declared board binds one board");
+        let bound = build_program_boards(
+            &board_decl("board", BoardKindDecl::Markdown, Some("./board")),
+            &root,
+            &system,
+        )
+        .expect("a first-class Markdown board must bind a durable board");
+        assert_eq!(
+            bound.execution.len(),
+            1,
+            "one declared board binds one board"
+        );
 
-        let (domain, board) = &bound.boards[0];
+        let (domain, board) = &bound.execution[0];
         assert_eq!(domain, "board");
 
         // The board is program-relative and rooted under the declared `path`, so a write lands
@@ -3019,8 +3102,7 @@ mod fleet_and_board_wiring {
             .unwrap_or(0);
         assert!(
             on_disk > 0,
-            "a durable board must leave the item on disk under the program-relative root; \
-             `board:memory` would leave nothing and the recovery story would be unprovable"
+            "a durable board must leave the item on disk under the program-relative root"
         );
         assert!(!item.id.is_empty(), "the created item has an id");
 
@@ -3078,7 +3160,7 @@ mod fleet_and_board_wiring {
                 "item": "item-0001",
             }));
         assert!(
-            subjects.iter().any(|s| s == "board/item/item-0001"),
+            subjects.iter().any(|s| s == "board:board/item/item-0001"),
             "the board item must be a concrete subject, got: {subjects:?}"
         );
         assert!(
@@ -3211,7 +3293,7 @@ pub(crate) mod cli_resource_ceiling_wiring {
                 None,
                 Vec::new(),
                 // The one C-299 seam: the CLI turns `[limits]` into runtime ceilings here.
-                cli_resource_limits(&cfg),
+                cli_resource_limits(&cfg, flux_runtime::AutonomyPosture::Supervised),
             )
             .into_executor(),
         );

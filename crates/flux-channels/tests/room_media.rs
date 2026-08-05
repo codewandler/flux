@@ -162,6 +162,7 @@ fn ready(owns_device_routing: bool) -> String {
     serde_json::to_string(&Ready {
         ready: MEDIA_PROTOCOL.into(),
         owns_device_routing,
+        routing_error: None,
     })
     .unwrap()
 }
@@ -339,6 +340,58 @@ async fn a_sidecar_that_does_not_own_device_routing_may_not_publish_audio() {
     .expect("video does not depend on audio capture");
 }
 
+/// D-235 — the composition, not the prose. Argv can name `unix:/run/user/<uid>/pulse/native`
+/// correctly and still reach nothing, because the sandbox mounts a tmpfs over `/run`. When the
+/// sidecar tells flux *why* it could not take routing ownership, that reason has to survive into the
+/// refusal an operator actually reads. Otherwise the only evidence is a zero level, and a zero level
+/// points at the room or at the sidecar rather than at the missing `[sandbox] writable` grant.
+#[tokio::test]
+async fn a_masked_audio_socket_is_named_in_the_refusal_rather_than_read_as_silence() {
+    let masked = "/run/user/1000/pulse/native";
+    let handshake = serde_json::to_string(&Ready {
+        ready: MEDIA_PROTOCOL.into(),
+        owns_device_routing: false,
+        routing_error: Some(format!(
+            "audio server `unix:{masked}` is not reachable: bubblewrap masks /run with a tmpfs, so \
+             grant it back with `[sandbox] writable = [\"/run/user/1000/pulse\"]`"
+        )),
+    })
+    .unwrap();
+
+    let (peer, double) = connect(Some(handshake), |r| Some(ok(r.id)), config()).await;
+    let peer = peer.expect("the handshake completes — a masked socket is not a protocol failure");
+    assert!(!peer.owns_device_routing());
+    assert_eq!(
+        peer.routing_error().map(str::to_string),
+        Some(
+            "audio server `unix:/run/user/1000/pulse/native` is not reachable: bubblewrap masks \
+             /run with a tmpfs, so grant it back with `[sandbox] writable = \
+             [\"/run/user/1000/pulse\"]`"
+                .to_string()
+        ),
+        "the sidecar's own explanation is preserved, not discarded at the handshake"
+    );
+
+    let error = peer
+        .publish_audio(&chunk())
+        .await
+        .expect_err("a sidecar that never reached the audio server must not publish")
+        .to_string();
+    assert!(
+        error.contains(masked),
+        "the refusal names the masked socket: {error}"
+    );
+    assert!(
+        error.contains("[sandbox] writable"),
+        "and names the grant that fixes it: {error}"
+    );
+    assert!(
+        double.commands().is_empty(),
+        "nothing reached the wire: {:?}",
+        double.commands()
+    );
+}
+
 /// Invariant 8 of the design, end to end over the wire: publish succeeds, mute reads false, and the
 /// probe says the track is silent — so publication is a **failure**.
 #[tokio::test]
@@ -403,6 +456,7 @@ async fn a_protocol_mismatch_is_refused_rather_than_negotiated() {
     let mismatched = serde_json::to_string(&Ready {
         ready: "flux.room-media.v9".into(),
         owns_device_routing: true,
+        routing_error: None,
     })
     .unwrap();
     let (peer, _double) = connect(Some(mismatched), |r| Some(ok(r.id)), config()).await;

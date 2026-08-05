@@ -70,7 +70,7 @@
 use super::loading::{op_coherence_warnings, plugin_tool_spec};
 use super::*;
 use flux_plugin_protocol::validate_manifest_operations;
-use flux_runtime::{LiveToolCatalog, ToolRegistry};
+use flux_runtime::{LiveToolCatalog, OperationPlacement, ToolRegistry};
 
 /// The result of a re-projection: the tools to install, and what changed relative to the catalog
 /// that was in force before. Produced by [`LoadedPlugin::refresh`]; installed by
@@ -136,7 +136,11 @@ impl CatalogRefresh {
                 assembled.remove(name);
             }
         }
-        assembled.try_register_all_from(source, self.tools.iter().cloned())?;
+        assembled.try_register_all_from_with_placement(
+            source,
+            self.tools.iter().cloned(),
+            OperationPlacement::NativeSystemOnly,
+        )?;
         *registry = assembled;
         Ok(())
     }

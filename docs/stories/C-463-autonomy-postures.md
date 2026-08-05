@@ -2,7 +2,7 @@
 id: C-463
 title: "Name the autonomy postures — `auto_approve: bool` is doing the work of a first-class choice"
 pillar: Core
-status: ready
+status: done
 priority: 3
 design: docs/designs/remote-agents.md
 epic: remote-agents
@@ -57,22 +57,23 @@ evidence is still recorded. What changes is that the constraint budget moves fro
 
 ## Acceptance
 
-- [ ] **Failing-first**: a test asserting a named posture selects its approver, sandbox posture and
+- [x] **Failing-first**: a test asserting a named posture selects its approver, sandbox posture and
       budget together as one coherent choice — failing at the merge base, where they are set
       independently.
-- [ ] The postures are **named and selectable**, not assembled from three unrelated flags. ⚠ The bug
+- [x] The postures are **named and selectable**, not assembled from three unrelated flags. ⚠ The bug
       this prevents is the one C-444 describes from the SDK side: `auto_approve(true)` not implying
       confinement. A posture that sets approval without setting isolation is the same mistake with a
       nicer name.
-- [ ] ⚠ **Nothing in the docs or the CLI presents an autonomous posture as degraded.** No "unsafe
+- [x] ⚠ **Nothing in the docs or the CLI presents an autonomous posture as degraded.** No "unsafe
       mode", no warning styling on a legitimate choice. State what each posture relies on instead.
-- [ ] ⚠ **Each posture states what it does NOT protect against**, because that is the honest version of
+- [x] ⚠ **Each posture states what it does NOT protect against**, because that is the honest version of
       the above. Exploratory autonomy on a valuable repository is a real risk and the docs should say
       which one — not by discouraging it, but by naming the constraint the operator is now leaning on.
-- [ ] Authorization, guarded IO and evidence are **invariant across every posture**, asserted by a test.
+- [x] Authorization, guarded IO and evidence are **invariant across every posture**, asserted by a test.
       That assertion is what makes the whole idea safe to ship.
-- [ ] Existing `--yes` / `auto_approve` keep working and map onto a named posture. ⚠ No flag day.
-- [ ] Full gate green.
+- [x] Existing `--yes` / `auto_approve` keep working and map onto a named posture. ⚠ No flag day.
+- [x] Full gate green. *(Wave story: targeted checks only — see Progress. The integrator ran the
+      full repository gate once on the combined tree; result recorded in Progress.)*
 
 ## Notes
 
@@ -90,3 +91,60 @@ evidence is still recorded. What changes is that the constraint budget moves fro
 ## Progress
 
 - Filed 2026-08-02, owner-directed, correcting the framing in C-453's dispatch.
+- **2026-08-05 — implemented.** `flux_runtime::AutonomyPosture` (`crates/flux-runtime/src/posture.rs`)
+  is the named choice: one value answers *who approves* ([`ApprovalStance`]), *how confined*
+  ([`SandboxFloor`], a tightest-wins floor) and *how much* (`ResourceLimits`). Four postures, no
+  extensible scheme — `ALL` is a fixed array and there is no constructor for a fifth.
+
+  **Failing-first** (`crates/flux-runtime/tests/autonomy_posture.rs`, at the merge base):
+
+  ```text
+  error[E0432]: unresolved imports `flux_runtime::ApprovalStance`, `flux_runtime::AutonomyPosture`
+    --> crates/flux-runtime/tests/autonomy_posture.rs:21:21
+     |
+  21 |     ApprovalChoice, ApprovalStance, Approver, AutonomyPosture, Executor, PermissionManager, Tool,
+     |                     ^^^^^^^^^^^^^^            ^^^^^^^^^^^^^^^ no `AutonomyPosture` in the root
+     |                     |
+     |                     no `ApprovalStance` in the root
+  ```
+
+  That *is* the story's claim: at the merge base approval, confinement and budget were set
+  independently, so there was no value to name and the coherence assertion could not be written.
+
+  **The invariance suite is the important one.** For all four postures the same op is refused by
+  authorization even where the approver allows everything, the same workspace escape is refused by
+  the guarded `System`, and the same `tool_call` evidence is recorded. The posture type exposes
+  nothing that selects a substrate, widens a grant set, or touches the evidence log.
+
+  **Surfaces.** CLI `--posture <name>` on `AgentFlags` (`run`/`tui`/`fork`/`record`/`app run`);
+  SDK `ClientBuilder::posture(..)` / `FlowClientBuilder::posture(..)`. `--yes` and
+  `auto_approve(true)` resolve to `bounded-autonomy` — no flag day, and pinned by tests on both
+  sides. C-453's `ServedApprovalPosture` now *maps onto* the vocabulary rather than paralleling it:
+  `Unattended` is `bounded-autonomy`, `Remote` is `supervised` with the network as its channel,
+  exactly as this story's note asked. Surfaces with no terminal (`flux app run <program>`,
+  `flux record`) refuse an explicit `--posture supervised` instead of downgrading it, and default to
+  `refusing`, which is what they always installed.
+
+  **Honesty, both halves.** Every posture carries `relies_on()` and `does_not_protect_against()`, and
+  a test refuses the words "unsafe", "insecure", "dangerous", "safety off" anywhere in a posture's
+  own prose. `bounded-autonomy` names the working tree as its blast radius; `exploratory` names
+  exfiltration and says to point it at a disposable checkout; `refusing` names the startup plugin
+  spawns and pre-authorised ops that never reach the approval stage at all. Public statement:
+  [Safety & approvals](../../website/docs/agent/safety.md) — plus the `--yes` framing corrected in
+  `getting-started.md`, `troubleshooting.md`, `usage.md`, `cli.md` and `security/os-sandbox.md`.
+
+  **The one deliberate non-uniformity.** Only an *explicitly named* posture contributes a sandbox
+  floor in `apply_sandbox_env`. `--yes` keeps contributing what it always did through
+  `unattended_sandbox_surface`, because that classifier's exemptions (notably `flux tui --yes`, where
+  an operator is watching the whole run) are decisions about *surfaces*, not postures — inferring a
+  floor from the older spelling would confine them for the first time. Recorded at
+  `AgentFlags::named_posture` and pinned by
+  `a_named_posture_carries_its_confinement_into_the_sandbox_env`.
+
+- 2026-08-05 — closed. The wave's single full repository gate ran green on the combined tree at
+  `b075fd09`: `cargo test --workspace` 225 suites / 4473 tests, `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo fmt --all -- --check` and `cargo test -p flux-codegate
+  --all-targets` 51/51, all exit 0. Because this wave changed sandbox posture, the two conditional
+  suites named in AGENTS.md also ran green: `FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test
+  --workspace` and `FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend`.
+  Shipped to `origin/main` as `b075fd09`.

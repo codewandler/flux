@@ -5,7 +5,8 @@ description: "Attach indexed knowledge or an async live system of record to an e
 
 # Datasources
 
-The SDK supports the complementary datasource shapes below:
+A datasource is a named, declared, **read-only** record surface — operations *do*; datasources
+*know* — and it has exactly one declared access mode. The SDK supports both:
 
 | | Indexed knowledge | Live system of record |
 |---|---|---|
@@ -16,7 +17,10 @@ The SDK supports the complementary datasource shapes below:
 | SDK wiring | `try_register_pack` | `ClientBuilder::try_with_live_datasource` |
 
 Both project ordinary operations into the catalog. Every call still crosses authorization →
-approval → guarded execution; registering a datasource does not create an IO or policy bypass.
+approval → guarded execution; registering a datasource does not create an IO or policy bypass. The
+two contracts deliberately do not merge: an indexed snapshot and a live read-through need different
+shapes, and anything write-capable — such as a [work board](../agent/datasources.md#work-boards) —
+is not a datasource at all.
 
 ## Live systems of record
 

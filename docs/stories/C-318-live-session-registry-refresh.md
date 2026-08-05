@@ -2,7 +2,7 @@
 id: C-318
 title: "The refreshed catalog reaches a running session — the registry A-95 froze on purpose"
 pillar: Core
-status: active
+status: done
 priority: 12
 areas: [flux-cli]
 note: "C-310's honest boundary, declared by its own implementor — the refresh mechanism and its operator surface exist, but Executor owns its ToolRegistry by value with no registry_mut, and execution.rs cites A-95 prompt-cache stability as the reason the surfaced set must not churn mid-turn"
@@ -55,7 +55,7 @@ one.
       role/`with_tools` policy.
 - [x] Original exact and `family.*` disable intent is re-evaluated for live additions, and a failed
       live publication leaves both the plugin and published generation unchanged.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces.
 
 Design, boundary rationale, cache measurement, and focused verification evidence are recorded in
 [live-session-catalog-refresh.md](../designs/live-session-catalog-refresh.md). The repository-wide

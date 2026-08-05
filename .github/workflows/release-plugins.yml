@@ -1,42 +1,130 @@
 # Plugin pack release channel (D-46, docs/designs/plugin-distribution.md).
 #
 # Hand-written on purpose — cargo-dist is NOT extended to the plugins workspace (dist models one
-# app per package; 20 nested-workspace packages would collide with the core release series). Deliberately
-# `workflow_dispatch`, NOT a tag push: the dist-generated release.yml triggers on the tag glob
-# '**[0-9]+.[0-9]+.[0-9]+*', which any semver-ish plugins tag would also match and red-X dist's
-# plan job. This workflow creates the `plugins-v<version>` tag + release itself via GITHUB_TOKEN
-# (workflow-created refs don't re-trigger workflows, so no recursion). Do NOT hand-push a
-# `plugins-v*` tag.
+# app per package; 20 nested-workspace packages would collide with the core release series).
+#
+# AUTHORITY (C-354). Publication happens on a push of an exact `plugins-v<X.Y.Z>` tag and nowhere
+# else. The three publication authorities remain three distinct jobs, and
+# each secret is named in exactly one step:
+#
+#   * `build` (5 targets) and `assemble` (index generation) are secret-free and hold no environment.
+#   * `sign` holds `MINISIGN_SECRET_KEY`, on the minisign step only.
+#   * `publish-github-release` holds `RELEASE_TOKEN`, on the create/upload step only.
+#   * `publish-host-kit` holds `CARGO_REGISTRY_TOKEN`, on the `cargo publish` step only.
+#
+# The tag itself is created by `release-control`, a narrow job that runs from a `workflow_run` of
+# the required `ci` aggregate on canonical `main`. It receives `RELEASE_TOKEN` only on the tag-control
+# step, checks that the green run's head SHA is still canonical `main`, that the lockstep version is
+# exact and that the tag is absent — and then creates that one tag. It signs nothing and publishes
+# nothing. See scripts/plugin-tag-control.sh.
+#
+# `workflow_dispatch` is retained as a BUILD/VALIDATION path only. It has no `publish` input, cannot
+# reach any authority-bearing step, cannot create a tag, sign, create a Release or
+# publish a crate; it stops after uploading its secret-free artifacts. This replaces the historical
+# branch-dispatched publication in which one job chose the version, signed the index, created the
+# Release and published the crate.
 #
 # Secrets: MINISIGN_SECRET_KEY — the contents of a PASSWORDLESS minisign secret key
-# (`minisign -G -W`); its public half is embedded in the flux binary (D-47). Required to publish;
-# a dry run without it skips signing with a notice.
+# (`minisign -G -W`); its public half is embedded in the flux binary (D-47). It is a `release`
+# repository secret, so a dry run cannot see it at all.
 
 name: release-plugins
 
 on:
+  push:
+    tags:
+      - "plugins-v[0-9]+.[0-9]+.[0-9]+"
+  # Build and validate the pack from any ref, with no credential and no publication path.
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Pack version to release (must equal plugins/ workspace.package.version)"
-        required: true
-        type: string
-      publish:
-        description: "Create the plugins-v<version> tag + GitHub release (false = dry run: artifacts only)"
-        required: true
-        type: boolean
-        default: false
+  # The automatic tag controller. `ci` on `main` is the required aggregate; a green run whose head
+  # is still canonical main is the only thing that may create a plugin tag.
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-plugins
+  group: release-plugins-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Packaging consumes plugins/target/... explicitly; fix the otherwise overridable workflow root.
+  CARGO_TARGET_DIR: target
+
 jobs:
+  # The only plugin-control job that receives the repository PAT, and the only effect it can have is the
+  # creation of one absent plugin tag at a validated canonical-main SHA.
+  release-control:
+    name: "release-control · create the absent plugin tag"
+    if: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.name == 'ci' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          persist-credentials: false
+
+      - name: Create the absent plugin tag at canonical main
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          CI_RUN_NAME: ${{ github.event.workflow_run.name }}
+          CI_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          CI_RUN_EVENT: ${{ github.event.workflow_run.event }}
+          CI_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          CI_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: scripts/plugin-tag-control.sh
+
+  # The lockstep version every archive name, manifest and index entry will report. On a tag it comes
+  # from the tag; on a manual build it comes from the workspace. Both are then required to agree
+  # with plugins/Cargo.toml, so a tag that does not describe its own tree never builds.
+  resolve:
+    name: resolve the lockstep pack version
+    if: ${{ github.event_name != 'workflow_run' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publishing: ${{ startsWith(github.ref, 'refs/tags/plugins-v') }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - id: version
+        shell: bash
+        run: |
+          # Read the whole [workspace.package] section, not a fixed-size window: `grep -A5` missed
+          # `version` the moment a comment was added above it, and the run failed on a manifest that
+          # was perfectly correct.
+          ws_version="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p' plugins/Cargo.toml \
+            | sed -nE 's/^version *= *"([^"]+)".*/\1/p' | head -1)"
+          if ! printf '%s' "$ws_version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::plugins workspace.package.version is not an exact X.Y.Z: '${ws_version}'"
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#plugins-v}"
+            if [ "${tag_version}" != "${ws_version}" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match plugins workspace.package.version '${ws_version}'"
+              exit 1
+            fi
+          fi
+          echo "version=${ws_version}" >> "$GITHUB_OUTPUT"
+          echo "pack version ${ws_version}"
+
   build:
     name: build (${{ matrix.target }})
+    needs: resolve
+    if: ${{ github.event_name != 'workflow_run' }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: true
       matrix:
@@ -56,21 +144,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-
-      # The requested version must be the plugins workspace's lockstep version — the index, the
-      # archive names, and the manifests all report it; a mismatch here would ship lies.
-      - name: Verify version input matches the plugins workspace
-        shell: bash
-        run: |
-          # Read the whole [workspace.package] section, not a fixed-size window: `grep -A5` missed
-          # `version` the moment a comment was added above it, and the run failed on a manifest that
-          # was perfectly correct.
-          ws_version="$(awk '/^\[workspace\.package\]/{p=1;next} /^\[/{p=0} p' plugins/Cargo.toml \
-            | sed -nE 's/^version *= *"([^"]+)".*/\1/p' | head -1)"
-          if [ "${ws_version}" != "${{ inputs.version }}" ]; then
-            echo "::error::input version '${{ inputs.version }}' != plugins workspace.package.version '${ws_version}' — bump plugins/Cargo.toml first"
-            exit 1
-          fi
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -85,18 +160,29 @@ jobs:
         with:
           workspaces: plugins
 
-      - name: Build the pack (release)
+      - name: Build the pack (release, Unix)
+        if: runner.os != 'Windows'
+        shell: bash
         working-directory: plugins
-        run: cargo build --release --workspace
+        run: ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo build --release --workspace
+
+      - name: Build the pack (release, Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        working-directory: plugins
+        run: ..\scripts\run-python3.cmd ..\scripts\build_ownership.py shared --workspace-root "%CD%" -- cargo build --release --workspace
 
       # One archive per plugin per target, containing just the binary:
       # flux-plugin-<name>-<version>-<target>.tar.xz (.zip on windows, binary keeps its .exe).
       - name: Package per-plugin archives
         shell: bash
+        env:
+          PACK_VERSION: ${{ needs.resolve.outputs.version }}
+          PACK_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="${{ inputs.version }}"
-          target="${{ matrix.target }}"
+          version="${PACK_VERSION}"
+          target="${PACK_TARGET}"
           mkdir -p out
           shopt -s nullglob
           count=0
@@ -128,12 +214,21 @@ jobs:
           path: out/*
           if-no-files-found: error
 
+  # Secret-free assembly. On a manual dispatch this is the last job that runs: the dry run stops
+  # here, with everything the release would carry except the signature it is not allowed to make.
   assemble:
-    name: assemble · index · sign${{ inputs.publish && ' · release' || ' (dry run)' }}
-    needs: build
+    name: assemble · index${{ startsWith(github.ref, 'refs/tags/plugins-v') && '' || ' (dry run)' }}
+    needs:
+      - resolve
+      - build
+    if: ${{ github.event_name != 'workflow_run' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
@@ -161,11 +256,13 @@ jobs:
       # that names a missing asset cannot occur; a missing build leg fails the count).
       - name: Generate plugins-index.json (sanity-gated)
         working-directory: plugins
+        env:
+          PACK_VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           expected_plugins="$(grep -rl '^name = "flux-plugin-' ./*/Cargo.toml | wc -l)"
           echo "expecting ${expected_plugins} plugins x 5 targets"
-          cargo run --release -p pack-index -- \
-            --version "${{ inputs.version }}" \
+          ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo run --release -p pack-index -- \
+            --version "${PACK_VERSION}" \
             --dir ../dist \
             --out ../dist/plugins-index.json \
             --released-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
@@ -173,71 +270,137 @@ jobs:
             --expect-targets 5
           cat ../dist/plugins-index.json
 
-      # One minisign signature covers every artifact transitively via the per-artifact sha256
-      # entries (the terraform sign-the-aggregate pattern). Publishing without the key is refused;
-      # a dry run without it proceeds unsigned with a loud notice.
+      - name: Upload the assembled pack
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: plugins-pack-${{ needs.resolve.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+  # One minisign signature covers every artifact transitively via the per-artifact sha256 entries
+  # (the terraform sign-the-aggregate pattern). This job exists so that the signing key is reachable
+  # from exactly one step of exactly one tag-triggered job, and from nothing that builds.
+  sign:
+    name: sign the pack index
+    needs:
+      - resolve
+      - assemble
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Collect the assembled pack
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: plugins-pack-${{ needs.resolve.outputs.version }}
+          path: dist
+
+      - name: Install minisign
+        run: sudo apt-get update -q && sudo apt-get install -y -q minisign
+
       - name: Sign the index (minisign)
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          PACK_VERSION: ${{ needs.resolve.outputs.version }}
         run: |
+          set -euo pipefail
           if [ -z "${MINISIGN_SECRET_KEY}" ]; then
-            if [ "${{ inputs.publish }}" = "true" ]; then
-              echo "::error::MINISIGN_SECRET_KEY secret is not set — cannot publish an unsigned pack"
-              exit 1
-            fi
-            echo "::notice::MINISIGN_SECRET_KEY not set — dry run proceeds UNSIGNED"
-            exit 0
+            echo "::error::MINISIGN_SECRET_KEY is not configured as an Actions secret — cannot publish an unsigned pack"
+            exit 1
           fi
-          sudo apt-get update -q && sudo apt-get install -y -q minisign
           umask 077
           printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${RUNNER_TEMP}/minisign.key"
           minisign -S -s "${RUNNER_TEMP}/minisign.key" \
             -m dist/plugins-index.json -x dist/plugins-index.json.minisig \
-            -t "flux plugin pack v${{ inputs.version }}"
+            -t "flux plugin pack v${PACK_VERSION}"
           rm -f "${RUNNER_TEMP}/minisign.key"
-          minisign -V >/dev/null 2>&1 || true
           test -s dist/plugins-index.json.minisig
 
-      # Dry run: everything the release would carry, as a workflow artifact — no tag, no release.
-      - name: Upload dry-run bundle
-        if: ${{ !inputs.publish }}
+      - name: Upload the detached signature
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: plugins-release-${{ inputs.version }}-dry-run
-          path: dist/*
+          name: plugins-index-signature-${{ needs.resolve.outputs.version }}
+          path: dist/plugins-index.json.minisig
           if-no-files-found: error
 
+  publish-github-release:
+    name: publish the plugins-v release
+    needs:
+      - resolve
+      - assemble
+      - sign
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Collect the assembled pack
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: plugins-pack-${{ needs.resolve.outputs.version }}
+          path: dist
+
+      - name: Collect the detached signature
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: plugins-index-signature-${{ needs.resolve.outputs.version }}
+          path: dist
+
       # --latest=false keeps releases/latest/download/flux-cli-installer.sh resolving to a CORE
-      # release; gh creates the plugins-v tag itself at the workflow's commit.
+      # release. The tag already exists — it is the event that started this job — so the Release is
+      # attached to it and no ref is created here.
       - name: Create the plugins-v release
-        if: ${{ inputs.publish }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+          PACK_VERSION: ${{ needs.resolve.outputs.version }}
         run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "::error::RELEASE_TOKEN is not configured as a repository Actions secret"
+            exit 1
+          fi
           test -s dist/plugins-index.json.minisig || { echo "::error::unsigned index"; exit 1; }
-          gh release create "plugins-v${{ inputs.version }}" dist/* \
+          gh release create "plugins-v${PACK_VERSION}" dist/* \
             --latest=false \
-            --target "${GITHUB_SHA}" \
-            --title "flux plugin pack v${{ inputs.version }}" \
+            --title "flux plugin pack v${PACK_VERSION}" \
             --notes "Prebuilt \`flux-plugin-*\` binaries for the five core targets, plus the minisign-signed \`plugins-index.json\`. Install with \`flux plugin install <name>\` (D-47). This release series is consumed by the flux CLI — it is not the flux core release."
 
-      # host-kit ships HERE, not with the flux closure (C-146). It is the plugin-side SDK on the
-      # 1.x protocol line, so a flux release has nothing to say about its version — publishing it
-      # from `scripts/publish-crates-io.sh` only meant republishing an unchanged crate every cut.
-      #
-      # Ordering: host-kit's dependencies (`codewandler-flux-plugin-protocol` and the serde-only
-      # leaves) are published by the FLUX closure, so a wire change must ship a flux release before
-      # this step can resolve it. The preflight turns that into a named error instead of an opaque
-      # `cargo publish` resolution failure.
+  # host-kit ships HERE, not with the flux closure (C-146). It is the plugin-side SDK on the
+  # 1.x protocol line, so a flux release has nothing to say about its version — publishing it
+  # from `scripts/publish-crates-io.sh` only meant republishing an unchanged crate every cut.
+  #
+  # Ordering: host-kit's dependencies (`codewandler-flux-plugin-protocol` and the serde-only
+  # leaves) are published by the FLUX closure, so a wire change must ship a flux release before
+  # this step can resolve it. The preflight turns that into a named error instead of an opaque
+  # `cargo publish` resolution failure.
+  publish-host-kit:
+    name: publish codewandler-flux-host-kit
+    needs:
+      - resolve
+      - publish-github-release
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
       - name: Publish codewandler-flux-host-kit to crates.io
-        if: ${{ inputs.publish }}
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -uo pipefail
           if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::warning::CARGO_REGISTRY_TOKEN not set — skipping the host-kit publish"
-            exit 0
+            echo "::error::CARGO_REGISTRY_TOKEN is not configured as an Actions secret"
+            exit 1
           fi
 
           # Both crates carry an explicit `version = "…"` in their [package] section (they are on
@@ -269,7 +432,8 @@ jobs:
             exit 1
           fi
 
-          if ! cargo publish --manifest-path plugins/host-kit/Cargo.toml; then
+          if ! scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "$PWD/plugins" -- \
+            cargo publish --manifest-path host-kit/Cargo.toml; then
             echo "::error::host-kit publish failed"
             exit 1
           fi

@@ -8,11 +8,75 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **Boards and the local coding fleet are now first-class agent automation surfaces** (Decision
+  0010; C-547, A-134, L-130, C-548–C-551, C-242, C-244, C-245, A-117). `flux board` exposes
+  session, repository and workspace scopes; general, planning and execution profiles; Track,
+  session, Markdown, memory and federated backends; vision, roadmap, decision and design documents;
+  deterministic Track rendering; and the exact current/history metric cube. `flux fleet` exposes
+  durable local sub-agent scheduling, acknowledged control, bounded inspection, handoff/rework/gate
+  records and explicit local-only apply. Both families share the `flux.cli/v1` JSON/NDJSON contract,
+  optimistic revisions, idempotent mutations, dry runs, schemas and concise rendered Agent Skills.
+  `BoardId`, `BoardRef`, independent scope/profile/backend contracts and `BoardRegistry` are public
+  through the datasource/capability/SDK seams, and Flux-Lang has a first-class closed `board`
+  declaration. The new Coding / AI-assisted development documentation ties the complete workflow
+  together for humans, Claude and Codex. Neither fleet run nor apply pushes, publishes, releases,
+  deploys or automatically deletes worktrees.
+
+- **Autonomy is now a named posture rather than an absence of safety** (C-463).
+  `flux_runtime::AutonomyPosture` names four choices — `supervised`, `bounded-autonomy`,
+  `exploratory` and `refusing` — and each one selects its approval stance, sandbox floor and budget
+  together as a single coherent value, instead of leaving them to three independently settable
+  flags. That coupling is the point: a posture that set approval without also setting confinement
+  would be C-444's bug with a nicer name. Selectable as `--posture` on the CLI and
+  `ClientBuilder::posture()` in the SDK. `--yes` and `auto_approve` are unchanged and map onto
+  `bounded-autonomy`; contradictory combinations are refused rather than silently resolved. The set
+  is a fixed four with no builder — deliberately not an extensible preset generator. Authorization,
+  guarded IO and evidence recording are invariant across all four, asserted by tests that drive the
+  same ungranted operation and the same workspace escape through every posture, including those
+  whose approver allows everything. Each posture documents what it does *not* protect against, and
+  no surface presents an autonomous posture as degraded.
+
+- **`flux review` now shows live progress while its built-in review flow runs** (C-530). The CLI can
+  render an interactive reviewer tree, append-only summaries, or no progress via
+  `--progress auto|tree|plain|off`; progress stays on stderr so Markdown and JSON reports remain clean
+  on stdout. The SDK's shared sink-backed flow runner forwards both direct operation events and
+  correlated child-agent activity without bypassing the normal execution envelope.
+
+- **`flow_run` can execute Flux-Lang supplied directly in its request.** The new mutually exclusive
+  `inline_program` address is parsed and revalidated against the live operation catalog, then runs
+  through the same session, approval, guarded-IO, input-seeding, and reentry boundaries as stored
+  names and workspace paths. Inline route receipts report no resolved filesystem path.
+- **Independent native gather calls from one model response now execute concurrently** (C-528).
+  Model stages and adaptive exploration share one batch scheduler that admits only idempotent,
+  low-risk, non-mutating calls with explicit read-only effects and an approval-free authorization
+  verdict. Pre-tool hooks, active cassettes, approval-sensitive calls, incomplete connector
+  `Network`-without-`Read` metadata, and every captured action remain ordered. Results retain the
+  provider's call order and ids across completion, refusal, failure and queue timeout; execution
+  still crosses the existing authorization, approval, cancellation, redaction, guarded-IO and
+  `max_concurrent_tool_calls` envelope.
+
+- **A tracked Flux-Lang writer role now authors checked `.flux` sources** (C-513).
+  `.flux/agents/flux-lang-writer.md` uses the coding profile and an explicit tool allow-list, reads
+  the repository language contract before editing, and separates parse/analyze checks from an
+  explicitly requested run through the ordinary guarded runtime. The public agent catalogue now
+  links every embedded fallback and tracked project role to its canonical source, with a census
+  test that detects inventory drift. The role narrows delegated capabilities; it does not create a
+  new authority boundary.
+
+- **Flux now embeds the Exchange Service Account client for official integrations** (C-503).
+  Operator-only environment configuration binds one Exchange origin and bearer; its authenticated
+  effective catalogue is adopted between turns and one-shot operations run through Exchange's HTTP
+  `invoke` contract. Exchange retains credential, tenant, connection, grant and runtime authority.
+  An outage withdraws only Exchange operations, leaves core Flux usable, and never selects a local
+  or plugin fallback. Streaming, subscriptions, cancellation frames, terminal lifecycle and leases
+  remain outside this first slice.
+
 - **Running REPL sessions can adopt a plugin's refreshed operation catalog at the next turn
   boundary** (C-318). `/plugin-refresh <name>` publishes one atomic generation shared by prompting,
   validation, authorization and dispatch. Mid-turn and already-running calls retain their original
   catalog; withdrawals, wildcard disables, nested runtimes and newly spawned children all preserve
-  their existing authority ceilings.
+  their existing authority ceilings. A refused refresh leaves both the retained plugin and the
+  published generation unchanged.
 
 - **Flux-Lang supports JSON-quoted object keys in field paths** (C-320). Expressions such as
   `$response.headers["content-type"]` and their optional `?` form preserve the existing strict-field
@@ -20,6 +84,140 @@ All notable changes to this project are documented in this file. The format is b
   and are mirrored in Prism, tree-sitter, TextMate and IntelliJ.
 
 ### Changed
+
+- **The v0.56.0 release path now runs from the repository's existing Actions secrets without a
+  dedicated GitHub App, release Environments, rulesets or branch protection** (C-559; supersedes the
+  C-353 configuration proposal and the matching C-354/C-516 identity clauses). Model, smoke, scribe,
+  build, receipt and verification work remains mutation-credential-free. `RELEASE_TOKEN` is scoped
+  to the isolated core promotion, plugin tag-control and GitHub Release steps; it preflights before
+  mutation and performs PAT-authenticated tag pushes so both tag workflows run. The ambient
+  `GITHUB_TOKEN` is limited to exact candidate dispatch and Actions observation. Parsed adversarial
+  fixtures reject secret scope drift, model/build exposure, ambient-token tag creation, missing PAT
+  tag triggering, combined publication authority and any restored App/Environment dependency.
+
+- **Operation execution placement is now explicit per operation** (C-478). The runtime distinguishes
+  local control-plane work, selected-execution-system effects, and native-system-only effects. Remote
+  catalogs retain compatible members of mixed packs, hide native-only operations, and repeat the
+  same fail-closed check at dispatch; unannotated extensions default to native-only remotely while
+  local execution remains unchanged. `/tools` reports the incompatibility reason, and a production
+  census keeps every built-in classification deliberate.
+
+- **Fenced Markdown code blocks now carry a structural `▎ ` gutter** (C-537). The shared layout
+  path applies it to every code row, including blank and list-nested rows, so terminal, ANSI, export,
+  and monochrome rendering identify code blocks consistently without relying on color.
+
+- **Every release authority is now scoped to the explicit job and step that consumes it** (C-354,
+  as superseded by C-559). All
+  four release workflows declare workflow-level `contents: read`; any other GitHub write permission
+  is granted on the one job that needs it, and no workflow- or job-level `env` carries a provider
+  key, `RELEASE_TOKEN`, `MINISIGN_SECRET_KEY` or `CARGO_REGISTRY_TOKEN`. Pre-tag promotion and
+  plugin tag control receive the existing `RELEASE_TOKEN` only on their host-owned steps; signing,
+  GitHub Release publication and Cargo publication remain distinct tag-triggered jobs, so no job
+  combines those authorities. Plugin and crates.io
+  publication accept only an exact tag push — the retained plugin `workflow_dispatch` is
+  structurally a build/validation path that cannot mint a token, create a tag, sign or publish, and
+  `crates-io.yml` drops `workflow_dispatch` entirely. `scripts/check-release-authority.sh` enforces
+  this by parsing the workflow/job/step graph — permissions, `on`, `if`, `needs`, `uses`, action
+  inputs and `env` — rather than by matching text, with 23 structural fixtures.
+
+- **The release-candidate receipt now binds the artifact bytes the publishing run must consume**
+  (C-355). Receipt `flux-release-candidate-v3` records each of the seven expected `artifacts-*`
+  uploads by API-reported name, immutable database id, size and exact `sha256:<64 lowercase hex>`
+  digest in one deterministic encoding; missing, expired, duplicate, malformed or extra artifacts
+  fail closed, and v2 is not accepted as a compatibility substitute. Promotion downloads each
+  archive by its receipt-bound id, hashes the raw response bytes and compares identity, size and
+  digest before opening it, then extracts into a fresh per-record namespace that rejects absolute
+  paths, `..` traversal, drive/UNC forms, control characters in names, symlinks and other
+  special members, duplicate members and cross-archive collisions. `merge-multiple: true` is no
+  longer the trust boundary.
+
+- **Core release promotion now binds preview, protected-main integration and public closure into one
+  gate** (C-516). `release_plan` reads fully framed commit messages and treats a non-empty
+  `[Unreleased]` `Action needed` section as the pre-1.0 breaking signal, correcting the current
+  preview from `0.55.1` to `0.56.0`. Promotion opens and merges a normal cut PR only after the exact
+  head's `ci`, stages the resulting canonical-main SHA as the candidate, creates the annotated tag
+  through the promoter App, selects only new exact-tag/SHA workflow runs, verifies the live Release
+  and whole `/releases/latest` fleet, and deletes evidence last. New Releases have one exact
+  28-asset inventory; every archive sidecar and the eleven-entry checksum index are recomputed, all
+  downloaded bytes must match positive unique GitHub metadata, and every asset must carry the exact
+  tag/SHA release-workflow attestation.
+
+- **The fleet delivery contract now validates one integrated wave instead of every child merge.**
+  A named wave has at most one writer and isolated worktree per story, targeted checks at story
+  handoff, dependency-ordered integration on one branch, and one unskippable full repository gate
+  on the final combined tree. Overlapping write sets are serialized, child branches do not open
+  competing pull requests, and a red gate preserves the failed candidate while publishing nothing.
+  The still-backlog C-242 contract and its design were corrected before implementation; no runtime
+  behaviour changed.
+
+- **Flux-Lang's authoring-ergonomics roadmap now has implementation contracts for L-131 through
+  L-140.** The wave covers structural type aliases and nested records, typed task outputs and repair
+  branches, constructors and multiline values, settled fan-out, collecting loops, structured agent
+  context, and first-class `Option`/`Result` foundations. This release adds the reviewed contracts,
+  not those language features.
+
+- **Embedded public documentation freshness is now a mandatory PR and publication gate** (C-515).
+  The unfiltered pull-request workflow and exact-SHA release candidate both install the pinned
+  website dependencies and verify `public-docs.zip`; website publication checks before upload or
+  deployment. Contributor and release guidance now require regeneration, inclusion of a changed
+  archive in the same commit, and a post-commit freshness check.
+
+- **`confirm` approval gates now carry analyzer-derived intent sets**. A confirm body now reports
+  its effective operation names plus host and semantic effects, unknown/failed body analysis remains
+  explicit, and bodyless confirms are represented as an explicit gate marker. Invalid confirm risk
+  labels are now rejected by analysis during the normal parse/analyze path.
+
+- **Datasources now carry the family's one declared read-only definition** (C-514). flux-roadmap
+  Decision 0006 governs the vocabulary: a datasource is a named, declared, read-only record surface
+  — *operations do; datasources know* — with exactly one access mode (indexed or live), one
+  registry direction across both modes, connector-owned vendor Datasource Definitions,
+  Exchange-owned tenant bindings and read seam, and a flux-owned wire vocabulary and Flux-Lang
+  declaration surface. The work board leaves the datasource vocabulary as a first-class
+  write-capable surface: a new epic charters its own `board` declaration, `board:` subject
+  namespace and SDK seam, and the Jira/GitLab board stories are re-pointed from the plugin path
+  Milestone 5 removes onto Exchange-governed operations. The concepts and ecosystem pages (and
+  their website mirrors), both public datasource pages, and the affected designs — the live-seam
+  non-goal's named consumers, the discoverability registry disposition, and a partial supersession
+  of the connector-backed storage facade — were reconciled in the same documentation-only change.
+  No runtime behavior changed.
+
+- **The Exchange environment bearer is now documented as transitional compatibility** (C-511).
+  C-503's lower-level embedded-client setup remains available and redacted, but public and
+  contributor guidance no longer presents it as the managed Linux-local Milestone 1 bootstrap:
+  C-509 replaces it there with an Exchange-owned direct handoff into secure storage. Independently
+  provisioned remote Exchange use retains the configured origin/bearer on every Flux target until a
+  separate secure remote provisioning contract lands. This Decision 0012 correction changes no
+  shipped lifecycle behavior.
+
+- **Direct dependency changes are now explicit review events** (C-450). CI compares each workspace's
+  exact resolved direct edges with a committed review lock, including which selected packages run a
+  Cargo build script. Adding, moving, renaming or upgrading a direct dependency now fails with the
+  exact regeneration command until its lock diff is acknowledged.
+
+- **The public security guide now distinguishes secret prevention from containment** (C-461). It
+  identifies connector, host-authentication and non-serializable endpoint guarantees; maps local
+  program/provider/plugin credentials to their actual materialization paths; and states the
+  redactor, destination-scope, rotation, audit, and raw prompt/answer durable-log limits without an
+  unqualified "the model never sees secrets" claim.
+
+- **The provider guide now states the supported breadth and the rule for extending it** (C-449).
+  Flux ships eight production text-provider prefixes over four wire codecs plus one optional realtime
+  implementation; the maintained strategy is a narrow in-tree registry, OpenRouter for the catalogue
+  tail, and the Rust `Provider` interface for embedders—not one built-in prefix per vendor or a model
+  provider loader hidden in connectors/plugins.
+
+- **The contributor vision now classifies every decision-bearing finding from the comparative source
+  review exactly once** (C-452). It separates real engineering gaps from deliberate costs of the
+  mandatory effect envelope and from adoption evidence that code cannot manufacture, with an explicit
+  purchase and cost for every defended trade-off.
+
+- **Canonical and public integration documentation now follows the Exchange-only program** (C-501).
+  The signed plugin pack is documented as temporary compatibility behavior; the future path is one
+  embedded Service Account client with every official connector runtime executed by Exchange and no
+  local or plugin fallback. The roadmap now links the cross-repository authority and stages the
+  one-shot HTTP client before lifecycle, per-adapter proof/deletion, and unconditional plugin
+  infrastructure removal. This documentation correction does not claim that the client, an adapter
+  migration, or the zero-plugin release already ships.
 
 - **Every long-lived production server and channel listener now binds through the selected guarded
   execution system** (C-435). Guarded streams split into independent bounded read/write halves so
@@ -49,7 +247,122 @@ All notable changes to this project are documented in this file. The format is b
   automated cut no longer repeats the full six-command gate: the exact candidate SHA runs it once,
   and the immutable receipt binds that gated commit before main or the tag may move.
 
+- **The engineering presentation covers the full runtime story and works as a handout** (C-540).
+  Three new chapters — the adaptive agent loop, sessions as the operational record, and model
+  strategy — grow the deck to thirteen (about twenty minutes), and its Exchange status now matches
+  the shipped Service Account seam with snapshots re-verified against both sibling repositories
+  (connectors v0.20.0, exchange v0.17.0, 2026-08-05). All chapters render in the DOM, so printing
+  yields a complete handout with a static listing in place of the editor and the Monaco workbench
+  mounts only when the demo chapter is first shown. Deck keys keep working after activating any
+  control, touch swipe and a contents menu navigate, browser Back steps chapters, the pipeline
+  detail follows the site theme, and the footer, landing page, docs overview and README link the
+  deck — all pinned by the website contract so the deck can neither drift stale nor become an
+  orphan again.
+
+- **Contributor front doors state the adaptive-loop thesis and stop hardcoding release status**
+  (C-529). `docs/architecture.md`, `CONTRIBUTING.md` and the roadmap's Direction section no longer
+  describe the retired plan-compiler model; a new website-contract test pins the exact retired
+  sentences out. The roadmap's Next preamble and the story board's Status block become evergreen
+  pointers instead of version claims (which had rotted 13–17 releases stale), roadmap design links
+  stay inside `docs/`, the public REPL table documents `/plugin-refresh`, the README's published
+  topologies link regains its `/docs/` segment, `docs/language.md` points at the shipped
+  Glyph/Railflux projections and quoted-key field paths, the agent-loop and A2A contributor/website
+  pairs carry reciprocal pointer notes, and `docs/designs/` states its convention in a README.
+
 ### Fixed
+
+- **Native board/fleet real-child tests are hermetic on CI hosts without bubblewrap** (C-558). The
+  Linux-only mock-agent fixture supplies its own test backend instead of depending on the runner's
+  installed sandbox tools. Production unattended children still fail closed when confinement is
+  unavailable, and the explicit `FLUX_SANDBOX=off` kill switch is still not inherited through the
+  guarded process boundary.
+
+- **Workspace boards and Fleet now preserve their repository boundaries during real agent runs.**
+  `flux board --scope workspace check` validates every configured member, resolves namespaced
+  dependencies against the federated board and reports the aggregate story count instead of
+  silently checking only the roadmap checkout. Fleet turns receive every configured repository as
+  an explicit read-only root while retaining a single writable worktree, and capture now discards
+  an oversized activity event only at a complete NDJSON line boundary so a later terminal receipt
+  remains parseable. C-560 tracks the separate investigation into why a continued read-only turn
+  produced a 1.23 MB event and the source-side bounds it needs.
+
+- **The native board-and-fleet release gate now distinguishes fixture literals from executable
+  build entry points** (C-558). The build-ownership scanner ignores standalone Ruby string
+  predicates and literal-to-literal workflow mutations while still rejecting a real bare
+  `dist build`, including an immediately executed generated command. The independently versioned
+  board contracts move `codewandler-flux-datasource` 1.3.0 → 1.4.0 (additive public API), while the
+  new variant on the closed policy resource enum moves `codewandler-flux-policy` 1.0.0 → 2.0.0;
+  root and plugin dependency floors and both lockfiles now resolve those exact identities.
+
+- **Provider-declared quota exhaustion no longer enters transient retry backoff** (C-545). Codex,
+  OpenAI, Anthropic, OpenRouter, and Bedrock can classify explicit usage-limit or credit-exhaustion
+  responses as terminal, preserving the provider's reset or limit message for the caller. Bare and
+  otherwise unclassifiable HTTP 429 responses remain retryable.
+
+- **The TUI dependency graph no longer carries the unsound `lru 0.12.5` release** (C-205).
+  Ratatui, crossterm, ansi-to-tui, the first-party Markdown parity oracles and the maintained
+  tui-textarea successor now resolve as one ratatui 0.30 generation with `lru 0.18.2`. The
+  `RUSTSEC-2026-0002` exceptions were removed from both advisory gates after root and plugin scans
+  passed without them.
+
+- **Tool results can no longer attach to the wrong transcript card** (C-531). `run_call` mints a
+  process-unique `DispatchId` per call and stamps it on both the call and its result, so
+  `FlowSink::{tool_call, tool_result}` and `AgentSink::{tool_call, tool_timing, tool_result}` now
+  carry the pairing the durable log already had. The TUI resolves `finish_tool`/`time_tool` on that
+  id instead of scanning backwards for the newest same-name card, which cross-attached results as
+  soon as C-528 admitted concurrent same-name `read`/`grep`/`glob` batches. The same
+  name-keyed-collection bug is fixed one layer down in the whatif `RerunRecordingSink` (FIFO by op
+  name) and in `flux-orchestrate`'s `TextCollector` (LIFO by op name, the fleet pane's version of
+  the same cross-attachment). `progress_tool` still matches by name and documents why: a
+  `tool.progress` observation is raised below the interpreter that mints the id, and its only
+  producer is `AccessKind::Process`, which the parallel batch scheduler never admits. This is a
+  breaking signature change on published crates and obliges a workspace MINOR bump.
+
+- **A masked host audio socket now fails by name instead of reading zero** (D-235). The sandbox
+  masks `/run` with a tmpfs, so argv alone can never reach a PulseAudio/PipeWire socket at
+  `/run/user/<uid>/pulse`; the companion `[sandbox] writable` grant is now documented as required
+  rather than optional, in the design, the sidecar docs and the website. Flux also refuses a
+  configured writable path under `/run` that does not exist instead of creating it: an empty
+  directory bound over the mask applies successfully and still reaches nothing, which turned a
+  mistyped uid into a silent zero level. The `/run` tmpfs mask and its invariant are unchanged, and
+  no environment passthrough was added.
+
+- **Tool transcript output is safer and easier to inspect** (C-533, C-534, C-536, C-539). Live,
+  completed, and resumed tool text now consumes escape sequences and drops terminal control bytes
+  before it reaches a TUI cell. Patch inputs and unified-diff-shaped results render as real hunks
+  without misclassifying ordinary dash-prefixed prose, wrapped detail rows retain their card rail
+  and indent, and the TUI and CLI now consume one declared family of truncation budgets while
+  preserving their intentional surface-specific limits and verbose behavior.
+
+- **Repository builds now own their Cargo target while compiler output is live** (C-517).
+  `task install` acquires one cross-process shared lease before the resolved target is first touched
+  and retains it across workspace library tests plus both supported binary installs. Every
+  repository build entry point uses the same persistent sibling lock; `task clean` requires
+  exclusive ownership and refuses with an actionable diagnostic while builders are active.
+  Absolute, workspace-relative and fleet-provided `CARGO_TARGET_DIR` values remain reusable, and
+  Python 3.10+ supplies the pre-Cargo portable bootstrap through native Linux/macOS `flock` and
+  Windows `LockFileEx` branches. The regression gate reproduces the old deterministic compiler
+  output disappearance class and separately observes a real bundled-SQLite object under
+  `release/build/libsqlite3-sys-*/out` without claiming an unobserved incident participant.
+
+- **JaaS rooms now close the two residual races in their otherwise-pinned join path** (C-413).
+  Concurrent initial joins are serialized across check, handshake and install so only one session
+  and pump can be created; a concurrent leave waits for that transition and cannot strand the
+  session. XMPP-over-WebSocket now resolves once through `flux-system` and performs its handshake on
+  the exact vetted TCP address, closing the DNS-rebinding gap for the query-carried guest token.
+
+- **The CST layout formatter preserves a terminal column-zero module comment** (L-125). The LSP's
+  format-on-save path and `fluxlang fmt` no longer re-indent a comment after the final declaration
+  into that declaration's body; exact-text coverage also pins comments before, between, and trailing
+  on declarations and statements.
+
+- **A control-only room-media flood is now counted instead of being shed silently** (D-233). Audio
+  retains its reserved boundary, while the finite control queue exposes a separate loss diagnostic
+  and the media contract no longer claims that control events can never fill it.
+
+- **Room-media settings no longer expose sidecar arguments through `Debug` formatting** (D-234).
+  The executable and non-secret timing/buffer settings remain diagnosable, while every argument
+  after `argv[0]` is represented only by a redacted count in both media and containing room output.
 
 - **Webhook and connector HTTP ingress now shares the server's body, timeout, request-rate and
   concurrency controls** (C-409). Admission happens before `Deliverer` or task spawn, async work

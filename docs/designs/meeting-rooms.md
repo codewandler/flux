@@ -404,10 +404,11 @@ Four decisions in it are load-bearing, and each one is a measured finding rather
   surfaced, and even that only counts.
 
 **Backpressure.** Inbound audio arrives ~50×/s and never stops. `MediaStream` is bounded and sheds *audio*
-past capacity rather than growing, keeping `MEDIA_CONTROL_RESERVE` (32) slots back so `speech_started` and
-`participant` are never shed — a barge-in that arrives late is a bot talking over a person. Blocking
-instead would push backpressure onto the sidecar's pipe and stall the *outbound* half of the same
-protocol, so a flux that is slow at hearing would stop being able to speak.
+past capacity rather than growing, keeping `MEDIA_CONTROL_RESERVE` (32) slots back so audio cannot shed
+`speech_started` or `participant`. A control-only flood can still exhaust that finite queue; such loss is
+counted separately rather than hidden. A barge-in that arrives late is a bot talking over a person.
+Blocking instead would push backpressure onto the sidecar's pipe and stall the *outbound* half of the
+same protocol, so a flux that is slow at hearing would stop being able to speak.
 
 **Failure posture.** Every media failure is an **operation** failure. A sidecar that would not start, died,
 or wedged fails the `MediaPeer` call and nothing else: the room stays joined, text and presence keep
@@ -442,11 +443,36 @@ to get audio a human could hear, and it is the checklist to run **before** a cal
    cleared to a minimal allow-list — `DISPLAY`, `XDG_RUNTIME_DIR`, `PULSE_SERVER` and friends **do not**
    reach it. `HOME`, `USER`, `PATH`, `TMPDIR` do. Pass anything else in argv, which flux never interprets:
    `media { sidecar ["flux-room-media", "--audio-server", "unix:/run/user/1000/pulse/native"] }`.
-8. **Mind the sandbox.** flux confines subprocesses through bubblewrap when a backend is available, and
-   Chrome's own content sandbox needs a nested user namespace inside it (the reason `spawn_debug_pipe` is
-   the browser exemption for tier-3 browsing). A room-media sidecar spawned `Sandboxed` may need
-   `FLUX_SANDBOX=off` for the flux process, or its own `--no-sandbox` posture, and **that trade-off has
-   not been exercised against a live call yet.**
+8. **Grant the socket back through the sandbox — argv alone does not reach it (D-235).** ⚠ **Required, not
+   optional**, whenever the sandbox is on. Step 7 is only half the recipe: flux's Linux confinement mounts a
+   tmpfs over `/run` on every sandboxed spawn, deliberately, so that `docker.sock`, D-Bus and other host IPC
+   sockets stay unreachable. The PulseAudio/PipeWire socket lives under that mask. No value of
+   `--audio-server` can name a path the confinement removed, so the operator must re-expose its directory:
+
+   ```toml
+   # flux.toml — `id -u` gives the uid. Grant the *directory* that holds the socket.
+   [sandbox]
+   enabled = true
+   writable = ["/run/user/1000/pulse"]
+   ```
+
+   `writable` is the correct mechanism here despite its name. It emits a read-write bwrap `--bind`, and
+   read-write is exactly what a unix socket needs — `connect(2)` takes `MAY_WRITE` on the socket inode, so a
+   read-only bind would leave the socket visible and unconnectable. The bind is emitted *after* the `/run`
+   tmpfs, so it punches the host directory back through the mask instead of being erased by it. There is no
+   separate "reachable" grant in bubblewrap: reachability **is** the bind.
+
+   Two guards keep a mistake here loud. A configured `writable` path under `/run` that does not exist is
+   **refused at startup** rather than created — an empty directory bound over the mask would apply cleanly
+   and still reach nothing, and a wrong uid is the common typo. And a sidecar that could not reach its audio
+   server should report `routing_error` in its handshake, which flux quotes verbatim in the refusal to
+   publish; without it the only evidence is a level probe reading zero, which points at the room rather than
+   at the sandbox.
+9. **Mind the rest of the sandbox.** flux confines subprocesses through bubblewrap when a backend is
+   available, and Chrome's own content sandbox needs a nested user namespace inside it (the reason
+   `spawn_debug_pipe` is the browser exemption for tier-3 browsing). A room-media sidecar spawned
+   `Sandboxed` may need `FLUX_SANDBOX=off` for the flux process, or its own `--no-sandbox` posture, and
+   **that trade-off has not been exercised against a live call yet.**
 
 ## Multi-party is the design problem; the plumbing is the easy half
 

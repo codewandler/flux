@@ -1,5 +1,10 @@
 # A2A — Agent-to-Agent protocol
 
+> Contributor copy. The user-facing treatment is
+> [`website/docs/agent/a2a.md`](../website/docs/agent/a2a.md) — deliberately independent texts over
+> the same behavior, not mirrors; keep both consistent with the shipped tree. The conformance
+> matrix pair is already cross-linked from [a2a-conformance.md](a2a-conformance.md).
+
 flux speaks the [A2A protocol](https://a2a-protocol.org/) in **both directions**:
 
 - **Server** — `flux app run --serve` exposes a flux agent over A2A, so any A2A client (Claude Code,

@@ -48,6 +48,34 @@ you are working against a relocated or fixture store — so a `--store` session'
 appear where you might expect it.
 :::
 
+## Board and fleet state
+
+Board persistence follows the selected scope and backend; there is no hidden universal board
+database:
+
+| Surface | Durable state |
+|---|---|
+| session board | board events in the selected `events.db`; `--store` and `FLUX_STORE_DIR` relocate them with the owning session |
+| Track repository board | `docs/stories/`, its generated marker region, and authored vision/roadmap/decision/design documents in the repository |
+| Markdown execution board | one item file per record under the declaration's configured `root` |
+| federated workspace board | member `BoardRef`s and optional workspace planning documents; member stories remain in their owning repositories |
+| memory board | process memory only; never a recovery source |
+
+Fleet keeps its workspace authority beside the repositories it coordinates:
+
+| Path | Contents |
+|---|---|
+| `.flux/fleet.toml` | closed fleet configuration: repositories, boards, gates, templates, limits, fences and worktree root |
+| `.flux/fleet/state.json` | folded coordinator, worker, wave, handoff, review, gate and apply state |
+| `.flux/fleet/events.ndjson` | append-only redacted fleet events and coordinator notes |
+| `.flux/fleet/worktrees/` | the default integration/story worktree root; the configured `worktree_root` may point elsewhere |
+
+`--store` does not relocate repository/workspace boards or the `.flux/fleet*` ledger. Back up the
+authored board files, fleet manifest/state/events, and every Git commit or ref named by an active
+wave together. Do not delete a fleet worktree merely because the ledger is durable: an unfinished
+worker may still have uncommitted source there. Use `flux fleet status`, `worktrees`, and `inspect`
+before recovery or cleanup.
+
 ## Postgres backend (opt-in)
 
 For deployments that embed the flux crates and run **several processes or replicas against one
@@ -125,5 +153,7 @@ shape-identical to the SQLite backend's.
 
 - [Configuration](./config.md) — runtime settings that affect local sessions.
 - [Datasources](../agent/datasources.md) — the knowledge layer these records serve.
+- [Boards](../coding/boards.md) — board scopes, profiles, backends, import/export and recovery authority.
+- [Fleet](../coding/fleet.md) — durable worker, wave, handoff, gate and apply state.
 - [Time Machine](../agent/time-machine.md) — replay, fork, and diff recorded runs.
 - [FlowClient](../sdk/flow-client.md) — deterministic flow execution over stored state.

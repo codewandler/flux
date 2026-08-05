@@ -35,9 +35,8 @@
 #   * unmaintained = "all"  — the 0.20 default; stated here so it is visibly a decision. Any crate,
 #                             transitive included, with an unmaintained advisory fails.
 #   * unsound      = "all"  — OVERRIDES the default "workspace", which only fails on unsound advisories
-#                             against direct workspace members and would silently pass a transitive one
-#                             (e.g. lru RUSTSEC-2026-0002 below — cargo-deny stays completely quiet on
-#                             it under the default). Vulnerabilities always error and cannot be softened.
+#                             against direct workspace members and would silently pass a transitive one.
+#                             Vulnerabilities always error and cannot be softened.
 #   * yanked       = "deny" — OVERRIDES the default "warn": depending on a version that was yanked from
 #                             crates.io is a supply-chain smell and should fail, not merely warn.
 unmaintained = "all"
@@ -45,7 +44,7 @@ unsound = "all"
 yanked = "deny"
 
 # Every ignore below is triaged, not a blanket allow: each carries the advisory ID, why it is not an
-# exploitable vulnerability in flux's usage, and what would clear it. All four are *informational*
+# exploitable vulnerability in flux's usage, and what would clear it. All three are *informational*
 # (unmaintained / unsound), NOT vulnerabilities — a vulnerability advisory against any of these crates
 # carries a different RUSTSEC id and would still fail the build. An unexplained ignore is a silent
 # regression: do not add a bare RUSTSEC id here.
@@ -65,13 +64,6 @@ ignore = [
     # ttf-parser. Unmaintained (successor: harfrust). What would change this: the render stack moving
     # off rustybuzz, or a vulnerability advisory reachable from rendered input.
     { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained; reached only via the SVG/PNG render path, not vulnerable" },
-    # `lru` 0.12.5 — *unsound* (not vulnerable): `IterMut` can invalidate an internal pointer, a
-    # Stacked-Borrows soundness violation that is only reachable by code calling `LruCache::iter_mut`.
-    # It is a transitive dependency here, and the real fix is a version bump (`patched = >= 0.16.3`),
-    # which this story cannot make — Cargo.lock is out of its fence. Ignored with a standing follow-up
-    # to bump lru; the entry disappears the moment the lockfile moves to >= 0.16.3. What else would
-    # change it: the advisory being re-rated from unsound to a vulnerability.
-    { id = "RUSTSEC-2026-0002", reason = "lru IterMut unsound (not a vulnerability); fix is a lockfile bump to >=0.16.3 that this story cannot make" },
 ]
 
 [licenses]

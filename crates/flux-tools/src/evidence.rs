@@ -12,20 +12,21 @@ use serde_json::{json, Value};
 
 use flux_core::Result;
 use flux_evidence::{Observation, Phase};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{tool_input_schema, Effect, Idempotency, Risk, ToolSpec};
 
 /// Register the evidence ops (`observe`, `evidence`, `metrics`). Called from
 /// [`register_builtins`](crate::register_builtins) — they are general-purpose audit primitives any flow
 /// may use, advertised like the other built-ins.
 pub fn try_register_evidence(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-tools evidence pack",
         vec![
             Arc::new(ObserveOp) as Arc<dyn Tool>,
             Arc::new(EvidenceOp),
             Arc::new(MetricsOp),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 
@@ -51,7 +52,11 @@ pub fn install_evidence(registry: &mut ToolRegistry) -> Result<()> {
         Arc::new(EvidenceOp),
         Arc::new(MetricsOp),
     ] {
-        assembled.replace_from(SOURCE, tool)?;
+        assembled.replace_from_with_placement(
+            SOURCE,
+            tool,
+            OperationPlacement::LocalControlPlane,
+        )?;
     }
     *registry = assembled;
     Ok(())

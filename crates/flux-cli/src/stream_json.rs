@@ -48,6 +48,10 @@ pub(super) enum ProtocolLine {
     ToolCall {
         v: u32,
         session: String,
+        /// C-531: the per-dispatch id, repeated on this call's `tool_result` line. Additive on the
+        /// v1 schema. A client pairs on it instead of on `name` + arrival order, which is unsound
+        /// once two same-name idempotent calls run concurrently and finish out of order.
+        dispatch: u64,
         name: String,
         input: Value,
     },
@@ -56,6 +60,8 @@ pub(super) enum ProtocolLine {
     ToolResult {
         v: u32,
         session: String,
+        /// The `dispatch` of the `tool_call` line this result belongs to (C-531).
+        dispatch: u64,
         name: String,
         is_error: bool,
         content: String,
@@ -217,24 +223,31 @@ impl AgentSink for StreamJsonSink {
         self.answer.push_str(text);
     }
 
-    fn tool_call(&mut self, name: &str, input: &Value) {
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &Value) {
         self.write(ProtocolLine::ToolCall {
             v: SCHEMA_VERSION,
             session: self.session.clone(),
+            dispatch: dispatch.get(),
             name: name.to_string(),
             input: input.clone(),
         });
     }
 
-    fn tool_timing(&mut self, _name: &str, timing: &flux_core::OperationTiming) {
+    fn tool_timing(
+        &mut self,
+        _dispatch: DispatchId,
+        _name: &str,
+        timing: &flux_core::OperationTiming,
+    ) {
         self.pending_timing = Some(*timing);
     }
 
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
         let duration_us = self.pending_timing.take().map(|t| t.total_us);
         self.write(ProtocolLine::ToolResult {
             v: SCHEMA_VERSION,
             session: self.session.clone(),
+            dispatch: dispatch.get(),
             name: name.to_string(),
             is_error: result.is_error,
             content: result.content.clone(),
@@ -478,6 +491,7 @@ mod tests {
         let line = ProtocolLine::ToolCall {
             v: SCHEMA_VERSION,
             session: "s1".into(),
+            dispatch: 1,
             name: "write".into(),
             input: serde_json::json!({
                 "path": "note.txt",

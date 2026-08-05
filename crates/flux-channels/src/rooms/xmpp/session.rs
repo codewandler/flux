@@ -19,7 +19,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
 
 use flux_core::{Error, Result};
-use flux_system::net::{guard_url_scoped, PrivateNetAllow};
+use flux_system::net::{
+    dial_scoped_pinned_with_resolver, DialStream, DialTarget, HostResolver, PrivateNetAllow,
+    SystemHostResolver,
+};
 
 use super::stanza::{
     parse, stanza, Element, NS_BIND, NS_CLIENT, NS_DELAY, NS_FRAMING, NS_MUC, NS_MUC_USER, NS_PING,
@@ -98,20 +101,7 @@ pub(super) async fn connect_and_join(
     events: RoomEventSender,
     occupants: Arc<Mutex<Vec<Occupant>>>,
 ) -> Result<Joined> {
-    let endpoint = guarded_endpoint(&config.url, &config.private_net)?;
-    // Never the endpoint verbatim in a message: a JaaS guest token rides its query string (D-206).
-    let shown = endpoint_for_display(&endpoint).to_string();
-    let mut request = endpoint
-        .as_str()
-        .into_client_request()
-        .map_err(|e| Error::Other(format!("xmpp: bad endpoint {shown}: {e}")))?;
-    // RFC 7395 §3.1: the WebSocket subprotocol identifier for XMPP.
-    request
-        .headers_mut()
-        .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("xmpp"));
-    let (mut ws, _response) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|e| Error::Other(format!("xmpp: cannot reach {shown}: {e}")))?;
+    let mut ws = connect_endpoint(&config.url, &config.private_net).await?;
 
     let domain = config.domain_or_host();
     open_stream(&mut ws, &domain, config.handshake_timeout).await?;
@@ -157,30 +147,61 @@ pub(super) async fn connect_and_join(
     })
 }
 
-/// Vet the WebSocket endpoint through **the** egress guard.
-///
-/// `flux_system::net` speaks `http`/`https`, so the endpoint is guarded in its HTTP form and the
-/// dialled URL is rebuilt from the guard's own normalized answer — there is no second URL guard here,
-/// which is the point. Note the limitation the guard's own docs name: a URL-returning guard does not
-/// pin the connection to the vetted addresses, so this closes SSRF-by-configuration, not DNS
-/// rebinding. The endpoint is operator configuration, never model output.
-fn guarded_endpoint(raw: &str, allow: &PrivateNetAllow) -> Result<String> {
-    let (ws_scheme, http_scheme) = match raw.split_once("://") {
-        Some(("wss", _)) => ("wss", "https"),
-        Some(("ws", _)) => ("ws", "http"),
-        _ => {
-            return Err(Error::Other(format!(
-                "xmpp: endpoint must be a ws:// or wss:// url, got {}",
-                endpoint_for_display(raw)
-            )))
-        }
+/// Vet, resolve once, and connect the WebSocket endpoint through `flux-system`'s pinned TCP dial.
+/// The hostname stays in the RFC 6455/TLS request for certificate and Host validation; only the TCP
+/// destination is replaced with the exact address the egress guard admitted. A JaaS guest token may
+/// ride the query, so every diagnostic uses [`endpoint_for_display`] rather than the raw URL.
+async fn connect_endpoint(raw: &str, allow: &PrivateNetAllow) -> Result<Ws> {
+    connect_endpoint_with_resolver(raw, allow, &SystemHostResolver)
+        .await
+        .map(|(socket, _)| socket)
+}
+
+async fn connect_endpoint_with_resolver(
+    raw: &str,
+    allow: &PrivateNetAllow,
+    resolver: &dyn HostResolver,
+) -> Result<(Ws, Vec<std::net::SocketAddr>)> {
+    let shown = endpoint_for_display(raw).to_string();
+    let endpoint = url::Url::parse(raw)
+        .map_err(|error| Error::Other(format!("xmpp: bad endpoint {shown}: {error}")))?;
+    if !matches!(endpoint.scheme(), "ws" | "wss") {
+        return Err(Error::Other(format!(
+            "xmpp: endpoint must be a ws:// or wss:// url, got {shown}"
+        )));
+    }
+    if !endpoint.username().is_empty() || endpoint.password().is_some() {
+        return Err(Error::Other(format!(
+            "xmpp: endpoint must not carry userinfo, got {shown}"
+        )));
+    }
+    let host = endpoint
+        .host_str()
+        .ok_or_else(|| Error::Other(format!("xmpp: endpoint has no host: {shown}")))?;
+    let port = endpoint
+        .port_or_known_default()
+        .ok_or_else(|| Error::Other(format!("xmpp: endpoint has no port: {shown}")))?;
+    let target = DialTarget::Tcp {
+        host: host.to_owned(),
+        port,
     };
-    let probe = format!("{http_scheme}{}", &raw[ws_scheme.len()..]);
-    let guarded = guard_url_scoped(&probe, allow)?;
-    Ok(format!(
-        "{ws_scheme}{}",
-        &guarded.as_str()[http_scheme.len()..]
-    ))
+    let (stream, pinned) = dial_scoped_pinned_with_resolver(&target, allow, resolver).await?;
+    let tcp = match stream {
+        DialStream::Tcp(stream) => stream,
+        _ => return Err(Error::Other("xmpp: guarded dial did not return TCP".into())),
+    };
+    let mut request = endpoint
+        .as_str()
+        .into_client_request()
+        .map_err(|error| Error::Other(format!("xmpp: bad endpoint {shown}: {error}")))?;
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("xmpp"));
+    let (socket, _response) =
+        tokio_tungstenite::client_async_tls_with_config(request, tcp, None, None)
+            .await
+            .map_err(|error| Error::Other(format!("xmpp: cannot reach {shown}: {error}")))?;
+    Ok((socket, pinned))
 }
 
 /// Send `<open/>` and read the stream features the server answers with.
@@ -578,6 +599,30 @@ async fn read_until(
 mod tests {
     use super::*;
 
+    use std::net::{IpAddr, Ipv4Addr};
+
+    struct FixedResolver(IpAddr);
+
+    impl HostResolver for FixedResolver {
+        fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<IpAddr>> {
+            Ok(vec![self.0])
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn select_xmpp_subprotocol(
+        _request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+        mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+    ) -> std::result::Result<
+        tokio_tungstenite::tungstenite::handshake::server::Response,
+        tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+    > {
+        response
+            .headers_mut()
+            .insert("Sec-WebSocket-Protocol", HeaderValue::from_static("xmpp"));
+        Ok(response)
+    }
+
     fn ctx() -> SocketContext {
         SocketContext {
             room_jid: "standup@conference.example.org".into(),
@@ -593,19 +638,52 @@ mod tests {
         interpret(&parse(xml).unwrap(), &ctx(), tracked)
     }
 
-    #[test]
-    fn the_endpoint_is_guarded_and_loopback_needs_a_grant() {
-        // The one egress guard, reached through its http form. A loopback endpoint is refused unless
-        // the caller holds a scoped grant — no second URL guard, no exception carved for XMPP.
-        let refused =
-            guarded_endpoint("ws://127.0.0.1:5280/xmpp-websocket", &PrivateNetAllow::None);
-        assert!(refused.is_err(), "{refused:?}");
-        assert_eq!(
-            guarded_endpoint("ws://127.0.0.1:5280/xmpp-websocket", &PrivateNetAllow::Any).unwrap(),
-            "ws://127.0.0.1:5280/xmpp-websocket"
-        );
-        assert!(guarded_endpoint("https://example.org/x", &PrivateNetAllow::Any).is_err());
-        assert!(guarded_endpoint("standup@conference.example.org", &PrivateNetAllow::Any).is_err());
+    #[tokio::test]
+    async fn the_endpoint_dials_the_guard_vetted_address_without_resolving_again() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_hdr_async(stream, select_xmpp_subprotocol)
+                .await
+                .unwrap()
+        });
+        // This hostname is deliberately not resolvable by the system. Success proves the handshake
+        // used FixedResolver's already-vetted address rather than handing the hostname to the
+        // WebSocket connector for a second DNS lookup.
+        let endpoint = format!("ws://rebind.invalid:{}/xmpp-websocket", address.port());
+        let (socket, pinned) = connect_endpoint_with_resolver(
+            &endpoint,
+            &PrivateNetAllow::Any,
+            &FixedResolver(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pinned, vec![address]);
+        drop(socket);
+        drop(server.await.unwrap());
+
+        let refused = connect_endpoint_with_resolver(
+            &endpoint,
+            &PrivateNetAllow::None,
+            &FixedResolver(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await;
+        assert!(refused.is_err());
+        assert!(connect_endpoint_with_resolver(
+            "https://example.org/x",
+            &PrivateNetAllow::Any,
+            &FixedResolver(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .is_err());
+        assert!(connect_endpoint_with_resolver(
+            "standup@conference.example.org",
+            &PrivateNetAllow::Any,
+            &FixedResolver(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        )
+        .await
+        .is_err());
     }
 
     #[test]

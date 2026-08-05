@@ -331,6 +331,10 @@ pub struct JaasRoom {
     inner: Arc<Mutex<Option<Arc<XmppMucRoom>>>>,
     /// Ends the forwarding/refresh task.
     cancel: Mutex<Option<CancellationToken>>,
+    /// Serializes the initial check → handshake → install transition. This is an async mutex
+    /// deliberately held across the handshake: the ordinary `inner` mutex remains short-held, while
+    /// a second `join` cannot construct a session in the window before the first one is installed.
+    initial_join_gate: tokio::sync::Mutex<()>,
 }
 
 impl JaasRoom {
@@ -344,6 +348,7 @@ impl JaasRoom {
             observed: OnceLock::new(),
             inner: Arc::new(Mutex::new(None)),
             cancel: Mutex::new(None),
+            initial_join_gate: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -365,6 +370,7 @@ impl Room for JaasRoom {
     }
 
     async fn join(&self, identity: &RoomIdentity) -> Result<RoomStream> {
+        let _initial_join = self.initial_join_gate.lock().await;
         if self.inner.lock().unwrap().is_some() {
             return Err(Error::Other("jaas: already joined".into()));
         }
@@ -410,6 +416,10 @@ impl Room for JaasRoom {
     }
 
     async fn leave(&self) -> Result<()> {
+        // Pair with `join`: if a handshake is already in flight, wait for its session to be
+        // installed and then take it. Without sharing this gate, `leave` could observe `None` and
+        // return while that handshake later published a session nobody owns.
+        let _initial_join = self.initial_join_gate.lock().await;
         // **Cancel before taking `inner`, and never the other way round.** A refresh may be
         // mid-flight; `SessionPump::rejoin` re-checks this token while holding the same lock, and
         // that pairing is what stops a replacement session from being installed into a room we have

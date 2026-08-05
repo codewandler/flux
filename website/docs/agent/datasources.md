@@ -5,8 +5,9 @@ description: "The agent's governed data layer: indexed knowledge and async live 
 
 # Datasources
 
-A **datasource** is a governed data boundary the agent reaches through
-[operations](../language/ops.md). Flux supports two complementary read forms:
+A **datasource** is a named, declared, **read-only** record surface the agent reaches through
+[operations](../language/ops.md). Operations *do*; datasources *know* — anything that mutates is
+not a datasource. Every datasource has one declared access mode:
 
 | | Indexed knowledge | Live system of record |
 |---|---|---|
@@ -17,18 +18,20 @@ A **datasource** is a governed data boundary the agent reaches through
 | Operations | `sources`, `search`, `get`, `list`, `relation`, `batch_get` | `<domain>.list`, `<domain>.get` |
 
 The split is intentional. A stable local snapshot benefits from indexing and ranked search; a
-changing system of record needs async calls and backend-owned continuation cursors. Work that is
-claimed and moved is a separate [work-board](#work-boards) contract with an enforced state machine.
-None is a side channel: datasource reads and board operations enter the ordinary operation catalog
-and cross authorization → approval → guarded IO.
+changing system of record needs async calls and backend-owned continuation cursors. The two access
+modes stay two contracts — what they share is identity and the read-only definition. Work that is
+claimed and moved therefore is not a datasource at all but a separate [work-board](#work-boards)
+contract with an enforced state machine. None is a side channel: datasource reads and board
+operations enter the ordinary operation catalog and cross authorization → approval → guarded IO.
 
 ## Datasources vs. operations
 
 - An **operation** is the universal callable unit—the verbs of the system. Every tool, plugin
   operation, toolchain command, cognition op, and datasource read uses the same catalog and safety
   envelope.
-- A **datasource** defines the data and access contract. An indexed datasource owns records; a live
-  datasource owns an entity/filter/page schema and a host-side backend.
+- A **datasource** defines the data and access contract, and it is read-only by definition. An
+  indexed datasource owns records; a live datasource owns an entity/filter/page schema and a
+  host-side backend.
 - The agent reaches either form **through operations**. Indexed retrieval uses the common operations
   listed below;
   registering a live domain named `support` generates `support.list` and `support.get`.
@@ -198,54 +201,59 @@ For embedding code and the indexed `try_register_pack` recipe, see
 
 ## Work boards
 
-A **work board** is not a third datasource read model. It is a write-capable work registry with a
+A **work board** is not a datasource — it mutates, and a datasource is read-only by definition. It
+is a write-capable work registry with a
 typed item state machine—`ready`, `claimed`, `in_progress`, `review`, `done`, `blocked`,
 `failed`—behind a swappable backend. The full spine, and which transitions are legal, is in
-[Work boards and the fleet](./fleet.md#the-item-lifecycle). Indexed knowledge and live read domains
+[Boards](../coding/boards.md#profile-general-planning-or-execution). Indexed knowledge and live read domains
 cannot express work that is claimed, moved, retried, and commented on, which is what a coordinator
 agent needs in order to hand tasks out and reconcile them after a crash.
 
-Flux-Lang currently places boards in the program's `datasource` declaration slot, distinguished by a
-`board:` kind:
+Flux-Lang gives boards their own declaration and registry:
 
 ```flux
-datasource board
-  kind "board:markdown"
-  path "./board"
+board product
+  scope "repository"
+  profile "execution"
+  kind "markdown"
+  root "./board"
 ```
 
-The declaration's **name** becomes the operation prefix, so this one generates `board.list`,
-`board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
+The declaration's **name** becomes the operation prefix. A binding named `board` generates
+`board.list`, `board.get`, `board.create`, `board.transition`, `board.claim`, `board.comment`,
 `board.record_dispatch`, `board.query`, `board.comments`, `board.reassign`, and
-`board.record_evidence`. Board kinds live in their own `board:` namespace on purpose: `markdown`
-already means *a directory of docs to index*, so a board that happens to be backed by markdown files
-needs a name that cannot be confused with it. A knowledge kind is never promoted to a board, a board
-kind is never ingested as knowledge, and a `board:` kind naming a backend that does not exist is an
-error rather than a fall-through.
+`board.record_evidence`. A knowledge datasource is never promoted to a board, and a board never
+enters the datasource catalogue. The retired `datasource ... kind "board:*"` spelling fails with an
+exact first-class replacement instead of opening a second registry.
 
 Available backends:
 
 | Kind | Storage | Use |
 |---|---|---|
-| `board:markdown` | one markdown file per item under `path`, with a derived index | durable — survives a restart, so a coordinator can re-derive its runs |
-| `board:memory` | in-process | a single run, and tests |
+| `session` | the owning session event stream | temporary general, planning, or execution work that survives continue/replay/fork |
+| `track` | YAML-frontmatter stories plus authored planning documents | repository planning without converting an existing Track board |
+| `markdown` | one markdown file per item under `root`, with a derived index | durable — survives a restart, so a coordinator can re-derive its runs |
+| `memory` | in-process | a single run, and tests |
+| `federated` | references to named member boards plus optional workspace documents | one dependency-aware planning view across repositories without copying their stories |
 
-`path` is resolved relative to the **program file's** directory, exactly like a knowledge
-datasource's, and the board inherits the session's guarded filesystem root rather than opening one of
-its own.
+`root` is resolved relative to the **program file's** directory, and the board inherits the
+session's guarded filesystem root rather than opening one of its own.
 
-`board:memory` cannot outlive the process that created it, so a Program relying on crash recovery
-wants `board:markdown`.
+The valid durable combinations are session scope + `session`, repository scope + `track` or
+`markdown`, and workspace scope + `federated`; `memory` is deliberately scope-neutral for tests and
+demos. `memory` cannot outlive the process that created it, so a Program relying on crash recovery
+chooses a durable backend. Later Jira/Trello adapters attach to the same board registry without
+becoming datasource kinds.
 
 The machine-oriented reads are `board.query`, which returns a page as typed JSON rows (every field
 present, absent optionals as `null`) so a flow can `each` over items and `match` on their state, and
 `board.comments`, which returns one item's notes as an array. `board.query` also accepts a
 `depends_on` filter that keeps only items whose dependencies are all `done`. `board.list` and
 `board.get` render prose for reading. See
-[Work boards and the fleet](./fleet.md#reading-the-board-as-data).
+[Boards](../coding/boards.md#the-stable-agent-api).
 
 The seven mutating operations are gated like any other write: each reports a concrete
-`<name>/item/<id>` approval subject—`<name>/item/new` for `create`, since no id exists yet—so a grant
+`board:<name>/item/<id>` approval subject—`board:<name>/item/new` for `create`, since no id exists yet—so a grant
 scoped to one item can never move another. `transition` validates the edge against the state machine
 *before* writing, so an illegal move is a clean error and leaves the item byte-identical.
 

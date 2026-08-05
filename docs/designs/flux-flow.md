@@ -239,9 +239,10 @@ instruction into a reusable, auditable runbook.
 
 The SDK surface: `compile(nl) -> Flow`, `flow.render()`, `flow.risk()`, `flow.run(approver)`,
 `flow.save(name)`, `load(name).run(params)`. The **agent-facing** analogue is the pair of tools
-`flow_list` (discover flows/ops in the flows home) and `flow_run(name | path, inputs?)` (run either a
-stored flow by name or a freshly read, workspace-relative `.flux` path, seed `inputs` as literal
-binds, and re-enter the depth-guarded `run_plan` path against the live operation catalog).
+`flow_list` (discover flows/ops in the flows home) and
+`flow_run(name | path | inline_program, inputs?)` (run a stored flow by name, a freshly read
+workspace-relative `.flux` path, or Flux source supplied directly in the request; seed `inputs` as
+literal binds; and re-enter the depth-guarded `run_plan` path against the live operation catalog).
 
 ## 7. Approval, determinism, error handling
 

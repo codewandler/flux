@@ -8,21 +8,40 @@ Thanks for your interest in flux. Contributions — bug reports, fixes, features
   non-negotiable safety invariants, and where to make common changes). It applies to humans and
   agents alike.
 - Read **[docs/vision.md](docs/vision.md)** for the project's direction and principles. The headline:
-  **the LLM is not the runtime** (the model compiles a request into a plan the runtime executes, with
-  non-bypassable safety as the invariant that buys), and **quality over quantity** — flux is
-  deliberately small, correct, and fully tested, not a sprawling feature pile.
+  **the LLM is not the runtime** (the model supplies bounded judgment inside an authored adaptive
+  loop; the runtime owns control flow and executes approved action batches, with non-bypassable
+  safety as the invariant that buys), and **quality over quantity** — flux is deliberately small,
+  correct, and fully tested, not a sprawling feature pile.
 
 ## The green gate (run before opening a PR)
 
 A change isn't done until all of these pass — CI enforces them:
 
 ```bash
+scripts/build-embedded-docs.sh
+# If the archive changed, include it in the same commit as the website/source change:
+git add crates/flux-server/assets/public-docs.zip
+git commit
+scripts/build-embedded-docs.sh --check
+
 cargo build --workspace
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo test -p flux-codegate          # architecture layering lint
 ```
+
+The order matters: the final freshness check is against the committed checkout. Do not open the PR
+with an uncommitted regenerated archive; a change outside `website/**` can still affect generated
+public documentation, so CI runs this check on every pull request without a path filter.
+
+Repository build scripts use `scripts/owned-cargo` to hold shared OS ownership of the resolved
+Cargo target; `task clean` is the only repository cleanup entry point and requires exclusive
+ownership. This keeps `CARGO_TARGET_DIR` reusable across compatible builds while preventing cleanup
+from unlinking live compiler output. Python 3.10+ is the pre-Cargo prerequisite: Task selects
+`python3`/`python` on Linux and macOS and `python`/`py -3` on Windows, or accepts an explicit
+`PYTHON=<executable>`. If a direct operator `cargo` command shares the target, finish it before
+running `task clean`.
 
 Every behavioral change ships with a test that fails before it. A safety-invariant change (anything
 touching the authorization → approval → guarded-IO chain) must keep the no-bypass tests passing and

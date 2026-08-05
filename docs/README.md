@@ -34,10 +34,12 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | Latest repository architecture review | [designs/architecture-review-2026-07-14/review.md](designs/architecture-review-2026-07-14/review.md) — ranked findings, evidence, and linked remediation stories |
 | Security / readiness reviews and their triage state | [reviews/README.md](reviews/README.md) — `single/` passes, `aggregate/` claim ledgers, `archive/` handled passes |
 | Using the CLI / TUI / SDK / server | [usage.md](usage.md) |
+| AI-assisted coding with scoped boards, Track stories, local sub-agents and fleet | [website overview](../website/docs/coding/overview.md), [boards](../website/docs/coding/boards.md), [fleet](../website/docs/coding/fleet.md) |
 | Choosing a model/provider | [model.md](model.md) |
 | The self-hosted agent loop | [agent-loop.md](agent-loop.md) |
 | Agent-to-agent (A2A) | [a2a.md](a2a.md) |
 | A2A protocol support (what's supported / partial / not yet) | [a2a-conformance.md](a2a-conformance.md) |
+| A worked third-party workflow (Zendesk triage) — ⚠ its backing integration was replaced; not currently runnable against a live account | [zendesk-triage.md](zendesk-triage.md) |
 | **Language pillar** (essence) | [language.md](language.md) — Flux-Lang semantics in one place |
 | **Language pillar** (deep) | [../crates/flux-lang/docs/](../crates/flux-lang/docs/) — PRD, reference, syntax, STATUS |
 | Generated agent skills | [designs/generated-flux-skills.md](designs/generated-flux-skills.md) — `flux skill` root/section skills grounded in live catalogs |

@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use flux_core::Result;
 use flux_lang::program::ChannelDecl;
-use flux_runtime::{Tool, ToolContext, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolResult};
 use flux_spec::{Idempotency, Risk, ToolSpec};
 
 use crate::bus::Bus;
@@ -33,7 +33,7 @@ pub(crate) fn register(
     channels: Arc<Vec<ChannelDecl>>,
     host: Weak<dyn JourneyHost>,
 ) -> Result<()> {
-    registry.try_register_all_from(
+    registry.try_register_all_from_with_placement(
         "flux-app orchestration pack",
         vec![
             Arc::new(EmitOp { bus: bus.clone() }) as Arc<dyn Tool>,
@@ -44,6 +44,7 @@ pub(crate) fn register(
             Arc::new(AskOp { bus, channels }),
             Arc::new(SpawnOp { host }),
         ],
+        OperationPlacement::LocalControlPlane,
     )
 }
 

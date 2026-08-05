@@ -385,10 +385,14 @@ pub(super) fn assemble_app_execution_environment(
     .with_workspace(workspace)
 }
 
-/// The approval posture a `flux app run <program>` executor runs under: `--yes` auto-approves every
-/// call, and without it every call that needs approval is **denied** rather than queued at a prompt
-/// — a program's channels (cron, webhook, Slack) fire with no operator attached, so there is nobody
-/// to answer one.
+/// The approver a `flux app run <program>` executor runs, given its resolved
+/// [`AutonomyPosture`](flux_runtime::AutonomyPosture).
+///
+/// `supervised` never reaches here — a program's channels (cron, webhook, Slack) fire with no
+/// operator attached, so `AgentFlags::headless_posture` refuses it and defaults the unstated case to
+/// `refusing`. That default is what this surface has always installed: `--yes` auto-approves every
+/// call (`bounded-autonomy`), and without it every call that reaches approval is **denied** rather
+/// than queued at a prompt nobody is watching.
 ///
 /// ⚠ **This is not a sandbox boundary, and an earlier draft of C-410 wrongly treated it as one.**
 /// Two things route around it entirely: [`run_app`] calls [`assemble_integrations`] at startup,
@@ -396,16 +400,12 @@ pub(super) fn assemble_app_execution_environment(
 /// approver; and a program declaring no capability policy dispatches under `LEGACY_JOURNEY_ALLOW`
 /// (flux-app's `app.rs`), whose pre-authorised ops resolve to `PermDecision::Allow` and so never
 /// reach an approver either. `flux app run <program>` is therefore pinned to the fail-closed
-/// sandbox profile in its own right — see `unattended_sandbox_surface` (dispatch.rs).
-///
-/// What it *is* remains worth pinning: the `--yes` / no-`--yes` split for calls that do reach
-/// approval. See `app_run_approval_posture`.
-pub(super) fn app_run_approver(auto_approve: bool) -> Arc<dyn Approver> {
-    if auto_approve {
-        Arc::new(AllowApprover)
-    } else {
-        Arc::new(flux_runtime::DenyApprover)
-    }
+/// sandbox profile in its own right — see `unattended_sandbox_surface` (dispatch.rs). That gap is
+/// exactly what `AutonomyPosture::Refusing::does_not_protect_against` names.
+pub(super) fn app_run_approver(posture: flux_runtime::AutonomyPosture) -> Arc<dyn Approver> {
+    posture
+        .approver(None)
+        .expect("a program surface never resolves the supervised posture")
 }
 
 /// Which approval posture a **served** agent (`flux app run --serve`, no program) runs under.
@@ -420,6 +420,13 @@ pub(super) fn app_run_approver(auto_approve: bool) -> Arc<dyn Approver> {
 ///   exploration), where stopping at every effect is a broken agent rather than a careful one.
 /// - [`Remote`](Self::Remote) (`--remote-approval`) — park each guarded effect and wait for a
 ///   human's answer over `/approvals`. Silence denies.
+///
+/// ⚠ **These are two named postures, not two server modes** (C-463). `Unattended` *is*
+/// [`AutonomyPosture::BoundedAutonomy`](flux_runtime::AutonomyPosture::BoundedAutonomy) and `Remote`
+/// *is* [`AutonomyPosture::Supervised`](flux_runtime::AutonomyPosture::Supervised) with the network
+/// as its channel — a remote approver is the supervised posture made reachable, not a third thing
+/// the other postures deviate from. [`posture`](Self::posture) states that mapping, and it is what
+/// keeps the sandbox floor and the budget on this surface agreeing with every other surface's.
 ///
 /// ⚠ **What changed in C-453.** Before it, only the first was reachable: every approver in the tree
 /// was local, so a served agent could be `AllowApprover` or `DenyApprover` and nothing with a human
@@ -467,12 +474,33 @@ impl ServedApprovalPosture {
         }
     }
 
-    /// The approver the served engine's executor runs its effects through.
-    pub(super) fn approver(&self) -> Arc<dyn Approver> {
+    /// The named [`AutonomyPosture`](flux_runtime::AutonomyPosture) this served surface is running.
+    ///
+    /// The served flags select a posture; they do not define one. Naming it here is what lets the
+    /// sandbox floor and the resource budget be read off the same value every other surface reads,
+    /// instead of this surface carrying its own private idea of what `--yes` implies.
+    pub(super) fn posture(&self) -> flux_runtime::AutonomyPosture {
         match self {
-            Self::Unattended => Arc::new(AllowApprover),
-            Self::Remote(queue) => Arc::new(flux_runtime::RemoteApprover::new(Arc::clone(queue))),
+            Self::Unattended => flux_runtime::AutonomyPosture::for_auto_approval(),
+            // A human, per effect — the supervised posture with the network as its channel.
+            Self::Remote(_) => flux_runtime::AutonomyPosture::Supervised,
         }
+    }
+
+    /// The approver the served engine's executor runs its effects through.
+    ///
+    /// The posture decides; `Remote` supplies the channel it decides *with*, exactly as the
+    /// interactive surface supplies its terminal prompt.
+    pub(super) fn approver(&self) -> Arc<dyn Approver> {
+        let channel: Option<Arc<dyn Approver>> = match self {
+            Self::Unattended => None,
+            Self::Remote(queue) => Some(Arc::new(flux_runtime::RemoteApprover::new(Arc::clone(
+                queue,
+            )))),
+        };
+        self.posture()
+            .approver(channel)
+            .expect("the supervised served posture always carries its remote channel")
     }
 
     /// The queue the router serves — the same `Arc` [`approver`](Self::approver) parks on.
@@ -598,7 +626,11 @@ pub(super) async fn run_app(
         bail!("`--loop` only applies to the built-in coding agent, not `flux app run <program>`");
     }
 
-    let auto_approve = flags.yes;
+    // C-463: this surface has no terminal, so `supervised` is refused rather than downgraded and
+    // the unstated case resolves to `refusing` — exactly what an unflagged `flux app run <program>`
+    // has always installed. Resolved once here and used for both halves of the choice below: the
+    // approver, and the budget `cli_resource_limits` falls back to.
+    let program_posture = flags.headless_posture("`flux app run <program>`")?;
     // The bare `sonnet` alias, so the default model has ONE owner
     // (`flux_providers::anthropic::resolve_model`) — `app_provider_for` resolves it below.
     let spec = flags.model.clone().unwrap_or_else(|| "sonnet".to_string());
@@ -690,17 +722,16 @@ pub(super) async fn run_app(
     // and handed to both the reviewer sub-agents and the app's execution environment below.
     // Resolved once deliberately: a second `cli_resource_limits` call would mint a second semaphore,
     // so the app's own executors would silently stop sharing one budget (C-299's recorded risk).
-    let resource_limits = cli_resource_limits(&cfg);
+    let resource_limits = cli_resource_limits(&cfg, program_posture);
     // The knowledge datasource: build the program's declared datasources, and SHARE the backend so
     // integration plugins' contributed records (via the DatasourceHostCaps bridge) land in the same
     // index the `search`/`get`/`list`/`relation`/`batch_get`/`sources` ops read.
-    // A-131: a `datasource` declaration resolves to either the shared knowledge index or a
-    // write-capable `WorkBoard` (`kind = "board:<backend>"`), so the coordinator Program can name
-    // the board it works. The boards are registered below, once the integration registry exists.
-    let ProgramDatasources {
-        knowledge: backend,
-        boards,
-    } = build_datasources(&program.datasources, &program_dir, &system).await?;
+    let ProgramDatasources { knowledge: backend } =
+        build_datasources(&program.datasources, &program_dir, &system).await?;
+    // Boards are a separate first-class declaration and registry. Backend adapters—including
+    // future Jira/Trello providers—extend this seam without entering the datasource catalogue.
+    let ProgramBoards { execution: boards } =
+        build_program_boards(&program.boards, &program_dir, &system)?;
     let mut extra_tools: Vec<(String, Arc<dyn flux_runtime::Tool>)> =
         flux_capabilities::datasource_tools(backend.clone())
             .into_iter()
@@ -754,7 +785,11 @@ pub(super) async fn run_app(
         .transpose()?;
     let mut integration_registry = ToolRegistry::new();
     for (source, tool) in extra_tools {
-        integration_registry.try_register_from(source, tool)?;
+        integration_registry.try_register_from_with_placement(
+            source,
+            tool,
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        )?;
     }
     // The declared work boards (A-113's port). `try_register_work_board` *derives* the generated op
     // set from the port itself, so an operation added to `WorkBoard` reaches a Program through this
@@ -767,7 +802,14 @@ pub(super) async fn run_app(
     let mut board_handles: Vec<(String, Arc<dyn flux_capabilities::WorkBoard>)> = Vec::new();
     for (domain, board) in boards {
         board_handles.push((domain.clone(), Arc::clone(&board)));
-        flux_capabilities::try_register_work_board(&mut integration_registry, &domain, board)?;
+        let surface =
+            flux_capabilities::try_register_work_board(&mut integration_registry, &domain, board)?;
+        for operation in &surface.group.tools {
+            integration_registry.declare_placement(
+                operation,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )?;
+        }
     }
     // Outbound A2A dispatch (A-116). Registered through the same helper the agent assembly uses, so
     // `flux app run` and `flux run` offer the identical fleet catalog under the identical grant.
@@ -788,7 +830,7 @@ pub(super) async fn run_app(
     let environment = assemble_app_execution_environment(
         system.clone(),
         integration_registry,
-        app_run_approver(auto_approve),
+        app_run_approver(program_posture),
         app_workspace,
         redactor,
         resource_limits,
@@ -1004,7 +1046,7 @@ mod app_run_approval_posture {
 
     #[tokio::test]
     async fn the_unflagged_app_run_approver_denies_every_call() {
-        let approver = app_run_approver(false);
+        let approver = app_run_approver(flux_runtime::AutonomyPosture::Refusing);
         let choice = approver
             .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
             .await;
@@ -1018,7 +1060,7 @@ mod app_run_approval_posture {
 
     #[tokio::test]
     async fn the_yes_flagged_app_run_approver_still_allows() {
-        let approver = app_run_approver(true);
+        let approver = app_run_approver(flux_runtime::AutonomyPosture::BoundedAutonomy);
         let choice = approver
             .request("write", &["/etc/passwd".to_string()], &IntentSet::default())
             .await;
@@ -1250,7 +1292,7 @@ mod app_run_resource_ceiling_wiring {
             "[limits]\nmax_concurrent_tool_calls = 1\ntool_call_queue_timeout_ms = 30000\n",
         )
         .expect("the `[limits]` concurrency keys must parse");
-        cli_resource_limits(&cfg)
+        cli_resource_limits(&cfg, flux_runtime::AutonomyPosture::Supervised)
     }
 
     fn temp_root(tag: &str) -> std::path::PathBuf {

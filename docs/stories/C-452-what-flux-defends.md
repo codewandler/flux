@@ -2,7 +2,7 @@
 id: C-452
 title: "Write down what flux defends rather than closes — so nobody 'fixes' the envelope to win a rubric"
 pillar: Core
-status: ready
+status: done
 priority: 5
 design: docs/designs/pi-comparison-remediation.md
 epic: pi-comparison-remediation
@@ -33,19 +33,19 @@ that was a feature. That is a real failure mode and it is cheap to prevent.
 
 ## Acceptance
 
-- [ ] Each defended trade-off stated with **what it buys and what it costs** — not a defence, a
+- [x] Each defended trade-off stated with **what it buys and what it costs** — not a defence, a
       reckoning. A trade-off with no stated cost reads as denial.
-- [ ] ⚠ Every finding in the review is in **exactly one** of three buckets — *close it* · *defend it* ·
+- [x] ⚠ Every finding in the review is in **exactly one** of three buckets — *close it* · *defend it* ·
       *not code* — and the buckets are complete. A finding in none of them is one nobody decided about.
-- [ ] Lives where a contributor will meet it before proposing a change. `docs/vision.md` already carries
+- [x] Lives where a contributor will meet it before proposing a change. `docs/vision.md` already carries
       the principles that decide ties and is the likeliest home; ⚠ do not create a fourth document that
       says what three already imply.
-- [ ] ⚠ **Honest about what is genuinely behind.** A page that defends everything is a page nobody
+- [x] ⚠ **Honest about what is genuinely behind.** A page that defends everything is a page nobody
       believes. C-444 (SDK defaults), C-445 (interactive confinement), C-446 (Windows) and C-448
       (cancellation) are **real gaps**, and this page should say so and point at them.
-- [ ] The register matches `vision.md`'s own — it states the improvement-loop pillar is *"currently
+- [x] The register matches `vision.md`'s own — it states the improvement-loop pillar is *"currently
       aspirational, and this document says so honestly."*
-- [ ] Full gate green.
+- [x] Full gate green.
 
 ## Notes
 
@@ -60,3 +60,10 @@ that was a feature. That is a real failure mode and it is cheap to prevent.
 
 ## Progress
 - Filed 2026-08-02 from the Pi comparison.
+- 2026-08-03 — added the contributor decision register to `docs/vision.md`. It assigns each atomic
+  review finding one stable ID and exactly one of `close it`, `defend it`, or `not code`; splits the
+  independent claims inside F4/F5 explicitly; names C-444/C-445/C-446/C-448 as real gaps; and states
+  both the purchase and cost for every defended choice. Added the maintainer-facing changelog entry.
+  Targeted verification: `git diff --check` and `cargo test -p flux-codegate` (51 passed). The wave
+  parent owns the single full repository gate.
+- 2026-08-04: the final integrated wave passed the complete repository gate.

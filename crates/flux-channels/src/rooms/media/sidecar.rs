@@ -17,6 +17,42 @@
 //! That is not a workaround for the env-clearing rule; it is the rule working. A media sidecar is a
 //! subprocess like any other, and flux does not hand subprocesses the host's environment.
 //!
+//! ## Argv is necessary and not sufficient (D-235)
+//!
+//! ⚠ The paragraph above is the whole recipe only when the sandbox is off. Under flux's Linux
+//! confinement there is a **second, required** step, and omitting it fails silently.
+//!
+//! `flux-system` mounts a tmpfs over `/run` on every sandboxed spawn — deliberately, to keep
+//! `docker.sock`, D-Bus and other host IPC sockets unreachable even when the network namespace is
+//! shared. The PulseAudio/PipeWire socket lives at `/run/user/<uid>/pulse/native`, under that mask.
+//! So argv can name the audio server *correctly* and still reach nothing: no value of
+//! `--audio-server` can point at a path the confinement removed.
+//!
+//! The operator must therefore also grant the socket's directory back:
+//!
+//! ```toml
+//! # flux.toml — required for host audio, not optional. `id -u` gives the uid.
+//! [sandbox]
+//! enabled = true
+//! writable = ["/run/user/1000/pulse"]
+//! ```
+//!
+//! `writable` is the right mechanism despite its name. It emits a read-write bwrap `--bind`, and
+//! read-write is what a unix socket needs — `connect(2)` takes `MAY_WRITE` on the socket inode, so
+//! a read-only bind would leave the socket visible and unconnectable. The bind is emitted *after*
+//! the `/run` tmpfs, so it re-exposes the host directory through the mask rather than being erased
+//! by it. Grant the directory that holds the socket, not the socket file itself.
+//!
+//! Two things flux does to keep a mistake here loud rather than silent:
+//!
+//! - A configured `writable` path under `/run` that does not exist is **refused at startup**
+//!   instead of being created. An empty directory bound over the mask would apply cleanly and still
+//!   reach nothing, and a wrong uid is the common typo.
+//! - A sidecar that could not reach its audio server reports
+//!   [`Ready::routing_error`](super::protocol::Ready::routing_error), which
+//!   [`SidecarMediaPeer::publish_audio`] quotes in its refusal. The failure names the socket; it
+//!   does not arrive as a level probe reading zero.
+//!
 //! ## Failure posture
 //!
 //! Every failure here is an **operation** failure. A sidecar that would not start, died mid-call, or
@@ -54,7 +90,9 @@ use crate::config::MediaSettings;
 use crate::rooms::{RoomId, RoomIdentity};
 
 /// Everything flux needs to know about a media sidecar. Note what is not here: no device, no audio
-/// server, no display. Those are the sidecar's, and they ride in [`argv`](Self::argv).
+/// server, no display. Those are the sidecar's, and they ride in [`argv`](Self::argv) — which is
+/// necessary but not sufficient for a host socket under `/run`, whose matching `[sandbox] writable`
+/// grant the module header describes.
 ///
 /// `Debug` is **hand-written**, for the reason `WebhookSettings` gives: a channel declaration's
 /// values are host-resolved before this struct is built, so an operator who wrote
@@ -163,6 +201,9 @@ pub struct SidecarMediaPeer {
     /// The sidecar's own claim that it routes its capture device. Refusing to publish audio without
     /// it is what stops a browser-default (and therefore silent) track from reaching a real room.
     owns_device_routing: bool,
+    /// The sidecar's explanation for a `false` claim, when it has one (D-235). Kept so a masked
+    /// audio socket is reported as a confinement/configuration failure rather than as silence.
+    routing_error: Option<String>,
     /// Handed out once, by [`MediaPeer::join`]. The reader task starts at connect — the handshake
     /// needs it — so the stream exists before anyone has joined.
     stream: Mutex<Option<MediaStream>>,
@@ -180,6 +221,7 @@ impl std::fmt::Debug for SidecarMediaPeer {
         f.debug_struct("SidecarMediaPeer")
             .field("config", &self.config)
             .field("owns_device_routing", &self.owns_device_routing)
+            .field("routing_error", &self.routing_error)
             .field("death_reason", &self.death_reason())
             .finish()
     }
@@ -287,6 +329,7 @@ impl SidecarMediaPeer {
             writer: tokio::sync::Mutex::new(Box::new(writer)),
             next_id: AtomicU64::new(1),
             owns_device_routing: ready.owns_device_routing,
+            routing_error: ready.routing_error,
             stream: Mutex::new(Some(stream)),
             _child: child,
             reader: Mutex::new(task.disarm()),
@@ -302,6 +345,15 @@ impl SidecarMediaPeer {
     /// is refused — see [`super`] for the two measured reasons.
     pub fn owns_device_routing(&self) -> bool {
         self.owns_device_routing
+    }
+
+    /// Why the sidecar could not take routing ownership, when it said (D-235).
+    ///
+    /// Only meaningful while [`Self::owns_device_routing`] is `false`. The common answer on Linux
+    /// is that the host audio socket named in argv is behind the sandbox's `/run` tmpfs and was
+    /// never granted back with `[sandbox] writable`.
+    pub fn routing_error(&self) -> Option<&str> {
+        self.routing_error.as_deref()
     }
 
     /// Why the sidecar is gone, or `None` while it is alive.
@@ -514,11 +566,24 @@ impl MediaPeer for SidecarMediaPeer {
 
     async fn publish_audio(&self, audio: &AudioChunk) -> Result<()> {
         if !self.owns_device_routing {
+            // D-235: the sidecar's own reason is the diagnosable half. Without it the operator's
+            // only evidence is a level probe reading zero, which points at the room rather than at
+            // the sandbox — so when the sidecar said nothing, name the likeliest cause here.
+            let cause = match self.routing_error.as_deref() {
+                Some(reason) => format!(" — {reason}"),
+                None => " — the sidecar gave no reason. On Linux the usual one is the sandbox: it \
+                         masks `/run` with a tmpfs, so the host audio socket named in the \
+                         sidecar's argv (conventionally `/run/user/<uid>/pulse/native`) is absent \
+                         unless the operator also granted its directory back with `[sandbox] \
+                         writable = [\"/run/user/<uid>/pulse\"]`. Argv alone does not reach it"
+                    .to_string(),
+            };
             return Err(Error::Other(format!(
                 "room media: the sidecar `{}` does not claim to own device routing, so flux will \
                  not publish audio through it — a browser-default capture is silent on Chrome 150 \
                  (measured 2026-07-30: `--use-fake-device-for-media-capture` ignored, \
-                 `setAudioInputDevice` did not stick) and every status reads healthy while it is",
+                 `setAudioInputDevice` did not stick) and every status reads healthy while it \
+                 is{cause}",
                 self.config.argv.first().map(String::as_str).unwrap_or("")
             )));
         }

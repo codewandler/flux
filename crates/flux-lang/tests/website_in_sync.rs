@@ -217,3 +217,49 @@ fn website_ecosystem_mirrors_the_contributor_page() {
         "ecosystem",
     );
 }
+
+/// Return a small line window around the first occurrence of `needle` so a contract can require
+/// nearby qualification without pinning an entire documentation page byte-for-byte.
+fn line_window(content: &str, needle: &str, radius: usize) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let line = lines
+        .iter()
+        .position(|candidate| candidate.contains(needle))
+        .unwrap_or_else(|| panic!("missing `{needle}`"));
+    let start = line.saturating_sub(radius);
+    let end = (line + radius + 1).min(lines.len());
+    lines[start..end].join("\n")
+}
+
+#[test]
+fn exchange_environment_token_is_linux_local_replaced_and_remote_transitional() {
+    const TOKEN: &str = "FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN";
+    for path in [
+        "README.md",
+        "website/docs/reference/config.md",
+        "docs/ecosystem.md",
+        "website/docs/direction/connector-native-integrations.md",
+    ] {
+        let content = std::fs::read_to_string(repo_path(path))
+            .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        let window = line_window(&content, TOKEN, 12).to_ascii_lowercase();
+        assert!(
+            window.contains("transitional")
+                && window.contains("c-509")
+                && window.contains("linux-local")
+                && window.contains("every flux target"),
+            "{path} must scope C-509 to Linux-local replacement and retain transitional remote attach on every Flux target:\n{window}"
+        );
+    }
+
+    let source = std::fs::read_to_string(repo_path("crates/flux-cli/src/execution.rs"))
+        .expect("read Flux CLI assembly");
+    let assembly = line_window(&source, "host startup configuration", 5).to_ascii_lowercase();
+    assert!(
+        assembly.contains("transitional")
+            && assembly.contains("c-509")
+            && assembly.contains("linux-local")
+            && assembly.contains("every flux target"),
+        "the C-503 assembly comment must scope C-509 to Linux-local replacement and retain remote attach on every Flux target"
+    );
+}

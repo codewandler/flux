@@ -1,52 +1,86 @@
-# Release trust residuals — 2026-08-01
+# Release trust residuals — 2026-08-04
+
+> **Authority supersession (C-559, 2026-08-05).** The original C-353 proposal for a dedicated
+> `flux-release-promoter` App, release environments, tag rulesets and branch protection is not the
+> v0.56.0 release design. The repository has none of those settings, and the user directed that they
+> not be provisioned. This document records the executable replacement below; the original proposal
+> remains in C-353 as historical, unchecked hardening work.
 
 ## Context
 
-The validation pass over [`docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md`](../reviews/aggregate/2026-08-01-aggregate-complaint-triage.md)
-found `REL-01`'s bootstrap allegation **closed** — `scripts/install-release-tooling.sh` verifies
-cargo-dist against a committed SHA-256 and executes no downloaded script — and `REL-02`
-**closed from `v0.38.0` forward**: `actions/attest` runs over every artifact, the attestations were
-verified live for `v0.44.0` against `/repos/codewandler/flux/attestations/`, and both README and
-getting-started document `gh attestation verify` bound to signer-workflow, tag ref and source digest.
+The validation pass over
+[`docs/reviews/aggregate/2026-08-01-aggregate-complaint-triage.md`](../reviews/aggregate/2026-08-01-aggregate-complaint-triage.md)
+found the download-bootstrap and artifact-attestation allegations already closed, but release
+authority and promotion ordering still needed work. Read-only GitHub evidence on 2026-08-05 showed:
 
-What survived is the **authority** half of REL-01, which no code change addressed and which the
-platform now confirms rather than leaves unknown. `gh api` answered every query:
+- no `main` protection, tag ruleset, `release-control` environment, `release` environment,
+  `flux-release-promoter` installation or `PROMOTION_APP_ID` variable;
+- repository secret names including `RELEASE_TOKEN`, `MINISIGN_SECRET_KEY` and provider keys, plus
+  the organization `CARGO_REGISTRY_TOKEN`; and
+- an explicit user decision to use those existing Actions secrets rather than add unavailable App
+  or Environment configuration.
 
-- `branches/main/protection` → **404, not protected**; `rulesets` → `[]`.
-- `collaborators` → one admin; `gh pr list --state merged` → **empty**. Every commit lands by direct push.
-- `environments` → only `github-pages`. `RELEASE_TOKEN`, `CARGO_REGISTRY_TOKEN` and
-  `MINISIGN_SECRET_KEY` carry no reviewer, no branch policy, no wait timer.
-- `ci.yml` has been red on `main` for six consecutive pushes and blocked nothing.
+Secret values remain write-only and were neither read nor copied. C-559 changes workflow placement,
+not credential values or ownership.
 
-`ASSURE-04`'s "external-unknown" half is therefore no longer unknown; it is verified absent.
+## Active authority design
 
-## Finding-to-story traceability
+- **Model and build work are credential-free for release mutation.** The release-flow `cut` job may
+  receive only the selected provider credential at the consuming step. Candidate planning, builds,
+  receipts, byte verification and assembly receive no release secret.
+- **`RELEASE_TOKEN` is the host mutation identity.** Only the core promotion step, plugin tag-control
+  step and two GitHub Release create/upload steps name it. The core helper preflights the PAT before
+  mutation, then uses it for the exact cut ref, pull request, merge, merged-main candidate ref,
+  annotated-tag push and exact cleanup. The plugin helper uses it only to push the one absent exact
+  `plugins-vX.Y.Z` annotated tag at current canonical `main`.
+- **The ambient `GITHUB_TOKEN` cannot move repository state.** In core promotion it has
+  `contents: read` and `actions: write`; it dispatches the exact candidate workflow and observes
+  check runs and Actions runs. A PAT-authenticated git push creates each tag so the tag-triggered
+  workflows run. No direct or force push to `main`, force tag, tag update or tag recreation path
+  exists.
+- **Every secret remains step-scoped.** `MINISIGN_SECRET_KEY` appears only on plugin index signing;
+  `CARGO_REGISTRY_TOKEN` only on the applicable Cargo publish step; provider keys only on their
+  model/smoke consumers; and `RELEASE_TOKEN` only on the four host-owned consumers above. No
+  workflow or job environment holds a long-lived credential, and no GitHub Environment is used.
+- **Publication authorities do not compose.** Attestation, GitHub Release publication, plugin
+  signing and Cargo publication remain separate jobs. Manual plugin dispatch is secret-free
+  build/validation only. Core candidate preparation remains exact-ref/exact-SHA and secret-free.
+- **Candidate receipt v3 authenticates the handoff.** It binds the exact seven non-expired
+  `artifacts-*` uploads by immutable ID, size and GitHub-reported SHA-256. Raw ZIP bytes are checked
+  before safe namespaced extraction, hosting, attestation or publication.
+- **The promotion gate has one exact release shape.** A core release contains the 28 named assets,
+  exact checksums and attestations defined by C-516. Promotion waits for newly created exact-tag/SHA
+  binary and crates.io runs, verifies the live Release, runs the fleet/latest audit, and performs
+  candidate cleanup last.
 
-| Residual (validated 2026-08-01) | Story |
+## Story traceability
+
+| Story | Disposition for v0.56.0 |
 | --- | --- |
-| `main` has no protection and no rulesets; release secrets have no environment gate | C-353 |
-| `release-plugins.yml` grants `contents: write` workflow-wide including the vendor-dep build matrix; `crates-io.yml` holds the registry token at job level across `cargo publish`, which runs every dependency `build.rs` | C-354 |
-| The candidate receipt binds version + commit + run-id but **no artifact digests**, so `host` promotes fetched bytes unverified and attests whatever arrived | C-355 |
-| Installers are attested but the documented primary path runs `sh flux-installer.sh` without a verify step; no machine-readable statement of the first attested tag | C-356 |
-| One author, one admin, zero merged PRs, no succession or incident-exercise evidence | C-357 |
+| C-353 | Superseded by C-559. Its App, environments, rulesets, branch protection and external secret migration are not required or claimed. |
+| C-354 | Done. Its job/step isolation and tag-only publication remain; its App/Environment placement clauses are historical and superseded. |
+| C-355 | Done. Candidate receipt v3 and raw-byte verification are unchanged. |
+| C-516 | Done with C-559's PAT identity substitution; PR/merged-main SHA, exact runs, 28 assets and cleanup-last ordering are unchanged. |
+| C-559 | Implements the active no-App/no-Environment authority contract and release-policy fixtures. |
+| C-356 / C-357 | Visible consumer-verification and governance residuals; neither blocks v0.56.0 publication. |
 
-## Decisions
+## Failure behavior
 
-- **A gate that blocks nothing is documentation.** Every assurance lane in this repo is advisory
-  while `main` accepts unreviewed force-pushable direct pushes. Protection is the precondition that
-  makes the rest of the assurance work load-bearing, so it ranks first.
-- **Publication authority is scoped to the step that publishes.** A token live in a job that
-  compiles third-party build scripts is a token that third-party build scripts can reach.
-- **Provenance certifies what arrived, not what was built.** Attestation applied after an
-  unverified artifact fetch proves the workflow's identity, not the bytes' integrity. The receipt
-  must carry digests for the handoff to be authenticated.
-- **Checksums from the producing workflow are integrity metadata, never a trust root.** This holds
-  for the `.sha256` files, `sha256.sum`, and the checksums baked into the installer alike.
-- **Bus factor is a risk to own, not a story to fake.** It is recorded with an owner and a review
-  date; no code change can close it.
+Missing, invalid or read-only `RELEASE_TOKEN` fails before the first remote promotion mutation. A
+failed candidate or post-tag verifier preserves the exact candidate and prints the same-SHA resume
+command. Before tag creation a retained candidate may resume the one absent tag creation; after the
+tag exists it is reused and never moved, deleted or recreated. GitHub Release and Cargo publication
+remain idempotent on rerun.
 
 ## Closure proof
 
-Re-run the platform queries that produced this design (`branches/main/protection`, `rulesets`,
-`environments`, `collaborators`, merged-PR count) and require each to return the intended state.
-Verify one full release under the new receipt binding.
+`scripts/check-release-authority.sh` parses all four release workflows and rejects workflow/job
+secret scope, release authority beside model/build work, `GITHUB_TOKEN` tag creation, a missing PAT
+tag trigger, combined signing/GitHub/Cargo authority, or any restored App/Environment dependency.
+`scripts/test-promote-release-flow.sh` pins PAT preflight, PR/merge/candidate/tag ordering, ambient
+token limits, exact tag-run waits and cleanup-last behavior. Running
+`scripts/plugin-tag-control.sh --self-test` proves only a green current-main `ci` result plus usable PAT can push the one absent
+plugin tag. C-355 and C-516 retain their receipt, asset, live-release and fleet/latest suites.
+
+v0.56.0 is a core checkpoint release, not the Milestone-1 product release. C-509/C-510 still own the
+separate managed-local Exchange clean-machine journey.

@@ -209,6 +209,10 @@ pub struct FlowEngine {
     surface_sink: Option<Arc<dyn flux_runtime::SurfaceSink>>,
     /// Host-owned typed interaction channel, copied into every lexical turn context.
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
+    /// Optional host-owned catalogue source refreshed after the turn gate is held and before the
+    /// immutable C-318 generation is adopted. Exchange uses this seam; engines without a remote
+    /// catalogue keep the byte-identical no-hook path.
+    catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>>,
     /// One active public turn per engine. Nested authored operations stay inside the already-held
     /// lifecycle and call the runtime directly, so they never recursively acquire this gate.
     turn_gate: tokio::sync::Mutex<()>,
@@ -406,6 +410,7 @@ impl FlowEngine {
             evidence_flushed: std::sync::atomic::AtomicUsize::new(0),
             surface_sink: None,
             user_interaction: None,
+            catalog_refresher: None,
             turn_gate: tokio::sync::Mutex::new(()),
         })
     }
@@ -428,6 +433,19 @@ impl FlowEngine {
         interaction: Arc<dyn flux_runtime::UserInteraction>,
     ) -> Self {
         self.user_interaction = Some(interaction);
+        self
+    }
+
+    /// Attach a host-owned operation-catalogue source.
+    ///
+    /// Refresh failures are observable but do not abort the turn: a remote integration outage must
+    /// remove that source's operations while core Flux remains usable. The refresher owns that
+    /// fail-closed withdrawal before returning the diagnostic.
+    pub fn with_catalog_refresher(
+        mut self,
+        refresher: Arc<dyn flux_runtime::CatalogRefresher>,
+    ) -> Self {
+        self.catalog_refresher = Some(refresher);
         self
     }
 
@@ -941,6 +959,22 @@ impl FlowEngine {
         scope_override: Option<Arc<crate::cassette::CassetteScope>>,
         turn_started: Option<&mut (dyn FnMut(i64) + Send)>,
     ) -> Result<()> {
+        // C-503 over C-318: every public caller reaches this function only while holding the
+        // engine's single-active-turn gate. Refresh before `begin_turn_lifecycle` snapshots the
+        // generation, never after a provider has seen it. A remote outage is an integration
+        // withdrawal, not a reason core Flux cannot answer this turn.
+        if let Some(refresher) = &self.catalog_refresher {
+            if let Err(error) = refresher.refresh(&self.executor.live_catalog()).await {
+                self.executor.observe(flux_evidence::Observation::new(
+                    "catalog.refresh_failed",
+                    flux_evidence::Phase::Turn,
+                    serde_json::json!({
+                        "source": "host",
+                        "error": self.executor.context().redactor.redact(&error.to_string()),
+                    }),
+                ));
+            }
+        }
         let lifecycle = self.begin_turn_lifecycle(
             session_id,
             program.label(user_input),
@@ -1233,7 +1267,7 @@ impl FlowEngine {
         // config/skills/roles loading deliberately stays fixed to `self.cwd` (entering a worktree
         // changes the working directory, not the agent's authority).
         let active_system = self.executor.context().system();
-        let disabled = self.executor.disabled_ops_for(registry);
+        let disabled = self.executor.unavailable_ops_for(registry);
         let (advertised, surfaced) = surfaced_op_names(
             registry,
             &self.groups,
@@ -2231,9 +2265,9 @@ pub fn trace_loop() -> bool {
 fn drain_event(ev: crate::loop_host::SinkEvent, sink: &mut dyn AgentSink, reveal: bool) {
     use crate::loop_host::SinkEvent;
     let machinery = match &ev {
-        SinkEvent::ToolCall(name, _)
-        | SinkEvent::ToolTiming(name, _)
-        | SinkEvent::ToolResult(name, _) => is_loop_machinery_op(name),
+        SinkEvent::ToolCall(_, name, _)
+        | SinkEvent::ToolTiming(_, name, _)
+        | SinkEvent::ToolResult(_, name, _) => is_loop_machinery_op(name),
         _ => false,
     };
     if reveal || !machinery {
@@ -2749,7 +2783,7 @@ mod tests {
             self.text.push_str(text);
         }
 
-        fn tool_call(&mut self, name: &str, _input: &Value) {
+        fn tool_call(&mut self, _dispatch: flux_core::DispatchId, name: &str, _input: &Value) {
             self.tools.push(name.to_string());
         }
 
@@ -3528,6 +3562,71 @@ mod tests {
             before.len(),
             after.len(),
         );
+    }
+
+    struct PublishGainedAtBoundary {
+        calls: Arc<AtomicUsize>,
+        tool_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl flux_runtime::CatalogRefresher for PublishGainedAtBoundary {
+        async fn refresh(&self, catalog: &flux_runtime::LiveToolCatalog) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            catalog.try_update(|registry| {
+                if registry.get("catalog_gain").is_none() {
+                    registry.try_register_from(
+                        "turn-boundary test refresher",
+                        Arc::new(GainedCatalogTool(self.tool_calls.clone())),
+                    )?;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    /// C-503: the host refresher runs inside the engine's public turn boundary, before C-318 takes
+    /// the generation shown to the provider. This pins the wiring in addition to C-318's existing
+    /// proof that an already-adopted generation stays immutable for the whole live turn.
+    #[tokio::test]
+    async fn host_catalogue_refresh_is_visible_to_the_turn_it_precedes() {
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let (engine, events, requests) = scripted_engine(
+            vec![
+                native_call(
+                    "intent-1",
+                    "declare_intent",
+                    json!({"intent": "use gained op", "capability_families": ["core"]}),
+                ),
+                native_call("gain-1", "catalog_gain", json!({})),
+                prose("boundary refresh worked"),
+            ],
+            AgentLoopSpec::default(),
+        );
+        engine.executor.allow(&["catalog_gain"]);
+        let engine = engine.with_catalog_refresher(Arc::new(PublishGainedAtBoundary {
+            calls: refreshes.clone(),
+            tool_calls: tool_calls.clone(),
+        }));
+        let session = events.create_session("scripted/test-model").unwrap();
+
+        engine
+            .run_turn(
+                &session,
+                "use the refreshed operation",
+                &mut CollectSink::default(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert!(requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request.tools.iter().any(|tool| tool.name == "catalog_gain")));
     }
 
     /// C-318 turn-boundary proof through the real engine gate: publication happens only after the

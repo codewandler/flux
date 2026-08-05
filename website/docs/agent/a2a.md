@@ -5,6 +5,9 @@ description: "How flux serves and calls A2A v0.3 agents over JSON-RPC/HTTP, incl
 
 # Agent-to-agent (A2A)
 
+<!-- Editors: the contributor deep-dive is docs/a2a.md in the repository. The two texts are
+deliberately independent, not mirrors; keep both consistent with the shipped tree. -->
+
 flux implements the JSON-RPC-over-HTTP binding of the
 [A2A v0.3.0 specification](https://a2a-protocol.org/v0.3.0/specification/) in both directions. It
 can expose a local flux agent to a compatible v0.3 client, and it can call a compatible v0.3 agent

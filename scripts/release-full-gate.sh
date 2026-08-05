@@ -4,7 +4,9 @@
 # only release gate receipt.
 set -euo pipefail
 
+SOURCE_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$(git rev-parse --show-toplevel)"
+source "$SOURCE_ROOT/scripts/build-ownership.sh"
 
 if [ "$#" -gt 1 ]; then
   echo "usage: scripts/release-full-gate.sh [expected-40-hex-sha]" >&2
@@ -28,11 +30,11 @@ else
 fi
 
 gate() { "$@" || { echo "!! gate step failed: $*" >&2; exit 1; }; }
-gate cargo build --workspace
-gate cargo test --workspace
-gate cargo clippy --workspace --all-targets -- -D warnings
+gate owned_cargo build --workspace
+gate owned_cargo test --workspace
+gate owned_cargo clippy --workspace --all-targets -- -D warnings
 gate cargo fmt --all --check
 gate cargo fmt --manifest-path plugins/Cargo.toml --all --check
-gate cargo test -p flux-codegate
+gate owned_cargo test -p flux-codegate
 
 echo "   mandatory release gate green"

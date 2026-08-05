@@ -3,12 +3,15 @@
 How flux is built and why. This is the canonical design reference; [AGENTS.md](../AGENTS.md) is the
 day-to-day contributor contract, and [vision.md](vision.md) is the *why*.
 
-The shape follows one idea: **the LLM is not the runtime.** Every turn the model is a compiler
-front-end — it emits a typed Flux-Lang plan (a graph) or answers in prose; the deterministic
-`flux-flow` engine executes that plan, node by node, through the safety envelope below. The model has
-no directly-callable tools, so even a read is a plan node and a turn is always an auditable graph.
+The shape follows one idea: **the LLM is not the runtime.** Every turn runs an authored Flux-Lang
+loop in the deterministic `flux-flow` engine; the model participates only inside typed stages —
+interpreting intent, exploring with operations' exact native schemas, and proposing literal calls.
+Safe reads execute through the envelope and return evidence; effectful proposals are captured,
+frozen into an immutable action batch, and executed through the safety envelope below. The model
+never generates per-turn executable Flux, and a turn is always an auditable, replayable record —
+see [agent-loop.md](agent-loop.md) for the adaptive loop and why it replaced model-generated plans.
 Everything that follows — strict layers, the envelope, providers, sessions — is the substrate that
-inversion executes against. For the compact semantic model of the language itself, see
+discipline executes against. For the compact semantic model of the language itself, see
 [Flux-Lang semantics](language.md).
 
 ## Shape: one workspace, strict layers
@@ -206,9 +209,15 @@ A "provider" conflates two orthogonal axes, modeled separately and composed by `
   Chat, OpenAI Responses).
 - **`Credential`** — auth/transport profile: tokens, base URL, gating headers, refresh.
 
-`provider/model` routing selects a cell. v1 ships `anthropic`, `claude`, `openai`, `codex`, `aws`
-(Bedrock), `openrouter`, `ollama`, and `ollama-anthropic`. Adding a
-provider is a small composition, never a fork of the loop. Streaming is a
+`provider/model` routing selects a cell. The production text registry has eight prefixes:
+`anthropic`, `claude`, `openai`, `codex`, `aws` (Bedrock), `openrouter`, `ollama`, and
+`ollama-anthropic`, composed over four concrete wire codecs. The separate full-duplex
+`RealtimeProvider` seam has one optional in-tree implementation, OpenAI Realtime. Adding a provider
+is a small composition, never a fork of the loop—but the maintained registry grows only for a
+genuinely distinct wire, credential lifecycle, or provider behavior. The long model-vendor tail goes
+through OpenRouter; Rust embedders can implement `Provider`. Model providers do not load as effect
+connectors or native plugins. See [the provider guide](model.md#provider-breadth-strategy) for the
+decision and the route to a provider Flux does not name. Streaming is a
 `Chunk` stream; usage accounting preserves input/cache tokens across `message_start`/`message_delta`.
 
 ## Agent loop, sessions, context

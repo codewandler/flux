@@ -14,16 +14,123 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Flux now has one durable board-and-fleet workflow for AI-assisted development.** `flux board`
+  manages a session checklist, one repository's Track stories, or a cross-repository workspace,
+  including vision, roadmap, decisions, designs, exact progress statistics, and current/history
+  reports. `flux fleet` schedules bounded local sub-agents into isolated worktrees, preserves their
+  commits and test/review evidence across restart, and provides stable status, message, activity,
+  log, worktree, and integration inspection. Claude, Codex, and scripts use the same clean JSON API;
+  `flux board skill` and `flux fleet skill` print short installed-version guides. A green wave stays
+  local until you explicitly run `flux fleet apply`, and neither command pushes, releases, deploys,
+  or removes worktrees for you. The new **Coding / AI-assisted development** docs section explains
+  the whole model and every backend.
+
+- **You can now name how much autonomy an agent runs with, in one choice.** `--posture supervised`
+  asks you before each effect. `--posture bounded-autonomy` never asks and instead constrains the
+  run with policy, a fail-closed sandbox and budgets — the posture unattended runs already used.
+  `--posture exploratory` suits research and long investigations where being interrupted is itself
+  the problem, leaning on hard isolation and full evidence instead. `--posture refusing` denies
+  everything. Each posture sets its approval, confinement and budget together, so you cannot end up
+  with approvals switched off and confinement left open. The documentation states plainly what each
+  one relies on and what it does not protect you against. `--yes` keeps working and means
+  `bounded-autonomy`.
+
+- **Streaming JSON output now identifies which call each tool event belongs to.** Tool call and tool
+  result lines carry a new `dispatch` field holding the same identifier on both ends of one call, so
+  a script consuming the stream can pair a result with its call directly instead of guessing by tool
+  name. The field is additive; existing consumers are unaffected.
+
+- **`flux review` now shows what it is doing while reviewers work.** By default it displays a live
+  reviewer tree in a terminal and readable progress lines when redirected. Use
+  `--progress tree|plain|off` to choose the display explicitly. Progress goes to stderr, so the final
+  Markdown or JSON report on stdout stays clean for scripts.
+
+- **Agents can now run a Flux program supplied directly in a `flow_run` call.** Use
+  `inline_program` when a program does not need to be saved first; it supports the same input bindings
+  and execution safeguards as named and file-based flows.
+- **You can delegate Flux-Lang authoring to a purpose-built repository role.** The
+  `flux-lang-writer` inspects the language contract, makes focused `.flux` changes, and validates
+  syntax and analysis without running an effectful flow as a shortcut. Actual execution still uses
+  Flux's normal authorization, approval, guarded IO, sandboxing, and redaction. A source-linked
+  catalogue now makes every built-in and repository role discoverable.
+
+- **The first-run Exchange command surface is explicit and safe while its dependencies land.**
+  `flux exchange local start|status|stop` and `flux integration connect|grant|list|doctor` now have
+  closed command shapes. Their current deterministic `unsupported` response is a temporary gate,
+  not the final local-lifecycle or integration result contract. Until the compatible Exchange
+  release and Flux lifecycle manager ship, the commands make no changes, setting values stay out of
+  diagnostics, and credential or token arguments are not accepted. The final managed lifecycle and
+  owner onboarding run only on the two Linux GNU targets; other Flux targets keep the commands but
+  return a typed side-effect-free platform refusal and may still use a separately provisioned Linux
+  Exchange through the authenticated runtime HTTP client.
+
+- **Flux can now use operations granted to an Exchange Service Account.** Set the Exchange URL and
+  Service Account token in the host environment. Flux refreshes the available operations between
+  turns and sends one-shot calls to Exchange, while Exchange keeps credentials and deployment
+  choices. If Exchange goes offline, core Flux tools keep working and external operations disappear.
+
 - **Flux programs can read headers and other map keys that contain punctuation directly.** Use
   familiar quoted access such as `$response.headers["content-type"]`; append `?` for optional access.
   Quoted numeric keys remain object keys, while unquoted numeric brackets remain list indexes.
 
 ### Improved
 
+- **Releases no longer depend on repository settings that were never configured.** The release
+  pipeline uses the existing release credential only in its isolated host-controlled mutation and
+  GitHub Release steps. Model and build work still cannot see it, tags are pushed with the separate
+  credential so their workflows run, and missing or unusable authority now fails before promotion
+  changes repository state. No dedicated GitHub App, release Environment, ruleset or branch
+  protection setup is required or claimed.
+
+- **Remote execution now keeps compatible tools available instead of hiding their whole group.**
+  Each tool declares whether it works on the selected execution system, belongs on the local control
+  plane, or is native-only. Native-only tools stay hidden and are refused if called directly, while
+  compatible tools in the same group remain usable; `/tools` explains why an unavailable tool was
+  excluded.
+
+- **Fenced code blocks are easier to recognize in every Markdown view.** Each row now has a `▎ `
+  gutter in the terminal, exported output, and monochrome displays, including blank rows and code
+  nested inside lists.
+
+- **Tool cards now keep hostile terminal bytes inert and make diffs much easier to read.** Escape
+  sequences and control bytes are stripped before live or historical tool output reaches the TUI;
+  patch and Git diff output gets hunk/add/delete styling, long wrapped rows stay inside their card,
+  and the CLI and TUI share one explicit truncation policy without changing `-v` full-output mode.
+
+- **Release downloads now close as one exact, auditable set.** The release controller derives
+  migration versions from complete change records and the customer-facing action-needed section,
+  merges the deterministic cut through protected `main`, and verifies all 28 expected downloads,
+  checksums, provenance, publication workflows and the latest-release pointer before cleaning up
+  recovery evidence.
+
+- **Flux can inspect independent evidence sources at the same time.** When a model requests several
+  safe reads together, Flux overlaps them within the configured tool-concurrency limit and still
+  returns their results in request order. Writes, approval-sensitive work, hooked calls, and tools
+  without trustworthy read-only metadata remain ordered.
+
+- **The security guide now tells you which secret guarantee you actually have.** It separates
+  credentials kept outside Flux or a plugin from values materialized locally and protected by
+  scopes and redaction. It also states plainly that unknown credentials pasted into prompts are not
+  redacted and that raw prompts and answers are written to session history.
+
+- **The model guide now explains how to use a provider Flux does not name.** Use an OpenRouter
+  catalogue id for hosted models, either Ollama wire for local models, or implement the Rust provider
+  interface in an embedded product. Flux keeps a small, fully maintained built-in set instead of
+  promising a separate adapter for every vendor.
+
+- **The integration guides now distinguish today's plugin compatibility path from its replacement.**
+  The signed plugin pack still works today while adapters migrate. The embedded Exchange client is
+  now the official path, with Exchange executing connector runtimes and no local fallback; adapter
+  migrations and final plugin removal remain planned work.
+
 - **A running REPL can now pick up a plugin's changed actions without restarting.** Run
   `/plugin-refresh <name>`; the current turn keeps the actions it started with, and the next turn
   adopts the complete refreshed set. Existing plugin grants and disabled-tool patterns still apply
   to newly advertised actions, and a rejected refresh changes nothing.
+
+- **Approval screens now show what each confirm guard is about.** A confirm that wraps real work now
+  shows the planned operations and their likely effects, instead of only a plain message. Unknown
+  operations are shown explicitly, and invalid confirm risk labels are rejected before execution.
 
 - **Maintainers can now cut a release by merging `main` into `release`.** The hosted flow writes the
   release notes, derives the version mechanically, prepares and verifies the exact build once, then
@@ -31,7 +138,50 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   preserved; it cannot silently finish as a partial release. The expensive release gate now runs
   once on that exact candidate instead of being repeated during the cut.
 
+- **The engineering presentation grew to thirteen chapters and became easier to share.** It now
+  walks through the agent loop, session records, and model strategy (about twenty minutes end to
+  end), prints as a complete handout, and supports touch swipe, a contents menu, and the browser
+  Back button; keyboard shortcuts keep working after you click a control. Its Exchange chapter
+  reflects what actually ships today, and the presentation is linked from the site's front page,
+  footer, docs overview, and README instead of hiding behind the playground.
+
 ### Fixed
+
+- **Workspace Board checks and cross-repository Fleet runs now operate on the repositories you
+  configured.** Board validation includes every workspace member and understands namespaced
+  dependencies between them. Fleet agents can read each configured checkout without broadening
+  their write access, and one unusually large activity update can no longer corrupt the final
+  completion record.
+
+- **Long-term quota exhaustion now returns immediately instead of wasting retry time.** When a
+  provider explicitly says that usage or credits are exhausted, Flux preserves the reset or limit
+  message and returns control after the first response. Ordinary short-lived rate limits continue
+  to retry.
+
+- **The terminal UI no longer includes a dependency version with a known soundness defect.** Its
+  rendering and input stack was updated together without changing the TUI's behavior.
+
+- **A tool's result, timing and progress always land on the tool card that started it.** When
+  several same-named reads or searches run at once, a result that arrived out of order could resolve
+  whichever card was newest, leaving the real one spinning and the finished one showing another
+  call's output. Each call now carries its own identity from start to finish, so the transcript,
+  the fleet pane and replayed runs all pair correctly no matter how many calls overlap.
+
+- **Building and installing Flux from one checkout no longer loses live compiler output to
+  repository cleanup.** `task install` keeps its Cargo target reusable while it verifies and
+  installs both `flux` and `flux-lsp`; `task clean` now refuses until active repository builds have
+  finished. Existing absolute or relative `CARGO_TARGET_DIR` choices continue to work.
+
+- **JaaS room joins no longer race each other or re-resolve their signalling host.** Two concurrent
+  joins now create one live room session, and the XMPP WebSocket connects only to the address Flux's
+  network guard already checked.
+
+- **Formatting no longer moves a final top-level comment into the preceding flow.** Format-on-save
+  and `fluxlang fmt` now keep a comment written at the left margin after the last declaration at the
+  left margin, preserving which part of the program it documents.
+
+- **Room-media diagnostics no longer include sidecar command arguments.** The sidecar executable
+  remains visible for troubleshooting, while tokens and other host-specific arguments are redacted.
 
 - **Webhook and connector listeners now refuse overload consistently with the main server.** Body
   size, timeout, request-rate and concurrent-work limits apply before a delivery can start, and
@@ -42,6 +192,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   JSON code block is normalized safely.
 
 ### Action needed
+
+- **Bringing real room audio to a sandboxed agent requires granting the audio socket explicitly.**
+  The sandbox hides the host's `/run` directory, so naming your audio server on the sidecar's command
+  line is necessary but not sufficient — the socket itself has to be granted. Add the directory that
+  holds it, for example `writable = ["/run/user/1000/pulse"]` under `[sandbox]`, using your own user
+  id. Flux now refuses at startup if a configured writable path under `/run` does not exist, naming
+  the path and the likely cause, rather than creating an empty directory that applies cleanly and
+  silently reaches nothing. If you previously had such a path in your config, correct it — a wrong
+  user id was indistinguishable from working audio until now.
 
 - **Rust server integrations must use the guarded address-based serving APIs.** The helpers that
   accepted an already-bound native TCP listener have been removed. Single-agent serving now uses the
@@ -978,19 +1137,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 - **Hand work to other flux agents, and pick it back up after a restart.** A program can now declare
   a **work board** — a list of tasks with real states (ready, claimed, in progress, blocked, review,
-  done, failed) — and hand items out to remote flux workers without waiting for them. Declaring one
-  takes three lines: a `datasource` named `board`, a `kind` of `"board:markdown"`, and the `path` the
-  items live under.
+  done, failed) — and hand items out to remote flux workers without waiting for them. Boards now use
+  a first-class `board` declaration with explicit scope, profile, backend kind, and root; the former
+  datasource-shaped spelling has been retired.
 
   That gives your program operations to list, read, create, claim, move, comment on and dispatch
-  board items. `board:markdown` keeps one file per item on disk, so **the board survives the process
+  board items. The `markdown` board backend keeps one file per item on disk, so **the board survives the process
   that wrote it** — which is the point. When work is handed to a worker, the worker's address and the
   task handle are written back onto the item itself, so a coordinator that is restarted can read the
   board and find every run that was in flight, then poll or cancel it. There is no second place where
   run state lives and no state file to reconcile: restart, re-read the board, carry on.
 
-  `board:memory` is also available for a single run and for tests, but it cannot outlive its process,
-  so anything relying on recovery wants `board:markdown`.
+  The `memory` backend is also available for a single run and for tests, but it cannot outlive its
+  process, so anything relying on recovery wants `markdown`.
 
   Handing out work is gated like any other outbound request: a worker on a private or loopback
   address is refused unless you allow it, each dispatch is approved against **that specific worker's

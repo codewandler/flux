@@ -25,6 +25,16 @@ const sidebars = {
     'whats-new',
     {
       type: 'category',
+      label: 'Coding / AI-assisted development',
+      collapsed: false,
+      items: [
+        'coding/overview',
+        'coding/boards',
+        'coding/fleet',
+      ],
+    },
+    {
+      type: 'category',
       label: 'Fundamentals',
       items: ['concepts', 'ecosystem', 'infrastructure', 'topologies', 'remote-system-deployment'],
     },

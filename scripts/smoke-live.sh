@@ -31,7 +31,9 @@ set -uo pipefail
 
 MODEL="${FLUX_SMOKE_MODEL:-anthropic/opus}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-FLUX="${FLUX_BIN:-$ROOT/target/release/flux}"
+source "$ROOT/scripts/build-ownership.sh"
+ROOT_TARGET=$(owned_target_at "$ROOT") || exit
+FLUX="${FLUX_BIN:-$ROOT_TARGET/release/flux}"
 
 SHAPE_CHECK=0
 if [ "${1:-}" = "--shapes" ] || [ "${FLUX_SMOKE_SHAPES:-0}" = "1" ]; then
@@ -129,7 +131,7 @@ run_shape_checks() {
 step "pre-flight (model: $MODEL, bin: $FLUX)"
 if [ ! -x "$FLUX" ]; then
   echo "  building release binary…"
-  ( cd "$ROOT" && cargo build --release ) || { echo "build failed"; exit 1; }
+  ( cd "$ROOT" && owned_cargo build --release ) || { echo "build failed"; exit 1; }
 fi
 echo "  credentials:"
 "$FLUX" auth status 2>/dev/null | sed 's/^/    /'

@@ -374,7 +374,7 @@ pub struct RoomSettings {
 /// [`sidecar`](Self::sidecar) argv, which flux never interprets.
 ///
 /// `#[non_exhaustive]`: D-209…D-211 will add knobs to this bag.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[non_exhaustive]
 pub struct MediaSettings {
     /// The sidecar's argv, `argv[0]` first. Executed through `flux_system::System` like every other
@@ -402,9 +402,64 @@ pub struct MediaSettings {
     pub min_publish_rms: Option<f32>,
 }
 
+impl std::fmt::Debug for MediaSettings {
+    /// Redact the host-resolved argv after its diagnosable program name, following
+    /// [`WebhookSettings`]' hand-written formatter: keep the configuration shape visible without
+    /// ever offering a resolved secret to the formatter.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MediaSettings")
+            .field("program", &self.sidecar.first())
+            .field(
+                "args",
+                &format_args!("{} <redacted>", self.sidecar.len().saturating_sub(1)),
+            )
+            .field("handshake_timeout_secs", &self.handshake_timeout_secs)
+            .field("command_timeout_secs", &self.command_timeout_secs)
+            .field("event_buffer", &self.event_buffer)
+            .field("min_publish_rms", &self.min_publish_rms)
+            .finish()
+    }
+}
+
 /// The nick flux joins a room under when the declaration does not say. A room containing humans is
 /// owed an honest answer about what just joined it.
 pub const DEFAULT_ROOM_NICK: &str = "flux";
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::RoomSettings;
+
+    #[test]
+    fn media_and_room_settings_debug_never_print_sidecar_arguments() {
+        let room: RoomSettings = serde_json::from_value(json!({
+            "backend": "mock",
+            "room": "standup@conference.example",
+            "media": {
+                "sidecar": ["room-sidecar", "--token", "resolved-room-token"]
+            }
+        }))
+        .expect("room media settings deserialize");
+        let media = room.media.as_ref().expect("media is present");
+
+        for text in [format!("{media:?}"), format!("{room:?}")] {
+            assert!(
+                text.contains("room-sidecar"),
+                "argv[0] stays diagnosable: {text}"
+            );
+            assert!(
+                !text.contains("--token"),
+                "argv past zero is redacted: {text}"
+            );
+            assert!(
+                !text.contains("resolved-room-token"),
+                "resolved secrets never reach the formatter: {text}"
+            );
+            assert!(text.contains("<redacted>"), "redaction is visible: {text}");
+        }
+    }
+}
 
 /// `kind = "slack"` settings (compiled in by default; gated only for `--no-default-features` builds).
 #[cfg(feature = "slack")]

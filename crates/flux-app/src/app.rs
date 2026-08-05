@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use flux_agent::{resolve_compact_threshold_env, AgentProfile, AgentSpec, Permissions};
-use flux_core::{Error, Result, Usage};
+use flux_core::{DispatchId, Error, OperationTiming, Result, Usage};
 use flux_events::EventStore;
 use flux_evidence::{Observation, Phase};
 use flux_flow::engine::FlowEngine;
@@ -911,9 +911,11 @@ impl Engine {
             // `FlowClient::with_sub_agents` use, so a journey delegates through the identical envelope.
             // Children audit into the app's own event store by default (A-08), correlated per spawn.
             let spawner = sub_agents.map(|sa| {
-                if let Err(error) =
-                    registry.try_register_from("app sub-agent task operation", Arc::new(TaskTool))
-                {
+                if let Err(error) = registry.try_register_from_with_placement(
+                    "app sub-agent task operation",
+                    Arc::new(TaskTool),
+                    flux_runtime::OperationPlacement::LocalControlPlane,
+                ) {
                     registration_error.borrow_mut().get_or_insert(error);
                 }
                 sa.with_audit(events.clone()).into_spawner(system.clone())
@@ -2111,12 +2113,16 @@ fn scope_datasource_tools(registry: &mut ToolRegistry, allowed: &[String]) -> Re
     let mut scoped = registry.clone();
     for name in DATASOURCE_OPS {
         if let Some(inner) = scoped.get(name) {
-            scoped.replace_from(
+            let placement = scoped
+                .effective_placement(name)
+                .unwrap_or(flux_runtime::OperationPlacement::NativeSystemOnly);
+            scoped.replace_from_with_placement(
                 "flux-app declared datasource-scope adapter",
                 Arc::new(DatasourceScopedTool {
                     inner,
                     allowed: allowed.to_vec(),
                 }),
+                placement,
             )?;
         }
     }
@@ -2558,7 +2564,7 @@ impl AgentSink for RecordingSink {
     fn text_delta(&mut self, text: &str) {
         self.text.push_str(text);
     }
-    fn tool_call(&mut self, name: &str, _input: &Value) {
+    fn tool_call(&mut self, _dispatch: DispatchId, name: &str, _input: &Value) {
         self.tools.push(name.to_string());
     }
     fn turn_end(&mut self, usage: Option<Usage>) {
@@ -2599,11 +2605,14 @@ impl AgentSink for UsageCapture<'_> {
     fn planning(&mut self, active: bool) {
         self.inner.planning(active);
     }
-    fn tool_call(&mut self, name: &str, input: &Value) {
-        self.inner.tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &Value) {
+        self.inner.tool_call(dispatch, name, input);
     }
-    fn tool_result(&mut self, name: &str, result: &ToolResult) {
-        self.inner.tool_result(name, result);
+    fn tool_timing(&mut self, dispatch: DispatchId, name: &str, timing: &OperationTiming) {
+        self.inner.tool_timing(dispatch, name, timing);
+    }
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &ToolResult) {
+        self.inner.tool_result(dispatch, name, result);
     }
     fn observation(&mut self, o: &flux_evidence::Observation) {
         self.inner.observation(o);

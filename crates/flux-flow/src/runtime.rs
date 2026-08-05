@@ -14,6 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use crate::AgentSink;
+use flux_core::DispatchId;
 use flux_runtime::{
     scope_runtime_turn, ApprovalChoice, Approver, Executor, ToolRegistry, ToolResult,
 };
@@ -309,14 +310,15 @@ impl FlowSink for SinkBridge<'_> {
     fn planning(&mut self, active: bool) {
         self.inner.planning(active);
     }
-    fn tool_call(&mut self, name: &str, input: &serde_json::Value) {
-        self.inner.tool_call(name, input);
+    fn tool_call(&mut self, dispatch: DispatchId, name: &str, input: &serde_json::Value) {
+        self.inner.tool_call(dispatch, name, input);
     }
-    fn tool_result(&mut self, name: &str, result: &OpOutcome) {
+    fn tool_result(&mut self, dispatch: DispatchId, name: &str, result: &OpOutcome) {
         if let Some(timing) = result.timing.as_ref() {
-            self.inner.tool_timing(name, timing);
+            self.inner.tool_timing(dispatch, name, timing);
         }
         self.inner.tool_result(
+            dispatch,
             name,
             &ToolResult {
                 content: result.content.clone(),
@@ -1389,13 +1391,18 @@ mod tests {
         timings: Vec<(String, flux_core::OperationTiming)>,
     }
     impl AgentSink for CollectSink {
-        fn tool_call(&mut self, name: &str, _input: &serde_json::Value) {
+        fn tool_call(&mut self, _dispatch: DispatchId, name: &str, _input: &serde_json::Value) {
             self.calls.push(name.to_string());
         }
         fn observation(&mut self, o: &flux_evidence::Observation) {
             self.observations.push(o.kind.clone());
         }
-        fn tool_timing(&mut self, name: &str, timing: &flux_core::OperationTiming) {
+        fn tool_timing(
+            &mut self,
+            _dispatch: DispatchId,
+            name: &str,
+            timing: &flux_core::OperationTiming,
+        ) {
             self.timings.push((name.to_string(), *timing));
         }
     }
@@ -2750,6 +2757,83 @@ mod tests {
             outcome.result, "did run",
             "AllowAlways must run the confirm body"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_flow_confirm_passes_captured_intents_to_approval_adapter() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<IntentSet>::new()));
+        let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CapturingApprover {
+            captured: Arc<std::sync::Mutex<Vec<IntentSet>>>,
+            approvals: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl Approver for CapturingApprover {
+            async fn request(
+                &self,
+                _tool: &str,
+                _s: &[String],
+                intents: &IntentSet,
+            ) -> ApprovalChoice {
+                self.approvals
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.captured.lock().unwrap().push(intents.clone());
+                ApprovalChoice::Allow
+            }
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "flux-flow-rt-{}-confirm-intents",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EffectOnlyWriteTool));
+        let ex = Executor::new(
+            reg,
+            PermissionManager::from_rules(&["effect_write".into()], &[]),
+            Arc::new(CapturingApprover {
+                captured: Arc::clone(&captured),
+                approvals: Arc::clone(&approvals),
+            }),
+            ToolContext::new(Arc::new(System::new(Workspace::new(&dir).unwrap()))),
+        );
+        let store = FlowStore::in_memory().unwrap();
+        let ast = DraftAst {
+            body: vec![Node::Confirm {
+                message: "confirm write".into(),
+                risk: Some("high".into()),
+                body: vec![Node::Call {
+                    op: "effect_write".into(),
+                    args: vec![flow_lit(json!({}))],
+                }],
+            }],
+            ..Default::default()
+        };
+        let mut sink = CollectSink::default();
+        let outcome = execute_flow(&store, &ex, "sess_confirm_intents", &ast, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, "wrote");
+        assert_eq!(
+            approvals.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "confirm must consult the runtime approver"
+        );
+        let observed = captured.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1, "exactly one confirm gate was raised");
+        let expected = IntentSet {
+            intents: vec![flux_spec::Intent {
+                behavior: flux_spec::IntentBehavior::Operation,
+                target: flux_spec::IntentTarget::Operation {
+                    name: "effect_write".into(),
+                    effects: vec![flux_spec::Effect::Write, flux_spec::Effect::Filesystem],
+                    semantic_effects: vec![flux_spec::FlowEffect::WriteFile],
+                },
+                role: flux_spec::IntentRole::Operation,
+                certainty: flux_spec::IntentCertainty::Certain,
+            }],
+        };
+        assert_eq!(observed[0], expected);
     }
 
     #[tokio::test]

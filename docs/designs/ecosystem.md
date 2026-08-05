@@ -215,7 +215,15 @@ tenant already has.
 
 **HTTP** is the complete Milestone 1 Flux client surface: effective catalogue and stateless
 `invoke`. Credential and connection management remain operator surfaces rather than Service Account
-client responsibilities.
+client responsibilities. On supported Linux, plan reads, connection changes, grants and Service
+Account minting require the separately OS-owner-authenticated native management client; those routes
+cannot be added to the Service-Account-only runtime client or aimed at a remote host. Every Flux
+platform, including Linux, may use an independently provisioned Linux Exchange only through the
+runtime HTTP client; secure remote provisioning requires a future provider contract. In the final
+Linux-local bootstrap, Service Account token bytes may
+exist only inside a host-owned secret resolver and sensitive Authorization transport, never argv,
+the environment, ordinary diagnostics or JSON, configuration, logs, events, session state or
+model-visible state.
 
 **One websocket per connected caller** is later lifecycle work for the three things that do not fit request/response, which
 are all the same shape — a long-lived authenticated bidirectional frame stream:

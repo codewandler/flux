@@ -7,11 +7,49 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Workflow consumers intentionally use checkout-relative target/... paths.
+  CARGO_TARGET_DIR: target
   # Note: deliberately NOT setting `RUSTFLAGS: -D warnings` globally — that would also deny warnings
   # in third-party dependencies, breaking CI on any upstream warning or new rustc lint. Warning
   # enforcement for our own code lives in the clippy step below (`-- -D warnings`).
 
 jobs:
+  build-ownership:
+    name: build ownership · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      - name: Install the pinned Go toolchain for Task
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 1.25.10
+          cache: false
+
+      - name: Install the pinned Task runner
+        shell: bash
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@v3.52.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      # This invokes unoverridden `task install` against a fake Cargo in a fresh HOME/CARGO_HOME.
+      # The fake refuses unless the native Unix/Windows lease already exists before target creation.
+      # Do not provision Python: each launcher must find the documented native prerequisite itself.
+      - name: Native ownership and Task bootstrap (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: scripts/run-python3.sh scripts/test_build_ownership.py -v
+
+      - name: Native ownership and Task bootstrap (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\run-python3.cmd scripts\test_build_ownership.py -v
+
   check:
     name: build · test · clippy · fmt · layering (no sandbox backend)
     runs-on: ubuntu-latest
@@ -27,6 +65,34 @@ jobs:
       FLUX_BWRAP_BIN: /nonexistent/bwrap
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # The committed server archive mirrors the rendered public website. This stays in the
+      # unfiltered PR workflow: generated website content can change from sources outside
+      # website/**, so a path filter would admit a stale archive.
+      - name: Install pinned website toolchain
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install pinned website dependencies
+        run: npm ci
+        working-directory: website
+
+      - name: Embedded documentation matches the public website
+        run: scripts/build-embedded-docs.sh --check
+
+      - name: Publication workflow contracts
+        run: |
+          scripts/test-embedded-docs-gates.sh
+          scripts/test-release-candidate.sh
+          # C-355: receipt v3 and the raw-ZIP trust boundary, including every corruption class the
+          # promotion consumer must refuse before it writes a single extracted byte.
+          scripts/run-python3.sh scripts/test_candidate_artifacts.py
+          # C-354: the promotion ordering fixtures existed but were never run by CI, so a
+          # regression in the irreversible half was only ever caught by reading the script.
+          scripts/test-promote-release-flow.sh
 
       - name: Install Rust toolchain
         # Pinned, not `stable`: every Rust release ships new clippy lints that `-D warnings`
@@ -51,17 +117,27 @@ jobs:
       - name: Fetch locked dependencies (all targets)
         run: cargo fetch --locked
 
+      - name: Build ownership inventory and native compiler disappearance regression
+        run: |
+          python scripts/test_build_entrypoints.py
+          scripts/test-build-ownership.sh --sqlite
+
+      # C-450: Cargo.lock pins versions, while this review lock pins the direct edges that selected
+      # them and calls out dependencies that execute build.rs during the build.
+      - name: Direct dependencies are explicitly acknowledged
+        run: ./scripts/check-crate-versions.sh --direct-dependencies root
+
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: scripts/owned-cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --workspace
+        run: scripts/owned-cargo build --workspace
 
       - name: Test
-        run: cargo test --workspace
+        run: scripts/owned-cargo test --workspace
 
       # The architecture lint (fluxplane `codegate` analog): inner crates must not depend on outer
       # layers. Run explicitly too so a layering regression is an obvious, named failure. Since C-266
@@ -72,7 +148,7 @@ jobs:
       # is deleted. `cargo test --workspace` above cannot catch that class by construction — the
       # whole point is that the suite stays green when the line goes.
       - name: Architecture layering, test sandbox-posture, and pin-census lints
-        run: cargo test -p flux-codegate
+        run: scripts/owned-cargo test -p flux-codegate
 
       # C-308: `cargo test --workspace` above builds every member with its DEFAULT features, so a
       # target behind a non-default one is invisible to it — and a test no gate exercises is a test
@@ -186,14 +262,14 @@ jobs:
         run: bwrap --unshare-user --unshare-pid --ro-bind / / /bin/true
 
       - name: Build
-        run: cargo build --workspace
+        run: scripts/owned-cargo build --workspace
 
       # The whole suite, with a live backend. `sandbox_posture.rs` stays green here because it forces
       # backend discovery at nonexistent paths itself — it asserts the no-backend postures hermetically
       # rather than by inferring them from the host, which is what makes a two-sided gate possible at
       # all without weakening a single one of its assertions.
       - name: Test (workspace, sandbox backend available)
-        run: cargo test --workspace
+        run: scripts/owned-cargo test --workspace
 
       # Step 5 of the shape guard (`app run --serve`) is a serving surface, and serving surfaces
       # inherit `require`. With a real backend it must start CONFINED — the posture the guard could
@@ -295,21 +371,30 @@ jobs:
         with:
           workspaces: plugins
 
+      # The direct-dependency ratchet uses cargo metadata --offline after the build. A restored
+      # target cache can satisfy compilation without restoring registry source, so fetch the exact
+      # locked plugin closure before that offline audit.
+      - name: Fetch locked plugin dependencies
+        run: cargo fetch --locked --manifest-path plugins/Cargo.toml
+
       - name: Format
         working-directory: plugins
         run: cargo fmt --all --check
 
       - name: Clippy (deny warnings)
         working-directory: plugins
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
         working-directory: plugins
-        run: cargo build --workspace
+        run: ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo build --workspace
 
       - name: Test
         working-directory: plugins
-        run: cargo test --workspace
+        run: ../scripts/run-python3.sh ../scripts/build_ownership.py shared --workspace-root "$PWD" -- cargo test --workspace
+
+      - name: Direct dependencies are explicitly acknowledged
+        run: ./scripts/check-crate-versions.sh --direct-dependencies plugins
 
   crate-versions:
     name: independently-versioned crates moved their version
@@ -346,6 +431,19 @@ jobs:
         run: |
           ./scripts/check-release-integrity.sh --self-test
           ./scripts/check-release-integrity.sh
+
+      # C-354: permissions are job-scoped and secrets can be step-scoped, so least privilege for a
+      # release pipeline is a property of the parsed workflow/job/step graph. This parses all four
+      # release workflows and rejects any credential that escapes its explicit authorized steps.
+      - name: Release authority is scoped to the job and step that consume it
+        run: |
+          ./scripts/check-release-authority.sh --self-test
+          ./scripts/check-release-authority.sh
+
+      - name: Promotion helpers fail closed
+        run: |
+          ./scripts/bundle-release-cut.sh --self-test
+          ./scripts/plugin-tag-control.sh --self-test
 
   no-direct-io:
     name: model-facing tool crates do not reach IO behind flux-system
@@ -537,11 +635,11 @@ jobs:
       # crates/flux-sdk/PUBLISHING.md.
       - name: Clippy (postgres feature, deny warnings)
         run: |
-          cargo clippy -p codewandler-flux-pg --all-targets -- -D warnings
-          cargo clippy -p codewandler-flux-events -p codewandler-flux-capabilities --features postgres --all-targets -- -D warnings
+          scripts/owned-cargo clippy -p codewandler-flux-pg --all-targets -- -D warnings
+          scripts/owned-cargo clippy -p codewandler-flux-events -p codewandler-flux-capabilities --features postgres --all-targets -- -D warnings
 
       - name: Test flux-pg (bridge + pool + DSN)
-        run: cargo test -p codewandler-flux-pg
+        run: scripts/owned-cargo test -p codewandler-flux-pg
 
       - name: Test Postgres backends (flux-events + flux-capabilities)
-        run: cargo test -p codewandler-flux-events -p codewandler-flux-capabilities --features postgres
+        run: scripts/owned-cargo test -p codewandler-flux-events -p codewandler-flux-capabilities --features postgres

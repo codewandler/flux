@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use flux_cognition::{CognitionPack, ConsultTool, DEFAULT_CONSULT_MAX_CALLS};
 use flux_core::{Chunk, StopReason};
 use flux_provider::{ChunkStream, NullProvider, Provider, Request};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -173,6 +173,7 @@ fn is_complete_flux_module(source: &str) -> bool {
         "agent ",
         "channel ",
         "datasource ",
+        "board ",
         "flow ",
         "journey ",
         "op ",
@@ -361,6 +362,73 @@ fn cli_reference_covers_every_public_subcommand() {
             missing.len()
         );
     }
+    // C-318 shipped `/plugin-refresh` as a REPL command; it is part of the public CLI story even
+    // though it is not a subcommand `--help` can enumerate.
+    assert!(
+        read("website/docs/agent/cli.md").contains("/plugin-refresh"),
+        "website/docs/agent/cli.md omits the /plugin-refresh REPL command"
+    );
+}
+
+/// C-529: the contributor front doors must teach the current adaptive-loop thesis, not the retired
+/// plan-compiler one, and their status prose must not hardcode release claims that rot. Pins are
+/// scoped to the exact retired sentences (not broad phrase lists) because the roadmap's historical
+/// epic log may legitimately quote old wording.
+#[test]
+fn contributor_entry_docs_do_not_revive_the_retired_compiler_thesis() {
+    let architecture = read("docs/architecture.md");
+    let contributing = read("CONTRIBUTING.md");
+    let roadmap = read("docs/roadmap.md");
+    let readme = read("README.md");
+
+    for (name, text, stale) in [
+        (
+            "docs/architecture.md",
+            &architecture,
+            "it emits a typed Flux-Lang plan",
+        ),
+        (
+            "docs/architecture.md",
+            &architecture,
+            "even a read is a plan node",
+        ),
+        (
+            "CONTRIBUTING.md",
+            &contributing,
+            "the model compiles a request into a plan",
+        ),
+        (
+            "docs/roadmap.md",
+            &roadmap,
+            "compiler front-end that emits a Flux-Lang plan",
+        ),
+    ] {
+        assert!(
+            !text.contains(stale),
+            "{name} revived the retired compiler thesis: `{stale}`"
+        );
+    }
+    for (name, text) in [
+        ("docs/architecture.md", &architecture),
+        ("CONTRIBUTING.md", &contributing),
+    ] {
+        assert!(
+            normalized_prose(text).contains(&normalized_prose("adaptive loop")),
+            "{name} must name the adaptive loop that replaced model-generated plans"
+        );
+    }
+    assert!(
+        !roadmap.contains("is released and `[Unreleased]` is empty"),
+        "docs/roadmap.md's Next preamble must not hardcode a release-boundary claim"
+    );
+    assert!(
+        !roadmap.contains("](../designs/"),
+        "docs/roadmap.md design links must stay inside docs/ (use designs/…)"
+    );
+    assert!(
+        readme.contains("codewandler.github.io/flux/docs/topologies"),
+        "README.md must link the published topologies guide with its /docs/ segment"
+    );
 }
 
 /// The TUI page must document the keys the TUI actually binds.
@@ -867,6 +935,7 @@ fn complete_flux_fences_parse_and_legacy_syntax_stays_out() {
         "agent ",
         "channel ",
         "datasource ",
+        "board ",
         "flow ",
         "journey ",
         "op ",
@@ -1041,9 +1110,10 @@ fn homepage_flux_example_is_canonical_and_analyzes_against_the_live_catalog() {
     );
 }
 
-/// C-491: the team presentation is part of the release-matched docs artifact, not an external deck
-/// that can drift from its sources. Its one executable seam must remain L-128's already-declared
-/// scratch fixture, and the mutable ecosystem status must stay visibly dated.
+/// C-491/C-501: the team presentation is part of the release-matched docs artifact, not an external
+/// deck that can drift from its sources. Its one executable seam must remain L-128's
+/// already-declared scratch fixture, and its integration topology must match the accepted
+/// Exchange-only direction while matching the shipped one-shot client boundary.
 #[test]
 fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixture() {
     let route = read("website/src/pages/presentation.js");
@@ -1064,19 +1134,47 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
     for claim in [
         "The LLM is not the runtime.",
         "authorization → approval → guarded IO",
-        "flux-connectors main · v0.16.0",
-        "flux-exchange main · v0.13.0",
-        "Flux does not yet carry a client binding",
+        "every official integration",
+        "Exchange is the only official integration executor",
+        "Flux embeds the Exchange client",
+        "Core Flux remains useful without Exchange",
+        // C-540: one distinctive claim per added chapter — agent loop, sessions, model strategy.
+        "captured, not executed",
+        "resumes the exact flow",
+        "Sessions are the record",
+        "exercises the full pipeline",
     ] {
-        assert!(deck.contains(claim), "presentation omits `{claim}`");
+        assert!(
+            normalized_prose(&deck).contains(&normalized_prose(claim)),
+            "presentation omits `{claim}`"
+        );
     }
     assert!(
         deck.contains("fixture=\"rust-files\"") && deck.contains("<FluxWorkbench"),
         "the demo must reuse the declared L-128 scratch fixture"
     );
     assert!(
-        deck.contains("Source snapshot · 2026-08-03"),
+        deck.contains("Source snapshot · 2026-08-05"),
         "mutable sibling-project claims must carry a visible date"
+    );
+    assert!(
+        !deck.contains("invocation wiring is not built"),
+        "the deck revived the pre-C-503 Exchange gap claim"
+    );
+    let config = read("website/docusaurus.config.js");
+    assert!(
+        config.contains("to: '/presentation/'"),
+        "the site footer must link the presentation"
+    );
+    let homepage = read("website/src/pages/index.js");
+    assert!(
+        homepage.contains("to=\"/presentation/\""),
+        "the landing page must link the presentation"
+    );
+    let intro = read("website/docs/intro.md");
+    assert!(
+        intro.contains("/presentation/"),
+        "the docs overview must link the presentation"
     );
 
     for stale in [
@@ -1089,16 +1187,90 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
             "docs/ecosystem.md retained C-455's stale claim `{stale}`"
         );
     }
-    for absent in [
-        "flux itself has no exchange client binding",
-        "subscribe does not exist",
-        "hosted channels",
-        "execution records",
-    ] {
+    for absent in ["one-shot http", "streaming", "leases"] {
         assert!(
-            ecosystem_prose.contains(absent),
+            ecosystem_prose.contains(&normalized_prose(absent)),
             "ecosystem correction must keep the unbuilt boundary explicit: `{absent}`"
         );
+    }
+}
+
+/// C-501: the contributor and customer-facing direction pages are a release contract. The current
+/// plugin commands remain documented while they ship, but no page may turn that compatibility path
+/// into a permanent local connector runtime or imply that plugin infrastructure survives C-506.
+#[test]
+fn connector_native_docs_fix_exchange_as_the_only_future_official_execution_path() {
+    let vision = read("docs/vision.md");
+    let ecosystem = read("docs/ecosystem.md");
+    let roadmap = read("docs/roadmap.md");
+    let readme = read("README.md");
+    let direction = read("website/docs/direction/connector-native-integrations.md");
+    let plugins = read("website/docs/plugins/using-plugins.md");
+    let topologies = read("website/docs/topologies.md");
+
+    for (name, page) in [
+        ("vision", vision.as_str()),
+        ("ecosystem", ecosystem.as_str()),
+        ("roadmap", roadmap.as_str()),
+        ("README", readme.as_str()),
+        ("direction", direction.as_str()),
+        ("plugins", plugins.as_str()),
+    ] {
+        let prose = normalized_prose(page);
+        assert!(
+            prose.contains("only official integration")
+                || prose.contains("only future official integration"),
+            "{name} must state the Exchange-only official integration path"
+        );
+    }
+
+    for claim in [
+        "embedded Exchange client",
+        "official external operations are withdrawn",
+        "no local connector",
+        "no plugin fallback",
+    ] {
+        assert!(
+            normalized_prose(&ecosystem).contains(&normalized_prose(claim)),
+            "ecosystem must state `{claim}`"
+        );
+    }
+
+    for claim in [
+        "flux-roadmap",
+        "C-500",
+        "C-501",
+        "C-502",
+        "C-503",
+        "C-504",
+        "C-505",
+        "C-506",
+        "lifecycle",
+    ] {
+        assert!(roadmap.contains(claim), "roadmap must name `{claim}`");
+    }
+
+    for forbidden in [
+        "Flux supplies a local generic runtime host",
+        "local/hosted conformance",
+        "Flux never requires Exchange: local execution remains a complete path",
+        "the generic plugin protocol may remain",
+        "Third-party plugins and the generic stdio protocol may remain",
+        "flux must never *require* flux-exchange",
+    ] {
+        for (name, page) in [
+            ("vision", vision.as_str()),
+            ("ecosystem", ecosystem.as_str()),
+            ("roadmap", roadmap.as_str()),
+            ("direction", direction.as_str()),
+            ("plugins", plugins.as_str()),
+            ("topologies", topologies.as_str()),
+        ] {
+            assert!(
+                !normalized_prose(page).contains(&normalized_prose(forbidden)),
+                "{name} retains superseded placement claim `{forbidden}`"
+            );
+        }
     }
 }
 
@@ -2320,6 +2492,22 @@ fn execution_targets_have_one_complete_placement_and_deployment_contract() {
             deployment.contains(required),
             "{REMOTE_SYSTEM_DEPLOYMENT} is missing the deployment contract `{required}`"
         );
+    }
+}
+
+/// C-478: public topology and deployment guidance use the runtime's exact typed placement
+/// vocabulary instead of maintaining an independent prose-only list that can drift.
+#[test]
+fn operation_placement_vocabulary_matches_public_docs() {
+    for path in [TOPOLOGIES, REMOTE_SYSTEM_DEPLOYMENT] {
+        let page = read(path);
+        for placement in OperationPlacement::ALL {
+            assert!(
+                page.contains(placement.label()),
+                "{path} is missing the runtime placement label `{}`",
+                placement.label()
+            );
+        }
     }
 }
 

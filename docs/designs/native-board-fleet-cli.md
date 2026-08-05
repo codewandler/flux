@@ -1,0 +1,156 @@
+# Native board and fleet CLI
+
+**Status:** accepted by flux-roadmap Decision 0010 · **Epics:**
+[A-148](../stories/A-148-first-class-board-epic.md),
+[C-239](../stories/C-239-fleet-loop-epic.md) · **CLI contract:**
+[C-547](../stories/C-547-versioned-board-fleet-agent-cli-contract.md)
+
+## Outcome
+
+`flux board` and `flux fleet` are the supported automation API for a human, Claude or Codex. A
+repository supplies stories and declarative configuration, not tracking or coordinator scripts.
+Planning state remains in the repository that owns it; fleet execution state is durable runtime
+state linked by a concrete board-and-item reference.
+
+## Board model
+
+Every registered board has a stable binding id and three independent properties:
+
+```text
+BoardRef      { board: BoardId, item: ItemId }
+BoardScope    session(session_id) | repository(repository_id) | workspace(workspace_id)
+BoardProfile  general | planning | execution
+BoardBackend  session | track | markdown | memory | federated
+```
+
+The common item core is identity, title, assignee, dependencies, references, comments and evidence.
+General boards use `open|in_progress|blocked|done`. Planning boards use
+`backlog|ready|in-progress|blocked|done` and add priority, pillar, design, epic, areas and note.
+Execution boards retain the shipped WorkBoard state and runner/task/attempt fields.
+
+A planning board also has a document catalogue. `vision` and `roadmap` are revisioned singletons;
+`decision` is a stable collection whose records are `open|decided|superseded`; `design` is a stable
+linked collection. An open decision carries its question, options/trade-offs, recommendation and
+the exact items it blocks. These documents can reference stories and epics but are not queue items
+and never receive a work status. Repository boards normally bind them under `docs/`; a workspace
+board may own program-level vision, roadmap and decisions while federating member stories.
+
+Every profile exposes `list`, `get`, `query`, `create`, `transition`, `comment`, `comments` and
+`record_evidence`. Planning adds `update`; execution adds `claim`, `record_dispatch` and `reassign`.
+The operation set and state machine are fixed per profile and pass one backend-independent contract
+suite. The shipped execution profile therefore retains its eleven operations.
+
+The registry resolves every operation through `BoardRef`. A missing board selector is accepted only
+when exactly one board supports that operation; two candidates are an ambiguity error listing both.
+Subjects are `board:<binding>/item/<id>`. A federated mutation resolves to the concrete member first
+and authorizes that member subject, never a broad workspace subject.
+
+Session boards append state transitions to the session event store. Continuation reconstructs the
+same board, replay applies recorded events without live writes, and a fork copies the prefix before
+diverging. Repository boards are confined to their repository root. Workspace planning boards expose
+namespaced member references such as `flux/C-503`, calculate cross-repository dependency readiness
+and never copy authoritative story state.
+
+## Agent CLI contract
+
+Every board and fleet command supports human output plus `--output json`; event streams additionally
+support NDJSON. Mutations accept a versioned JSON request from `--request FILE|-`,
+`--idempotency-key`, `--if-revision` and `--dry-run`. Machine output is one `flux.cli/v1` envelope
+with deterministic ordering, request id, revision, data, warnings and a typed error. Exit classes
+distinguish invalid input, missing resource, conflict, denial, transient worker failure and failed
+validation/gate. Diagnostics never contaminate JSON stdout.
+
+Ergonomic commands are projections over two complete escape hatches:
+
+```text
+flux board call BOARD OP --request -
+flux fleet call OP --request -
+```
+
+`flux board schema` and `flux fleet schema` publish the request, response, enum and capability
+schemas. `flux board skill` and `flux fleet skill` render concise Markdown skill bodies by default;
+`--output json` returns `{name, description, instructions, cli_schema}`. Each guide contains only
+the installed version, safety invariants, discovery path and copyable common calls. It points to
+`schema` for detail instead of embedding the full reference. Golden tests parse the Markdown as an
+Agent Skill document and execute every shown command against fixtures.
+
+## Planning and fleet CLI
+
+The planning surface covers initialization, discovery, CRUD, transitions, next-item selection,
+validation, deterministic rendering, graph queries, statistics, history and reports. The Track
+backend preserves YAML frontmatter and the hand-written text outside board markers byte-for-byte.
+Compound story, epic, design and done commands are recoverable multi-file changes and expose their
+proposed patch in dry-run mode.
+
+`flux board vision show|set`, `flux board roadmap show|set`, and
+`flux board decision list|show|create|update|accept|supersede` expose the planning document catalogue;
+`flux board design` is the corresponding design-document surface. All accept revisions, dry runs
+and JSON. Board checks validate broken document links, duplicate decision ids and a roadmap that
+names missing items without rewriting authored prose.
+
+`flux board stats` returns one versioned metric cube. Every count dimension has
+`{done, remaining, total, percent}`. Planning boards report epics, stories, optional tasks,
+acceptance criteria and headline implementation plus the profile-state histogram; documents report
+vision/roadmap presence, decisions by lifecycle and designs. Git-backed boards add canonical commit
+totals. Federated scheduled boards add program stories, tranche lanes, waves and program groups and
+return both per-member and aggregate values. `--history --since YYYY-MM-DD` reconstructs daily
+canonical snapshots and reports `scope_added`, `scope_removed` and `completed` deltas. A missing
+dimension is `{schema: "absent", done: null, remaining: null, total: null, percent: null}`. HTML/SVG/
+TSV reports are pure renderings of this JSON, never independent calculations.
+
+Every fleet has exactly one reserved durable `main` coordinator. All user requirements, tasks and
+agent follow-ups enter through its intake; only it maintains the active roadmap/schedule. It plans
+against revisioned goals scoped to values, company, workspace, project and repository. Worker
+membership is explicit: `main` admits a worker and records parent, role, session, transport,
+capabilities, mode, fences and lease. Merely appearing in configuration or on a transport is not
+admission.
+
+`.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
+agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
+fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an
+ephemeral agent with temporary instructions/model/mode/capabilities/fences at dispatch time; both
+paths obey the same limits and can never create a second coordinator. A workspace fleet run selects
+the highest-priority dependency-satisfied wave unless the caller supplies explicit `BoardRef`s.
+The durable wave manifest pins source commits, proposed and observed write sets, worktrees,
+sessions, attempts, evidence, reviews, gates and local candidate branches.
+
+The host, not a prompt, enforces: at most ten stories per wave; one pinned integration
+branch/worktree per repository wave; one child branch/worktree and writer per story, inheriting the
+same pinned base; disjoint or serialized write sets; a test-only failing commit before behavior
+implementation; a targeted pass before handoff; fresh read-only review; two same-session rework
+rounds; dependency-ordered child-commit integration; and one unskippable full gate on each assembled
+integration tree. Red preserves the candidate and cannot transition planning items to done. Green
+leaves local `fleet/<wave>` branches. Only `flux fleet apply` revalidates and merges them, without
+pushing.
+
+Open decisions block only their linked work; other ready items continue. Human mode surfaces the
+structured choices and recommendation. Auto mode creates a fresh adversarial decision agent with
+the applicable values/company/project context, requires it to challenge the recommendation, and
+records its chosen outcome and rationale.
+
+Control commands provide durable acknowledgement levels: `accepted` after journalling, `delivered`
+after the persistent agent session acknowledges steering, and `completed` at a terminal turn. Status
+uses an independent read path while a worker is busy. Activity is redacted before persistence.
+
+## Scriptless parity
+
+The roadmap is the product acceptance fixture. Flux replaces canonical-ref refresh, schedule and
+dependency validation, status, worktree audit, worker start/stop/dispatch/follow-up/task/note,
+activity, bounded context, progress history and HTML/SVG reporting. Repository-specific build/test
+executables remain declared gates; they contain no scheduling or worker-control logic.
+
+Parity is proven side by side before helper removal. The Claude Track commands delegate to Flux and
+have no Python fallback. Codex and Claude instructions begin with `flux board skill` or
+`flux fleet skill`, then use JSON mode for automation.
+
+## Delivery map
+
+Board wave: C-547 (machine CLI contract), A-134 (registry/profile core), L-130 (declaration), C-548
+(session backend), C-549 (Track backend and board CLI), C-550 (federation and schedule).
+
+Fleet wave: C-244 (typed handoff), C-245 (same-session rework), C-242 (integration and explicit
+apply), A-117 (durable supervisor and fleet CLI), C-551 (inspection, reporting and roadmap parity).
+
+Generic task-agent backends and Codex/Claude/Hermes/Pi CLI harness adapters, authenticated remote
+A2A fleet members, a polished board/fleet TUI, vendor boards, containers, automatic publication and
+automatic worktree deletion are separately contracted follow-up epics rather than V1 dependencies.

@@ -26,13 +26,15 @@ and [Safety & approvals](./safety.md).
 
 | Command | What it does |
 |---|---|
-| `flux run "…"` | run an adaptive turn (`--yes` auto-approves; `-c` continues the last session) |
+| `flux run "…"` | run an adaptive turn (`--posture` selects the [autonomy posture](#autonomy-posture---posture); `-c` continues the last session) |
 | `flux run <module.flux> --entry <flow>` | select one top-level flow from a multi-flow module, execute it once with `--inputs` / repeatable `--arg`, and exit |
 | `flux` | interactive REPL |
 | `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet |
 | `flux system serve …` | serve one canonical workspace as an authenticated TLS [remote execution system](../topologies.md#local-runtime-remote-system) |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |
+| `flux board …` | inspect and mutate session, repository, or workspace [boards](../coding/boards.md); JSON is the stable automation API |
+| `flux fleet …` | schedule and inspect bounded local agents through the durable [fleet](../coding/fleet.md) workflow |
 | `flux flow list` (`ls`) | list project/global saved flows and composite ops without starting an agent session |
 | `flux flow run <name\|file>` | execute a saved flow by name or an existing Flux-Lang file (files win) |
 | `flux catalog core --format json` | export the deterministic, versioned catalogue of foundational operations, language nodes, capabilities, and their JSON Schemas |
@@ -52,6 +54,8 @@ and [Safety & approvals](./safety.md).
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
+| `flux exchange local start\|status\|stop` | enter the managed local Exchange lifecycle surface; until the signed release/lifecycle contract ships, each verb makes no change and returns a typed `unsupported` refusal. The final lifecycle runs only on the two Linux GNU targets; every other target keeps the command and refuses before effects (`--json` for one machine-readable result). |
+| `flux integration connect\|grant\|list\|doctor` | enter labelled Exchange connection management; until the provider connection/grant contracts ship, each command makes no change and returns a typed `unsupported` refusal. Final owner onboarding is Linux-local; the authenticated runtime HTTP client may still use an independently provisioned Linux Exchange from every Flux target. |
 | `flux policy simulate <proposed.toml>` | replay a proposed authorization policy against recorded op history — a diff of what it would have newly blocked and newly allowed, before you adopt it; a pure read, `--sessions N` / `--json` |
 | `flux skill …` | render or install generated Flux skills; see [Skills & roles](./skills-and-roles.md) |
 | `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
@@ -165,6 +169,35 @@ Matching is a read over the same durable, redacted event log every other session
 new index, and a secret's plaintext can never be used as a `--query` to confirm a redacted
 session's existence.
 
+## Autonomy posture (`--posture`)
+
+Who answers a guarded effect is a named choice, and it selects the approver, the OS-sandbox floor
+and the resource budget **together** — see
+[Autonomy is a posture](./safety.md#autonomy-is-a-posture) for what each one relies on and what it
+does not protect against.
+
+```bash
+flux run "refactor the parser"                            # supervised (default): you answer each effect
+flux run --posture bounded-autonomy "fix the flaky test"  # never prompt; confined, egress closed, budgeted
+flux run --yes "fix the flaky test"                       # the older spelling of the same posture
+flux run --posture exploratory "audit this repo for auth bugs"
+flux app run agent.flux --posture refusing                # nothing that reaches approval runs
+```
+
+- `--posture supervised` (default on interactive surfaces) — a human at the terminal, per effect.
+- `--posture bounded-autonomy` — no prompt; authorization policy, a fail-closed sandbox with the
+  network **closed**, and resource budgets constrain instead. `--yes` selects this.
+- `--posture exploratory` — no prompt, and interruption is the harm: the same fail-closed
+  confinement with egress **open**, wider ceilings and an uncapped evidence trail. For research,
+  security hardening and long exploration.
+- `--posture refusing` — every effect reaching the approval stage is denied. The default on a
+  surface with no operator attached (`flux app run <program>`, `flux record`), which also refuse an
+  explicit `--posture supervised` rather than silently downgrading it.
+- `--yes` together with a contradictory `--posture` is refused, not resolved. `--yes --posture
+  exploratory` is fine: both say "do not ask".
+- Authorization, guarded IO and the evidence trail do **not** vary with the posture. Approval is the
+  only stage of the three with a human in it.
+
 ## Turn controls
 
 ```bash
@@ -216,11 +249,16 @@ consider "the plan" or "the result". Line `type`s:
 | `turn_start` | once, before the turn begins | `session`, `model`, `input` |
 | `plan` | the agent proposes an action batch | `session`, `data` (batch id, action count, risk, the redacted batch) |
 | `approval` | that batch is requested/approved/denied | `session`, `phase`, `data` |
-| `tool_call` | an operation is about to run | `session`, `name`, `input` |
-| `tool_result` | it finished | `session`, `name`, `is_error`, `content`, `view`, `duration_us` |
+| `tool_call` | an operation is about to run | `session`, `dispatch`, `name`, `input` |
+| `tool_result` | it finished | `session`, `dispatch`, `name`, `is_error`, `content`, `view`, `duration_us` |
 | `steered` | mid-turn guidance was folded in (see below) | `session`, `messages` |
 | `turn_end` | once, at the end | `session`, `outcome` (`ok`/`error`), `error` (only when set), `answer`, `usage`, `cost_usd` |
 | `error` | the turn itself failed to run | `session`, `message` |
+
+`dispatch` is a process-unique id for one operation. It appears on the `tool_call` line and
+again on that call's `tool_result`, so a client pairs the two by identity. Do not pair on
+`name` and arrival order: independent read-only operations in one batch run concurrently and
+may finish in any order.
 
 `--stream-json-input` additionally reads the same NDJSON framing on stdin, for a multi-message
 conversation in one process — requires `--yes` (there is no interactive-approval framing over the
@@ -269,6 +307,7 @@ Bare `flux` opens a line-oriented REPL. Its built-in commands:
 | `/effort [level]` | show or set reasoning effort (`low`, `medium`, `high`, `xhigh`, `max`, `off`) |
 | `/tools` · `/evidence` | list available operations · show the session's evidence trail |
 | `/shell` | explicitly toggle the optional shell group |
+| `/plugin-refresh <name>` | re-read a loaded plugin's operation catalog; the refreshed set is adopted at the next turn boundary (the current turn keeps its catalog) |
 | `/session` · `/sessions` · `/resume <id>` · `/clear` | session management (`/sessions --prune` deletes empty sessions) |
 | `/compact` | compact older conversation history now |
 | `/insights [direction]` | show deterministic facts for the active session, then focus one grounded summary (for example, `focus on blockers`) |

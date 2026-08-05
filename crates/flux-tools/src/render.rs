@@ -23,7 +23,7 @@ use flux_core::{Error, Result};
 use flux_lang::highlight::{highlight, HighlightClass};
 use flux_lang::program::{CompositeOpDecl, Module};
 use flux_lang::render::{render_statement, render_styled_spans, Palette, Role};
-use flux_runtime::{Tool, ToolContext, ToolRegistry, ToolResult};
+use flux_runtime::{OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult};
 use flux_spec::{AccessKind, Effect, Idempotency, Risk, ToolSpec};
 
 // Theme — ported verbatim from `flux-tree-sitter/scripts/render-example.mjs` (One Dark), so the
@@ -435,7 +435,11 @@ fn resolve_source(ctx: &ToolContext, name: &str) -> Result<String> {
 
 /// Register the render pack: `flow_render`, beside `flow_list` / `flow_run`.
 pub fn try_register_render(registry: &mut ToolRegistry) -> Result<()> {
-    registry.try_register_from("flux-tools flow-render pack", Arc::new(FlowRenderTool))
+    registry.try_register_from_with_placement(
+        "flux-tools flow-render pack",
+        Arc::new(FlowRenderTool),
+        OperationPlacement::LocalControlPlane,
+    )
 }
 
 /// Compatibility wrapper for pre-fallible pack installers.

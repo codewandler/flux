@@ -131,7 +131,12 @@ where
 /// there — no connect-time re-resolution, closing the DNS-rebinding TOCTOU (C-77). With NO vetted
 /// addresses the guard vetted nothing at all, so this fails closed instead of connecting unpinned.
 /// The shared client's redirect policy is inert, so the fresh per-hop client mirrors it.
-fn pinned_client(shared: &Client, url: &Url, pinned: &[SocketAddr], op: &str) -> Result<Client> {
+pub(crate) fn pinned_client(
+    shared: &Client,
+    url: &Url,
+    pinned: &[SocketAddr],
+    op: &str,
+) -> Result<Client> {
     // No host at all can't reach here (the guard rejects it), but stay defensive.
     let Some(host) = url.host_str() else {
         return Ok(shared.clone());

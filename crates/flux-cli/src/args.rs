@@ -171,8 +171,25 @@ pub(super) struct AgentFlags {
     pub(super) agent: bool,
 
     /// Auto-approve every tool call (headless). Without it, unmatched calls prompt for approval.
+    /// The older spelling of `--posture bounded-autonomy`, and unchanged by it.
     #[arg(long)]
     pub(super) yes: bool,
+
+    /// The autonomy posture this run adopts — one named choice that selects who approves, how the
+    /// run is confined and what its budget is, together:
+    ///
+    /// `supervised` (default) — you answer each guarded effect at the terminal.
+    /// `bounded-autonomy` — never prompt; authorization policy, a fail-closed OS sandbox with the
+    /// network closed, and resource budgets constrain instead. Same as `--yes`.
+    /// `exploratory` — never prompt, and treat interruption as the harm: fail-closed sandbox,
+    /// network open, wider ceilings, uncapped evidence. For research, security hardening and long
+    /// exploration.
+    /// `refusing` — refuse every effect that reaches the approval stage.
+    ///
+    /// None of these is a reduced form of another; each states what it relies on and what it does
+    /// not protect against (`docs/agent/safety`).
+    #[arg(long, value_name = "NAME", value_parser = parse_autonomy_posture)]
+    pub(super) posture: Option<flux_runtime::AutonomyPosture>,
 
     /// Show tool output in full (no truncation). Action batches and tool inputs are always shown in
     /// full; this also un-caps tool *output* (e.g. large file reads). Also enabled by `FLUX_VERBOSE`.
@@ -267,6 +284,85 @@ impl AgentFlags {
         }
         AgentFlagsOnly::parse_from(&args).agent
     }
+
+    /// The [`AutonomyPosture`](flux_runtime::AutonomyPosture) this invocation runs under — the
+    /// single value that decides its approver, its OS-sandbox floor and its resource budget (C-463).
+    ///
+    /// ⚠ **No flag day.** `--yes` is not a fourth setting sitting beside `--posture`; it is the
+    /// older spelling of `bounded-autonomy` and keeps meaning exactly what it always meant — never
+    /// prompt, and let authorization policy, the fail-closed sandbox floor (C-262 / C-410) and the
+    /// resource budgets constrain instead. Naming the posture is that same choice said out loud.
+    ///
+    /// A contradiction is refused rather than resolved. `--yes --posture supervised` is two
+    /// opposite instructions, and quietly picking a winner would leave the operator's command line
+    /// and the run's behaviour disagreeing about whether anyone is being asked.
+    pub(super) fn autonomy_posture(&self) -> anyhow::Result<flux_runtime::AutonomyPosture> {
+        use flux_runtime::{ApprovalStance, AutonomyPosture};
+        match (self.posture, self.yes) {
+            (Some(posture), true) if posture.approval() != ApprovalStance::None => {
+                anyhow::bail!(
+                    "`--yes` and `--posture {posture}` are opposite approval postures: `--yes` \
+                     never asks, while `{posture}` {}. Pick one — `--yes` on its own is \
+                     `--posture bounded-autonomy`",
+                    match posture.approval() {
+                        ApprovalStance::PerEffect => "asks a human before each guarded effect",
+                        _ => "refuses every effect that reaches the approval stage",
+                    }
+                )
+            }
+            (Some(posture), _) => Ok(posture),
+            (None, true) => Ok(AutonomyPosture::for_auto_approval()),
+            // The CLI's default really is a human at a terminal; a surface with no terminal
+            // (`app run --serve`) chooses its own and never reaches this.
+            (None, false) => Ok(AutonomyPosture::Supervised),
+        }
+    }
+
+    /// The posture for a CLI surface with **no terminal to prompt at** — `flux record`, and
+    /// `flux app run <program>`, whose channels (cron, webhook, Slack) fire with no operator
+    /// attached.
+    ///
+    /// Same resolution as [`autonomy_posture`](Self::autonomy_posture), except that `supervised` is
+    /// not on the menu because there is nobody to ask. Unstated resolves to `refusing` — which is
+    /// what these surfaces have always installed — and *explicitly* naming `supervised` is refused
+    /// rather than quietly downgraded, because a stated posture the surface silently replaces is
+    /// the accident the named postures exist to prevent.
+    pub(super) fn headless_posture(
+        &self,
+        surface: &str,
+    ) -> anyhow::Result<flux_runtime::AutonomyPosture> {
+        use flux_runtime::AutonomyPosture;
+        let posture = self.autonomy_posture()?;
+        if posture == AutonomyPosture::Supervised {
+            if self.posture.is_some() {
+                anyhow::bail!(
+                    "`--posture supervised` asks a human before each guarded effect, and {surface} \
+                     has no terminal to ask at. Choose `bounded-autonomy` (never prompt; \
+                     authorization policy, a fail-closed sandbox and resource budgets constrain \
+                     instead), `exploratory`, or `refusing`"
+                );
+            }
+            return Ok(AutonomyPosture::Refusing);
+        }
+        Ok(posture)
+    }
+
+    /// The **explicitly named** posture, if any — the only form that contributes a sandbox floor of
+    /// its own in `apply_sandbox_env`.
+    ///
+    /// `--yes` is deliberately not read here even though it maps onto `bounded-autonomy`. That
+    /// posture's floor is exactly what `unattended_sandbox_surface` already contributes for the
+    /// flag, and the exemptions that classifier carries (the TUI, where an operator is watching the
+    /// whole run) are decisions about *surfaces*, not about postures. Inferring a floor from the
+    /// older spelling would silently confine those surfaces — a flag day this story rules out.
+    pub(super) fn named_posture(&self) -> Option<flux_runtime::AutonomyPosture> {
+        self.posture
+    }
+}
+
+/// Parse a `--posture` value, listing the four names on a typo rather than guessing one.
+fn parse_autonomy_posture(value: &str) -> Result<flux_runtime::AutonomyPosture, String> {
+    value.parse().map_err(|e: flux_core::Error| e.to_string())
 }
 
 /// The flux subcommands. Each renders its own `flux <cmd> --help`. With no subcommand, `flux` opens
@@ -389,6 +485,10 @@ pub(super) enum Commands {
         #[arg(long)]
         watch: bool,
     },
+    /// Manage scoped planning/execution boards. JSON is the stable agent API.
+    Board(BoardCommand),
+    /// Coordinate durable local Flux sub-agents without implicitly publishing changes.
+    Fleet(FleetCommand),
     /// Run a multi-agent program with its event-trigger channels (cron / webhook / Slack).
     App {
         #[command(subcommand)]
@@ -423,8 +523,8 @@ pub(super) enum Commands {
     /// Run the strict-review protocol over `--files` and print a `ReviewReport` (flux L-13; design
     /// `docs/designs/strict-review-flows.md`). Self-contained: the reviewer roles and the
     /// `strict_review` flow are embedded immutably in the binary, so this works in any repo without
-    /// trusting project role definitions. Read-only: this never posts anywhere, it only prints to
-    /// stdout.
+    /// trusting project role definitions. Live progress is derived from the shared flow-run event
+    /// sink and written to stderr; the final report alone is written to stdout.
     Review {
         #[command(flatten)]
         flags: ReviewFlags,
@@ -435,6 +535,10 @@ pub(super) enum Commands {
         /// `ReviewReport`).
         #[arg(long, value_enum, default_value_t)]
         format: ReviewFormat,
+        /// Live stderr progress: `auto` selects a transient tree on a terminal and plain summaries
+        /// otherwise; `tree` and `plain` force those renderers; `off` stays silent until the report.
+        #[arg(long, value_enum, default_value_t)]
+        progress: ReviewProgress,
         /// Exit 1 if any finding's severity is at or above this threshold (`info`|`low`|`medium`|
         /// `high`|`critical`). Omit to always exit 0 regardless of findings.
         #[arg(long, value_enum)]
@@ -578,6 +682,16 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Install and operate the separately released local Exchange authority.
+    Exchange {
+        #[command(subcommand)]
+        action: ExchangeAction,
+    },
+    /// Create, grant and inspect labelled Exchange connections without receiving vendor secrets.
+    Integration {
+        #[command(subcommand)]
+        action: IntegrationAction,
+    },
     /// Work with the authorization policy — currently `simulate`, which replays a proposed policy
     /// against the recorded op history before you adopt it.
     Policy {
@@ -656,6 +770,143 @@ pub(super) enum Commands {
     System {
         #[command(subcommand)]
         action: SystemAction,
+    },
+}
+
+/// `flux exchange …` — host-owned entry points for the separately released Exchange process.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum ExchangeAction {
+    /// Operate the verified local Exchange installation and its owned process.
+    Local {
+        #[command(subcommand)]
+        action: ExchangeLocalAction,
+    },
+}
+
+/// `flux exchange local …` — the closed lifecycle grammar owned by C-510.
+///
+/// These arguments deliberately contain no executable, URL, token, credential, port or process-id
+/// override. The lifecycle implementation consumes only C-510's verified channel and authenticated
+/// supervisor boundary once that provider contract is available.
+#[derive(clap::Subcommand, Debug, PartialEq, Eq)]
+pub(super) enum ExchangeLocalAction {
+    /// Start the verified compatible local Exchange, or report its already-running state.
+    Start {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse any ceremony that would require an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// Report the verified install and owned-process state without changing it.
+    Status {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop only the local Exchange instance owned by Flux's authenticated supervisor.
+    Stop {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse any ceremony that would require an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+}
+
+/// One syntactically valid metadata-selector `KEY=VALUE` assignment.
+///
+/// Only Exchange may interpret this as a grant selector. Connection fields deliberately do not use
+/// this parser until the provider-owned plan can prove that an identity or alias is non-secret.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct SelectorAssignment {
+    pub(super) key: String,
+    pub(super) value: String,
+    valid: bool,
+}
+
+impl std::fmt::Debug for SelectorAssignment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SelectorAssignment")
+            .field("key", &self.key)
+            .field("value", &"[redacted]")
+            .finish()
+    }
+}
+
+impl std::str::FromStr for SelectorAssignment {
+    type Err = String;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        let (key, value, valid) = match input.split_once('=') {
+            Some((key, value)) if !key.is_empty() => (key, value, true),
+            _ => ("", input, false),
+        };
+        Ok(Self {
+            key: key.into(),
+            value: value.into(),
+            valid,
+        })
+    }
+}
+
+impl SelectorAssignment {
+    pub(super) fn is_valid(&self) -> bool {
+        self.valid
+    }
+}
+
+/// `flux integration …` — labelled connection management over Exchange's published contracts.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum IntegrationAction {
+    /// Connect one labelled connector from its provider-published connection plan.
+    Connect {
+        /// Connector identity understood by Exchange.
+        connector: String,
+        /// Tenant-scoped connection label (for example, `company` or `sandbox`).
+        #[arg(long)]
+        name: String,
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse if any required non-secret setting needs an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// Preview or apply a metadata-selector grant for one labelled connection.
+    Grant {
+        /// Connector identity understood by Exchange.
+        connector: String,
+        /// Tenant-scoped connection label.
+        #[arg(long)]
+        name: String,
+        /// Opaque metadata selector `KEY=VALUE` interpreted by Exchange (repeatable).
+        #[arg(long = "selector", value_name = "KEY=VALUE", required = true)]
+        selectors: Vec<SelectorAssignment>,
+        /// Apply the previewed grant. Without this flag the command is preview-only.
+        #[arg(long)]
+        apply: bool,
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+        /// Refuse if applying the grant would require an interactive prompt.
+        #[arg(long)]
+        no_prompt: bool,
+    },
+    /// List labelled connections and their effective-operation state.
+    List {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diagnose local process, bootstrap, authentication, connection and grant state.
+    Doctor {
+        /// Emit one stable JSON result and never prompt.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1324,6 +1575,20 @@ pub(super) enum ReviewFormat {
     Json,
 }
 
+/// `flux review --progress` rendering policy. Progress always uses stderr.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum ReviewProgress {
+    /// Tree on an interactive stderr, append-only summaries otherwise.
+    #[default]
+    Auto,
+    /// Force the transient tree renderer.
+    Tree,
+    /// Force append-only status summaries (no cursor controls).
+    Plain,
+    /// Disable live progress.
+    Off,
+}
+
 /// `flux review --fail-on` severity threshold, ordered low → high so `>=` comparisons are meaningful.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
 pub(super) enum ReviewSeverity {
@@ -1348,5 +1613,326 @@ impl ReviewSeverity {
             "high" => Self::High,
             _ => Self::Critical,
         }
+    }
+}
+
+#[cfg(test)]
+mod c509_cli_grammar_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn local_exchange_lifecycle_has_a_closed_json_capable_grammar() {
+        for (verb, expected) in [
+            (
+                "start",
+                ExchangeLocalAction::Start {
+                    json: true,
+                    no_prompt: false,
+                },
+            ),
+            ("status", ExchangeLocalAction::Status { json: true }),
+            (
+                "stop",
+                ExchangeLocalAction::Stop {
+                    json: true,
+                    no_prompt: false,
+                },
+            ),
+        ] {
+            let cli = Cli::try_parse_from(["flux", "exchange", "local", verb, "--json"])
+                .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
+            let Some(Commands::Exchange {
+                action: ExchangeAction::Local { action },
+            }) = cli.command
+            else {
+                panic!("expected exchange local {verb}");
+            };
+            assert_eq!(action, expected);
+        }
+
+        assert!(Cli::try_parse_from(["flux", "exchange", "local", "run"]).is_err());
+        assert!(Cli::try_parse_from([
+            "flux",
+            "exchange",
+            "local",
+            "start",
+            "--executable",
+            "/tmp/flux-exchange",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn integration_connect_withholds_fields_until_a_plan_can_classify_them() {
+        let cli = Cli::try_parse_from([
+            "flux",
+            "integration",
+            "connect",
+            "custom-connector",
+            "--name",
+            "company",
+            "--json",
+            "--no-prompt",
+        ])
+        .expect("generic labelled connection grammar must parse");
+
+        let Some(Commands::Integration {
+            action:
+                IntegrationAction::Connect {
+                    connector,
+                    name,
+                    json,
+                    no_prompt,
+                },
+        }) = cli.command
+        else {
+            panic!("expected integration connect");
+        };
+        assert_eq!(connector, "custom-connector");
+        assert_eq!(name, "company");
+        assert!(json);
+        assert!(no_prompt);
+
+        for credential_flag in ["--token", "--password", "--secret", "--credential"] {
+            assert!(
+                Cli::try_parse_from([
+                    "flux",
+                    "integration",
+                    "connect",
+                    "custom-connector",
+                    "--name",
+                    "company",
+                    credential_flag,
+                    "not-accepted",
+                ])
+                .is_err(),
+                "{credential_flag} must never enter Flux's CLI grammar"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "flux",
+            "integration",
+            "connect",
+            "custom-connector",
+            "--name",
+            "company",
+            "--endpoint",
+            "https://code.example.test",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "flux",
+            "integration",
+            "connect",
+            "custom-connector",
+            "--name",
+            "company",
+            "--field",
+            "origin=https://code.example.test",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn integration_management_grammar_is_metadata_selector_based() {
+        let grant = Cli::try_parse_from([
+            "flux",
+            "integration",
+            "grant",
+            "custom-connector",
+            "--name",
+            "company",
+            "--selector",
+            "custom-key=custom-value",
+            "--selector",
+            "another-key=another-value",
+            "--apply",
+            "--json",
+            "--no-prompt",
+        ])
+        .expect("metadata grant grammar must parse");
+        let Some(Commands::Integration {
+            action:
+                IntegrationAction::Grant {
+                    connector,
+                    name,
+                    selectors,
+                    apply,
+                    json,
+                    no_prompt,
+                },
+        }) = grant.command
+        else {
+            panic!("expected integration grant");
+        };
+        assert_eq!(connector, "custom-connector");
+        assert_eq!(name, "company");
+        assert_eq!(selectors.len(), 2);
+        let debug = format!("{selectors:?}");
+        assert!(!debug.contains("custom-value"));
+        assert!(!debug.contains("another-value"));
+        assert!(apply);
+        assert!(json);
+        assert!(no_prompt);
+
+        for verb in ["list", "doctor"] {
+            let cli = Cli::try_parse_from(["flux", "integration", verb, "--json"])
+                .unwrap_or_else(|error| panic!("{verb} must parse: {error}"));
+            assert!(matches!(cli.command, Some(Commands::Integration { .. })));
+        }
+
+        assert!(Cli::try_parse_from([
+            "flux",
+            "integration",
+            "grant",
+            "custom-connector",
+            "--name",
+            "company",
+            "--operation",
+            "tickets.delete",
+        ])
+        .is_err());
+    }
+}
+
+/// C-463 — the autonomy posture is one named choice on the CLI too, and `--yes` is a spelling of
+/// one of them rather than a fourth setting beside them.
+#[cfg(test)]
+mod c463_autonomy_posture_tests {
+    use super::*;
+    use clap::Parser;
+    use flux_runtime::{ApprovalStance, AutonomyPosture};
+    use flux_system::sandbox::SandboxMode;
+
+    fn flags(argv: &[&str]) -> AgentFlags {
+        let mut args = vec!["flux"];
+        args.extend_from_slice(argv);
+        AgentFlagsOnly::parse_from(&args).agent
+    }
+
+    /// ⚠ **No flag day.** `--yes` still works and still means what it meant; it is now the older
+    /// spelling of a posture whose name states the rest of what it always implied.
+    #[test]
+    fn yes_is_the_older_spelling_of_bounded_autonomy() {
+        let posture = flags(&["--yes"]).autonomy_posture().unwrap();
+        assert_eq!(posture, AutonomyPosture::BoundedAutonomy);
+        assert_eq!(
+            posture,
+            flags(&["--posture", "bounded-autonomy"])
+                .autonomy_posture()
+                .unwrap(),
+            "the two spellings must resolve to the same posture, or `--yes` has quietly become a \
+             fourth setting beside `--posture`"
+        );
+    }
+
+    /// The acceptance claim, at the surface an operator actually types: **one** value decides the
+    /// approver, the confinement floor and the budget. Nothing here can select the first without
+    /// also selecting the other two, which is the whole bug C-444 found from the SDK side.
+    #[test]
+    fn one_named_posture_selects_approver_confinement_and_budget_together() {
+        for (argv, expected) in [
+            (
+                &["--posture", "supervised"][..],
+                AutonomyPosture::Supervised,
+            ),
+            (&["--yes"][..], AutonomyPosture::BoundedAutonomy),
+            (
+                &["--posture", "exploratory"][..],
+                AutonomyPosture::Exploratory,
+            ),
+            (&["--posture", "refusing"][..], AutonomyPosture::Refusing),
+        ] {
+            let posture = flags(argv).autonomy_posture().unwrap();
+            assert_eq!(posture, expected, "{argv:?}");
+            if posture.approval() == ApprovalStance::None {
+                assert_eq!(
+                    posture.sandbox_floor().mode,
+                    SandboxMode::Require,
+                    "{argv:?}: chose not to prompt without choosing confinement"
+                );
+                assert!(
+                    !posture.budget().is_unbounded(),
+                    "{argv:?}: chose not to prompt without choosing a ceiling"
+                );
+            }
+        }
+    }
+
+    /// The CLI default is a human at a terminal — stated, rather than being whatever is left when
+    /// no flag is passed.
+    #[test]
+    fn the_default_posture_is_supervised() {
+        assert_eq!(
+            flags(&[]).autonomy_posture().unwrap(),
+            AutonomyPosture::Supervised
+        );
+    }
+
+    /// Two opposite instructions are refused, not silently resolved: a run whose command line and
+    /// whose behaviour disagree about whether anyone is being asked is the accident this prevents.
+    #[test]
+    fn contradictory_flags_are_refused_rather_than_resolved() {
+        for argv in [
+            &["--yes", "--posture", "supervised"][..],
+            &["--yes", "--posture", "refusing"][..],
+        ] {
+            let err = flags(argv)
+                .autonomy_posture()
+                .expect_err("{argv:?} must be refused")
+                .to_string();
+            assert!(
+                err.contains("opposite approval postures"),
+                "{argv:?}: {err}"
+            );
+        }
+        // Agreeing spellings are not a contradiction: both say "do not ask".
+        assert!(flags(&["--yes", "--posture", "exploratory"])
+            .autonomy_posture()
+            .is_ok());
+    }
+
+    /// A surface with no terminal cannot honour `supervised`. It refuses rather than downgrading —
+    /// a stated posture the surface silently replaces is exactly the class of accident the named
+    /// postures remove — and its unstated default stays `refusing`, which is what these surfaces
+    /// have always installed.
+    #[test]
+    fn a_headless_surface_refuses_supervised_and_defaults_to_refusing() {
+        assert_eq!(
+            flags(&[]).headless_posture("`flux record`").unwrap(),
+            AutonomyPosture::Refusing
+        );
+        assert_eq!(
+            flags(&["--yes"]).headless_posture("`flux record`").unwrap(),
+            AutonomyPosture::BoundedAutonomy
+        );
+        let err = flags(&["--posture", "supervised"])
+            .headless_posture("`flux record`")
+            .expect_err("an explicit supervised posture must be refused, not downgraded")
+            .to_string();
+        assert!(err.contains("no terminal to ask at"), "{err}");
+    }
+
+    /// Only an explicitly named posture contributes a sandbox floor of its own. `--yes` keeps
+    /// contributing exactly what it contributed before, through the surface classifier — otherwise
+    /// the surfaces that classifier deliberately exempts (the TUI, where an operator is watching
+    /// the whole run) would silently start being confined.
+    #[test]
+    fn only_an_explicit_posture_contributes_a_sandbox_floor() {
+        assert_eq!(flags(&["--yes"]).named_posture(), None);
+        assert_eq!(
+            flags(&["--posture", "exploratory"]).named_posture(),
+            Some(AutonomyPosture::Exploratory)
+        );
+    }
+
+    /// A typo is refused with the four names, never resolved to the nearest one.
+    #[test]
+    fn an_unknown_posture_name_is_refused_at_parse_time() {
+        let err = Cli::try_parse_from(["flux", "run", "--posture", "yolo", "hi"])
+            .expect_err("an unknown posture must not parse")
+            .to_string();
+        assert!(err.contains("bounded-autonomy"), "{err}");
     }
 }

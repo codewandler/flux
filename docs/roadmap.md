@@ -79,11 +79,37 @@ plugins. The semantic/embeddings path (`--features embeddings`) is validated man
 
 ## Next
 
-> The entries below are the epic log, newest first, each stamped with its status. Everything through
-> **v0.38.0** is released and `[Unreleased]` is empty. That cut carried the **adversarial review
-> remediation** and **Zendesk automation** epics below, plus the earlier tail (C-217, C-218, C-226,
-> C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252). See [CHANGELOG.md](../CHANGELOG.md) for
-> the itemized history.
+> The entries below are the epic log, newest first, each stamped with its status. For what is
+> released versus merged-but-untagged, read this file's status line (top) together with
+> [CHANGELOG.md](../CHANGELOG.md): versioned sections are tagged releases, and `[Unreleased]`
+> lists work merged since the latest cut. (Historical note: the v0.38.0 cut carried the
+> **adversarial review remediation** and **Zendesk automation** epics below, plus the earlier tail
+> C-217, C-218, C-226, C-233, C-234, C-240, C-246, C-247, C-251 partial, C-252.)
+
+### Flux-Lang authoring ergonomics — typed protocols, concise data and control (epic) — 🔄 **PROPOSED (L-131; L-132…L-140 filed, none started)**
+
+Substantial Flux programs can express typed multi-stage workflows today, but repeated JSON
+parse/assert boundaries, result objects, parallel task branches, counters, and terminal returns hide
+the protocol beneath its scaffolding. This provider-neutral, domain-neutral epic adds reusable data
+contracts and typed task results (L-132/L-133), bounded validation repair (L-134), pure local helpers
+and composable values (L-135/L-136), data-driven fan-out and collecting repeat loops (L-137/L-138),
+then structural task context and explicit optional/result values (L-139/L-140). It is additive to
+L-102's one canonical dialect, builds on L-113/L-116's hardening, and does not weaken the execution
+envelope. Every story carries a generic example; its syntax remains illustrative until that story's
+AST/lowering decision is accepted. Design:
+[flux-lang-authoring-ergonomics](designs/flux-lang-authoring-ergonomics.md).
+
+### Native boards — explicit scope, profile, backend and planning documents (epic) — 🔄 **IN PROGRESS (A-148; board wave ready)**
+
+Flux-roadmap Decision 0010 keeps Decision 0006's separation—mutable boards are not datasources—but
+supersedes its universal execution lifecycle. A BoardRegistry now owns stable BoardRefs; session,
+repository and workspace scopes compose independently with general, planning and execution profiles
+and their backends. Planning boards additionally own vision, roadmap, decision and design documents
+outside the queue. The delivered eleven WorkBoard ops remain the execution profile. C-547 establishes
+the versioned human/JSON agent CLI, A-134 the registry and SDK seam, L-130 the declaration, C-548 the
+session store, C-549 Track-compatible repository planning and C-550 federated cross-repository
+scheduling. `flux board skill` renders the concise installed guide. Design:
+[native-board-fleet-cli](designs/native-board-fleet-cli.md).
 
 ### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
 
@@ -157,16 +183,22 @@ Design: [execution-substrate.md](designs/execution-substrate.md).
 
 The old distinction between generated connectors and native technology plugins is retired. Docker,
 Kubernetes, SQL, observability, secret stores, collaboration tools, and the remaining official
-adapters become connector declarations whose runtime is explicit. Flux supplies a local generic
-runtime host and an Exchange binding; the same address and policy metadata must behave identically in
-both placements. Native integration crates remain until parity and cutover evidence exist.
+adapters become connector declarations whose runtime is explicit. Exchange is the only official
+integration executor. Flux will embed one native Service Account client for that API, with no local
+connector runtime and no plugin fallback. Until the migration reaches each adapter, the signed
+plugin pack remains temporary compatibility behavior rather than the destination architecture.
 
-**C-501** aligns Flux's public contract; **C-502** binds connector runtime artifacts locally;
-**C-503** mounts Exchange as a remote binding; **C-504** proves local/hosted conformance; **C-505**
-retires the eighteen measured integration crates; and **C-506** moves or retires only the remaining
-generic plugin support infrastructure. This program reuses C-394/C-397/C-399/C-435, the pending C-453
-remote-approval worktree, and the C-481…C-488 generated-channel worktree instead of filing them again.
-Design: [ecosystem.md](designs/ecosystem.md).
+The cross-repository source of truth is
+[`flux-roadmap`](https://github.com/codewandler/flux-roadmap), whose accepted Decision 0001 owns the
+dependency order and milestone boundaries. **C-500** is the umbrella epic. **C-501** aligns the
+public contract; **C-502** closes the rejected local runtime-host proposal without implementation;
+**C-503** embeds the effective-catalogue and one-shot HTTP client. Streams, cancellation,
+subscriptions and leases follow in the later lifecycle milestone. **C-504** freezes and runs
+legacy-plugin-versus-Exchange evidence per adapter; **C-505** deletes each adapter after its proof;
+and **C-506** unconditionally removes the plugin host, protocol, installer, signed pack and Flux
+release-artifact pipeline. The client, migrations and zero-plugin release remain planned, not
+shipped. Flux remains useful without Exchange for core capabilities; official external integrations
+are unavailable when Exchange is unavailable. Design: [ecosystem.md](designs/ecosystem.md).
 
 ### The secret the agent never sees — our redaction against their substitution (epic) — 🔄 **PROPOSED (C-458…C-461 filed, none started)**
 
@@ -332,24 +364,13 @@ DTMF; TLS/WSS; SRTP with SDES). And flux was built partway toward it: `flux-audi
 target — *"telephony's 8 kHz, WebRTC's 48 kHz… versus whatever a model speaks natively"* — with PCM16
 both endiannesses, a phase-carrying `Resampler` and a `Framer`. G.711 is 8 kHz.
 
-**One channel, two localities, neither required.** A call is terminated either by a **local sipx
-process** flux drives ([D-230](stories/D-230-the-native-sip-backend.md)) or by a hosted
-**[flux-exchange](designs/ecosystem.md)** ([D-231](stories/D-231-the-remote-sip-backend.md)) — the
-`kubectl` shape: one vocabulary, whether the thing serving it is across a socket on your laptop or
-across the network behind a cert. flux links nothing either way.
-[D-225](stories/D-225-one-sip-channel-two-localities.md) owns the locality-independent vocabulary and,
-crucially, makes **parity testable rather than aspirational** — two backends drift, and the one that
-drifts silently is the one nobody demos.
-
-⚠ **Neither locality may become mandatory, and both directions are already doctrine.** `ecosystem.md`:
-*"**flux must never require flux-exchange.** … Trading plugin-binary distribution pain for service
-lock-in would be a bad trade made twice."* And C-399's ownership decision: *"flux owns it,
-flux-exchange reuses it. **flux must be able to do this locally as dev without depending on a service —
-that is the local-first principle, not a convenience.**"* By the ecosystem's mechanical test the
-exchange owns the hosted case — it *"terminates channels"* and owns whatever *"requires holding a
-credential or knowing a tenant"*, and a SIP trunk is both — while flux's side stays a **kind** ("a voice
-call channel"), never a named provider. Rooms already prove the pattern in-repo: one `room` channel with
-`mock`, `xmpp` and `jaas` side by side.
+⚠ **Placement superseded by C-508 and flux-roadmap Decision 0001.** A future official SIP integration
+must execute through Exchange, whether Exchange itself runs on the operator's machine or in an
+isolated hosted deployment. Flux may consume generic voice-call events, but it does not drive a local
+sipx connector runtime or fall back when Exchange is unavailable. D-225's two-locality parity
+contract and D-230's native backend therefore require amendment or supersession before implementation;
+D-231 is the surviving placement direction. The protocol and media reasoning below remains useful,
+but its old local-host conclusion is not an active contract.
 
 ⚠ **Natively, sipx takes its IO from flux** — and this corrects the epic's first draft, which made it a
 sidecar on the D-205 precedent. That was wrong twice. D-205's reason was that `tokio-xmpp` *"opens its
@@ -632,13 +653,13 @@ Defects are tractable and clustered: 17 of 85 non-epic open stories describe som
 grouped in webhook delivery, the Flux-Lang grammar and its editor mirrors, and the redaction path —
 where two stories fail *open*.
 
-**"Done" is not a bug count.** The architecture is settled ([C-337](../designs/architectural-simplification.md)
+**"Done" is not a bug count.** The architecture is settled ([C-337](designs/architectural-simplification.md)
 says "preserve, do not redesign"), but the published API surface is not: C-337 records a scheduled
 breaking window for `AgentSpec`, compatibility doors slated for deletion, and 37 crates with no
 ownership audit — while carrying zero implementation stories. Benchmarking against an API with a
 deliberate break still queued makes regressions indistinguishable from intended churn. So this epic
 closes when the defect clusters close, C-337 is decomposed and its window scheduled, **and**
-[C-255](../designs/adversarial-review-remediation-2026-07-30.md)'s final bullet is ticked — three
+[C-255](designs/adversarial-review-remediation-2026-07-30.md)'s final bullet is ticked — three
 fresh independent reviews finding no reproducible High-severity containment defect. That bullet is the
 repo's own definition of stable, and its first closure pass found twelve defects after every child was
 marked done.
@@ -815,44 +836,43 @@ write boundary in [zendesk-triage.md](zendesk-triage.md), is the contract the re
 the `zendesk.*` operation names are the only part expected to move.
 Design: [zendesk-automation.md](designs/zendesk-automation.md).
 
-### The fleet runs the track / impl-coord loop (epic) — 🔄 **IN PROGRESS (C-239; F1 C-236 + F3 C-238 in flight, C-240…C-246 filed)**
+### Native fleet — board wave to reviewed local integration (epic) — 🔄 **IN PROGRESS (C-239; fleet wave ready after board foundation)**
 
-0.36.0 shipped a fleet *coordinator* — a Program declares a board and hands items to remote agents
-over A2A with `runner`/`task_id` written back — but not the loop the `track` plugin actually runs:
-select a wave of independent items, give each an isolated worker that implements and gates and commits
-on a scratch branch, review the returned diff **as evidence**, two rework rounds to the *same* worker,
-park after that, integrate serially with a full gate after **every** merge and revert on red, then
-write the ledger. The load-bearing decision is where that contract lives: **the model reasons, the
-host enforces.** A `WaveCoordinator` owns the irreversible, order-sensitive actions — isolation, gate,
-merge, revert, ledger — and the model owns only wave selection and diff review. The point is not
-tidiness: it means fenced ledger, gate-after-every-merge, never-implement, revert-on-red and
-park-after-two hold *even when the model is wrong or lazy*, because they are host behaviour rather
-than instructions a prompt can lose. `fleet.integrate` is the sharpest instance — it gates and merges
-or does neither, so the most-violated rule in the loop becomes unskippable; and gating per merge is
-what attributes the failure of two stories that each compile alone but not together, which is exactly
-the case that produces no git conflict. Coordination *prose* deliberately stays out of flux: the
-wave-selection and review heuristics are content, and they live in a reference `coordinator.flux` and
-its guidance. Sequenced so the data path lands before anything reasons over it — **F1** makes the
-board readable (`board.query` with a real `output_schema`; today `render_compact` drops `runner`,
-`task_id`, `depends_on`, `repo` and `evidence`, so `each`/`match` has nothing typed to iterate, and
-C-235's JSON-quoted strings break even scraping the prose), **F2** makes it correct (a `Failed→Ready`
-retry currently keeps a dead `runner`/`task_id` and the next sweep chases a corpse), then F3–F5 make
-integration possible, F6–F8 make the worker real, F9 is the product and F10 makes a running fleet
-visible. **A code-read moved the scope boundary before any code landed**, and it is the most useful
-thing the design records: per-worker filesystem isolation does not exist for remote workers and is
-*designed out* (`git_worktree_enter` is caller-local by construction), and a worker cannot return a
-branch or a diff at all — `SpawnOutcome` has no artifact field and `flux-server` never populates
-`Task.artifacts` — so "review the diff as evidence" has no channel to a remote worker, and a branch
-*name* from another filesystem is useless anyway. **The full implementation loop is therefore a
-local-worker loop for now**, which is sound because local children get real isolation via C-100; the
-distributed half (Docker isolation, artifact return over A2A, discovery, worker auth) is the
-`agent-fleet-runtime` epic and is explicitly later. Two corrections went the other way: A2A session
-continuity on `contextId` **is** implemented, so F8's rework genuinely resumes the same worker; and
-`ProcessRuntime` is not an optimization but a **prerequisite for any wave larger than one**, because
-`FlowEngine`'s `turn_gate` means one worker serves one concurrent turn. Done looks like F9's offline
-end-to-end journey — a stub A2A worker, a `MemoryBoard`, two items, one integrating and one parking,
-no network and no real model — with every loop invariant pinned by a test instead of asserted in
-prose. Design: [designs/fleet-loop.md](designs/fleet-loop.md).
+Decision 0010 turns the delivered fleet primitives into a supported `flux fleet` product over local
+native sub-agents. The host enforces one writer/worktree per story, typed write-set fences,
+failing-first and targeted evidence, fresh review, two same-session reworks, dependency-ordered
+integration and one final full repository gate. Red preserves the exact candidate. Green leaves a
+local `fleet/<wave>` branch; only explicit `fleet apply` revalidates and merges it, and nothing
+pushes automatically. C-244 supplies the typed local handoff, C-245 rework, C-242 integration/apply,
+A-117 the durable supervisor and complete CLI, and C-551 bounded inspection, board statistics,
+reports and roadmap scriptless parity. Claude and Codex call the same versioned JSON CLI and can
+bootstrap from `flux fleet skill`; direct foreign-process and remote code workers remain later.
+Design: [native-board-fleet-cli](designs/native-board-fleet-cli.md).
+
+### Task-agent backends and CLI harness adapters (epic) — ⏸ **BACKLOG (C-552, C-553; after native fleet V1)**
+
+Fleet membership does not imply one execution transport. C-552 introduces a generic lifecycle and
+receipt port that keeps identity/admission/BoardRef/mode/fences separate from how a task runs. C-553
+then binds installed Codex, Claude, Hermes and Pi CLIs through argv-only local adapters with durable
+session and acknowledgement mapping. Native Flux sub-agents remain the V1 baseline; the adapters do
+not become alternate coordinators and cannot bypass handoff or publication fences. Design:
+[task-agent-backends](designs/task-agent-backends.md).
+
+### Authenticated remote fleet membership and A2A workers (epic) — ⏸ **BACKLOG (C-554, C-555; after C-552)**
+
+Remote discovery is not membership. C-554 adds main-coordinator invitations, authenticated
+hello/capability exchange, explicit admission and expiring leases. C-555 implements the generic task
+backend over A2A and verifies remote artifacts inside a local isolation boundary before integration.
+Network identity alone never grants a BoardRef or worker authority. Design:
+[remote-fleet-membership](designs/remote-fleet-membership.md).
+
+### Board and fleet operations TUI (epic) — ⏸ **BACKLOG (C-556, C-557; after native fleet V1)**
+
+The CLI stays the automation API, while the human UI centers the one main coordinator conversation.
+C-556 builds the responsive conversational shell and attention rail. C-557 adds read-only worker
+channel/activity peeks plus native board, decision, dependency and exact-statistics views. The TUI
+projects typed durable state and must be materially more useful than embedding compact CLI output.
+Design: [board-fleet-tui](designs/board-fleet-tui.md).
 
 ### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
 
@@ -979,35 +999,14 @@ as a divergence rather than papering over. Done looks like a coordinator discove
 starting it, dispatching to it, watching it through `Ready → Busy → Exited`, and reclaiming its work
 — offline, in CI. Design: [designs/agent-fleet-runtime.md](designs/agent-fleet-runtime.md).
 
-### Fleet coordinator — flux orchestrating flux across repos (epic) — 🔄 **DESIGNED (A-111; A-112…A-118 filed, none started)**
+### Remote fleet coordinator transports (epic) — ⏸ **BACKLOG (A-111; after native fleet dogfood)**
 
-The ask was a first-level orchestration harness: cross-repo work, Jira, a global board, remote
-agents dispatched and monitored, status reported back — and the assumption was that it needed a
-second app beside the coding agent. Reading the tree said otherwise. **`flux-app` is already that
-harness**: it runs a `.flux` Program of agents/channels/datasources/triggers/journeys over a bus and
-a delivery supervisor, `flux-channels` already supplies cron/webhook/slack/a2a adapters, and
-`plugins/jira` already has issue CRUD, transitions and search. The coordinator is a *Program*, not a
-binary. What is actually missing is narrower and more interesting. The state source flux would want
-already exists in shape — `LiveDatasource` (`datasource/live.rs:60`) has a backend declare its
-entities, filters and external authority, validates it once, and then *generates* uniform ops with
-stable permission subjects, a tool group and an ambient signal — but it is **read-only**, and a board
-needs create/transition/claim/comment. So the centre of this epic is **A-113**, a write-capable
-`WorkBoard` sibling carrying a typed state machine (`Ready → Claimed → InProgress → Review → Done`,
-plus `Blocked`/`Failed`) whose `transition` rejects an illegal edge *without writing* — purpose-built
-rather than generic precisely so the coordinator can reason over dependency waves and stuck items
-instead of shuffling opaque rows, with markdown, Jira, in-memory and GitLab backends behind one
-contract suite. Two findings sharpened the rest. The A2A **server** task surface is already complete
-(A-53…A-57, `flux-server/src/a2a.rs`); the gap is the **client** — `A2aClient` has no `cancel` and
-its only caller is the `flux a2a` REPL, so no journey can dispatch anywhere (**A-116**). And run
-state dissolves entirely: `fleet.dispatch` writes the `task_id` back onto the board item, so the
-board *is* the run registry and crash recovery is "restart, sweep, re-derive". The load-bearing
-blocker is none of that: `flux-channels` documents that deliveries are serialized by the shared
-`App` and that "cross-channel parallelism needs per-delivery bus isolation" (`lib.rs:20`), so a
-coordinator whose nightly sweep blocks webhook intake is single-threaded by construction — **A-112**
-lands first, and it is likely a MINOR. Done looks like `flux run coordinator.flux --serve` driving an
-intake → dispatch → sweep → done cycle offline in CI against `MemoryBoard` and a stub worker. Design:
-[designs/fleet-coordinator.md](designs/fleet-coordinator.md).
-
+The original coordinator design delivered useful foundations—WorkBoard, generated board operations,
+outbound A2A control and concurrent app delivery—but its conclusion that the product is only a
+`coordinator.flux` reference Program over remote workers is superseded by Decision 0010. C-239 and
+A-117 now own the native local supervisor and CLI. A-111 retains only the later remote transport,
+isolation, discovery and authentication extension after the local handoff contract is proven.
+Design record: [fleet-coordinator](designs/fleet-coordinator.md).
 ### Website truth and identity — the public site tells the truth and looks like the product (epic) — 🔄 **DESIGNED (C-196; C-197…C-204 filed, none started)**
 
 A 2026-07-29 audit of all 64 pages under `website/docs/` against the tree at `0.33.1` found the
@@ -2209,9 +2208,9 @@ Drift made visible, so it stops being silent. Each maps to a story on the
 
 ## Direction
 
-The through-line is **the LLM is not the runtime**: the model is a compiler front-end that emits a
-Flux-Lang plan, and the deterministic engine runs it — **non-bypassable safety** is the hard
-invariant that buys. Priority is **personal coding agent → reusable SDK → multi-user platform**. See
+The through-line is **the LLM is not the runtime**: the model supplies bounded judgment inside an
+authored adaptive loop, and the deterministic engine owns control flow and every effect —
+**non-bypassable safety** is the hard invariant that buys. Priority is **personal coding agent → reusable SDK → multi-user platform**. See
 [vision.md](vision.md). The annotated original design & planning document (with full
 milestone-by-milestone detail) is retained outside the repo by the author; this roadmap is the
 in-repo canonical summary.

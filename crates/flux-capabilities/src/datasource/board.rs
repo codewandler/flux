@@ -11,7 +11,7 @@
 //! else:
 //!
 //! * **Permission subjects stay concrete.** `board.transition` on `PROJ-42` reports
-//!   `board/item/PROJ-42`, never `board/item/*` and never nothing, so a grant scoped to one item
+//!   `board:board/item/PROJ-42`, never `board:board/item/*` and never nothing, so a grant scoped to one item
 //!   cannot silently move another. AGENTS.md:98 is explicit that an unscoped `Write` either gets
 //!   forced to approval or matches a broad `*` grant; [`UNRESOLVED_ID`] is why even a malformed
 //!   call reports something concrete. `board.create` has no id yet and reports
@@ -380,15 +380,15 @@ fn item_subject(domain: &str, id: &str) -> String {
         "" => UNRESOLVED_ID,
         id => id,
     };
-    format!("{domain}/{ENTITY}/{id}")
+    format!("board:{domain}/{ENTITY}/{id}")
 }
 
 impl BoardProjection {
     /// The subject one invocation touches. Never `*`, never empty — see [`UNRESOLVED_ID`].
     fn subject(&self, kind: OpKind, params: &Value) -> String {
         match kind {
-            OpKind::List | OpKind::Query => format!("{}/{ENTITY}", self.domain),
-            OpKind::Create => format!("{}/{ENTITY}/{NEW_ID}", self.domain),
+            OpKind::List | OpKind::Query => format!("board:{}/{ENTITY}", self.domain),
+            OpKind::Create => format!("board:{}/{ENTITY}/{NEW_ID}", self.domain),
             _ => item_subject(
                 &self.domain,
                 params.get("id").and_then(Value::as_str).unwrap_or_default(),
@@ -399,9 +399,9 @@ impl BoardProjection {
     fn requirements(&self, kind: OpKind, params: &Value) -> Vec<AuthorityRequirement> {
         let subject = self.subject(kind, params);
         let mut requirements = vec![if kind.writes() {
-            AuthorityRequirement::datasource_write(subject)
+            AuthorityRequirement::board_write(subject)
         } else {
-            AuthorityRequirement::datasource_read(subject)
+            AuthorityRequirement::board_read(subject)
         }];
         requirements.extend(self.access.iter().map(|access| match access {
             LiveAccess::Network { subject } => AuthorityRequirement::network_fetch(subject),
@@ -1459,12 +1459,12 @@ mod tests {
                 // `id: "*"` is a legal *literal* id, so the subject may contain it — but it must be
                 // scoped under the domain and entity, never be a bare wildcard the matcher widens.
                 assert!(
-                    subject.starts_with("board/item/"),
+                    subject.starts_with("board:board/item/"),
                     "{kind:?} {params} -> {subject}"
                 );
                 assert_eq!(
                     projection.requirements(kind, params)[0],
-                    AuthorityRequirement::datasource_write(&subject),
+                    AuthorityRequirement::board_write(&subject),
                     "{kind:?} {params}"
                 );
             }

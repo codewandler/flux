@@ -2,7 +2,7 @@
 id: D-237
 title: "The sidecar's default fetches lib-jitsi-meet from the network and `eval`s it with no integrity check"
 pillar: Agent
-status: ready
+status: blocked
 priority: 2
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -61,3 +61,32 @@ is `#[ignore]`d and unshipped. This must be settled **before** a real join ships
 - Surfaced by D-232's review, 2026-08-02. Pre-existing from D-208's sidecar asset rather than introduced
   by D-232.
 - Related: [D-232](D-232-the-media-sidecar-harness.md), [D-208](D-208-room-media-sidecar.md).
+
+## Progress
+
+- 2026-08-05 — dispatched in wave `flux-wave-20260805-0829` as `ready`; raised to `blocked` without
+  an implementation, because the acceptance surface is not on `main`.
+
+  Every clause of this contract is about `crates/flux-channels/assets/room-media/sidecar.js` — the
+  `:63` network default, the `(0, eval)` at `:216-223`, the refusal test, the version pin. That file
+  has never existed on `main` and is absent from the wave's source commit `dc07e60e`; it exists only
+  on the unmerged `impl/D-232`. There is no sidecar to make refuse anything.
+
+  **Ground truth for whoever records the decision.** `impl/D-232`'s tip (`6d1053b1`) has already
+  chosen, and the reasoning is worth preserving: a **local, version-and-integrity-pinned bundle
+  only**, because fetching from inside the spawned Node process would bypass flux-system's guarded
+  egress and DNS pinning *even if the bytes were hash-checked*. That is exactly the sandbox
+  interaction this story's Notes said to check rather than assume, and it argues against
+  fetch-with-SRI on grounds the contract did not anticipate. Pins used there: 8x8 release `6869`,
+  SHA-256 `09f03ed9d03f4c7dc4691d9e8781f9872ca89660c07a59dad5c292c83f89a0e1`. That commit is honest
+  that the state is interim — the bytes are operator-supplied rather than repository-vendored, so
+  neither accepted end state is fully reached.
+
+  No decision was recorded on the wave branch on purpose: recording it in the design doc while the
+  enforcing code lives on another branch is precisely the "documented elsewhere is not a defence"
+  failure this family of stories exists to attack, and it would conflict with `impl/D-232`'s own
+  design-doc edit.
+
+  **The D-237-before-D-236 ordering mandate is satisfied vacuously**: neither landed, so no page
+  context ever held unverified library bytes together with a live credential. Blocked behind D-232,
+  which is blocked on a human confirming audible tone in a live room.

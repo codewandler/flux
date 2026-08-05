@@ -2,7 +2,7 @@
 id: D-236
 title: "The sidecar reads its room token from an env var flux clears, so it can never authenticate"
 pillar: Agent
-status: ready
+status: blocked
 priority: 3
 epic: meeting-rooms
 design: docs/designs/meeting-rooms.md
@@ -76,3 +76,29 @@ argv path is not merely available, it is the path the code was already hardened 
 - Related: [D-235](D-235-argv-alone-does-not-reach-the-audio-server.md) is the same shape for the audio
   server (argv necessary but not sufficient). Both come from the same "host facts ride in argv" premise
   meeting reality.
+
+## Progress
+
+- 2026-08-05 — dispatched in wave `flux-wave-20260805-0829` as `ready`; raised to `blocked` without
+  an implementation, because the acceptance surface is not on `main`.
+
+  `crates/flux-channels/assets/room-media/sidecar.js` has never existed on `main` and is absent from
+  the wave's source commit `dc07e60e`. Verified four ways: `git ls-tree -r` finds no `.js` under
+  `flux-channels` on `main` or on the wave branch; `git log --all -- crates/flux-channels/assets`
+  returns exactly two commits, both on the unmerged `impl/D-232`; and `FLUX_ROOM_TOKEN` occurs in the
+  tree only in this story's own text and the generated board. There is no `process.env` read to
+  remove, no join options to thread a token into, and no `:415` error line to harden.
+
+  ⚠ **This corrects a factual claim in this story's own Notes.** "Verified 2026-08-02 that the line
+  is on `main`" is wrong: the line is on `impl/D-232`, whose merge-base with `main` is `25fc674a`.
+  The finding itself is real — it is simply not yet reachable from `main`.
+
+  The Rust half of the seam needs no change: argv is already opaque to flux and
+  `MediaSidecarConfig`'s hand-written `Debug` already redacts, so `sidecar ["…", "--token",
+  secret "X"]` works today. The missing half is entirely the consumer.
+
+  **Real dependency: D-232**, which is itself `blocked` on a human confirming an audible tone in an
+  operator-owned live room. `impl/D-232`'s tip (`6d1053b1`) already implements most of this story —
+  an argv `--token` flag with redaction. Writing a second implementation on `main` would have
+  produced a divergent duplicate guaranteed to conflict when that branch lands. The decision owed is
+  whether to land `impl/D-232`, not whether to rewrite it.
