@@ -260,6 +260,14 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **The native board-and-fleet release gate now distinguishes fixture literals from executable
+  build entry points** (C-558). The build-ownership scanner ignores standalone Ruby string
+  predicates and literal-to-literal workflow mutations while still rejecting a real bare
+  `dist build`, including an immediately executed generated command. The independently versioned
+  board contracts move `codewandler-flux-datasource` 1.3.0 → 1.4.0 (additive public API), while the
+  new variant on the closed policy resource enum moves `codewandler-flux-policy` 1.0.0 → 2.0.0;
+  root and plugin dependency floors and both lockfiles now resolve those exact identities.
+
 - **Provider-declared quota exhaustion no longer enters transient retry backoff** (C-545). Codex,
   OpenAI, Anthropic, OpenRouter, and Bedrock can classify explicit usage-limit or credit-exhaustion
   responses as terminal, preserving the provider's reset or limit message for the caller. Bare and

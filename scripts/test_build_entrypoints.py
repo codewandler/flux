@@ -28,6 +28,16 @@ CHECKED_FRONTENDS = (
     re.compile(r"(?<![\w-])(?:command\s+)?cargo-nextest\s+(?:run|archive)\b"),
     re.compile(r"(?<![\w-])(?:command\s+)?cargo(?:\.exe)?\s+(?:nextest|llvm-cov|fuzz|zigbuild)\b"),
 )
+RUBY_STRING_LITERAL = r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+RUBY_REGEX_LITERAL = r"/(?:\\.|[^/\\])*/[a-z]*"
+RUBY_ASSIGNMENT_TARGET = rf"[A-Za-z_]\w*(?:\[\s*{RUBY_STRING_LITERAL}\s*\])?"
+RUBY_NON_EXECUTABLE_LITERAL_LINE = re.compile(
+    rf"^\s*(?:(?:(?:next|return|break)\s+)?(?:if|unless)\s+"
+    rf"[A-Za-z_]\w*\.include\?\(\s*{RUBY_STRING_LITERAL}\s*\)"
+    rf"|{RUBY_ASSIGNMENT_TARGET}\s*=\s*[A-Za-z_]\w*\.sub\(\s*"
+    rf"(?:{RUBY_REGEX_LITERAL}|{RUBY_STRING_LITERAL})\s*,\s*"
+    rf"{RUBY_STRING_LITERAL}\s*\))\s*(?:#.*)?$"
+)
 OWNED_SPELLINGS = (
     "owned_cargo",
     "owned-cargo",
@@ -79,8 +89,19 @@ def entrypoint_files(root: Path) -> list[Path]:
     return sorted(selected)
 
 
+def mask_non_executable_literals(line: str) -> str:
+    """Hide standalone Ruby predicate/mutation fixture lines, but never execution sinks."""
+
+    if RUBY_NON_EXECUTABLE_LITERAL_LINE.fullmatch(line):
+        return " " * len(line)
+    return line
+
+
 def target_match(line: str) -> re.Match[str] | None:
-    matches = [pattern.search(line) for pattern in (CARGO_SHELL, CARGO_ARGV, *CHECKED_FRONTENDS)]
+    searchable = mask_non_executable_literals(line)
+    matches = [
+        pattern.search(searchable) for pattern in (CARGO_SHELL, CARGO_ARGV, *CHECKED_FRONTENDS)
+    ]
     return min((match for match in matches if match), key=lambda match: match.start(), default=None)
 
 
@@ -141,16 +162,27 @@ def self_test() -> None:
         root = Path(raw)
         fixtures = {
             "Taskfile.yaml": "tasks:\n  bad:\n    cmds:\n      - $CARGO run -p flux-cli\n",
-            ".github/workflows/build.yml": "jobs:\n  bad:\n    steps:\n      - run: dist build --artifacts=global\n",
+            ".github/workflows/bare-cargo-dist-build.yml": (
+                "jobs:\n  bad:\n    steps:\n      - run: dist build --artifacts=global\n"
+            ),
             ".github/actions/nested/action.yml": "runs:\n  steps:\n    - run: command cargo +nightly clippy\n",
             "scripts/release/deep-build.ps1": "& $env:CARGO test --workspace\n",
             "bench/windows/build.cmd": "%CARGO% build --release\n",
             "bench/windows/direct.cmd": "cargo.exe test --workspace\n",
             "scripts/cross-build.sh": "cross build --release\n",
             "scripts/nextest.sh": "cargo nextest run --workspace\n",
+            "scripts/ruby-generated-command.sh": (
+                'system(run.sub(/owned wrapper/, "dist build"))\n'
+            ),
             "crates/fixture/nested-build.py": 'subprocess.run(["cargo", "check"])\n',
         }
-        for relative, content in fixtures.items():
+        safe_fixtures = {
+            "scripts/release-integrity-fixture.sh": (
+                'next unless run.include?("-- dist build")\n'
+                'step["run"] = run.sub(/build_ownership\\.py shared -- dist build/, "dist build")\n'
+            ),
+        }
+        for relative, content in {**fixtures, **safe_fixtures}.items():
             path = root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
@@ -158,6 +190,15 @@ def self_test() -> None:
         missing = [relative for relative in fixtures if not any(row.startswith(relative + ":") for row in failures)]
         if missing:
             raise AssertionError(f"entry-point self-test missed alternate/nested bypasses: {missing}")
+        false_positives = [
+            relative
+            for relative in safe_fixtures
+            if any(row.startswith(relative + ":") for row in failures)
+        ]
+        if false_positives:
+            raise AssertionError(
+                f"entry-point self-test treated fixture literals as commands: {false_positives}"
+            )
 
 
 def main() -> int:
