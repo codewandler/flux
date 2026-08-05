@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`flux review` now shows live progress while its built-in review flow runs** (C-530). The CLI can
+  render an interactive reviewer tree, append-only summaries, or no progress via
+  `--progress auto|tree|plain|off`; progress stays on stderr so Markdown and JSON reports remain clean
+  on stdout. The SDK's shared sink-backed flow runner forwards both direct operation events and
+  correlated child-agent activity without bypassing the normal execution envelope.
+
 - **`flow_run` can execute Flux-Lang supplied directly in its request.** The new mutually exclusive
   `inline_program` address is parsed and revalidated against the live operation catalog, then runs
   through the same session, approval, guarded-IO, input-seeding, and reentry boundaries as stored

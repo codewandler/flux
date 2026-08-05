@@ -763,8 +763,9 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 flags,
                 files,
                 format,
+                progress,
                 fail_on,
-            }) => run_review(&flags, files, format, fail_on).await,
+            }) => run_review(&flags, files, format, progress, fail_on).await,
             Some(Commands::Loop { action }) => run_loop_cmd(action).await,
             Some(Commands::Sessions {
                 prune,

@@ -17,6 +17,11 @@
 
 ### New
 
+- **`flux review` now shows what it is doing while reviewers work.** By default it displays a live
+  reviewer tree in a terminal and readable progress lines when redirected. Use
+  `--progress tree|plain|off` to choose the display explicitly. Progress goes to stderr, so the final
+  Markdown or JSON report on stdout stays clean for scripts.
+
 - **Agents can now run a Flux program supplied directly in a `flow_run` call.** Use
   `inline_program` when a program does not need to be saved first; it supports the same input bindings
   and execution safeguards as named and file-based flows.

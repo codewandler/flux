@@ -33,6 +33,7 @@ mod plugin_cmd;
 mod policy_cmd;
 mod rendering;
 mod review;
+mod review_progress;
 mod session;
 mod splash;
 mod stream_json;

@@ -1,4 +1,5 @@
 use super::*;
+use crate::review_progress::ReviewProgressSink;
 
 /// Name the supported harness benchmark once per `flux eval` invocation (C-296).
 ///
@@ -162,20 +163,15 @@ fn review_flow_client(
         .context("build flow client")
 }
 
-/// `flux review --files <path>… [--format md|json] [--fail-on <severity>]` — run the strict-review
-/// protocol (flux L-13; `docs/designs/strict-review-flows.md` "Phase 4") over `files` and print the
-/// resulting `ReviewReport`. Runs the SAME embedded `strict_review` flow text
-/// (`flux_app::review::STRICT_REVIEW_FLOW_SRC` — the checked-in `examples/strict_review.flux`, the
-/// identical source the `review_code` app journey wraps as a composite op) through
-/// `flux_sdk::FlowClient::run_flow` — the deterministic `parse` → `analyze` → `execute_with` path, no
-/// model round-trip for the flow itself (only the reviewer sub-agents call a model). Self-contained:
-/// The immutable reviewer roles and flow text ship in the binary, so this works in any repo without
-/// trusting that repo's `.flux/agents/review-*.md`. Read-only: `strict_review`'s reviewer roles all
-/// declare `tools: []`, and this command never writes anywhere but stdout.
+/// `flux review --files <path>… [--format md|json] [--progress auto|tree|plain|off]
+/// [--fail-on <severity>]` — run the immutable strict-review built-in through the shared observable
+/// flow-run lifecycle. The progress sink receives top-level operations and correlated reviewer-child
+/// activity while the unchanged `ReviewReport` remains the only stdout payload.
 pub(super) async fn run_review(
     flags: &ReviewFlags,
     files: Vec<String>,
     format: ReviewFormat,
+    progress: ReviewProgress,
     fail_on: Option<ReviewSeverity>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("current dir")?;
@@ -211,10 +207,47 @@ pub(super) async fn run_review(
     let mut inputs = serde_json::Map::new();
     inputs.insert("files".to_string(), serde_json::json!(files));
 
-    let out = client
-        .run_flow(flux_app::review::STRICT_REVIEW_FLOW_SRC, inputs)
-        .await
-        .map_err(|e| anyhow::anyhow!("strict_review: {e}"))?;
+    let progress = ReviewProgressSink::shared(progress);
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .start();
+
+    // Event transitions drive meaningful updates; a small ticker keeps elapsed/idle/stalled state
+    // visually live while a reviewer is quiet inside one provider call. It owns no execution and is
+    // stopped before the terminal frame is painted, so it cannot outlive the review run.
+    let ticker_cancel = tokio_util::sync::CancellationToken::new();
+    let ticker = {
+        let progress = progress.clone();
+        let cancel = ticker_cancel.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = interval.tick() => progress
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .tick(),
+                }
+            }
+        })
+    };
+
+    let run = client
+        .run_flow_with_sink(
+            flux_app::review::STRICT_REVIEW_FLOW_SRC,
+            inputs,
+            progress.clone(),
+        )
+        .await;
+    ticker_cancel.cancel();
+    let _ = ticker.await;
+    progress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(run.is_ok());
+    let out = run.map_err(|e| anyhow::anyhow!("strict_review: {e}"))?;
     let report: flux_tools::cognition::ReviewReport = serde_json::from_str(&out.result)
         .with_context(|| {
             format!(

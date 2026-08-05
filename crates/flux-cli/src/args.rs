@@ -423,8 +423,8 @@ pub(super) enum Commands {
     /// Run the strict-review protocol over `--files` and print a `ReviewReport` (flux L-13; design
     /// `docs/designs/strict-review-flows.md`). Self-contained: the reviewer roles and the
     /// `strict_review` flow are embedded immutably in the binary, so this works in any repo without
-    /// trusting project role definitions. Read-only: this never posts anywhere, it only prints to
-    /// stdout.
+    /// trusting project role definitions. Live progress is derived from the shared flow-run event
+    /// sink and written to stderr; the final report alone is written to stdout.
     Review {
         #[command(flatten)]
         flags: ReviewFlags,
@@ -435,6 +435,10 @@ pub(super) enum Commands {
         /// `ReviewReport`).
         #[arg(long, value_enum, default_value_t)]
         format: ReviewFormat,
+        /// Live stderr progress: `auto` selects a transient tree on a terminal and plain summaries
+        /// otherwise; `tree` and `plain` force those renderers; `off` stays silent until the report.
+        #[arg(long, value_enum, default_value_t)]
+        progress: ReviewProgress,
         /// Exit 1 if any finding's severity is at or above this threshold (`info`|`low`|`medium`|
         /// `high`|`critical`). Omit to always exit 0 regardless of findings.
         #[arg(long, value_enum)]
@@ -1322,6 +1326,20 @@ pub(super) enum ReviewFormat {
     Md,
     /// The raw `ReviewReport` JSON.
     Json,
+}
+
+/// `flux review --progress` rendering policy. Progress always uses stderr.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(super) enum ReviewProgress {
+    /// Tree on an interactive stderr, append-only summaries otherwise.
+    #[default]
+    Auto,
+    /// Force the transient tree renderer.
+    Tree,
+    /// Force append-only status summaries (no cursor controls).
+    Plain,
+    /// Disable live progress.
+    Off,
 }
 
 /// `flux review --fail-on` severity threshold, ordered low → high so `>=` comparisons are meaningful.
