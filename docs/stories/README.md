@@ -294,6 +294,13 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 _flux's central claim is that **the LLM is not the runtime** — authored control flow and a deterministic_
 - [A-139 — The loop view must not become the bottleneck or the liar — bounded redraw, honest elision](A-139-the-loop-view-under-load.md) · Agent · a fast loop emits events faster than a terminal can usefully redraw, and sub-agent fan-out multiplies it. ⚠ The failure mode is a view that silently drops steps — which in a demo reads as flux doing less than it did
 
+### Agent-native Flux documentation
+_`flux docs` already serves the documentation bundled with the running binary, and generated Flux_
+- [C-578 — Agent-native Flux documentation — release-matched answers through a datasource (epic)](C-578-agent-native-flux-documentation-epic.md) · Core · EPIC — Flux questions activate a bounded built-in docs datasource instead of relying on model memory, arbitrary checkout reads or web search
+- [C-579 — Build the release-matched Flux documentation datasource](C-579-build-the-release-matched-flux-docs-datasource.md) · Core · derive deterministic topic/page/section records from the same committed public-doc source and bind them to the Flux release and corpus digest
+- [C-580 — Expose bounded Flux documentation retrieval through datasource operations](C-580-expose-bounded-flux-docs-retrieval-operations.md) · Core · register flux-docs in complete agent assemblies and reuse sources/search/get/list/relation/batch_get; topic overview is a projection, not a second backend
+- [C-581 — Surface Flux documentation for questions about Flux itself](C-581-surface-flux-docs-for-self-directed-questions.md) · Agent · intent-aware activation for Flux commands, configuration, Agent-Loop, Flux-Lang, Board/Fleet, SDK and safety without polluting unrelated turns
+
 ### Approval Distillation
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
 

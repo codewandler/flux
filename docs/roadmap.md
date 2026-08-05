@@ -922,6 +922,16 @@ projects typed durable loop/progress/budget/controller state and must be materia
 embedding compact CLI output.
 Design: [board-fleet-tui](designs/board-fleet-tui.md).
 
+### Agent-native Flux documentation (epic) — ⏸ **BACKLOG (C-578…C-581)**
+
+Questions about Flux itself should be grounded in the documentation belonging to the running
+release, not model memory, arbitrary checkout reads or implicit web search. C-579 builds the
+deterministic indexed `flux-docs` datasource from the same source as `flux docs`; C-580 registers it
+through the ordinary datasource operations with bounded topic/page/section retrieval; C-581
+intent-surfaces those operations for questions about Flux commands, Agent-Loop, Flux-Lang,
+Board/Fleet, SDK, safety and related topics while keeping unrelated turns quiet. Design:
+[agent-native-flux-docs](designs/agent-native-flux-docs.md).
+
 ### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
 
 Three stories filed separately turned out to be one failure at three depths, and grouping them said
