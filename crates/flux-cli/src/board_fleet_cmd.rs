@@ -1217,6 +1217,19 @@ fn hash_path_metadata(path: &Path, hasher: &mut impl Hasher) {
     }
 }
 
+fn hash_guarded_file_revision(
+    system: &flux_system::System,
+    path: &str,
+    hasher: &mut impl Hasher,
+) -> Result<()> {
+    path.hash(hasher);
+    match system.file_revision(path)? {
+        Some(revision) => revision.hash(hasher),
+        None => "missing".hash(hasher),
+    }
+    Ok(())
+}
+
 fn repository_git_dir(root: &Path) -> Option<PathBuf> {
     let dot_git = root.join(".git");
     let mut git_dir = if dot_git.is_dir() {
@@ -1258,28 +1271,25 @@ fn hash_canonical_ref_metadata(root: &Path, canonical_ref: &str, hasher: &mut im
 
 fn fleet_tui_refresh_token(root: &Path) -> Result<String> {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let system = flux_system::System::new(flux_system::Workspace::new(root)?);
     for path in [
-        root.join(".flux/fleet/state.json"),
-        root.join(".flux/fleet.toml"),
-        root.join(".flux/board.toml"),
-        root.join(".flux/board-state.json"),
-        root.join("ROADMAP.md"),
-        root.join("VISION.md"),
+        ".flux/fleet/state.json",
+        ".flux/fleet.toml",
+        ".flux/board.toml",
+        ".flux/board-state.json",
+        "ROADMAP.md",
+        "VISION.md",
     ] {
-        hash_path_metadata(&path, &mut hasher);
+        hash_guarded_file_revision(&system, path, &mut hasher)?;
     }
-    for directory in [root.join("decisions"), root.join("docs/decisions")] {
-        if let Ok(entries) = fs::read_dir(directory) {
-            let mut paths = entries
-                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-                .collect::<Vec<_>>();
-            paths.sort();
-            for path in paths {
-                hash_path_metadata(&path, &mut hasher);
-            }
+    for directory in ["decisions", "docs/decisions"] {
+        directory.hash(&mut hasher);
+        for (path, revision) in system.directory_revisions(directory)? {
+            path.hash(&mut hasher);
+            revision.hash(&mut hasher);
         }
     }
-    if root.join(".flux/board.toml").is_file() {
+    if system.file_revision(".flux/board.toml")?.is_some() {
         let board = read_board_workspace_config(root)?;
         for member in &board.members {
             let member_root = board_member_root(root, member)?;

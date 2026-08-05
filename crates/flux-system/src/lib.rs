@@ -172,6 +172,16 @@ pub struct Workspace {
     unconfined: bool,
 }
 
+/// Cheap filesystem identity for deciding whether a guarded workspace file needs to be reread.
+///
+/// This is deliberately metadata-only: callers may use it as a cache invalidation token, never as
+/// a substitute for reading and validating the file that owns the actual state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileRevision {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
+}
+
 /// An owned, process-local workspace for untrusted ephemeral projects.
 ///
 /// Creation and recursive cleanup live in `flux-system`, keeping documentation servers and other
@@ -1836,6 +1846,51 @@ impl System {
         Ok(meta.modified()?)
     }
 
+    /// Read a cheap metadata-only revision through the workspace confinement boundary.
+    /// Missing files return `None`; an escaping path or another metadata error remains explicit.
+    pub fn file_revision(&self, path: &str) -> Result<Option<FileRevision>> {
+        let resolved = self.workspace.resolve_read(path)?;
+        let metadata = match std::fs::metadata(resolved) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(FileRevision {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }))
+    }
+
+    /// Metadata-only revisions for direct children of a guarded directory, sorted by name.
+    /// Missing directories are empty; every child is independently confinement-checked so a
+    /// symlink cannot turn cache invalidation into an unguarded project-metadata read.
+    pub fn directory_revisions(&self, dir: &str) -> Result<Vec<(String, FileRevision)>> {
+        let root = self.workspace.resolve_read(dir)?;
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = entries
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+
+        let base = dir.trim_end_matches('/');
+        let mut revisions = Vec::with_capacity(names.len());
+        for name in names {
+            let path = if base.is_empty() {
+                name.clone()
+            } else {
+                format!("{base}/{name}")
+            };
+            if let Some(revision) = self.file_revision(&path)? {
+                revisions.push((path, revision));
+            }
+        }
+        Ok(revisions)
+    }
+
     /// List the entries of a directory within the workspace (names only).
     pub async fn list_dir(&self, path: &str) -> Result<Vec<String>> {
         let p = self.workspace.resolve_read(path)?;
@@ -3191,6 +3246,32 @@ mod tests {
         sys.write_file("m.txt", "ab").await.unwrap();
         let t2 = sys.file_mtime("m.txt").await.unwrap();
         assert!(t2 >= t1, "mtime should not go backwards");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn guarded_file_revisions_are_sorted_metadata_only_and_missing_safe() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file("decisions/002.md", "second").await.unwrap();
+        sys.write_file("decisions/001.md", "first").await.unwrap();
+
+        assert_eq!(sys.file_revision("missing.md").unwrap(), None);
+        assert_eq!(
+            sys.file_revision("decisions/001.md").unwrap().unwrap().len,
+            5
+        );
+        assert_eq!(
+            sys.directory_revisions("decisions")
+                .unwrap()
+                .into_iter()
+                .map(|(path, revision)| (path, revision.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("decisions/001.md".into(), 5),
+                ("decisions/002.md".into(), 6)
+            ]
+        );
+        assert!(sys.file_revision("../escape").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 

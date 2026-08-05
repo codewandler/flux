@@ -49,7 +49,10 @@ Turn durable fleet and board projections into useful native views for supervisio
   a cheap truthful seed and durable-state token while one coalesced blocking worker builds the full
   view; loading, unavailable and stale states are explicit and a failed refresh preserves the last
   good projection. Regression coverage holds a source snapshot blocked while the async caller stays
-  responsive and verifies startup-error versus later-stale behavior.
+  responsive and verifies startup-error versus later-stale behavior. The combined `task install`
+  gate then caught the token's first raw metadata read; cache invalidation now uses synchronous,
+  confinement-checked file revisions behind `flux-system`, with a boundary regression. The exact
+  install entrypoint passes and replaces both local binaries.
 
 ## Notes
 
