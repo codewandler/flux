@@ -36,8 +36,10 @@ second execution placement.
 - Flux now embeds the Exchange client. When `FLUX_EXCHANGE_URL` and
   `FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN` are configured, it projects that account's effective
   catalogue between turns and invokes admitted one-shot HTTP operations. That environment bearer is
-  transitional C-503 compatibility, not final onboarding; C-509 replaces it with an Exchange-owned
-  direct handoff into secure storage. Subscribe, streaming,
+  transitional C-503 compatibility, not final onboarding. C-509 replaces it only for managed
+  Linux-local bootstrap; independently provisioned remote Exchange use retains the configured
+  origin/bearer on every Flux target until secure remote provisioning is separately contracted.
+  Subscribe, streaming,
   cancellation frames, terminal lifecycle and leases remain planned.
 
 This direction changes ownership and the migration target. It does **not** claim that Docker,

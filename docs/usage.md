@@ -266,7 +266,8 @@ flux plugin install <name>       # the plugin CLI — verified install from the 
 flux exchange local status      # managed local Exchange lifecycle surface (start/status/stop);
                                  #   currently makes no change and returns a temporary unsupported gate
                                  #   until the signed release and lifecycle manager ship; its final
-                                 #   typed status, diagnostics and exit codes belong to that manager
+                                 #   typed status, diagnostics and exit codes belong to that manager.
+                                 #   Final lifecycle is Linux-only; other targets refuse before effects
 flux integration list           # labelled Exchange connection surface (connect/grant/list/doctor);
                                  #   currently makes no change and returns a temporary unsupported gate
                                  #   while remaining dependencies land; credential flags and

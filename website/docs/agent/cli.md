@@ -52,8 +52,8 @@ and [Safety & approvals](./safety.md).
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
-| `flux exchange local start\|status\|stop` | enter the managed local Exchange lifecycle surface; until the signed release/lifecycle contract ships, each verb makes no change and returns a typed `unsupported` refusal (`--json` for one machine-readable result) |
-| `flux integration connect\|grant\|list\|doctor` | enter labelled Exchange connection management; until the provider connection/grant contracts ship, each command makes no change and returns a typed `unsupported` refusal, while unclassified connection fields and credential flags remain unavailable |
+| `flux exchange local start\|status\|stop` | enter the managed local Exchange lifecycle surface; until the signed release/lifecycle contract ships, each verb makes no change and returns a typed `unsupported` refusal. The final lifecycle runs only on the two Linux GNU targets; every other target keeps the command and refuses before effects (`--json` for one machine-readable result). |
+| `flux integration connect\|grant\|list\|doctor` | enter labelled Exchange connection management; until the provider connection/grant contracts ship, each command makes no change and returns a typed `unsupported` refusal. Final owner onboarding is Linux-local; the authenticated runtime HTTP client may still use an independently provisioned Linux Exchange from every Flux target. |
 | `flux policy simulate <proposed.toml>` | replay a proposed authorization policy against recorded op history — a diff of what it would have newly blocked and newly allowed, before you adopt it; a pure read, `--sessions N` / `--json` |
 | `flux skill …` | render or install generated Flux skills; see [Skills & roles](./skills-and-roles.md) |
 | `flux preset …` | list, inspect, render, or run prebuilt flow recipes |
