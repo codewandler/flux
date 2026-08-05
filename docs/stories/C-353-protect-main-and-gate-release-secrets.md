@@ -2,11 +2,11 @@
 id: C-353
 title: Protect main and gate release secrets behind protected environments
 pillar: Core
-status: ready
+status: blocked
 priority: 1
 epic: release-trust-residuals
 design: docs/designs/release-trust-residuals.md
-note: "v0.56.0 blocker — cumulative tag rulesets, PR-only main, repository-only flux-release-promoter, separate release-control/release environments, and external value-free secret entry"
+note: "superseded for v0.56.0 by user-directed C-559 — do not provision the App, variables, environments or rulesets"
 ---
 
 # Protect `main` and gate release secrets behind protected environments
@@ -115,6 +115,11 @@ publication credentials, and keep reversible configuration separate from externa
 
 ## Progress
 
+- 2026-08-05 — superseded by C-559 at the user's direction. The repository has none of the App,
+  variable, environment or ruleset configuration this contract requested; it must not be provisioned
+  for v0.56.0. C-559 preserves step-isolated host mutation with the existing `RELEASE_TOKEN` and
+  removes these external settings from the executable release path. The unchecked Acceptance below
+  remains the historical hardening proposal, not authorized implementation work.
 - 2026-08-01 — filed from validation of REL-01/ASSURE-04.
 - 2026-08-04 — contract raised to `ready` against canonical
   `9e3108b1b6856e30fa2e0baa2475d75d21fbc19f` after PR #29. Live evidence still shows no branch

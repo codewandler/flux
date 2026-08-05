@@ -61,9 +61,10 @@ the final step, never early cleanup.
       `refs/tags/v0.56.0`, the expected source digest and no self-hosted runner. The verifier rejects
       historical optional assets or allowlists as substitutes for the new-release contract.
 - [ ] After the candidate succeeds and before creating the tag, promotion snapshots the highest run
-      database ID for `release.yml` and `crates-io.yml`. Only the `flux-release-promoter`
-      installation token creates the annotated tag, once, at the verified candidate/merged-main SHA;
-      `RELEASE_TOKEN`, `GITHUB_TOKEN`, a PAT or an administrator is not a tag-creation identity.
+      database ID for `release.yml` and `crates-io.yml`. Only the separate host-owned promotion step
+      using the existing repository `RELEASE_TOKEN` creates the annotated tag, once, at the verified
+      candidate/merged-main SHA; `GITHUB_TOKEN`, model/build jobs and an administrator path are not
+      tag-creation identities. The PAT push must trigger both tag workflows.
       After the tag exists, promotion waits for one newly created run of each workflow with
       `databaseId` above its snapshot, `event=push`, exact tag ref and exact head SHA; older runs,
       branch/manual runs, wrong tags/SHAs, duplicate ambiguous matches, skipped/cancelled jobs or a
@@ -76,9 +77,9 @@ the final step, never early cleanup.
       failure preserves the candidate ref and prints byte-for-byte resume commands for the same
       tag/SHA without rebuilding or deleting evidence. Before tag creation, resume may create the
       absent tag once; after creation, resume must verify and reuse the immutable tag and can never
-      move, delete or recreate it. Only the narrow promotion job's `flux-release-promoter`
-      installation token may perform the final candidate deletion; `RELEASE_TOKEN`, `GITHUB_TOKEN`, a
-      PAT and an administrator cannot clean up or otherwise move that ref.
+      move, delete or recreate it. Only the narrow host-owned promotion step using `RELEASE_TOKEN`
+      may perform the final candidate deletion; `GITHUB_TOKEN`, model/build jobs and an administrator
+      path cannot clean up or otherwise move that ref.
 - [ ] Failing-first fixtures exhaust version parsing (body/footer/bang/action-needed mismatch and
       record-boundary traps); asset shape (each missing/extra/duplicate app, target and metadata
       class); sidecar/sum membership and digest corruption; tag peel, Release target/draft/prerelease,
@@ -94,6 +95,10 @@ the final step, never early cleanup.
 
 ## Progress
 
+- 2026-08-05 — C-559 supersedes only this story's dedicated-App identity clauses at the user's
+  direction. Exact PR/merged-main SHA, candidate-v3, tag-run, 28-asset, fleet/latest and cleanup-last
+  ordering remain unchanged; the isolated host-owned promotion step now uses the already-configured
+  repository `RELEASE_TOKEN` and requires no App or GitHub Environment setup.
 - 2026-08-05 — implemented the coherent C-516 lane on canonical `d21b92dd`: fully framed complete
   commit parsing plus the `[Unreleased]` action-needed signal now pins the live `0.55.0 -> 0.56.0`
   preview; staged/live verification enforces the exact 28 names, sidecars, eleven-record sum,
@@ -116,6 +121,6 @@ the final step, never early cleanup.
 - C-355 authenticates the seven Actions artifact ZIPs entering the host. This story authenticates
   the 28 files assembled from them and the final public/latest state; neither contract subsumes the
   other.
-- C-353 owns the promotion App, cumulative tag rules and two environments. C-354 owns token
-  placement and the plugin tag trigger. This story owns the core cut PR and exact merged-SHA
-  sequence; it does not claim the current direct-push implementation is acceptable.
+- C-559 supersedes C-353's App/environment path and the matching C-354 placement clauses. C-354
+  still owns job/step isolation and the plugin tag trigger. This story owns the core cut PR and exact
+  merged-SHA sequence; it does not permit direct pushes to `main`.

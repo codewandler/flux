@@ -6,7 +6,7 @@ status: done
 priority: 2
 epic: release-trust-residuals
 design: docs/designs/release-trust-residuals.md
-note: "v0.56.0 blocker — App-only promotion in release-control; tag-only signing/GitHub Release/Cargo publication in release; plugin branch publication removed"
+note: "historical C-354 boundary implemented; App/environment clauses superseded for v0.56.0 by user-directed C-559"
 ---
 
 # Scope promotion and publication tokens to the jobs that consume them
@@ -87,6 +87,11 @@ Cargo publication use distinct tag-triggered jobs inside `release`.
 
 ## Progress
 
+- 2026-08-05 — C-559 supersedes the checked App-token and GitHub Environment placement clauses at
+  the user's direction. They remain below as the historical C-354 implementation record. The active
+  contract keeps the same job/step isolation but uses the existing repository `RELEASE_TOKEN` only
+  in the host-owned core promotion, plugin tag-control and GitHub Release steps, with no dedicated
+  App, repository variable or GitHub Environment dependency.
 - 2026-08-05 — implemented. `scripts/check-release-authority.sh` parses all four release workflows
   (aliases resolved) into workflow/job/step structure and binds every long-lived credential to one
   authorized step; run failing-first against the pre-change tree it reported 34 violations, including
