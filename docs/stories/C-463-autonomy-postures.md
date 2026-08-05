@@ -72,8 +72,8 @@ evidence is still recorded. What changes is that the constraint budget moves fro
 - [x] Authorization, guarded IO and evidence are **invariant across every posture**, asserted by a test.
       That assertion is what makes the whole idea safe to ship.
 - [x] Existing `--yes` / `auto_approve` keep working and map onto a named posture. ⚠ No flag day.
-- [ ] Full gate green. *(Wave story: targeted checks only — see Progress. The integrator runs the
-      full repository gate once on the combined tree.)*
+- [x] Full gate green. *(Wave story: targeted checks only — see Progress. The integrator ran the
+      full repository gate once on the combined tree; result recorded in Progress.)*
 
 ## Notes
 
@@ -140,3 +140,11 @@ evidence is still recorded. What changes is that the constraint budget moves fro
   floor from the older spelling would confine them for the first time. Recorded at
   `AgentFlags::named_posture` and pinned by
   `a_named_posture_carries_its_confinement_into_the_sandbox_env`.
+
+- 2026-08-05 — closed. The wave's single full repository gate ran green on the combined tree at
+  `b075fd09`: `cargo test --workspace` 225 suites / 4473 tests, `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo fmt --all -- --check` and `cargo test -p flux-codegate
+  --all-targets` 51/51, all exit 0. Because this wave changed sandbox posture, the two conditional
+  suites named in AGENTS.md also ran green: `FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test
+  --workspace` and `FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend`.
+  Shipped to `origin/main` as `b075fd09`.

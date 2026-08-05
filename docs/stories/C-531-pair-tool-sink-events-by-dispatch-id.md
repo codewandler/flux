@@ -2,7 +2,7 @@
 id: C-531
 title: "Pair tool sink events by dispatch id"
 pillar: Core
-status: in-progress
+status: done
 priority: 2
 epic: tool-output-rendering
 design: docs/designs/tool-output-rendering.md
@@ -37,7 +37,7 @@ already has.
 - [x] The whatif `RerunRecordingSink` FIFO pairing hazard is either fixed by the id or explicitly
       re-scoped in its comments.
 - [x] Breaking signature change on published crates is recorded as a workspace MINOR decision.
-- [ ] Full repository gate green.
+- [x] Full repository gate green.
 
 ## Progress
 
@@ -102,6 +102,19 @@ already has.
   unpushed cut is re-taken to include the wave; otherwise it forces 0.57.0. No version is bumped
   here — the wave ships the code, and the release owner picks between re-cutting 0.56.0 and cutting
   0.57.0 with full knowledge that the published-crate trait signatures changed.
+
+- 2026-08-05 — closed. The wave's single full repository gate ran green on the combined tree at
+  `b075fd09`: `cargo test --workspace` 225 suites / 4473 tests, `cargo clippy --workspace
+  --all-targets -- -D warnings`, `cargo fmt --all -- --check` and `cargo test -p flux-codegate
+  --all-targets` 51/51, all exit 0. Because this wave changed sandbox posture, the two conditional
+  suites named in AGENTS.md also ran green: `FLUX_BWRAP_BIN=/nonexistent/bwrap cargo test
+  --workspace` and `FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend`.
+  Shipped to `origin/main` as `b075fd09`.
+
+  Both remaining boxes are now closed: the stream-json release-note line landed in `WHATS-NEW.md`
+  (New, the additive `dispatch` field) with its engineering entry in `CHANGELOG.md` (Fixed), and the
+  gate above ticks the last one. `status` moves to `done`. The MINOR obligation recorded above is
+  unaffected by closing the story — it is owed by the next release cut, not by this story.
 
 ## Notes
 
