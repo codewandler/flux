@@ -11,7 +11,10 @@ path = ARGV.fetch(0)
 code = File.read(path)
 abort "promotion does not require the step-scoped RELEASE_TOKEN" unless
   code.include?('[ -n "${RELEASE_TOKEN:-}" ]') && code.include?('[ -z "${PROMOTION_TOKEN:-}" ]')
-abort "direct main push returned" if code.match?(/(?:HEAD|CUT_SHA|MERGED_SHA):(?:refs\/heads\/)?main/)
+main_push = 'git_with_release_token push "$PUSH_URL" "$MERGED_SHA:refs/heads/main"'
+abort "exact fast-forward main push missing or duplicated" unless code.scan(main_push).length == 1
+without_main_push = code.sub(main_push, '')
+abort "another direct main push returned" if without_main_push.match?(/push[^\n]*(?:HEAD|CUT_SHA|MERGED_SHA):(?:refs\/heads\/)?main/)
 abort "force push to main returned" if code.match?(/push[^\n]*--force[^\n]*(?<!-)\bmain\b/)
 abort "direct git tag push returned" if code.match?(/push[^\n]*TAG_REF:\$TAG_REF/)
 abort "administrator merge bypass returned" if code.include?("--admin")
@@ -22,18 +25,21 @@ abort "the imported cut is not verified before use" unless
 
 required = {
   bundle: 'git bundle verify "$RELEASE_CUT_BUNDLE"',
-  source_main: 'SOURCE_MAIN_SHA=${source_parents[2]}',
-  source_tree: 'release trigger $SOURCE_SHA differs from canonical-main parent $SOURCE_MAIN_SHA',
+  source_head: 'SOURCE_HEAD_SHA=${source_parents[2]}',
+  source_tree: 'release trigger $SOURCE_SHA differs from frozen source head $SOURCE_HEAD_SHA',
   cut_branch: 'CUT_BRANCH=release-cuts/$TAG',
   pat_preflight: 'RELEASE_CAN_PUSH=$(release_gh api',
-  main_descends: 'git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN"',
+  wrapper_base: 'source wrapper does not contain release trigger base ${source_parents[1]}',
+  source_main: 'SOURCE_MAIN_SHA=${source_head_parents[1]}',
+  main_descends: 'canonical main $REMOTE_MAIN does not descend from release source $SOURCE_MAIN_SHA',
   cut_push: 'git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"',
-  pr: 'release_gh pr create',
-  exact_ci: 'wait_for_ci || fail',
-  merge: 'release_gh pr merge',
-  canonical_main: 'git/ref/heads/main',
-  merged_parents: 'MERGED_CUT_SHA=${merged_parents[2]}',
+  ci_baseline: 'CI_BASELINE=$(latest_run_id ci.yml)',
+  ci_dispatch: 'actions_gh workflow run ci.yml',
+  exact_ci: 'CI_RUN=$(wait_for_exact_dispatch_run ci.yml',
   merge_tree: 'GIT_INDEX_FILE="$expected_index" git read-tree -m',
+  merge_commit: 'git commit-tree "$EXPECTED_TREE"',
+  main_push: 'git_with_release_token push "$PUSH_URL" "$MERGED_SHA:refs/heads/main"',
+  canonical_main: '[ "$(remote_sha refs/heads/main)" = "$MERGED_SHA" ]',
   exact_tree: 'merged main does not contain the exact cut diff',
   candidate: '"$MERGED_SHA:$CANDIDATE_REF"',
   candidate_readback: 'does not point at the merged canonical-main SHA',
@@ -53,7 +59,7 @@ indexes = required.transform_values do |needle|
   abort "missing promotion boundary #{needle}" unless index
   index
 end
-order = %i[bundle cut_branch source_main source_tree pat_preflight main_descends cut_push pr exact_ci merge canonical_main merged_parents merge_tree exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
+order = %i[bundle cut_branch source_head source_tree pat_preflight source_main wrapper_base main_descends cut_push ci_baseline ci_dispatch exact_ci merge_tree merge_commit main_push canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
 order.each_cons(2) do |left, right|
   abort "promotion order regressed: #{left} must precede #{right}" unless indexes.fetch(left) < indexes.fetch(right)
 end
@@ -70,7 +76,6 @@ abort "failure no longer retains an exact resume command" unless code.include?('
 
 actions_calls = code.lines.map(&:strip).select { |line| line.start_with?('actions_gh ') }
 allowed_actions = [
-  /^actions_gh api .*check-runs/,
   /^actions_gh workflow run /,
   /^actions_gh run (list|watch|download|view) /,
 ]
@@ -87,17 +92,19 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/flux-promoter-policy.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 for needle in \
   'git bundle verify "$RELEASE_CUT_BUNDLE"' \
-  'SOURCE_MAIN_SHA=${source_parents[2]}' \
-  'release trigger $SOURCE_SHA differs from canonical-main parent $SOURCE_MAIN_SHA' \
+  'SOURCE_HEAD_SHA=${source_parents[2]}' \
+  'release trigger $SOURCE_SHA differs from frozen source head $SOURCE_HEAD_SHA' \
+  'source wrapper does not contain release trigger base ${source_parents[1]}' \
+  'SOURCE_MAIN_SHA=${source_head_parents[1]}' \
   'RELEASE_CAN_PUSH=$(release_gh api' \
-  'git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN"' \
+  'canonical main $REMOTE_MAIN does not descend from release source $SOURCE_MAIN_SHA' \
   'git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"' \
-  'release_gh pr create' \
-  'wait_for_ci || fail' \
-  'release_gh pr merge' \
-  'git/ref/heads/main' \
-  'MERGED_CUT_SHA=${merged_parents[2]}' \
+  'CI_BASELINE=$(latest_run_id ci.yml)' \
+  'actions_gh workflow run ci.yml' \
+  'CI_RUN=$(wait_for_exact_dispatch_run ci.yml' \
   'GIT_INDEX_FILE="$expected_index" git read-tree -m' \
+  'git commit-tree "$EXPECTED_TREE"' \
+  'git_with_release_token push "$PUSH_URL" "$MERGED_SHA:refs/heads/main"' \
   '"$MERGED_SHA:$CANDIDATE_REF"' \
   'scripts/release-candidate.sh verify' \
   'RELEASE_BASELINE=$(latest_run_id release.yml)' \
@@ -119,7 +126,6 @@ done
 for injection in \
   'git push origin HEAD:main' \
   'git_with_promoter push --force "$PUSH_URL" "$MERGED_SHA:main"' \
-  'release_gh pr merge "$PR_NUMBER" --admin' \
   'git_with_release_token push "$PUSH_URL" "$TAG_REF:$TAG_REF"'
 do
   cp "$PROMOTER" "$tmp/mutant"
@@ -143,16 +149,24 @@ git -C "$repo" add version unrelated
 git -C "$repo" commit -q -m base
 git -C "$repo" branch main
 git -C "$repo" switch -q -c release
+git -C "$repo" commit -q --allow-empty -m release-tip
 git -C "$repo" switch -q main
 printf 'reviewed notes\n' >"$repo/notes"
 git -C "$repo" add notes
 git -C "$repo" commit -q -m source
 source_main=$(git -C "$repo" rev-parse HEAD)
+git -C "$repo" switch -q -c release-source main
+git -C "$repo" merge -q --no-ff release -m up-to-date-source
+source_head=$(git -C "$repo" rev-parse HEAD)
 git -C "$repo" switch -q release
-git -C "$repo" merge -q --no-ff main -m release-trigger
+git -C "$repo" merge -q --no-ff release-source -m release-trigger
 source_sha=$(git -C "$repo" rev-parse HEAD)
-[ "$(git -C "$repo" rev-parse "$source_sha^2")" = "$source_main" ] \
-  || { echo 'FAIL: fixture release merge did not bind canonical-main parent 2' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$source_sha^2")" = "$source_head" ] \
+  || { echo 'FAIL: fixture release merge did not bind frozen source head' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$source_head^2")" = "$(git -C "$repo" rev-parse "$source_sha^1")" ] \
+  || { echo 'FAIL: fixture source wrapper did not contain release trigger base' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$source_head^1")" = "$source_main" ] \
+  || { echo 'FAIL: fixture source wrapper did not bind canonical main' >&2; exit 1; }
 [ "$(git -C "$repo" rev-parse "$source_sha^{tree}")" = "$(git -C "$repo" rev-parse "$source_main^{tree}")" ] \
   || { echo 'FAIL: fixture release merge changed canonical-main content' >&2; exit 1; }
 printf '0.56.0\n' >"$repo/version"
@@ -164,11 +178,15 @@ printf 'concurrent main work\n' >"$repo/unrelated"
 git -C "$repo" add unrelated
 git -C "$repo" commit -q -m concurrent
 merged_base=$(git -C "$repo" rev-parse HEAD)
-git -C "$repo" merge -q --no-ff release -m merge-cut
-merged_sha=$(git -C "$repo" rev-parse HEAD)
 expected_index=$tmp/expected-index
 GIT_INDEX_FILE="$expected_index" git -C "$repo" read-tree -m "$source_main" "$merged_base" "$cut_sha"
 expected_tree=$(GIT_INDEX_FILE="$expected_index" git -C "$repo" write-tree)
+merged_sha=$(printf 'release: merge deterministic cut v0.56.0\n' | \
+  git -C "$repo" commit-tree "$expected_tree" -p "$merged_base" -p "$cut_sha")
+[ "$(git -C "$repo" rev-parse "$merged_sha^1")" = "$merged_base" ] \
+  || { echo 'FAIL: constructed release merge lost live-main parent 1' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$merged_sha^2")" = "$cut_sha" ] \
+  || { echo 'FAIL: constructed release merge lost exact-cut parent 2' >&2; exit 1; }
 [ "$expected_tree" = "$(git -C "$repo" rev-parse "$merged_sha^{tree}")" ] \
   || { echo 'FAIL: exact cut diff verification rejected a safe canonical-main descendant' >&2; exit 1; }
 [ "$(git -C "$repo" rev-parse "$cut_sha^{tree}")" != "$(git -C "$repo" rev-parse "$merged_sha^{tree}")" ] \

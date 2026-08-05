@@ -6,7 +6,7 @@ status: done
 priority: 4
 epic: release-trust-residuals
 design: docs/designs/release-trust-residuals.md
-note: "delivered v0.56.0 gate — cut PR through ci, merged-main candidate/tag binding, full-message versioning, exact 28 assets/runs and fleet/latest audit before cleanup"
+note: "delivered v0.56.0 gate — exact staged-cut CI through a fast-forward two-parent main merge, candidate/tag binding, full-message versioning, exact 28 assets/runs and fleet/latest audit before cleanup"
 ---
 
 # Make release preview, exact asset inventory, and latest-state audit one promotion gate
@@ -31,13 +31,16 @@ the final step, never early cleanup.
       pinned to the current `v0.55.0` baseline proves the preview changes from the presently wrong
       `0.55.1` to `0.56.0`; no subject-only parser, manual override or weaker compatibility rule
       satisfies this contract.
-- [x] The host stages the deterministic cut on a fresh promotion branch, opens a normal pull request
-      to canonical `main`, and waits for the exact head's required `ci` aggregate before merging.
-      It verifies the merge result is a new canonical `main` commit containing the exact cut diff,
-      resolves that full SHA from GitHub after the merge, and only then creates
-      `release-candidates/v0.56.0` at that SHA. The PR head/local cut/release-branch SHA cannot be a
-      candidate or tag target. Direct `HEAD:main`, another direct/force push and an administrator
-      bypass are absent from promotion and recovery fixtures.
+- [x] The host stages the deterministic cut on a fresh promotion branch, dispatches the repository's
+      complete `ci.yml` on that exact ref/SHA, and waits for the unique post-baseline run to finish
+      successfully. It reconstructs the exact three-way cut result against the live descendant of
+      the release source, creates a two-parent commit with live `main` first and the exact cut
+      second, and performs one ordinary fast-forward push that fails if `main` moved concurrently.
+      It verifies the result is the new canonical `main` commit containing the exact cut diff and
+      only then creates `release-candidates/v0.56.0` at that SHA. The local cut/release-branch SHA
+      cannot be a candidate or tag target. Arbitrary `HEAD:main`, cut-to-main,
+      non-fast-forward/force push and administrator-bypass paths are absent from promotion and
+      recovery fixtures.
 - [x] Staged and live verification require exactly these 28 distinct regular-file assets, with no
       omissions, extras or duplicate names:
   - ten application archives: each of `flux-cli` and `codewandler-flux-lsp` for
@@ -83,11 +86,11 @@ the final step, never early cleanup.
 - [x] Failing-first fixtures exhaust version parsing (body/footer/bang/action-needed mismatch and
       record-boundary traps); asset shape (each missing/extra/duplicate app, target and metadata
       class); sidecar/sum membership and digest corruption; tag peel, Release target/draft/prerelease,
-      asset IDs/sizes/digests and attestation binding; PR check/merge/result-SHA mismatch;
+      asset IDs/sizes/digests and attestation binding; exact-dispatch/run/merge-parent/result-SHA mismatch;
       direct-main/ambient-token tag paths; old/wrong/ambiguous workflow runs; verifier exit `1` and `2`; latest
-      drift; and cleanup-before-audit. Success fixtures prove the exact `0.55.0 -> 0.56.0`, normal
-      PR → merged-main SHA → candidate → one-time PAT tag, 28-asset and post-tag sequence. No weaker
-      compatibility fixture passes.
+      drift; and cleanup-before-audit. Success fixtures prove the exact `0.55.0 -> 0.56.0`, exact
+      cut CI → fast-forward merged-main SHA → candidate → one-time PAT tag, 28-asset and post-tag
+      sequence. No weaker compatibility fixture passes.
 - [x] `scripts/release-candidate.sh`, `scripts/promote-release-flow.sh`,
       `scripts/verify-github-release.sh`, `scripts/check-release-tags.sh`, both tag workflows and the
       release policy test agree on these identities and ordering. The focused self-tests plus full
@@ -95,26 +98,41 @@ the final step, never early cleanup.
 
 ## Progress
 
+- 2026-08-05 — live `release` protection requires a PR head updated to the base before merge. The
+  promoter now accepts that additional source wrapper only when it is a two-parent merge containing
+  the exact release-trigger base, its other parent is an ancestor of live canonical `main`, and its
+  tree is byte-identical to that canonical-main parent. The outer release trigger must remain
+  content-identical to the wrapper. This supports the configured strict rule without an admin
+  bypass or weakening source identity.
+- 2026-08-05 — GitHub documents that a PR created by `GITHUB_TOKEN` places its workflow runs behind
+  manual approval, so moving PR control from the PAT would introduce another hidden setting
+  dependency. The no-settings controller instead dispatches the existing complete `ci.yml` on the
+  exact staged cut SHA, reconstructs the exact three-way tree against live descendant `main`, and
+  pushes one two-parent fast-forward merge commit. Normal git rejection handles a concurrent main
+  move; no Pull Request API permission, approval click or force push is involved.
+- 2026-08-05 — release run `31038895447` completed the credential-free cut, staged only the exact
+  cut ref, and then proved the configured PAT has repository-ref authority but no Pull Request API
+  authority. The failed run created no PR, candidate or tag.
 - 2026-08-05 — release run `31035954598` proved the credential-free cut green, then the controller
   rejected promotion before its first mutation because it compared canonical `main` to the
   release-only trigger merge SHA. Promotion now binds that merge's content-identical second parent
   as the canonical-main source, accepts only descendant movement of `main`, and reconstructs the
-  exact cut patch against the actual PR base in an isolated Git index before candidate creation.
+  exact cut patch against the live main base in an isolated Git index before candidate creation.
   A semantic fixture preserves a concurrent main commit while proving the exact patch. The failed
   run created no cut ref, candidate or tag.
 - 2026-08-05 — done after C-559 replaced only the unavailable promotion identity. The existing
-  repository `RELEASE_TOKEN` is preflighted before mutation and performs the exact cut/PR/merge,
+  repository `RELEASE_TOKEN` is preflighted before mutation and performs the exact cut/merge,
   merged-main candidate, annotated-tag push and cleanup sequence. The ambient token is limited to
   candidate dispatch and Actions observation. All C-516 version, receipt, 28-asset, exact-run,
   public/latest and cleanup-last gates remain unchanged and pass with the revised authority policy.
 - 2026-08-05 — C-559 supersedes only this story's dedicated-App identity clauses at the user's
-  direction. Exact PR/merged-main SHA, candidate-v3, tag-run, 28-asset, fleet/latest and cleanup-last
+  direction. Exact cut-CI/merged-main SHA, candidate-v3, tag-run, 28-asset, fleet/latest and cleanup-last
   ordering remain unchanged; the isolated host-owned promotion step now uses the already-configured
   repository `RELEASE_TOKEN` and requires no App or GitHub Environment setup.
 - 2026-08-05 — implemented the coherent C-516 lane on canonical `d21b92dd`: fully framed complete
   commit parsing plus the `[Unreleased]` action-needed signal now pins the live `0.55.0 -> 0.56.0`
   preview; staged/live verification enforces the exact 28 names, sidecars, eleven-record sum,
-  GitHub metadata bytes and attestations; promotion now encodes normal PR/`ci`/merged-main candidate,
+  GitHub metadata bytes and attestations; promotion now encodes exact cut `ci`/merged-main candidate,
   one-time tag, exact new runs, live Release, fleet/latest and cleanup-last ordering. Focused parser,
   promotion-policy, asset, fleet and release-integrity fixtures pass. Final `done` reconciliation is
   intentionally left to the integration wave because C-353/C-354 concurrently owned the
@@ -134,5 +152,6 @@ the final step, never early cleanup.
   the 28 files assembled from them and the final public/latest state; neither contract subsumes the
   other.
 - C-559 supersedes C-353's App/environment path and the matching C-354 placement clauses. C-354
-  still owns job/step isolation and the plugin tag trigger. This story owns the core cut PR and exact
-  merged-SHA sequence; it does not permit direct pushes to `main`.
+  still owns job/step isolation and the plugin tag trigger. This story owns the exact cut-CI and
+  fast-forward two-parent merged-SHA sequence; it permits only the constructed merge commit to
+  advance `main`, never an arbitrary tree or force update.

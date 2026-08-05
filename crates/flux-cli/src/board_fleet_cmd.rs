@@ -94,6 +94,7 @@ async fn guarded_agent_run_async(
     read_roots: &[PathBuf],
     fleet_root: &Path,
     agent_id: &str,
+    environment: &[(String, String)],
     argv: &[String],
 ) -> Result<flux_system::ProcessOutput> {
     const CAPTURE_LIMIT: usize = 1024 * 1024;
@@ -110,14 +111,13 @@ async fn guarded_agent_run_async(
     let argv = argv.to_vec();
     let fleet_root = fleet_root.to_path_buf();
     let agent_id = agent_id.to_string();
+    let mut environment = environment.to_vec();
+    environment.push((
+        crate::stream_json::STREAM_JSON_LINE_LIMIT_ENV.to_string(),
+        FLEET_STREAM_JSON_LINE_LIMIT.to_string(),
+    ));
     let mut child = system
-        .spawn_background(
-            &argv,
-            &[(
-                crate::stream_json::STREAM_JSON_LINE_LIMIT_ENV.to_string(),
-                FLEET_STREAM_JSON_LINE_LIMIT.to_string(),
-            )],
-        )
+        .spawn_background(&argv, &environment)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let deadline = tokio::time::Instant::now() + CONTROL_PROCESS_TIMEOUT;
     let mut stdout = Vec::new();
@@ -188,11 +188,17 @@ fn guarded_agent_run(
     read_roots: &[PathBuf],
     fleet_root: &Path,
     agent_id: &str,
+    environment: &[(String, String)],
     argv: &[String],
 ) -> Result<flux_system::ProcessOutput> {
     tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(guarded_agent_run_async(
-            worktree, read_roots, fleet_root, agent_id, argv,
+            worktree,
+            read_roots,
+            fleet_root,
+            agent_id,
+            environment,
+            argv,
         ))
     })
 }
@@ -203,10 +209,16 @@ fn guarded_agent_run_on(
     read_roots: &[PathBuf],
     fleet_root: &Path,
     agent_id: &str,
+    environment: &[(String, String)],
     argv: &[String],
 ) -> Result<flux_system::ProcessOutput> {
     runtime.block_on(guarded_agent_run_async(
-        worktree, read_roots, fleet_root, agent_id, argv,
+        worktree,
+        read_roots,
+        fleet_root,
+        agent_id,
+        environment,
+        argv,
     ))
 }
 
@@ -1956,7 +1968,7 @@ fn run_fleet_action(
             if !command.dry_run {
                 let system = guarded_system(root)?;
                 if system.read_optional_text(".flux/fleet.toml")?.is_none() {
-                    system.write_file_atomic(".flux/fleet.toml", &format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\nallow_ad_hoc_agents = true\nworktree_root = \".flux/fleet/worktrees\"\n\n# [main]\n# instructions = \".flux/fleet/main.md\"\n# model = \"codex/gpt-5.6-sol\"\n\n# [[agent_templates]]\n# id = \"story-worker\"\n# role = \"writer\"\n# instructions = \".flux/fleet/agents/story-worker.md\"\n# mode = \"write\"\n# max_instances = {max_workers}\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
+                    system.write_file_atomic(".flux/fleet.toml", &format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\nallow_ad_hoc_agents = true\nworktree_root = \".flux/fleet/worktrees\"\n\n# [main]\n# instructions = \".flux/fleet/main.md\"\n# model = \"codex/gpt-5.6-sol\"\n\n# [[agent_templates]]\n# id = \"story-worker\"\n# role = \"writer\"\n# instructions = \".flux/fleet/agents/story-worker.md\"\n# mode = \"write\"\n# capabilities = [\"read\", \"edit\", \"git\", \"shell\"]\n# fences = [\".git/**\", \".flux/fleet/**\"]\n# max_instances = {max_workers}\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
                 }
                 write_fleet_state(root, &state)?;
                 append_fleet_event(
@@ -2252,6 +2264,39 @@ fn run_fleet_action(
             if selected.is_empty() {
                 bail!("not-found: no dependency-satisfied ready items");
             }
+            let config = read_fleet_config(root)?;
+            let template = config
+                .agent_templates
+                .iter()
+                .find(|template| template.id == "story-worker");
+            let instructions = match template {
+                Some(template) => read_configured_instructions(
+                    root,
+                    &template.instructions,
+                    "story-worker instructions",
+                )?,
+                None => "Implement exactly one assigned story in the current isolated worktree. Read its Goal, Acceptance, linked design, applicable decisions and AGENTS.md. Add failing-first evidence for behavior, run targeted checks, commit the exact story-sized result, and return a concise handoff. Never integrate, push, publish, deploy, or edit the fleet ledger.".into(),
+            };
+            let role = template
+                .map(|template| template.role.as_str())
+                .unwrap_or("writer");
+            let mode = template
+                .map(|template| template.mode)
+                .unwrap_or(FleetTaskMode::Write);
+            let requested_capabilities = template
+                .map(|template| template.capabilities.clone())
+                .unwrap_or_else(|| {
+                    DEFAULT_STORY_CAPABILITIES
+                        .iter()
+                        .map(|capability| (*capability).to_string())
+                        .collect()
+                });
+            let (capabilities, operations) =
+                normalize_worker_capabilities(mode, &requested_capabilities)?;
+            let template_fences = template
+                .map(|template| template.fences.clone())
+                .unwrap_or_default();
+            let model = template.and_then(|template| template.model.clone());
             let wave = format!("wave-{}", state.revision + 1);
             let topology = prepare_wave_worktrees(command, root, &wave, &selected)?;
             state.revision += 1;
@@ -2265,11 +2310,39 @@ fn run_fleet_action(
                     .find(|story| story["board_ref"].as_str() == Some(item.as_str()))
                     .cloned()
                     .unwrap_or(Value::Null);
+                let worktree = PathBuf::from(
+                    assignment["worktree"]
+                        .as_str()
+                        .context("validation/gate: story worker assignment has no worktree")?,
+                );
+                let repository_id = assignment["repository"]
+                    .as_str()
+                    .or_else(|| item.split_once('/').map(|(repository, _)| repository));
+                let repository_fences = repository_id
+                    .and_then(|repository_id| {
+                        config
+                            .repositories
+                            .iter()
+                            .find(|repository| repository.id == repository_id)
+                    })
+                    .map(|repository| repository.fences.clone())
+                    .unwrap_or_default();
+                let fences =
+                    normalize_fences(template_fences.iter().cloned().chain(repository_fences));
+                let read_roots = Vec::<PathBuf>::new();
+                let capability_set = capability_set_manifest(
+                    mode,
+                    &capabilities,
+                    &operations,
+                    &worktree,
+                    &read_roots,
+                    &fences,
+                );
                 state.agents.insert(
                     worker.clone(),
                     json!({
                         "id": worker,
-                        "role": "worker",
+                        "role": role,
                         "parent": "main",
                         "created_by": "main",
                         "board_ref": item,
@@ -2277,6 +2350,15 @@ fn run_fleet_action(
                         "transport": "flux-local",
                         "session": format!("{wave}-session-{}", index + 1),
                         "assignment": assignment,
+                        "template": template.map(|template| template.id.as_str()),
+                        "model": model,
+                        "mode": mode,
+                        "instructions": redact(&instructions),
+                        "capabilities": capabilities,
+                        "fences": fences,
+                        "writable_root": display_path(&worktree),
+                        "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
+                        "capability_set": capability_set,
                     }),
                 );
             }
@@ -2289,28 +2371,6 @@ fn run_fleet_action(
                 json!({"wave": wave, "items": selected, "coordinator": "main", "topology": topology}),
             )?;
             if !*prepare_only && !command.dry_run {
-                let config = read_fleet_config(root)?;
-                let template = config
-                    .agent_templates
-                    .iter()
-                    .find(|template| template.id == "story-worker");
-                let instructions = match template {
-                    Some(template) => read_configured_instructions(
-                        root,
-                        &template.instructions,
-                        "story-worker instructions",
-                    )?,
-                    None => "Implement exactly one assigned story in the current isolated worktree. Read its Goal, Acceptance, linked design, applicable decisions and AGENTS.md. Add failing-first evidence for behavior, run targeted checks, commit the exact story-sized result, and return a concise handoff. Never integrate, push, publish, deploy, or edit the fleet ledger.".into(),
-                };
-                let model = template.and_then(|template| template.model.clone());
-                for agent in state.agents.values_mut().filter(|agent| {
-                    agent["id"]
-                        .as_str()
-                        .is_some_and(|id| id.starts_with(&format!("{wave}-worker-")))
-                }) {
-                    agent["template"] = json!(template.map(|template| template.id.as_str()));
-                    agent["model"] = json!(model.clone());
-                }
                 let workers = state
                     .agents
                     .iter()
@@ -2332,24 +2392,7 @@ fn run_fleet_action(
                     );
                     let item = agent["board_ref"].as_str().unwrap_or("unknown/unknown");
                     let request = story_worker_request(item, assignment, &worktree);
-                    let context_origin = agent_context_origin(
-                        &worker,
-                        &instructions,
-                        Some(assignment),
-                        false,
-                        state.main_agent.goals_revision,
-                    );
-                    specs.push(AgentTurnSpec {
-                        store: agent_store_path(&worktree, &worker)?,
-                        id: worker,
-                        worktree,
-                        read_roots: vec![],
-                        model: model.clone(),
-                        instructions: instructions.clone(),
-                        request,
-                        resume: false,
-                        context_origin,
-                    });
+                    specs.push(addressed_turn_spec(root, &state, &worker, request)?);
                 }
                 state.revision += 1;
                 for spec in &specs {
@@ -5864,6 +5907,16 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
             &template.instructions,
             &format!("agent template {} instructions", template.id),
         )?;
+        normalize_worker_capabilities(template.mode, &template.capabilities).map_err(|error| {
+            let message = error.to_string();
+            let detail = message
+                .strip_prefix("validation/gate: ")
+                .unwrap_or(&message);
+            anyhow::anyhow!(
+                "validation/gate: agent template {} capability contract: {detail}",
+                template.id
+            )
+        })?;
     }
     validate_schedule_groups(&config.tranches, "tranche", usize::MAX)?;
     validate_schedule_groups(&config.waves, "wave", 10)?;
@@ -6131,7 +6184,182 @@ struct AgentTurnSpec {
     instructions: String,
     request: String,
     resume: bool,
+    enforce_operation_ceiling: bool,
+    admitted_operations: Vec<String>,
+    capability_set: Value,
+    shell_capability: bool,
     context_origin: Value,
+}
+
+const DEFAULT_STORY_CAPABILITIES: [&str; 4] = ["read", "edit", "git", "shell"];
+const REQUIRED_WRITER_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
+const AGENT_LOOP_MACHINERY_OPERATIONS: [&str; 9] = [
+    "detect_intent",
+    "explore",
+    "approve_batch",
+    "execute_batch",
+    "present_results",
+    "ai_segment",
+    "observe",
+    "evidence",
+    "metrics",
+];
+
+fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
+    Some(match name {
+        "read" => &[
+            "read",
+            "glob",
+            "grep",
+            "search",
+            "get",
+            "list",
+            "sources",
+            "batch_get",
+            "relation",
+            "cwd",
+            "home_dir",
+            "sys_info",
+            "now",
+        ],
+        "edit" => &["write", "edit", "append", "patch"],
+        "git-read" => &["git_status", "git_diff", "git_log", "git_hunks"],
+        // A story writer may inspect, stage and commit its own result. Integration, checkout,
+        // worktree mutation, revert and push remain coordinator operations, not worker tools.
+        "git" => &[
+            "git_status",
+            "git_diff",
+            "git_log",
+            "git_hunks",
+            "git_stage",
+            "git_stage_hunks",
+            "git_unstage",
+            "git_commit",
+            "git_branch",
+        ],
+        "shell" => &["bash", "proc.run"],
+        "rust" => &[
+            "cargo_check",
+            "cargo_build",
+            "cargo_test",
+            "cargo_clippy",
+            "cargo_fmt",
+        ],
+        "node" => &["npm", "node_run"],
+        "go" => &["go_build", "go_test", "go_vet"],
+        "python" => &["python_run", "pytest"],
+        "make" => &["make"],
+        "task" => &["task"],
+        _ => return None,
+    })
+}
+
+fn normalize_worker_capabilities(
+    mode: FleetTaskMode,
+    requested: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    let mut capabilities = requested
+        .iter()
+        .map(|capability| capability.trim().to_ascii_lowercase())
+        .filter(|capability| !capability.is_empty())
+        .collect::<Vec<_>>();
+    capabilities.sort();
+    capabilities.dedup();
+
+    let required: &[&str] = match mode {
+        FleetTaskMode::ReadOnly => &["read"],
+        FleetTaskMode::Write => &REQUIRED_WRITER_CAPABILITIES,
+    };
+    let mut missing = required
+        .iter()
+        .filter(|required| !capabilities.iter().any(|found| found == **required))
+        .map(|required| (*required).to_string())
+        .collect::<Vec<_>>();
+    for capability in &capabilities {
+        let invalid_for_mode =
+            mode == FleetTaskMode::ReadOnly && !matches!(capability.as_str(), "read" | "git-read");
+        if invalid_for_mode || capability_operations(capability).is_none() {
+            missing.push(capability.clone());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    if !missing.is_empty() {
+        bail!(
+            "validation/gate: missing required capabilities: {}",
+            missing.join(", ")
+        )
+    }
+
+    let mut operations = capabilities
+        .iter()
+        .flat_map(|capability| capability_operations(capability).unwrap_or_default())
+        .map(|operation| (*operation).to_string())
+        .collect::<Vec<_>>();
+    operations.extend(
+        AGENT_LOOP_MACHINERY_OPERATIONS
+            .iter()
+            .map(|operation| (*operation).to_string()),
+    );
+    operations.sort();
+    operations.dedup();
+    Ok((capabilities, operations))
+}
+
+fn normalize_fences(fences: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut fences = [".git/**".to_string(), ".flux/fleet/**".to_string()]
+        .into_iter()
+        .chain(fences)
+        .map(|fence| fence.trim().trim_start_matches("./").to_string())
+        .filter(|fence| !fence.is_empty())
+        .collect::<Vec<_>>();
+    fences.sort();
+    fences.dedup();
+    fences
+}
+
+fn capability_set_manifest(
+    mode: FleetTaskMode,
+    capabilities: &[String],
+    operations: &[String],
+    writable_root: &Path,
+    read_roots: &[PathBuf],
+    fences: &[String],
+) -> Value {
+    let projection = json!({
+        "schema": "flux.fleet-capability-set/v1",
+        "mode": mode,
+        "capabilities": capabilities,
+        "operations": operations,
+        "writable_root": display_path(writable_root),
+        "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
+        "fences": fences,
+    });
+    let encoded =
+        serde_json::to_string(&projection).expect("capability-set projection is JSON serializable");
+    json!({
+        "schema": "flux.fleet-capability-set/v1",
+        "digest_sha256": flux_lang::runtime::sha256_hex(&encoded),
+        "mode": mode,
+        "capability_count": capabilities.len(),
+        "operation_count": operations.len(),
+        "read_root_count": read_roots.len(),
+        "fence_count": fences.len(),
+        "writable_root_sha256": flux_lang::runtime::sha256_hex(&display_path(writable_root)),
+    })
+}
+
+fn value_string_list(value: &Value, key: &str, agent: &str) -> Result<Vec<String>> {
+    value[key]
+        .as_array()
+        .with_context(|| format!("validation/gate: admitted agent {agent} has no {key} snapshot"))?
+        .iter()
+        .map(|entry| {
+            entry.as_str().map(str::to_string).with_context(|| {
+                format!("validation/gate: admitted agent {agent} has a non-string {key} entry")
+            })
+        })
+        .collect()
 }
 
 fn agent_context_origin(
@@ -6227,6 +6455,10 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         instructions,
         request,
         resume,
+        enforce_operation_ceiling: false,
+        admitted_operations: Vec::new(),
+        capability_set: Value::Null,
+        shell_capability: false,
         context_origin,
     })
 }
@@ -6254,32 +6486,49 @@ fn addressed_turn_spec(
         .as_str()
         .map(PathBuf::from)
         .unwrap_or_else(|| root.to_path_buf());
-    let config = read_fleet_config(root)?;
-    let story_assignment = agent["assignment"]["worktree"].is_string();
-    let read_roots = if story_assignment {
-        Vec::new()
-    } else {
-        config
-            .repositories
-            .iter()
-            .map(|repository| repository_root(root, repository))
-            .collect::<Result<Vec<_>>>()?
-    };
-    let template = agent["template"].as_str().and_then(|id| {
-        config
-            .agent_templates
-            .iter()
-            .find(|template| template.id == id)
-    });
-    let instructions = match (agent["instructions"].as_str(), template) {
-        (Some(instructions), _) => instructions.to_string(),
-        (None, Some(template)) => read_configured_instructions(
-            root,
-            &template.instructions,
-            &format!("agent template {} instructions", template.id),
-        )?,
-        (None, None) => "Complete the addressed task within the admitted role, mode, capabilities and fences. Return durable evidence; never push, publish or deploy.".to_string(),
-    };
+    let writable_root = agent["writable_root"].as_str().with_context(|| {
+        format!("validation/gate: admitted agent {target} has no writable-root snapshot")
+    })?;
+    if Path::new(writable_root) != worktree {
+        bail!(
+            "validation/gate: admitted agent {target} writable root drifted; explicit re-admission is required"
+        )
+    }
+    let read_roots = value_string_list(agent, "read_roots", target)?
+        .into_iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let instructions = agent["instructions"]
+        .as_str()
+        .with_context(|| {
+            format!("validation/gate: admitted agent {target} has no instruction snapshot")
+        })?
+        .to_string();
+    let mode: FleetTaskMode = serde_json::from_value(agent["mode"].clone()).with_context(|| {
+        format!("validation/gate: admitted agent {target} has no valid mode snapshot")
+    })?;
+    let configured_capabilities = value_string_list(agent, "capabilities", target)?;
+    let (capabilities, admitted_operations) =
+        normalize_worker_capabilities(mode, &configured_capabilities)?;
+    let fences = normalize_fences(value_string_list(agent, "fences", target)?);
+    let capability_set = capability_set_manifest(
+        mode,
+        &capabilities,
+        &admitted_operations,
+        &worktree,
+        &read_roots,
+        &fences,
+    );
+    let admitted_digest = agent["capability_set"]["digest_sha256"]
+        .as_str()
+        .with_context(|| {
+            format!("validation/gate: admitted agent {target} has no capability-set digest")
+        })?;
+    if capability_set["digest_sha256"].as_str() != Some(admitted_digest) {
+        bail!(
+            "validation/gate: admitted agent {target} capability-set digest drifted; explicit re-admission is required"
+        )
+    }
     let resume = agent["runtime_session"].is_string();
     let context_origin = agent_context_origin(
         target,
@@ -6293,13 +6542,14 @@ fn addressed_turn_spec(
         store: agent_store_path(&worktree, target)?,
         worktree,
         read_roots,
-        model: agent["model"]
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| template.and_then(|template| template.model.clone())),
+        model: agent["model"].as_str().map(str::to_string),
         instructions,
         request,
         resume,
+        enforce_operation_ceiling: true,
+        shell_capability: capabilities.iter().any(|capability| capability == "shell"),
+        admitted_operations,
+        capability_set,
         context_origin,
     })
 }
@@ -6469,6 +6719,12 @@ fn agent_turn_argv(executable: &Path, spec: &AgentTurnSpec, prompt: String) -> V
     if let Some(model) = spec.model.as_deref() {
         argv.extend(["--model".into(), model.into()]);
     }
+    if spec.enforce_operation_ceiling {
+        argv.push("--operation-ceiling".into());
+        for operation in &spec.admitted_operations {
+            argv.extend(["--operation".into(), operation.clone()]);
+        }
+    }
     for root in &spec.read_roots {
         argv.extend(["--add-dir".into(), display_path(root)]);
     }
@@ -6485,6 +6741,11 @@ fn execute_agent_turn_with_runtime(
     let store = spec.store.clone();
     let prompt = render_agent_turn_prompt(spec, goals);
     let argv = agent_turn_argv(&std::env::current_exe()?, spec, prompt);
+    let environment = if spec.shell_capability {
+        vec![("FLUX_ENABLE_BASH".to_string(), "1".to_string())]
+    } else {
+        Vec::new()
+    };
     let output = match runtime {
         Some(runtime) => guarded_agent_run_on(
             runtime,
@@ -6492,6 +6753,7 @@ fn execute_agent_turn_with_runtime(
             &spec.read_roots,
             fleet_root,
             &spec.id,
+            &environment,
             &argv,
         ),
         None => guarded_agent_run(
@@ -6499,6 +6761,7 @@ fn execute_agent_turn_with_runtime(
             &spec.read_roots,
             fleet_root,
             &spec.id,
+            &environment,
             &argv,
         ),
     }
@@ -6535,6 +6798,7 @@ fn execute_agent_turn_with_runtime(
         "events": events,
         "stream_budget": stream_budget,
         "context_origin": spec.context_origin.clone(),
+        "capability_set": spec.capability_set.clone(),
         "store": display_path(&store),
         "exit_code": output.exit_code,
     })))
@@ -6554,6 +6818,7 @@ fn execute_and_record_agent_turn(
             "ack": "accepted",
             "dry_run": true,
             "context_origin": spec.context_origin,
+            "capability_set": spec.capability_set,
         }));
     }
     state.revision += 1;
@@ -6572,7 +6837,7 @@ fn execute_and_record_agent_turn(
         root,
         state,
         "agent.turn.delivered",
-        json!({"agent": spec.id, "intake": intake_id, "ack": "delivered"}),
+        json!({"agent": spec.id, "intake": intake_id, "ack": "delivered", "capability_set": spec.capability_set.clone()}),
     )?;
 
     let goals = scoped_goals(state);
@@ -6761,18 +7026,31 @@ fn fleet_spawn(
     if id == "main" || state.agents.contains_key(&id) {
         bail!("conflict/precondition: agent id {id:?} is reserved or already registered")
     }
-    let mut capabilities = template
-        .map(|template| template.capabilities.clone())
-        .unwrap_or_default();
+    let mut capabilities = match template {
+        Some(template) => template.capabilities.clone(),
+        None if options.capabilities.is_empty() => match mode {
+            FleetTaskMode::ReadOnly => vec!["read".into()],
+            FleetTaskMode::Write => DEFAULT_STORY_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_string())
+                .collect(),
+        },
+        None => Vec::new(),
+    };
     capabilities.extend(options.capabilities.iter().cloned());
-    capabilities.sort();
-    capabilities.dedup();
+    let (capabilities, operations) = normalize_worker_capabilities(mode, &capabilities)?;
     let mut fences = template
         .map(|template| template.fences.clone())
         .unwrap_or_default();
     fences.extend(options.fences.iter().cloned());
-    fences.sort();
-    fences.dedup();
+    let fences = normalize_fences(fences);
+    let read_roots = config
+        .repositories
+        .iter()
+        .map(|repository| repository_root(root, repository))
+        .collect::<Result<Vec<_>>>()?;
+    let capability_set =
+        capability_set_manifest(mode, &capabilities, &operations, root, &read_roots, &fences);
     state.revision += 1;
     let registration = json!({
         "schema": "flux.fleet-agent-registration/v1",
@@ -6789,6 +7067,9 @@ fn fleet_spawn(
         "instructions_source": instructions_path.as_ref().map(|path| display_path(path)),
         "capabilities": capabilities,
         "fences": fences,
+        "writable_root": display_path(root),
+        "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
+        "capability_set": capability_set,
         "status": "admitted",
         "lease": {"generation": state.revision, "holder": id, "status": "active"},
         "created_by": "main",
@@ -8534,6 +8815,10 @@ mod tests {
             instructions: "Implement only the assigned story as a writer.".into(),
             request: "Work only on flux/C-566 at pinned base abc123.".into(),
             resume: false,
+            enforce_operation_ceiling: true,
+            admitted_operations: vec!["read".into(), "edit".into()],
+            capability_set: json!({"digest_sha256":"worker-one"}),
+            shell_capability: false,
             context_origin: json!({"kind":"story-assignment"}),
         };
 
@@ -8561,6 +8846,10 @@ mod tests {
             instructions: "Implement only the assigned story as a writer.".into(),
             request: format!("Work only on {item}."),
             resume: false,
+            enforce_operation_ceiling: true,
+            admitted_operations: vec!["read".into(), "edit".into()],
+            capability_set: json!({"digest_sha256":id}),
+            shell_capability: false,
             context_origin: json!({"kind":"story-assignment","board_ref":item}),
         };
         let first = worker("wave-1-worker-1", "flux/C-566", "/stores/worker-1");
@@ -8606,6 +8895,105 @@ mod tests {
             .iter()
             .any(|argument| argument == "/stores/worker-2"));
         assert!(!continued_argv.last().unwrap().contains("changed main goal"));
+        let admitted = |argv: &[String]| {
+            argv.windows(2)
+                .filter(|pair| pair[0] == "--operation")
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(admitted(&first_argv), admitted(&continued_argv));
+    }
+
+    #[test]
+    fn story_worker_launch_argv_enforces_an_operation_ceiling() {
+        let spec = AgentTurnSpec {
+            id: "wave-1-worker-1".into(),
+            worktree: PathBuf::from("/tmp/story-C-565"),
+            read_roots: vec![],
+            store: PathBuf::from("/tmp/story-C-565/store"),
+            model: None,
+            instructions: "Implement only the admitted story.".into(),
+            request: "Work only on flux/C-565.".into(),
+            resume: false,
+            enforce_operation_ceiling: true,
+            admitted_operations: vec!["read".into(), "edit".into()],
+            capability_set: json!({"digest_sha256":"worker-one"}),
+            shell_capability: false,
+            context_origin: json!({"kind":"story-assignment"}),
+        };
+
+        let argv = agent_turn_argv(
+            Path::new("/bin/flux"),
+            &spec,
+            render_agent_turn_prompt(&spec, "private main goal"),
+        );
+
+        assert!(
+            argv.iter()
+                .any(|argument| argument == "--operation-ceiling"),
+            "story worker launch had no host-enforced operation ceiling: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn worker_admission_names_every_missing_required_capability() {
+        let error =
+            normalize_worker_capabilities(FleetTaskMode::Write, &["read".into(), "edit".into()])
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "validation/gate: missing required capabilities: git"
+        );
+    }
+
+    #[test]
+    fn read_only_worker_admission_rejects_mutating_or_unknown_capabilities() {
+        let error = normalize_worker_capabilities(
+            FleetTaskMode::ReadOnly,
+            &["read".into(), "shell".into(), "unknown".into()],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "validation/gate: missing required capabilities: shell, unknown"
+        );
+    }
+
+    #[test]
+    fn capability_manifest_is_bounded_body_free_and_root_sensitive() {
+        let capabilities = DEFAULT_STORY_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect::<Vec<_>>();
+        let (capabilities, operations) =
+            normalize_worker_capabilities(FleetTaskMode::Write, &capabilities).unwrap();
+        let first = capability_set_manifest(
+            FleetTaskMode::Write,
+            &capabilities,
+            &operations,
+            Path::new("/private/story-one"),
+            &[],
+            &["secrets/**".into()],
+        );
+        let second = capability_set_manifest(
+            FleetTaskMode::Write,
+            &capabilities,
+            &operations,
+            Path::new("/private/story-two"),
+            &[],
+            &["secrets/**".into()],
+        );
+        let encoded = serde_json::to_string(&first).unwrap();
+
+        assert_eq!(first["schema"], "flux.fleet-capability-set/v1");
+        assert_eq!(first["digest_sha256"].as_str().unwrap().len(), 64);
+        assert_ne!(first["digest_sha256"], second["digest_sha256"]);
+        assert!(!encoded.contains("/private/story-one"));
+        assert!(!encoded.contains("git_commit"));
+        assert!(!encoded.contains("secrets/**"));
+        assert!(encoded.len() < 512, "capability manifest was {encoded}");
     }
 
     #[test]
@@ -8750,6 +9138,21 @@ mod tests {
         )
         .unwrap();
         let mut state = FleetState::default();
+        let capabilities = DEFAULT_STORY_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect::<Vec<_>>();
+        let (capabilities, operations) =
+            normalize_worker_capabilities(FleetTaskMode::Write, &capabilities).unwrap();
+        let fences = normalize_fences(Vec::<String>::new());
+        let capability_set = capability_set_manifest(
+            FleetTaskMode::Write,
+            &capabilities,
+            &operations,
+            &worktree,
+            &[],
+            &fences,
+        );
         state.agents.insert(
             "wave-1-worker-1".into(),
             json!({
@@ -8757,6 +9160,12 @@ mod tests {
                 "status": "completed",
                 "board_ref": "flux/C-566",
                 "instructions": "Implement only C-566 as its writer.",
+                "mode": "write",
+                "capabilities": capabilities,
+                "fences": fences,
+                "writable_root": display_path(&worktree),
+                "read_roots": [],
+                "capability_set": capability_set,
                 "runtime_session": "s_1",
                 "assignment": {
                     "board_ref": "flux/C-566",

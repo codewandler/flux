@@ -75,6 +75,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **Fleet workers keep the same tools and workspace authority for their whole assignment.** Flux
+  validates each worker's declared capability bundles before it starts, then preserves that exact
+  ceiling across messages, restarts, resume, and rework. Changing a template affects only newly
+  admitted workers; it cannot silently give an existing worker more tools, paths, process access,
+  or network authority. Status and receipts show a compact contract digest for verification.
+
 - **Fleet workers now begin as fresh, assignment-scoped writers.** Each story worker sees its own
   exact story, pinned branch and worktree plus the configured writer instructions. It no longer
   inherits the main agent's conversation, workspace-wide goals, another worker's history or an

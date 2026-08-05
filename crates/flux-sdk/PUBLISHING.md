@@ -152,14 +152,20 @@ skipped, so a failed run is re-runnable).
 
 ### Normal path: merge `main` into `release`
 
-The deliberate release action is merging a pull request from `main` into the `release` branch.
-Direct pushes to `release` are not the normal path. No branch protection, ruleset, GitHub App or
-GitHub Environment is required or claimed by this release path. Open the release PR with:
+The deliberate release action is merging a pull request from a frozen canonical-`main` source into
+the `release` branch. Direct pushes to `release` are not the normal path. No new ruleset, GitHub App
+or GitHub Environment is required by this release path. If `release` has strict up-to-date
+protection, update the frozen PR branch after opening it; the promoter unwraps that merge only when
+its release-base parent, canonical-main parent and byte-identical tree all match exactly. Open the
+release PR with:
 
 ```sh
-gh pr create --base release --head main \
+source=release-source/vX.Y.Z-$(git rev-parse --short=8 HEAD)
+git push origin "HEAD:refs/heads/$source"
+pr=$(gh pr create --base release --head "$source" \
   --title "release: promote main" \
-  --body "Merge main into the release trigger branch."
+  --body "Merge the frozen canonical-main snapshot into the release trigger branch.")
+gh pr update-branch "${pr##*/}" --merge
 ```
 
 Merging that PR is the whole release action; its resulting push to `release` starts the workflow.
@@ -176,16 +182,16 @@ the controller as a git bundle (`scripts/bundle-release-cut.sh`) carrying exactl
 its annotated tag, with the trigger commit as the bundle's prerequisite.
 
 The separate `release-control` job is the only one with core promotion authority. Its single host
-step receives the existing repository `RELEASE_TOKEN`, verifies that the PAT is usable before the
-first remote mutation, and then:
+step receives the existing repository `RELEASE_TOKEN`, verifies that the PAT can move repository
+refs before the first remote mutation, and then:
 
 1. imports and verifies the cut bundle, re-derives every identity from the imported objects, and
    binds the release merge's content-identical second parent as the canonical-`main` source snapshot;
-2. pushes the cut to `refs/heads/release-cuts/vX.Y.Z`, opens the normal pull request to `main`, waits
-   for that exact head's required `ci`, and merges it — `main` is never pushed directly or
-   force-pushed. `main` may advance during the build and checks only when it remains a descendant of
-   the bound source; after the merge, an isolated Git index reconstructs the three-way result and
-   proves the exact cut patch was applied while retaining those concurrent commits;
+2. pushes the cut to `refs/heads/release-cuts/vX.Y.Z`, dispatches the complete `ci.yml` on that exact
+   ref/SHA and waits for the unique new run to succeed. It then reads live `main`, requires it to
+   remain a descendant of the bound source, reconstructs the three-way cut in an isolated Git index,
+   and creates one two-parent commit with live `main` first and the exact cut second. An ordinary
+   fast-forward push advances `main`; a concurrent main move is rejected rather than overwritten;
 3. stages the resulting merged canonical-`main` SHA at `refs/heads/release-candidates/vX.Y.Z`;
 4. dispatches `.github/workflows/release.yml` from that exact ref; that workflow verifies its
    checked-out SHA, runs `scripts/release-full-gate.sh` once, and only then builds all five
@@ -241,18 +247,20 @@ Owned by `scripts/candidate_artifacts.py` (with `scripts/release-candidate.sh` a
 point); adversarial fixtures for every corruption class in `scripts/test_candidate_artifacts.py`.
 
 If any full-gate command fails, the candidate run creates no receipt. The promotion helper is
-waiting with `--exit-status`, so it retains the candidate ref for diagnosis and leaves both `main`
-and the tag untouched.
+waiting with `--exit-status`, so it retains the merged main and candidate ref for diagnosis while
+leaving the tag untouched.
 
 Three Actions secrets are required for publication. The automatic cut itself requires none:
 
 - **`RELEASE_TOKEN`** — the existing fine-grained GitHub PAT scoped to this repository with Contents
-  and Pull requests write authority. It is named only on four host-owned steps: core promotion,
+  write authority. It is named only on four host-owned steps: core promotion,
   plugin tag control, core GitHub Release creation and plugin GitHub Release creation. The promotion
-  helper uses it for the cut ref, pull request and merge, merged-main candidate, annotated-tag push
-  and exact cleanup; plugin tag control uses it for the one absent exact plugin tag. It never enters
-  cut, build, signing or Cargo publication work. The ambient `GITHUB_TOKEN` dispatches/observes
-  Actions only and never creates a tag, because its ref events would not start tag workflows.
+  helper uses it for the cut ref, exact fast-forward main merge, merged-main candidate,
+  annotated-tag push and exact cleanup;
+  plugin tag control uses it for the one absent exact plugin tag. It never enters
+  cut, build, signing or Cargo publication work. The ambient `GITHUB_TOKEN` dispatches/observes the
+  exact cut CI, candidate and tag runs under job-scoped `actions: write`; it retains `contents: read`
+  and never creates a ref or tag, because its ref events would not start tag workflows.
 - **`MINISIGN_SECRET_KEY`** — the plugin pack signing key, named only in the minisign step of
   `release-plugins.yml`'s `sign` job.
 - **`CARGO_REGISTRY_TOKEN`** — a crates.io API token from an account that can publish the
@@ -269,8 +277,8 @@ partitioned by job, and each long-lived credential occurrence is named on an exp
 | Authority | Where it lives | What it can do |
 | --- | --- | --- |
 | plan / cut / assembly | no GitHub write permission, provider credential or release secret | derive, validate and assemble artifacts |
-| promotion | `release-control`, step-scoped `RELEASE_TOKEN` | cut branch, PR, merge, candidate ref, one tag and exact cleanup |
-| candidate dispatch / Actions observation | `release-control`, ambient `GITHUB_TOKEN` with `actions: write`, `contents: read` | dispatch and observe the exact runs; no repository mutation |
+| release refs and tag | `release-control`, step-scoped `RELEASE_TOKEN` | cut branch, exact fast-forward main merge, candidate ref, one tag and exact cleanup |
+| Actions control | `release-control`, ambient `GITHUB_TOKEN` with `actions: write`, `contents: read` | dispatch/observe exact cut CI, candidate and tag runs; never move a git ref |
 | attestation | separate job, `id-token: write` + `attestations: write` | attest the already-checked asset set |
 | GitHub Release | separate job, step-scoped `RELEASE_TOKEN` | create/upload one Release |
 | plugin signing | separate job, step-scoped `MINISIGN_SECRET_KEY` | sign `plugins-index.json` |
