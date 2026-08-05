@@ -2303,11 +2303,6 @@ fn run_fleet_action(
                     None => "Implement exactly one assigned story in the current isolated worktree. Read its Goal, Acceptance, linked design, applicable decisions and AGENTS.md. Add failing-first evidence for behavior, run targeted checks, commit the exact story-sized result, and return a concise handoff. Never integrate, push, publish, deploy, or edit the fleet ledger.".into(),
                 };
                 let model = template.and_then(|template| template.model.clone());
-                let read_roots = config
-                    .repositories
-                    .iter()
-                    .map(|repository| repository_root(root, repository))
-                    .collect::<Result<Vec<_>>>()?;
                 for agent in state.agents.values_mut().filter(|agent| {
                     agent["id"]
                         .as_str()
@@ -2336,20 +2331,24 @@ fn run_fleet_action(
                             .context("validation/gate: story worker assignment has no worktree")?,
                     );
                     let item = agent["board_ref"].as_str().unwrap_or("unknown/unknown");
-                    let request = format!(
-                        "Work only on board item {item}. Your branch is {} at pinned base {}. Use `flux board skill`, then inspect the story contract. Finish with one exact commit and report its full SHA, observed write set, targeted test argv, failing-before/passing-after evidence, and summary for `flux fleet handoff`.",
-                        assignment["branch"].as_str().unwrap_or("unknown"),
-                        assignment["base_commit"].as_str().unwrap_or("unknown"),
+                    let request = story_worker_request(item, assignment, &worktree);
+                    let context_origin = agent_context_origin(
+                        &worker,
+                        &instructions,
+                        Some(assignment),
+                        false,
+                        state.main_agent.goals_revision,
                     );
                     specs.push(AgentTurnSpec {
                         store: agent_store_path(&worktree, &worker)?,
                         id: worker,
                         worktree,
-                        read_roots: read_roots.clone(),
+                        read_roots: vec![],
                         model: model.clone(),
                         instructions: instructions.clone(),
                         request,
-                        resume: agent["runtime_session"].is_string(),
+                        resume: false,
+                        context_origin,
                     });
                 }
                 state.revision += 1;
@@ -6122,7 +6121,7 @@ struct SpawnOptions<'a> {
     fences: &'a [String],
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct AgentTurnSpec {
     id: String,
     worktree: PathBuf,
@@ -6132,6 +6131,50 @@ struct AgentTurnSpec {
     instructions: String,
     request: String,
     resume: bool,
+    context_origin: Value,
+}
+
+fn agent_context_origin(
+    id: &str,
+    instructions: &str,
+    assignment: Option<&Value>,
+    resume: bool,
+    goals_revision: u64,
+) -> Value {
+    let session_mode = if resume { "continue" } else { "fresh" };
+    if id == "main" {
+        return json!({
+            "schema": "flux.fleet-context-origin/v1",
+            "kind": "main-coordinator",
+            "agent": "main",
+            "session_mode": session_mode,
+            "goals_revision": goals_revision,
+        });
+    }
+    let assignment = assignment.cloned().unwrap_or_else(|| json!({}));
+    let assignment_projection = json!({
+        "board_ref": assignment["board_ref"],
+        "repository": assignment["repository"],
+        "wave": assignment["wave"],
+        "branch": assignment["branch"],
+        "base_commit": assignment["base_commit"],
+        "worktree": assignment["worktree"],
+    });
+    let assignment_json = serde_json::to_string(&assignment_projection)
+        .expect("assignment context projection is JSON serializable");
+    json!({
+        "schema": "flux.fleet-context-origin/v1",
+        "kind": if assignment_projection["board_ref"].is_string() {
+            "story-assignment"
+        } else {
+            "admitted-worker"
+        },
+        "agent": id,
+        "board_ref": assignment_projection["board_ref"],
+        "session_mode": session_mode,
+        "assignment_sha256": flux_lang::runtime::sha256_hex(&assignment_json),
+        "worker_contract_sha256": flux_lang::runtime::sha256_hex(instructions.trim()),
+    })
 }
 
 fn read_configured_instructions(root: &Path, path: &Path, label: &str) -> Result<String> {
@@ -6147,6 +6190,15 @@ fn read_configured_instructions(root: &Path, path: &Path, label: &str) -> Result
         .with_context(|| format!("not-found: {label} {}", absolute.display()))
 }
 
+fn story_worker_request(item: &str, assignment: &Value, worktree: &Path) -> String {
+    format!(
+        "Work only on board item {item}. Your isolated worktree is {}. Your branch is {} at pinned base {}. Use `flux board skill`, then inspect the owning repository's AGENTS.md, the exact story contract and linked design. Implement that contract as a writer; do not select, observe or explore unrelated work. Finish with one exact commit and report its full SHA, observed write set, targeted test argv, failing-before/passing-after evidence, and summary for `flux fleet handoff`.",
+        display_path(worktree),
+        assignment["branch"].as_str().unwrap_or("unknown"),
+        assignment["base_commit"].as_str().unwrap_or("unknown"),
+    )
+}
+
 fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<AgentTurnSpec> {
     let config = read_fleet_config(root)?;
     let read_roots = config
@@ -6158,6 +6210,14 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
     };
+    let resume = state.main_agent.session.is_some();
+    let context_origin = agent_context_origin(
+        "main",
+        &instructions,
+        None,
+        resume,
+        state.main_agent.goals_revision,
+    );
     Ok(AgentTurnSpec {
         id: "main".into(),
         worktree: root.to_path_buf(),
@@ -6166,7 +6226,8 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         model: config.main.model,
         instructions,
         request,
-        resume: state.main_agent.session.is_some(),
+        resume,
+        context_origin,
     })
 }
 
@@ -6194,11 +6255,16 @@ fn addressed_turn_spec(
         .map(PathBuf::from)
         .unwrap_or_else(|| root.to_path_buf());
     let config = read_fleet_config(root)?;
-    let read_roots = config
-        .repositories
-        .iter()
-        .map(|repository| repository_root(root, repository))
-        .collect::<Result<Vec<_>>>()?;
+    let story_assignment = agent["assignment"]["worktree"].is_string();
+    let read_roots = if story_assignment {
+        Vec::new()
+    } else {
+        config
+            .repositories
+            .iter()
+            .map(|repository| repository_root(root, repository))
+            .collect::<Result<Vec<_>>>()?
+    };
     let template = agent["template"].as_str().and_then(|id| {
         config
             .agent_templates
@@ -6214,6 +6280,14 @@ fn addressed_turn_spec(
         )?,
         (None, None) => "Complete the addressed task within the admitted role, mode, capabilities and fences. Return durable evidence; never push, publish or deploy.".to_string(),
     };
+    let resume = agent["runtime_session"].is_string();
+    let context_origin = agent_context_origin(
+        target,
+        &instructions,
+        agent.get("assignment"),
+        resume,
+        state.main_agent.goals_revision,
+    );
     Ok(AgentTurnSpec {
         id: target.to_string(),
         store: agent_store_path(&worktree, target)?,
@@ -6225,7 +6299,8 @@ fn addressed_turn_spec(
             .or_else(|| template.and_then(|template| template.model.clone())),
         instructions,
         request,
-        resume: agent["runtime_session"].is_string(),
+        resume,
+        context_origin,
     })
 }
 
@@ -6360,23 +6435,28 @@ fn execute_agent_turn(fleet_root: &Path, spec: &AgentTurnSpec, goals: &str) -> R
     execute_agent_turn_with_runtime(fleet_root, spec, goals, None)
 }
 
-fn execute_agent_turn_with_runtime(
-    fleet_root: &Path,
-    spec: &AgentTurnSpec,
-    goals: &str,
-    runtime: Option<&tokio::runtime::Handle>,
-) -> Result<Value> {
-    let store = spec.store.clone();
-    let prompt = format!(
-        "{}\n\nApplicable revisioned goals:\n{}\n\nCurrent request:\n{}",
-        spec.instructions.trim(),
-        goals,
-        spec.request.trim()
-    );
+fn render_agent_turn_prompt(spec: &AgentTurnSpec, goals: &str) -> String {
+    if spec.id == "main" {
+        format!(
+            "{}\n\nApplicable revisioned goals:\n{}\n\nCurrent request:\n{}",
+            spec.instructions.trim(),
+            goals,
+            spec.request.trim()
+        )
+    } else {
+        format!(
+            "{}\n\nCurrent assignment:\n{}",
+            spec.instructions.trim(),
+            spec.request.trim()
+        )
+    }
+}
+
+fn agent_turn_argv(executable: &Path, spec: &AgentTurnSpec, prompt: String) -> Vec<String> {
     let mut argv = vec![
-        std::env::current_exe()?.display().to_string(),
+        executable.display().to_string(),
         "--store".into(),
-        store.display().to_string(),
+        spec.store.display().to_string(),
         "--color".into(),
         "never".into(),
         "run".into(),
@@ -6393,6 +6473,18 @@ fn execute_agent_turn_with_runtime(
         argv.extend(["--add-dir".into(), display_path(root)]);
     }
     argv.push(prompt);
+    argv
+}
+
+fn execute_agent_turn_with_runtime(
+    fleet_root: &Path,
+    spec: &AgentTurnSpec,
+    goals: &str,
+    runtime: Option<&tokio::runtime::Handle>,
+) -> Result<Value> {
+    let store = spec.store.clone();
+    let prompt = render_agent_turn_prompt(spec, goals);
+    let argv = agent_turn_argv(&std::env::current_exe()?, spec, prompt);
     let output = match runtime {
         Some(runtime) => guarded_agent_run_on(
             runtime,
@@ -6442,6 +6534,7 @@ fn execute_agent_turn_with_runtime(
         "usage": terminal["usage"],
         "events": events,
         "stream_budget": stream_budget,
+        "context_origin": spec.context_origin.clone(),
         "store": display_path(&store),
         "exit_code": output.exit_code,
     })))
@@ -6460,6 +6553,7 @@ fn execute_and_record_agent_turn(
             "agent": spec.id,
             "ack": "accepted",
             "dry_run": true,
+            "context_origin": spec.context_origin,
         }));
     }
     state.revision += 1;
@@ -8428,6 +8522,157 @@ mod tests {
             assert!(skill.contains("schema --output json"));
         }
     }
+
+    #[test]
+    fn first_story_worker_prompt_does_not_inherit_fleet_wide_goals() {
+        let spec = AgentTurnSpec {
+            id: "wave-1-worker-1".into(),
+            worktree: PathBuf::from("/tmp/story-C-566"),
+            read_roots: vec![],
+            store: PathBuf::from("/tmp/story-C-566/store"),
+            model: None,
+            instructions: "Implement only the assigned story as a writer.".into(),
+            request: "Work only on flux/C-566 at pinned base abc123.".into(),
+            resume: false,
+            context_origin: json!({"kind":"story-assignment"}),
+        };
+
+        let prompt = render_agent_turn_prompt(
+            &spec,
+            "- company/private-coordinator-goal: inspect unrelated repositories",
+        );
+
+        assert!(prompt.contains("Implement only the assigned story as a writer."));
+        assert!(prompt.contains("Work only on flux/C-566 at pinned base abc123."));
+        assert!(
+            !prompt.contains("private-coordinator-goal"),
+            "story-worker prompt inherited Fleet-wide coordinator context: {prompt}"
+        );
+    }
+
+    #[test]
+    fn parallel_story_worker_launches_use_fresh_distinct_stores() {
+        let worker = |id: &str, item: &str, store: &str| AgentTurnSpec {
+            id: id.into(),
+            worktree: PathBuf::from(format!("/tmp/{item}")),
+            read_roots: vec![],
+            store: PathBuf::from(store),
+            model: None,
+            instructions: "Implement only the assigned story as a writer.".into(),
+            request: format!("Work only on {item}."),
+            resume: false,
+            context_origin: json!({"kind":"story-assignment","board_ref":item}),
+        };
+        let first = worker("wave-1-worker-1", "flux/C-566", "/stores/worker-1");
+        let second = worker("wave-1-worker-2", "connectors/C-517", "/stores/worker-2");
+        let first_argv = agent_turn_argv(
+            Path::new("/bin/flux"),
+            &first,
+            render_agent_turn_prompt(&first, "private main goal"),
+        );
+        let second_argv = agent_turn_argv(
+            Path::new("/bin/flux"),
+            &second,
+            render_agent_turn_prompt(&second, "private main goal"),
+        );
+
+        assert!(!first_argv.iter().any(|argument| argument == "--continue"));
+        assert!(!second_argv.iter().any(|argument| argument == "--continue"));
+        assert!(first_argv
+            .iter()
+            .any(|argument| argument == "/stores/worker-1"));
+        assert!(second_argv
+            .iter()
+            .any(|argument| argument == "/stores/worker-2"));
+        assert_ne!(first.store, second.store);
+        assert!(!first_argv.last().unwrap().contains("connectors/C-517"));
+        assert!(!second_argv.last().unwrap().contains("flux/C-566"));
+
+        let mut continued_first = first.clone();
+        continued_first.resume = true;
+        continued_first.context_origin["session_mode"] = json!("continue");
+        let continued_argv = agent_turn_argv(
+            Path::new("/bin/flux"),
+            &continued_first,
+            render_agent_turn_prompt(&continued_first, "changed main goal"),
+        );
+        assert!(continued_argv
+            .iter()
+            .any(|argument| argument == "--continue"));
+        assert!(continued_argv
+            .iter()
+            .any(|argument| argument == "/stores/worker-1"));
+        assert!(!continued_argv
+            .iter()
+            .any(|argument| argument == "/stores/worker-2"));
+        assert!(!continued_argv.last().unwrap().contains("changed main goal"));
+    }
+
+    #[test]
+    fn story_worker_request_names_only_the_exact_pinned_assignment() {
+        let assignment = json!({
+            "board_ref": "flux/C-566",
+            "branch": "fleet/wave-1/flux/story/C-566",
+            "base_commit": "abc123",
+            "worktree": "/worktrees/C-566",
+        });
+        let request =
+            story_worker_request("flux/C-566", &assignment, Path::new("/worktrees/C-566"));
+
+        for expected in [
+            "flux/C-566",
+            "/worktrees/C-566",
+            "fleet/wave-1/flux/story/C-566",
+            "abc123",
+            "AGENTS.md",
+            "exact story contract",
+            "linked design",
+            "Implement that contract as a writer",
+        ] {
+            assert!(
+                request.contains(expected),
+                "missing {expected:?}: {request}"
+            );
+        }
+        assert!(request.contains("do not select, observe or explore unrelated work"));
+    }
+
+    #[test]
+    fn story_worker_context_origin_is_bounded_metadata_not_prompt_content() {
+        let assignment = json!({
+            "board_ref": "flux/C-566",
+            "repository": "flux",
+            "wave": "wave-1",
+            "branch": "fleet/wave-1/flux/story/C-566",
+            "base_commit": "abc123",
+            "worktree": "/worktrees/C-566",
+        });
+        let manifest = agent_context_origin(
+            "wave-1-worker-1",
+            "private worker instructions that must not be persisted",
+            Some(&assignment),
+            false,
+            42,
+        );
+        let encoded = serde_json::to_string(&manifest).unwrap();
+
+        assert_eq!(manifest["kind"], "story-assignment");
+        assert_eq!(manifest["board_ref"], "flux/C-566");
+        assert_eq!(manifest["session_mode"], "fresh");
+        assert_eq!(manifest["assignment_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(
+            manifest["worker_contract_sha256"].as_str().unwrap().len(),
+            64
+        );
+        assert!(!encoded.contains("private worker instructions"));
+        assert!(!encoded.contains("fleet/wave-1/flux/story/C-566"));
+        assert!(!encoded.contains("/worktrees/C-566"));
+        assert!(
+            encoded.len() < 512,
+            "context manifest grew to {} bytes",
+            encoded.len()
+        );
+    }
     #[test]
     fn fleet_redaction_covers_secret_fields_paths_commands_and_model_text() {
         let value = redact_value(json!({
@@ -8480,6 +8725,73 @@ mod tests {
         );
         const { assert!(FLEET_STREAM_JSON_LINE_LIMIT < 256 * 1024) };
 
+        std::fs::remove_dir_all(base).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn addressed_story_worker_gets_no_automatic_sibling_repository_roots() {
+        let base = std::env::temp_dir().join(format!(
+            "flux-fleet-worker-read-roots-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let fleet = base.join("roadmap");
+        let flux = base.join("flux");
+        let connectors = base.join("connectors");
+        let exchange = base.join("exchange");
+        let worktree = base.join("worktrees/C-566");
+        for directory in [&fleet, &flux, &connectors, &exchange, &worktree] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::create_dir_all(fleet.join(".flux")).unwrap();
+        std::fs::write(
+            fleet.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"flux\"\nroot = \"../flux\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"connectors\"\nroot = \"../connectors\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"exchange\"\nroot = \"../exchange\"\ngate = [\"true\"]\n",
+        )
+        .unwrap();
+        let mut state = FleetState::default();
+        state.agents.insert(
+            "wave-1-worker-1".into(),
+            json!({
+                "id": "wave-1-worker-1",
+                "status": "completed",
+                "board_ref": "flux/C-566",
+                "instructions": "Implement only C-566 as its writer.",
+                "runtime_session": "s_1",
+                "assignment": {
+                    "board_ref": "flux/C-566",
+                    "branch": "fleet/wave-1/flux/story/C-566",
+                    "base_commit": "abc123",
+                    "worktree": display_path(&worktree),
+                },
+            }),
+        );
+
+        let spec = addressed_turn_spec(
+            &fleet,
+            &state,
+            "wave-1-worker-1",
+            "Apply the exact review findings.".into(),
+        )
+        .unwrap();
+
+        assert!(spec.resume);
+        assert!(spec.read_roots.is_empty());
+        assert_eq!(spec.worktree, worktree);
+        assert_eq!(spec.context_origin["board_ref"], "flux/C-566");
+        assert_eq!(spec.context_origin["session_mode"], "continue");
+        for status in ["cancelled", "failed"] {
+            let mut terminal = state.clone();
+            terminal.agents.get_mut("wave-1-worker-1").unwrap()["status"] = json!(status);
+            let error = addressed_turn_spec(
+                &fleet,
+                &terminal,
+                "wave-1-worker-1",
+                "This must not continue.".into(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("not available for delivery"));
+        }
         std::fs::remove_dir_all(base).ok();
     }
 

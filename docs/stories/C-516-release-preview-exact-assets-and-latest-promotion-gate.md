@@ -95,6 +95,13 @@ the final step, never early cleanup.
 
 ## Progress
 
+- 2026-08-05 — release run `31035954598` proved the credential-free cut green, then the controller
+  rejected promotion before its first mutation because it compared canonical `main` to the
+  release-only trigger merge SHA. Promotion now binds that merge's content-identical second parent
+  as the canonical-main source, accepts only descendant movement of `main`, and reconstructs the
+  exact cut patch against the actual PR base in an isolated Git index before candidate creation.
+  A semantic fixture preserves a concurrent main commit while proving the exact patch. The failed
+  run created no cut ref, candidate or tag.
 - 2026-08-05 — done after C-559 replaced only the unavailable promotion identity. The existing
   repository `RELEASE_TOKEN` is preflighted before mutation and performs the exact cut/PR/merge,
   merged-main candidate, annotated-tag push and cleanup sequence. The ambient token is limited to

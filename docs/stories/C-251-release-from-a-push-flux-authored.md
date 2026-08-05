@@ -162,6 +162,12 @@ workflows and runs the public Release verifier before reporting success. Keeping
 half outside the model-authored program means a bug in the program cannot publish directly.
 
 ## Progress
+- 2026-08-05 — release run `31035954598` completed the provider-free build and deterministic cut,
+  then stopped before its first remote mutation because the promoter incorrectly required canonical
+  `main` to equal the release-only trigger merge commit. The promoter now binds the trigger merge's
+  canonical-main parent, permits only descendant main movement during CI, and verifies the exact cut
+  patch against the actual PR base before staging a candidate. The failed run created no cut ref,
+  candidate or tag; hosted publication remains the final open acceptance evidence.
 - 2026-08-05 — **Provider credentials were removed from the automatic release contract.** Release
   run `31025539856` failed twice solely because Anthropic reported an exhausted credit balance;
   explicit OpenRouter run `31026403780` then failed with a 402 balance error, and the free-router
