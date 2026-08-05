@@ -1,4 +1,4 @@
-//! Historical Usage Observatory TUI state (C-516..C-518).
+//! Historical Usage Observatory TUI state (C-522..C-524).
 //!
 //! Rendering is a pure projection to text rows so layout/state tests do not need a terminal clock.
 //! The chat renderer applies the active theme to these rows; no color carries meaning here.

@@ -170,7 +170,7 @@ All notable changes to this project are documented in this file. The format is b
   automated cut no longer repeats the full six-command gate: the exact candidate SHA runs it once,
   and the immutable receipt binds that gated commit before main or the tag may move.
 
-- **The engineering presentation covers the full runtime story and works as a handout** (C-528).
+- **The engineering presentation covers the full runtime story and works as a handout** (C-540).
   Three new chapters — the adaptive agent loop, sessions as the operational record, and model
   strategy — grow the deck to thirteen (about twenty minutes), and its Exchange status now matches
   the shipped Service Account seam with snapshots re-verified against both sibling repositories

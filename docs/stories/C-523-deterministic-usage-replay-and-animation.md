@@ -1,5 +1,5 @@
 ---
-id: C-517
+id: C-523
 title: "Add deterministic usage replay and bounded animation"
 pillar: Core
 status: backlog
@@ -11,7 +11,7 @@ note: "Drive the static observatory with a virtual clock, seekable playback, coa
 
 ## Goal
 
-Add a deterministic virtual replay clock and explanatory route animation to C-516 without changing
+Add a deterministic virtual replay clock and explanatory route animation to C-522 without changing
 its exact analysis. Playback remains seekable and responsive from 4-hour windows through dense
 seven-day histories.
 
@@ -32,10 +32,10 @@ seven-day histories.
 - [ ] A seven-day stress fixture in `dense_replay_keeps_frame_work_bounded` proves memory, visible pulse
       count, and per-frame rendering work remain bounded and that input processing is not starved by
       animation.
-- [ ] Pausing or disabling animation leaves every C-516 control, exact total, comparison, grouping, and
+- [ ] Pausing or disabling animation leaves every C-522 control, exact total, comparison, grouping, and
       inspector usable; reduced-motion presentation introduces no hidden metric or color-only meaning.
 - [ ] Snapshot/state coverage adds pause, seek-backward, range-change, speed-change, fit, and coalesced-
-      burst states to C-516's layout matrix.
+      burst states to C-522's layout matrix.
 
 ## Progress
 
@@ -43,5 +43,5 @@ seven-day histories.
 
 ## Notes
 
-- Depends on [C-516](C-516-static-usage-observatory-tui.md).
-- Animation is a projection of C-515's buckets and C-514's usage facts, never an accounting source.
+- Depends on [C-522](C-522-static-usage-observatory-tui.md).
+- Animation is a projection of C-521's buckets and C-520's usage facts, never an accounting source.

@@ -1,5 +1,5 @@
 ---
-id: C-514
+id: C-520
 title: "Project truthful usage attribution and cost"
 pillar: Core
 status: backlog
@@ -11,7 +11,7 @@ note: "Keep provider, model, timestamp and price provenance explicit; never doub
 
 ## Goal
 
-Turn C-513's source records into comparable usage facts without overstating what Flux knows. Provider,
+Turn C-519's source records into comparable usage facts without overstating what Flux knows. Provider,
 model, time, token tiers, and cost provenance remain explicit, and Flux-native call plus legacy turn
 data obey one non-duplicating selection rule.
 
@@ -33,7 +33,7 @@ data obey one non-duplicating selection rule.
       reported, table-estimated/subscription-equivalent, and unpriced coverage. The failing-first test
       `mixed_cost_provenance_survives_aggregation` proves unknown cost never renders or serializes as
       `$0` and historical estimates retain their pricing basis.
-- [ ] C-513's `flux usage` parity remains green after the projection is adopted.
+- [ ] C-519's `flux usage` parity remains green after the projection is adopted.
 
 ## Progress
 
@@ -41,6 +41,6 @@ data obey one non-duplicating selection rule.
 
 ## Notes
 
-- Depends on [C-513](C-513-shared-cross-harness-usage-timeline.md).
-- Reuse the selection and pricing semantics cited by [C-512](C-512-usage-observatory-epic.md) in
+- Depends on [C-519](C-519-shared-cross-harness-usage-timeline.md).
+- Reuse the selection and pricing semantics cited by [C-518](C-518-usage-observatory-epic.md) in
   `crates/flux-events/src/projection.rs`; do not create a competing accounting system.

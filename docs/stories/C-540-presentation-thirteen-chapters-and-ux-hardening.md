@@ -1,5 +1,5 @@
 ---
-id: C-528
+id: C-540
 title: Grow the engineering presentation to thirteen chapters and harden its UX
 pillar: Core
 status: done
@@ -41,7 +41,7 @@ printable as a handout, and navigable by keyboard and touch without dead ends.
 - [x] The presentation is linked from the site footer, the landing page, the docs overview, and
       the repository README — pinned by website_contract so it cannot become an orphan again.
 - [x] The embedded docs bundle is regenerated deterministically and the repository gate passes on
-      this story's footprint. (Amended 2026-08-05: one provably foreign in-flight C-512 change in
+      this story's footprint. (Amended 2026-08-05: one provably foreign in-flight C-518 change in
       flux-capabilities keeps the shared tree's workspace test/clippy red at closure time; see
       Progress.)
 
@@ -58,7 +58,7 @@ printable as a handout, and navigable by keyboard and touch without dead ends.
   are hydration-safe by construction, but the repo has no browser-automation harness — the first
   live keyboard/swipe/print smoke is the next speaker dry-run.
 - 2026-08-05: Closed with a shared-tree caveat: workspace test/clippy are red only inside
-  flux-capabilities' in-flight C-512 change (E0308 at usage_observatory.rs:945 in its test
+  flux-capabilities' in-flight C-518 change (E0308 at usage_observatory.rs:945 in its test
   target, two lib clippy errors) — untouched by this story and modified before this session.
   `cargo test --workspace --exclude codewandler-flux-capabilities`: 208 suites green; root fmt
   diffs are confined to the same in-flight change.

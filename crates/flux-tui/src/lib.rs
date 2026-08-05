@@ -4062,7 +4062,7 @@ where
                     continue;
                 }
 
-                // C-512: historical observatory. Every key is handled here so chat state cannot
+                // C-518: historical observatory. Every key is handled here so chat state cannot
                 // drift while the metadata-only analysis view has focus.
                 if let Some(view) = state.observatory.as_mut() {
                     let seek = (view.clock.range.duration_ms() / 20).max(1);
@@ -9475,6 +9475,66 @@ mod tests {
             "verbose must show the tool output in full: {content}"
         );
         assert!(!content.contains("more lines"));
+    }
+
+    /// C-533: subprocess escape/control bytes never reach a ratatui span. Tool output is
+    /// sanitized at the transcript boundary — live results, the C-158 live tail, and historical
+    /// ingest — matching the posture of the neighboring surfaces (panes, approval prompts, fleet
+    /// names). Escapes are consumed whole; other control bytes are dropped; text survives.
+    #[test]
+    fn tool_output_is_sanitized_at_the_transcript_boundary() {
+        let flat = |state: &ChatState| {
+            state
+                .transcript_lines(80)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.clone().into_owned())
+                .collect::<String>()
+        };
+        let clean =
+            |text: &str| !text.contains('\u{1b}') && !text.contains('\u{7}') && !text.contains('\r');
+
+        // The C-158 live tail.
+        let mut state = ChatState::new("opus".into());
+        state.expand_tools = true;
+        state.push(Entry::Tool(ToolEntry::new(
+            "bash".into(),
+            serde_json::json!({"command": "cargo test"}),
+        )));
+        state.progress_tool("bash", "\u{1b}[32mok\u{1b}[0m so far\u{7}".into());
+        let live = flat(&state);
+        assert!(live.contains("ok so far"), "text survives: {live:?}");
+        assert!(clean(&live), "live tail carries no control bytes: {live:?}");
+
+        // The finished result: summary (first line) and expanded detail rows.
+        state.finish_tool(
+            "bash",
+            "\u{1b}[31merror\u{1b}[0m: it broke\nstep 10%\rdone\u{7}".into(),
+            true,
+        );
+        let done = flat(&state);
+        assert!(done.contains("error: it broke"), "text survives: {done:?}");
+        assert!(clean(&done), "finished card carries no control bytes: {done:?}");
+
+        // Historical ingest (the resume path).
+        let mut resumed = ChatState::new("opus".into());
+        resumed.expand_tools = true;
+        resumed.push(Entry::Tool(ToolEntry::historical(
+            "bash".into(),
+            serde_json::json!({"command": "make"}),
+            "\u{1b}]0;title\u{7}built\u{1b}[0m fine".into(),
+            false,
+            Duration::from_secs(1),
+        )));
+        let historical = flat(&resumed);
+        assert!(
+            historical.contains("built fine"),
+            "text survives: {historical:?}"
+        );
+        assert!(
+            clean(&historical),
+            "historical card carries no control bytes: {historical:?}"
+        );
     }
 
     /// `FLUX_VERBOSE` is value-parsed, not presence-tested: only `1|true|yes|on`

@@ -1,5 +1,5 @@
 ---
-id: C-513
+id: C-519
 title: "Extract one shared cross-harness usage timeline"
 pillar: Core
 status: backlog
@@ -41,7 +41,7 @@ boundary the observatory can use without depending on `flux-cli` or inventing an
 
 ## Notes
 
-- First child of [C-512](C-512-usage-observatory-epic.md); C-514 consumes this record and adds truthful
+- First child of [C-518](C-518-usage-observatory-epic.md); C-520 consumes this record and adds truthful
   provider/model attribution and pricing semantics.
 - Existing source seams are summarized in the epic: `crates/flux-cli/src/usage.rs`,
   `crates/flux-capabilities/src/harness/mod.rs`, and `crates/flux-events/src/kind.rs`.

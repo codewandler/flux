@@ -1,4 +1,4 @@
-//! Shared, metadata-only usage timeline and deterministic observatory projection (C-512).
+//! Shared, metadata-only usage timeline and deterministic observatory projection (C-518).
 //!
 //! This module is deliberately below both user-facing surfaces. Acquisition adapters produce
 //! [`UsageFact`] values; the CLI and TUI consume the same range, attribution, cost, bucketing and

@@ -1,5 +1,5 @@
 ---
-id: C-518
+id: C-524
 title: "Close Usage Observatory accessibility, performance, and entry points"
 pillar: Core
 status: backlog
@@ -29,14 +29,14 @@ experience remains truthful and responsive.
 - [ ] A failing-first end-to-end fixture named `seven_day_observatory_stays_bounded_and_responsive`
       covers all four harnesses and proves bounded memory, buckets, visible pulses, and redraw work while
       interaction remains responsive under the repository's documented test threshold.
-- [ ] Integrated totals and previous-period comparisons remain byte-for-byte consistent with C-513
-      through C-515 projections across pause, seek, speed, layout, and reduced-motion changes; reported,
+- [ ] Integrated totals and previous-period comparisons remain byte-for-byte consistent with C-519
+      through C-521 projections across pause, seek, speed, layout, and reduced-motion changes; reported,
       estimated/subscription-equivalent, and unpriced coverage is visible in every dollar surface.
 - [ ] A metadata-only sentinel test proves replay and inspection never load prompt, assistant, tool-
       argument, or transcript-body content.
 - [ ] User-facing help/documentation explains windows, controls, attribution limits, timestamp precision,
       cost provenance, unknown/unpriced states, coalesced `×N` pulses, and historical pricing basis.
-- [ ] The standard workspace build, test, clippy, fmt, and `flux-codegate` gates are green before C-512
+- [ ] The standard workspace build, test, clippy, fmt, and `flux-codegate` gates are green before C-518
       closes, with any additional TUI snapshot checks included in the normal test path.
 
 ## Progress
@@ -45,6 +45,6 @@ experience remains truthful and responsive.
 
 ## Notes
 
-- Depends on [C-517](C-517-deterministic-usage-replay-and-animation.md) and closes
-  [C-512](C-512-usage-observatory-epic.md) only after every child is done or explicitly retired with a
+- Depends on [C-523](C-523-deterministic-usage-replay-and-animation.md) and closes
+  [C-518](C-518-usage-observatory-epic.md) only after every child is done or explicitly retired with a
   recorded reason.

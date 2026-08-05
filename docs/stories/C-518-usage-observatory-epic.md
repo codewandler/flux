@@ -1,5 +1,5 @@
 ---
-id: C-512
+id: C-518
 title: "Usage Observatory — animated cross-harness, provider, and model replay in the TUI (epic)"
 pillar: Core
 status: backlog
@@ -105,22 +105,22 @@ inspected without exposing prompts or assistant text.
 
 ## Child stories
 
-1. [**C-513 — Extract one shared cross-harness usage timeline.**](C-513-shared-cross-harness-usage-timeline.md)
+1. [**C-519 — Extract one shared cross-harness usage timeline.**](C-519-shared-cross-harness-usage-timeline.md)
    Move reusable extraction and accounting inputs out of CLI-only private structs while preserving
    `flux usage` output and discovery/read-only limits.
-2. [**C-514 — Project truthful usage attribution and cost.**](C-514-truthful-usage-attribution-and-cost.md)
+2. [**C-520 — Project truthful usage attribution and cost.**](C-520-truthful-usage-attribution-and-cost.md)
    Normalize harness/provider/raw+canonical model, timestamp precision, per-tier usage, and
    reported/estimated/unpriced cost; prove legacy Flux logs do not double-count.
-3. [**C-515 — Build adaptive usage buckets and comparisons.**](C-515-adaptive-usage-buckets-and-comparisons.md)
+3. [**C-521 — Build adaptive usage buckets and comparisons.**](C-521-adaptive-usage-buckets-and-comparisons.md)
    Build plot-width-aware timeline buckets, cumulative totals, filters, hierarchy grouping, and
    equal-previous-period deltas with stable zero-baseline behavior.
-4. [**C-516 — Ship the static Usage Observatory TUI.**](C-516-static-usage-observatory-tui.md)
+4. [**C-522 — Ship the static Usage Observatory TUI.**](C-522-static-usage-observatory-tui.md)
    Ship responsive KPI, timeline, flow-route, comparison, filter, and inspector views before motion
    so the analysis remains useful with animation disabled.
-5. [**C-517 — Add deterministic usage replay and bounded animation.**](C-517-deterministic-usage-replay-and-animation.md)
+5. [**C-523 — Add deterministic usage replay and bounded animation.**](C-523-deterministic-usage-replay-and-animation.md)
    Add the virtual clock, playback controls, interpolated pulses, burst coalescing, checkpoints for
    backward seeks, and bounded rendering work.
-6. [**C-518 — Close Usage Observatory accessibility, performance, and entry points.**](C-518-usage-observatory-closure.md)
+6. [**C-524 — Close Usage Observatory accessibility, performance, and entry points.**](C-524-usage-observatory-closure.md)
    Preserve the live `/usage` view, wire help and navigation, add monochrome/reduced-motion coverage,
    and prove seven-day responsiveness.
 
@@ -129,7 +129,7 @@ stories consume them rather than re-deriving accounting inside widgets.
 
 ## Progress
 
-- 2026-08-04: Filed C-513 through C-518 from the accepted six sequencing boundaries. Each child now
+- 2026-08-04: Filed C-519 through C-524 from the accepted six sequencing boundaries. Each child now
   names its failing-first proof, dependencies, and non-overlapping ownership; the first three establish
   truthful shared data semantics before the static and animated TUI layers consume them.
 - Epic filed from the operator request after reconciling it with the repository rather than the

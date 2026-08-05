@@ -1,5 +1,5 @@
 ---
-id: C-515
+id: C-521
 title: "Build adaptive usage buckets and comparisons"
 pillar: Core
 status: backlog
@@ -13,7 +13,7 @@ note: "Derive stable plot-width buckets, cumulative totals, hierarchy groups and
 
 Provide the deterministic analysis projection used by every observatory panel: adaptive timeline
 buckets, cumulative totals, filtering, grouping, drill-down, sorting, and equal-previous-period
-comparison over C-514's truthful usage facts.
+comparison over C-520's truthful usage facts.
 
 ## Acceptance
 
@@ -41,5 +41,5 @@ comparison over C-514's truthful usage facts.
 
 ## Notes
 
-- Depends on [C-514](C-514-truthful-usage-attribution-and-cost.md).
-- This story owns data projection only. Static widgets belong to C-516 and replay state to C-517.
+- Depends on [C-520](C-520-truthful-usage-attribution-and-cost.md).
+- This story owns data projection only. Static widgets belong to C-522 and replay state to C-523.

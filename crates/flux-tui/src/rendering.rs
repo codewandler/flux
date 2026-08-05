@@ -509,7 +509,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         );
     }
 
-    // C-512: the historical observatory is an explicit sibling of C-140's live `/usage` overlay.
+    // C-518: the historical observatory is an explicit sibling of C-140's live `/usage` overlay.
     // Its rows are monochrome-complete text; the active theme supplies presentation only.
     if let Some(observatory) = &state.observatory {
         let t = &state.theme;

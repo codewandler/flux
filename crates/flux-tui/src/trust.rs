@@ -285,10 +285,21 @@ pub(crate) fn sanitize(raw: &str) -> String {
 /// structure *is* its newlines. Everything else is filtered identically — a newline carries no
 /// styling and cannot leave the pane's rect, because the surface still owns every row budget.
 fn sanitize_block(raw: &str) -> String {
-    sanitize_inner(raw, true)
+    sanitize_inner(raw, true, true)
 }
 
-fn sanitize_inner(raw: &str, keep_newlines: bool) -> String {
+/// C-533: [`sanitize`] for transcript tool output. The same escape consumption and
+/// control/invisible dropping — subprocess bytes render as text and only text — with two
+/// deliberate differences from the pane forms: newlines survive (tool output is legitimately
+/// multi-line, and the card owns its row budget), and [`is_reserved`] glyphs pass through. The
+/// reserved-glyph replacement is chrome-forgery defense for *agent-authored regions*; a tool card
+/// is harness-attributed content inside the card's own chrome, and legitimate process output
+/// (cargo's dependency trees, box-drawing CLIs) draws with those glyphs.
+pub(crate) fn sanitize_tool_output(raw: &str) -> String {
+    sanitize_inner(raw, true, false)
+}
+
+fn sanitize_inner(raw: &str, keep_newlines: bool, replace_reserved: bool) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -298,7 +309,7 @@ fn sanitize_inner(raw: &str, keep_newlines: bool) -> String {
             '\t' => out.push(' '),
             '\n' if keep_newlines => out.push('\n'),
             c if c.is_control() || is_invisible(c) => {}
-            c if is_reserved(c) => out.push(' '),
+            c if replace_reserved && is_reserved(c) => out.push(' '),
             c => out.push(c),
         }
     }

@@ -1,5 +1,5 @@
 ---
-id: C-516
+id: C-522
 title: "Ship the static Usage Observatory TUI"
 pillar: Core
 status: backlog
@@ -25,7 +25,7 @@ metadata-only inspection across deliberate wide, medium, and compact layouts.
       compare with the immediately preceding equal-length period.
 - [ ] The static activity-flow view communicates each known harness → provider → model route while
       unknown provider and cost status remain labelled. Token and cost timelines, KPI totals, and the
-      comparison table preserve C-514/C-515's exact values and provenance.
+      comparison table preserve C-520/C-521's exact values and provenance.
 - [ ] Wide, medium, and compact layouts use the existing TUI theme rather than hardcoded colors and
       remain understandable in monochrome and with motion disabled.
 - [ ] Snapshot/state coverage named `usage_observatory_layout_matrix` includes at least wide, narrow,
@@ -33,7 +33,7 @@ metadata-only inspection across deliberate wide, medium, and compact layouts.
 - [ ] Inspection loads and displays usage metadata only; prompts, assistant answers, tool arguments,
       and transcript bodies do not enter observatory state.
 - [ ] C-140's live per-session `/usage` behavior remains available and is not silently redefined by the
-      new historical view; entry-point and help closure remain owned by C-518.
+      new historical view; entry-point and help closure remain owned by C-524.
 
 ## Progress
 
@@ -41,6 +41,6 @@ metadata-only inspection across deliberate wide, medium, and compact layouts.
 
 ## Notes
 
-- Depends on [C-515](C-515-adaptive-usage-buckets-and-comparisons.md).
-- The static-first boundary is deliberate: C-517 may decorate this view with motion but cannot make
+- Depends on [C-521](C-521-adaptive-usage-buckets-and-comparisons.md).
+- The static-first boundary is deliberate: C-523 may decorate this view with motion but cannot make
   any analysis or comparison depend on animation.

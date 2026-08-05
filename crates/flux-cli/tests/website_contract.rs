@@ -1136,7 +1136,7 @@ fn engineering_presentation_is_discoverable_grounded_and_reuses_the_guarded_fixt
         "Exchange is the only official integration executor",
         "Flux embeds the Exchange client",
         "Core Flux remains useful without Exchange",
-        // C-528: one distinctive claim per added chapter — agent loop, sessions, model strategy.
+        // C-540: one distinctive claim per added chapter — agent loop, sessions, model strategy.
         "captured, not executed",
         "resumes the exact flow",
         "Sessions are the record",

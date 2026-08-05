@@ -1,8 +1,8 @@
 # Interactive Flux presentation
 
-**Story:** C-491 (ten-chapter deck, shipped 0.53.0) · C-528 (thirteen chapters, UX hardening,
+**Story:** C-491 (ten-chapter deck, shipped 0.53.0) · C-540 (thirteen chapters, UX hardening,
 refreshed truth boundary)
-**Status:** implemented; amended 2026-08-05 by C-528
+**Status:** implemented; amended 2026-08-05 by C-540
 
 ## Decision
 
@@ -60,7 +60,7 @@ are not used as timeless marketing claims.
 The embedded-router contract names the new entry point so a source-only page cannot be reported as
 shipped before the tracked archive is regenerated. Website contract tests pin the content boundary,
 stale-claim removal (including the retired pre-C-503 Exchange gap claim), one distinctive claim per
-chapter added by C-528, the dated snapshot labels, and the non-console entry points (footer,
+chapter added by C-540, the dated snapshot labels, and the non-console entry points (footer,
 landing page, docs overview) so the deck cannot become an orphan again. The ordinary website build,
 mirror regeneration checks, deterministic embedded bundle check, and full Rust gate remain the
 completion criteria.
