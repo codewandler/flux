@@ -10,6 +10,8 @@ All notable changes to this project are documented in this file. The format is b
 
 - Release checksum verification accepts cargo-dist sidecars with trailing blank lines while still
   requiring one exact lowercase digest/filename record and at least one newline terminator.
+- A tag-scoped recovery dispatch can attest an already verified, receipt-bound candidate without
+  rebuilding, retagging, or granting publication authority to the attestation job.
 
 ## [0.56.0] - 2026-08-05
 
