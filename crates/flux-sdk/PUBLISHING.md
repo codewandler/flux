@@ -152,14 +152,20 @@ skipped, so a failed run is re-runnable).
 
 ### Normal path: merge `main` into `release`
 
-The deliberate release action is merging a pull request from `main` into the `release` branch.
-Direct pushes to `release` are not the normal path. No branch protection, ruleset, GitHub App or
-GitHub Environment is required or claimed by this release path. Open the release PR with:
+The deliberate release action is merging a pull request from a frozen canonical-`main` source into
+the `release` branch. Direct pushes to `release` are not the normal path. No new ruleset, GitHub App
+or GitHub Environment is required by this release path. If `release` has strict up-to-date
+protection, update the frozen PR branch after opening it; the promoter unwraps that merge only when
+its release-base parent, canonical-main parent and byte-identical tree all match exactly. Open the
+release PR with:
 
 ```sh
-gh pr create --base release --head main \
+source=release-source/vX.Y.Z-$(git rev-parse --short=8 HEAD)
+git push origin "HEAD:refs/heads/$source"
+pr=$(gh pr create --base release --head "$source" \
   --title "release: promote main" \
-  --body "Merge main into the release trigger branch."
+  --body "Merge the frozen canonical-main snapshot into the release trigger branch.")
+gh pr update-branch "${pr##*/}" --merge
 ```
 
 Merging that PR is the whole release action; its resulting push to `release` starts the workflow.

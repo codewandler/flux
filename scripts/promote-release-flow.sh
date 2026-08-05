@@ -48,17 +48,17 @@ SOURCE_SHA=$(git rev-parse HEAD^)
 [[ "$CUT_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "invalid local release history"
 [ "$SOURCE_SHA" = "$GITHUB_SHA" ] || fail "cut parent $SOURCE_SHA is not trigger SHA $GITHUB_SHA"
 
-# A normal PR merge into `release` has the old release tip as parent 1 and the frozen canonical-main
-# source as parent 2. The release merge must be content-identical to that main snapshot: `release`
-# contributes ancestry only, never a second implementation line. Main may advance while this build
-# runs, so promotion binds this parent and later proves the exact cut patch on the actual merge base
-# instead of comparing canonical main to the release-only merge commit.
+# A normal PR merge into `release` has the old release tip as parent 1 and the frozen source head as
+# parent 2. The release merge must be content-identical to that head: `release` contributes ancestry
+# only, never a second implementation line. A strict up-to-date rule may make the source head one
+# additional merge of that same release tip into canonical main; that wrapper is unwrapped below
+# only when its parents and tree prove exactly that shape.
 mapfile -t source_record < <(git rev-list --parents -n1 "$SOURCE_SHA")
 read -r -a source_parents <<<"${source_record[0]}"
 [ "${#source_parents[@]}" -eq 3 ] || fail "release trigger $SOURCE_SHA is not a two-parent PR merge"
-SOURCE_MAIN_SHA=${source_parents[2]}
-[ "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$(git rev-parse "$SOURCE_MAIN_SHA^{tree}")" ] \
-  || fail "release trigger $SOURCE_SHA differs from canonical-main parent $SOURCE_MAIN_SHA"
+SOURCE_HEAD_SHA=${source_parents[2]}
+[ "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$(git rev-parse "$SOURCE_HEAD_SHA^{tree}")" ] \
+  || fail "release trigger $SOURCE_SHA differs from frozen source head $SOURCE_HEAD_SHA"
 
 # The local tag is cut-script evidence only. The public tag is created later at the merged-main SHA.
 mapfile -t local_tags < <(git tag --points-at "$CUT_SHA" --list 'v*')
@@ -149,6 +149,22 @@ trap cleanup_notice EXIT
 REMOTE_MAIN=$(remote_sha refs/heads/main)
 [[ "$REMOTE_MAIN" =~ ^[0-9a-f]{40}$ ]] || fail "canonical main is missing"
 git fetch --no-tags --quiet origin "$REMOTE_MAIN" || fail "could not fetch canonical main $REMOTE_MAIN"
+SOURCE_MAIN_SHA=$SOURCE_HEAD_SHA
+if ! git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN"; then
+  mapfile -t source_head_record < <(git rev-list --parents -n1 "$SOURCE_HEAD_SHA")
+  read -r -a source_head_parents <<<"${source_head_record[0]}"
+  [ "${#source_head_parents[@]}" -eq 3 ] \
+    || fail "frozen source head $SOURCE_HEAD_SHA is neither canonical main nor an up-to-date wrapper"
+  if [ "${source_head_parents[1]}" = "${source_parents[1]}" ]; then
+    SOURCE_MAIN_SHA=${source_head_parents[2]}
+  elif [ "${source_head_parents[2]}" = "${source_parents[1]}" ]; then
+    SOURCE_MAIN_SHA=${source_head_parents[1]}
+  else
+    fail "source wrapper does not contain release trigger base ${source_parents[1]}"
+  fi
+  [ "$(git rev-parse "$SOURCE_HEAD_SHA^{tree}")" = "$(git rev-parse "$SOURCE_MAIN_SHA^{tree}")" ] \
+    || fail "source wrapper $SOURCE_HEAD_SHA differs from canonical-main parent $SOURCE_MAIN_SHA"
+fi
 git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN" \
   || fail "canonical main $REMOTE_MAIN does not descend from release source $SOURCE_MAIN_SHA"
 [ -z "$(remote_sha "$CUT_REF")" ] || fail "$CUT_REF already exists; promotion branches are fresh"

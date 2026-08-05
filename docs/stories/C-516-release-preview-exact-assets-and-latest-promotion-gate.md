@@ -98,6 +98,12 @@ the final step, never early cleanup.
 
 ## Progress
 
+- 2026-08-05 — live `release` protection requires a PR head updated to the base before merge. The
+  promoter now accepts that additional source wrapper only when it is a two-parent merge containing
+  the exact release-trigger base, its other parent is an ancestor of live canonical `main`, and its
+  tree is byte-identical to that canonical-main parent. The outer release trigger must remain
+  content-identical to the wrapper. This supports the configured strict rule without an admin
+  bypass or weakening source identity.
 - 2026-08-05 — GitHub documents that a PR created by `GITHUB_TOKEN` places its workflow runs behind
   manual approval, so moving PR control from the PAT would introduce another hidden setting
   dependency. The no-settings controller instead dispatches the existing complete `ci.yml` on the

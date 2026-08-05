@@ -55,6 +55,10 @@ not credential values or ownership.
   exact checksums and attestations defined by C-516. Promotion waits for newly created exact-tag/SHA
   binary and crates.io runs, verifies the live Release, runs the fleet/latest audit, and performs
   candidate cleanup last.
+- **Strict release-branch protection is compatible, not bypassed.** An up-to-date frozen source may
+  contain one wrapper merge. Promotion unwraps it only when one parent is the exact release-trigger
+  base, the other is an ancestor of live canonical `main`, and the wrapper/outer-trigger trees are
+  byte-identical to that main parent. No administrator merge path exists.
 
 ## Story traceability
 

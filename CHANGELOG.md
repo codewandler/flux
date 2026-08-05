@@ -166,7 +166,9 @@ All notable changes to this project are documented in this file. The format is b
   verifies the live Release and whole `/releases/latest` fleet, and deletes evidence last. The
   release trigger is bound to its content-identical canonical-main parent; if `main` advances during
   the cut and checks, promotion accepts only a descendant and reconstructs the exact cut patch in an
-  isolated Git index against the live main base before candidate creation. New Releases have one
+  isolated Git index against the live main base before candidate creation. A strict up-to-date rule
+  may add one source-wrapper merge; it is accepted only when it contains the exact release base and
+  canonical-main parents and is byte-identical to the latter. New Releases have one
   exact 28-asset inventory; every archive sidecar and the eleven-entry checksum index are recomputed,
   all downloaded bytes must match positive unique GitHub metadata, and every asset must carry the
   exact tag/SHA release-workflow attestation.

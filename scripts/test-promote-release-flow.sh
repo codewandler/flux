@@ -25,11 +25,13 @@ abort "the imported cut is not verified before use" unless
 
 required = {
   bundle: 'git bundle verify "$RELEASE_CUT_BUNDLE"',
-  source_main: 'SOURCE_MAIN_SHA=${source_parents[2]}',
-  source_tree: 'release trigger $SOURCE_SHA differs from canonical-main parent $SOURCE_MAIN_SHA',
+  source_head: 'SOURCE_HEAD_SHA=${source_parents[2]}',
+  source_tree: 'release trigger $SOURCE_SHA differs from frozen source head $SOURCE_HEAD_SHA',
   cut_branch: 'CUT_BRANCH=release-cuts/$TAG',
   pat_preflight: 'RELEASE_CAN_PUSH=$(release_gh api',
-  main_descends: 'git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN"',
+  wrapper_base: 'source wrapper does not contain release trigger base ${source_parents[1]}',
+  source_main: 'SOURCE_MAIN_SHA=${source_head_parents[1]}',
+  main_descends: 'canonical main $REMOTE_MAIN does not descend from release source $SOURCE_MAIN_SHA',
   cut_push: 'git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"',
   ci_baseline: 'CI_BASELINE=$(latest_run_id ci.yml)',
   ci_dispatch: 'actions_gh workflow run ci.yml',
@@ -57,7 +59,7 @@ indexes = required.transform_values do |needle|
   abort "missing promotion boundary #{needle}" unless index
   index
 end
-order = %i[bundle cut_branch source_main source_tree pat_preflight main_descends cut_push ci_baseline ci_dispatch exact_ci merge_tree merge_commit main_push canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
+order = %i[bundle cut_branch source_head source_tree pat_preflight source_main wrapper_base main_descends cut_push ci_baseline ci_dispatch exact_ci merge_tree merge_commit main_push canonical_main exact_tree candidate candidate_readback receipt release_baseline crates_baseline tag_object tag_ref release_run crates_run live fleet cleanup]
 order.each_cons(2) do |left, right|
   abort "promotion order regressed: #{left} must precede #{right}" unless indexes.fetch(left) < indexes.fetch(right)
 end
@@ -90,10 +92,12 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/flux-promoter-policy.XXXXXX")
 trap 'rm -rf -- "$tmp"' EXIT
 for needle in \
   'git bundle verify "$RELEASE_CUT_BUNDLE"' \
-  'SOURCE_MAIN_SHA=${source_parents[2]}' \
-  'release trigger $SOURCE_SHA differs from canonical-main parent $SOURCE_MAIN_SHA' \
+  'SOURCE_HEAD_SHA=${source_parents[2]}' \
+  'release trigger $SOURCE_SHA differs from frozen source head $SOURCE_HEAD_SHA' \
+  'source wrapper does not contain release trigger base ${source_parents[1]}' \
+  'SOURCE_MAIN_SHA=${source_head_parents[1]}' \
   'RELEASE_CAN_PUSH=$(release_gh api' \
-  'git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN"' \
+  'canonical main $REMOTE_MAIN does not descend from release source $SOURCE_MAIN_SHA' \
   'git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"' \
   'CI_BASELINE=$(latest_run_id ci.yml)' \
   'actions_gh workflow run ci.yml' \
@@ -145,16 +149,24 @@ git -C "$repo" add version unrelated
 git -C "$repo" commit -q -m base
 git -C "$repo" branch main
 git -C "$repo" switch -q -c release
+git -C "$repo" commit -q --allow-empty -m release-tip
 git -C "$repo" switch -q main
 printf 'reviewed notes\n' >"$repo/notes"
 git -C "$repo" add notes
 git -C "$repo" commit -q -m source
 source_main=$(git -C "$repo" rev-parse HEAD)
+git -C "$repo" switch -q -c release-source main
+git -C "$repo" merge -q --no-ff release -m up-to-date-source
+source_head=$(git -C "$repo" rev-parse HEAD)
 git -C "$repo" switch -q release
-git -C "$repo" merge -q --no-ff main -m release-trigger
+git -C "$repo" merge -q --no-ff release-source -m release-trigger
 source_sha=$(git -C "$repo" rev-parse HEAD)
-[ "$(git -C "$repo" rev-parse "$source_sha^2")" = "$source_main" ] \
-  || { echo 'FAIL: fixture release merge did not bind canonical-main parent 2' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$source_sha^2")" = "$source_head" ] \
+  || { echo 'FAIL: fixture release merge did not bind frozen source head' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$source_head^2")" = "$(git -C "$repo" rev-parse "$source_sha^1")" ] \
+  || { echo 'FAIL: fixture source wrapper did not contain release trigger base' >&2; exit 1; }
+[ "$(git -C "$repo" rev-parse "$source_head^1")" = "$source_main" ] \
+  || { echo 'FAIL: fixture source wrapper did not bind canonical main' >&2; exit 1; }
 [ "$(git -C "$repo" rev-parse "$source_sha^{tree}")" = "$(git -C "$repo" rev-parse "$source_main^{tree}")" ] \
   || { echo 'FAIL: fixture release merge changed canonical-main content' >&2; exit 1; }
 printf '0.56.0\n' >"$repo/version"

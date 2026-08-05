@@ -51,13 +51,17 @@ environment and `release` environment from the Flux release path.
       dependency. Existing candidate-v3, exact merged-SHA, 28-asset and latest-release gates remain
       unchanged.
 - [x] The release trust design, C-353, C-354, C-516, publishing runbook, changelog and generated
-      board explicitly record this user-directed supersession. No live App, environment, ruleset or
-      branch-protection setup is required or claimed.
+      board explicitly record this user-directed supersession. No App, environment, new ruleset or
+      new branch-protection setup is required. Configured strict release-branch protection is
+      supported through an exactly validated up-to-date source wrapper, not an admin bypass.
 - [x] Focused release-policy checks and the full repository gate pass from the final committed tree;
       the story is done on canonical `main` before the v0.56.0 promotion begins.
 
 ## Progress
 
+- Strict live protection on `release` requires the frozen source PR to contain its current base.
+  Promotion unwraps that source merge only when it contains the exact release-trigger base and an
+  ancestor of live canonical `main`, with a tree byte-identical to the canonical-main parent.
 - Release run `31038895447` proved the provider-free cut again, then exposed that the existing
   fine-grained PAT can move repository refs but cannot call the Pull Request API. GitHub's documented
   approval requirement for Actions-created PR workflows rules out shifting that API call to
