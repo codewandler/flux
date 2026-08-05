@@ -451,6 +451,118 @@ fn digest(input: &str) -> String {
         .collect()
 }
 
+const ADAPTIVE_TOOL_RESULT_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdaptiveToolResultBudget {
+    actual_bytes: usize,
+    sha256: String,
+}
+
+fn bound_adaptive_tool_result(result: String) -> (String, Option<AdaptiveToolResultBudget>) {
+    let actual_bytes = result.len();
+    if actual_bytes <= ADAPTIVE_TOOL_RESULT_LIMIT {
+        return (result, None);
+    }
+
+    let sha256 = digest(&result);
+    let summary = json!({
+        "type": "tool_result_omitted",
+        "reason": "tool_result_too_large",
+        "actual_bytes": actual_bytes,
+        "limit_bytes": ADAPTIVE_TOOL_RESULT_LIMIT,
+        "sha256": &sha256,
+    })
+    .to_string();
+    (
+        summary,
+        Some(AdaptiveToolResultBudget {
+            actual_bytes,
+            sha256,
+        }),
+    )
+}
+
+const ADAPTIVE_HISTORY_LIMIT: usize = 512 * 1024;
+const ADAPTIVE_REQUEST_LIMIT: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdaptiveRequestBytes {
+    system_bytes: usize,
+    message_bytes: usize,
+    tool_bytes: usize,
+    total_bytes: usize,
+}
+
+fn serialized_bytes<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    serde_json::to_vec(value)
+        .map(|serialized| serialized.len())
+        .unwrap_or(usize::MAX)
+}
+
+fn adaptive_history_bytes<T: serde::Serialize + ?Sized>(messages: &T) -> usize {
+    serialized_bytes(messages)
+}
+
+fn adaptive_request_bytes<M, T>(system_text: &str, messages: &M, tools: &T) -> AdaptiveRequestBytes
+where
+    M: serde::Serialize + ?Sized,
+    T: serde::Serialize + ?Sized,
+{
+    let system_bytes = system_text.len();
+    let message_bytes = serialized_bytes(messages);
+    let tool_bytes = serialized_bytes(tools);
+    let total_bytes = system_bytes
+        .saturating_add(message_bytes)
+        .saturating_add(tool_bytes);
+    AdaptiveRequestBytes {
+        system_bytes,
+        message_bytes,
+        tool_bytes,
+        total_bytes,
+    }
+}
+
+fn adaptive_budget_status(actual_bytes: usize, limit_bytes: usize) -> Option<&'static str> {
+    if actual_bytes > limit_bytes {
+        Some("exceeded")
+    } else if actual_bytes >= limit_bytes.saturating_mul(4) / 5 {
+        Some("approaching")
+    } else {
+        None
+    }
+}
+
+fn adaptive_budget_diagnostic(
+    budget: &'static str,
+    actual_bytes: usize,
+    limit_bytes: usize,
+    request: Option<AdaptiveRequestBytes>,
+) -> Option<Value> {
+    let status = adaptive_budget_status(actual_bytes, limit_bytes)?;
+    let mut diagnostic = json!({
+        "budget": budget,
+        "status": status,
+        "actual_bytes": actual_bytes,
+        "limit_bytes": limit_bytes,
+    });
+    if let Some(request) = request {
+        let object = diagnostic
+            .as_object_mut()
+            .expect("budget diagnostic is an object");
+        object.insert("system_bytes".into(), request.system_bytes.into());
+        object.insert("message_bytes".into(), request.message_bytes.into());
+        object.insert("tool_bytes".into(), request.tool_bytes.into());
+    }
+    Some(diagnostic)
+}
+
+fn adaptive_budget_refusal(budget: &str, actual_bytes: usize, limit_bytes: usize) -> String {
+    format!(
+        "adaptive {budget} budget exceeded: actual_bytes={actual_bytes} limit_bytes={limit_bytes}"
+    )
+}
+
 /// Run only the intent stage and return a durable state artifact for [`explore_stage`].
 pub(crate) async fn detect_intent_stage(ctx: StagedContext) -> StagedRun {
     let mut usages = Vec::new();
@@ -1297,6 +1409,43 @@ async fn adaptive_explore(
                 capability_signal_tool(&families),
             ])
             .collect();
+        let history_bytes = adaptive_history_bytes(&req.messages);
+        let system_text = req.system_text();
+        let request_bytes = adaptive_request_bytes(
+            system_text.as_deref().unwrap_or_default(),
+            &req.messages,
+            &req.tools,
+        );
+        if let Some(diagnostic) = adaptive_budget_diagnostic(
+            "adaptive_history",
+            history_bytes,
+            ADAPTIVE_HISTORY_LIMIT,
+            None,
+        ) {
+            observe(ctx, "turn.budget", diagnostic);
+        }
+        if history_bytes > ADAPTIVE_HISTORY_LIMIT {
+            return Err(Error::Other(adaptive_budget_refusal(
+                "history",
+                history_bytes,
+                ADAPTIVE_HISTORY_LIMIT,
+            )));
+        }
+        if let Some(diagnostic) = adaptive_budget_diagnostic(
+            "adaptive_request",
+            request_bytes.total_bytes,
+            ADAPTIVE_REQUEST_LIMIT,
+            Some(request_bytes),
+        ) {
+            observe(ctx, "turn.budget", diagnostic);
+        }
+        if request_bytes.total_bytes > ADAPTIVE_REQUEST_LIMIT {
+            return Err(Error::Other(adaptive_budget_refusal(
+                "request",
+                request_bytes.total_bytes,
+                ADAPTIVE_REQUEST_LIMIT,
+            )));
+        }
         let repair_attempt = state.explore_calls;
         correlate_request(ctx, &mut req, "explore", state.explore_calls + 1);
         let request_model = req.model.clone();
@@ -1597,10 +1746,28 @@ async fn adaptive_explore(
                                 "call_id": &call.call_id,
                             }),
                         );
+                        // Redact before hashing or retaining the result so omission metadata cannot
+                        // become a stable fingerprint of an unredacted secret.
+                        let result = redactor.redact(&result);
+                        let (result, budget) = bound_adaptive_tool_result(result);
+                        if let Some(budget) = budget {
+                            observe(
+                                ctx,
+                                "turn.budget",
+                                json!({
+                                    "operation": &call.operation,
+                                    "budget": "tool_result",
+                                    "status": "exceeded",
+                                    "actual_bytes": budget.actual_bytes,
+                                    "limit_bytes": ADAPTIVE_TOOL_RESULT_LIMIT,
+                                    "sha256": budget.sha256,
+                                }),
+                            );
+                        }
                         state.gathered.push(GatheredEvidence {
                             op: call.operation,
                             input: redactor.redact(&call.input.to_string()),
-                            result: redactor.redact(&result),
+                            result: result.clone(),
                         });
                         results.push(ContentBlock::tool_result_text(call.call_id, result, false));
                     }
@@ -2624,6 +2791,11 @@ fn observe_model_call(ctx: &StagedContext, call: ModelCallObservation<'_>) {
             "transport_fallbacks": metrics.transport_fallbacks,
             "system_bytes": metrics.system_bytes,
             "message_bytes": metrics.message_bytes,
+            "message_count": metrics.message_count,
+            "tool_result_count": metrics.tool_result_count,
+            "tool_result_bytes": metrics.tool_result_bytes,
+            "tool_use_bytes": metrics.tool_use_bytes,
+            "text_bytes": metrics.text_bytes,
             "operations": metrics.operations,
             "schema_bytes": metrics.schema_bytes,
             "usage": usage,
@@ -3169,6 +3341,156 @@ mod tests {
     use super::*;
 
     static TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn adaptive_tool_result_is_bounded_without_retaining_payload() {
+        let payload_marker = "oversized-sensitive-tool-result";
+        let oversized =
+            payload_marker.repeat((ADAPTIVE_TOOL_RESULT_LIMIT / payload_marker.len()) + 2);
+        let actual_bytes = oversized.len();
+        let expected_digest = digest(&oversized);
+
+        let (bounded, budget) = bound_adaptive_tool_result(oversized.clone());
+        let budget = budget.expect("oversized result should report its budget");
+        assert!(!bounded.contains(payload_marker));
+        assert!(!bounded.contains(&oversized));
+        assert!(bounded.len() < 256);
+        assert!(bounded.contains(&actual_bytes.to_string()));
+        assert!(bounded.contains(&ADAPTIVE_TOOL_RESULT_LIMIT.to_string()));
+        assert!(bounded.contains(&expected_digest));
+        assert_eq!(budget.actual_bytes, actual_bytes);
+        assert_eq!(budget.sha256, expected_digest);
+
+        let in_budget = "small tool result".to_string();
+        let (unchanged, budget) = bound_adaptive_tool_result(in_budget.clone());
+        assert_eq!(unchanged, in_budget);
+        assert_eq!(budget, None);
+    }
+
+    #[test]
+    fn adaptive_history_and_request_budgets_are_hard_and_payload_free() {
+        let at_history_limit = "x".repeat(ADAPTIVE_HISTORY_LIMIT - 2);
+        assert_eq!(
+            adaptive_history_bytes(&at_history_limit),
+            ADAPTIVE_HISTORY_LIMIT
+        );
+        assert_eq!(
+            adaptive_budget_status(ADAPTIVE_HISTORY_LIMIT, ADAPTIVE_HISTORY_LIMIT),
+            Some("approaching")
+        );
+        assert_eq!(
+            adaptive_budget_status(ADAPTIVE_HISTORY_LIMIT + 1, ADAPTIVE_HISTORY_LIMIT),
+            Some("exceeded")
+        );
+
+        let marker = "sensitive-input-marker";
+        let messages = vec![marker];
+        let tools = vec![json!({"name": "bounded"})];
+        let request = adaptive_request_bytes("system", &messages, &tools);
+        assert_eq!(request.system_bytes, "system".len());
+        assert_eq!(
+            request.message_bytes,
+            serde_json::to_vec(&messages).unwrap().len()
+        );
+        assert_eq!(
+            request.tool_bytes,
+            serde_json::to_vec(&tools).unwrap().len()
+        );
+        assert_eq!(
+            request.total_bytes,
+            request
+                .system_bytes
+                .saturating_add(request.message_bytes)
+                .saturating_add(request.tool_bytes)
+        );
+        assert_eq!(
+            adaptive_budget_status(ADAPTIVE_REQUEST_LIMIT, ADAPTIVE_REQUEST_LIMIT),
+            Some("approaching")
+        );
+        assert_eq!(
+            adaptive_budget_status(ADAPTIVE_REQUEST_LIMIT + 1, ADAPTIVE_REQUEST_LIMIT),
+            Some("exceeded")
+        );
+
+        let diagnostic = adaptive_budget_diagnostic(
+            "adaptive_request",
+            ADAPTIVE_REQUEST_LIMIT + 1,
+            ADAPTIVE_REQUEST_LIMIT,
+            Some(request),
+        )
+        .unwrap()
+        .to_string();
+        let refusal = adaptive_budget_refusal(
+            "request",
+            ADAPTIVE_REQUEST_LIMIT + 1,
+            ADAPTIVE_REQUEST_LIMIT,
+        );
+        assert!(!diagnostic.contains(marker));
+        assert!(!refusal.contains(marker));
+        assert!(diagnostic.contains("system_bytes"));
+        assert!(diagnostic.contains("message_bytes"));
+        assert!(diagnostic.contains("tool_bytes"));
+
+        let roots = ["flux", "connectors", "exchange"];
+        let raw_marker = "continued-fleet-raw-result-marker";
+        let raw_result = format!("{raw_marker}:{}", "x".repeat(201 * 1024));
+        let raw_bytes = raw_result.len().saturating_mul(6);
+        let mut continued_messages = vec![Message::user_text(
+            "Continue the Fleet inspection across all configured repository roots.",
+        )];
+
+        for repair_attempt in 1..=6 {
+            let root = roots[(repair_attempt - 1) % roots.len()];
+            let tool_use_id = format!("continued-read-{repair_attempt}");
+            continued_messages.push(Message::assistant(vec![ContentBlock::ToolUse {
+                id: tool_use_id.clone(),
+                name: "read_root".into(),
+                input: json!({"root": root}),
+            }]));
+            let (bounded_result, omitted) = bound_adaptive_tool_result(raw_result.clone());
+            assert!(omitted.is_some());
+            continued_messages.push(Message::user(vec![ContentBlock::tool_result_text(
+                tool_use_id,
+                bounded_result,
+                false,
+            )]));
+            continued_messages.push(Message::user_text(format!(
+                "Repair attempt {repair_attempt}: continue the Fleet inspection for root {root} using only the bounded result summary."
+            )));
+        }
+
+        let tools = (0..28)
+            .map(|index| {
+                json!({
+                    "name": format!("continued_tool_{index}"),
+                    "description": "Inspect one configured Fleet root.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"root": {"type": "string"}},
+                        "required": ["root"]
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let seventh_request = adaptive_request_bytes(EXPLORE_SYSTEM, &continued_messages, &tools);
+        let serialized_messages = serde_json::to_string(&continued_messages).unwrap();
+        let seventh_round_diagnostic = adaptive_budget_diagnostic(
+            "seventh_explore_request",
+            seventh_request.total_bytes,
+            seventh_request.total_bytes,
+            Some(seventh_request),
+        )
+        .unwrap()
+        .to_string();
+
+        assert!(raw_bytes > 1_231_783);
+        assert!(serialized_messages.len() < ADAPTIVE_HISTORY_LIMIT);
+        assert!(serialized_messages.len() < raw_bytes / 10);
+        assert!(seventh_request.total_bytes < ADAPTIVE_REQUEST_LIMIT);
+        assert_eq!(tools.len(), 28);
+        assert!(!serialized_messages.contains(raw_marker));
+        assert!(!seventh_round_diagnostic.contains(raw_marker));
+    }
 
     /// A per-test workspace directory that removes itself on drop, so a run never leaks the
     /// `flux-staged-*` temp directories even when an assertion fails mid-test.

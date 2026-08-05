@@ -289,8 +289,16 @@ All notable changes to this project are documented in this file. The format is b
   silently checking only the roadmap checkout. Fleet turns receive every configured repository as
   an explicit read-only root while retaining a single writable worktree, and capture now discards
   an oversized activity event only at a complete NDJSON line boundary so a later terminal receipt
-  remains parseable. C-560 tracks the separate investigation into why a continued read-only turn
-  produced a 1.23 MB event and the source-side bounds it needs.
+  remains parseable.
+
+- **Continued Fleet turns now bound oversized evidence before it can break supervision** (C-560).
+  Adaptive tool results are replaced atomically above 64 KiB, accumulated adaptive history refuses
+  above 512 KiB and a provider request refuses above 1 MiB with payload-free diagnostics. Fleet
+  children emit valid source NDJSON lines below 240 KiB; parser defense at 256 KiB preserves a
+  terminal outcome and records byte counts plus a post-redaction digest instead of slicing JSON.
+  `model.call` reports system, schema, text, tool-use and tool-result bytes separately, and Fleet
+  receipts report stream-budget totals. The hermetic regression reproduces the observed continued
+  three-repository, 28-operation, six-repair/seventh-request shape without provider credentials.
 
 - **The native board-and-fleet release gate now distinguishes fixture literals from executable
   build entry points** (C-558). The build-ownership scanner ignores standalone Ruby string

@@ -281,6 +281,16 @@ Events are redacted before persistence, not merely at display time. The corpus c
 `.env`, key files, model commentary, commands, diffs, and JSON fields. Follow mode emits NDJSON so
 an agent does not parse terminal decoration.
 
+Fleet also bounds evidence before the supervisor retains it. Adaptive tool results larger than
+64 KiB become payload-free omission records; accumulated adaptive message history refuses above
+512 KiB and a complete provider request refuses above 1 MiB. Child NDJSON lines are limited to
+240 KiB (including the newline), below the 256 KiB parser boundary. An oversized nonterminal event
+becomes `event_omitted`; an oversized `turn_end` keeps its session, outcome, usage and cost while its
+answer/error payload becomes `payload_omitted`. `turn.budget`, `model.call` and the Fleet receipt's
+`stream_budget` report only the affected domain, byte count, limit and post-redaction digest—never
+the omitted repository content. Use `inspect worker` or `inspect result` to correlate that digest;
+do not expect `status` to reproduce an omitted payload.
+
 The paired board commands replace progress collectors and report generators:
 
 ```sh

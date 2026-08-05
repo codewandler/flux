@@ -107,10 +107,9 @@ pub(super) enum ProtocolLine {
     },
 }
 
-/// Serialize `line`, redact the WHOLE serialized text, then write it as one `\n`-terminated line to
-/// `out` and flush. Every emission path in this module funnels through here so nothing can bypass
-/// the redaction pass (the protocol-boundary guarantee the design doc names).
-fn write_line(out: &mut impl Write, line: &ProtocolLine, redactor: &Redactor) {
+pub(super) const STREAM_JSON_LINE_LIMIT_ENV: &str = "FLUX_STREAM_JSON_LINE_LIMIT_BYTES";
+
+fn protocol_line_text(line: &ProtocolLine, redactor: &Redactor) -> String {
     let text = serde_json::to_string(line).unwrap_or_else(|e| {
         serde_json::json!({
             "type": "error",
@@ -120,9 +119,75 @@ fn write_line(out: &mut impl Write, line: &ProtocolLine, redactor: &Redactor) {
         })
         .to_string()
     });
-    let redacted = redactor.redact(&text);
-    let _ = writeln!(out, "{redacted}");
-    let _ = out.flush();
+    redactor.redact(&text)
+}
+
+fn bounded_protocol_text(
+    line: &ProtocolLine,
+    redactor: &Redactor,
+    limit: Option<usize>,
+) -> Option<String> {
+    let text = protocol_line_text(line, redactor);
+    let Some(limit_bytes) = limit else {
+        return Some(text);
+    };
+    let actual_bytes = text.len();
+    if actual_bytes.saturating_add(1) <= limit_bytes {
+        return Some(text);
+    }
+
+    let original: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let original_type = original.get("type")?.as_str()?;
+    let session = original.get("session")?.as_str()?;
+    let sha256 = flux_lang::runtime::sha256_hex(&text);
+    let replacement = if original_type == "turn_end" {
+        let mut replacement = serde_json::json!({
+            "type": "turn_end",
+            "v": original.get("v").cloned().unwrap_or(serde_json::Value::Null),
+            "session": session,
+            "outcome": original.get("outcome").cloned().unwrap_or(serde_json::Value::Null),
+            "usage": original.get("usage").cloned().unwrap_or(serde_json::Value::Null),
+            "cost_usd": original.get("cost_usd").cloned().unwrap_or(serde_json::Value::Null),
+            "answer": "",
+            "payload_omitted": {
+                "reason": "event_too_large",
+                "actual_bytes": actual_bytes,
+                "limit_bytes": limit_bytes,
+                "sha256": sha256,
+            },
+        });
+        if !original.get("error").is_none_or(serde_json::Value::is_null) {
+            replacement["error"] = serde_json::Value::String("omitted: event_too_large".into());
+        }
+        replacement
+    } else {
+        serde_json::json!({
+            "type": "event_omitted",
+            "v": original.get("v").cloned().unwrap_or(serde_json::Value::Null),
+            "session": session,
+            "original_type": original_type,
+            "reason": "event_too_large",
+            "actual_bytes": actual_bytes,
+            "limit_bytes": limit_bytes,
+            "sha256": sha256,
+        })
+    };
+    let replacement = serde_json::to_string(&replacement).ok()?;
+    (replacement.len().saturating_add(1) <= limit_bytes).then_some(replacement)
+}
+
+/// Serialize `line`, redact the WHOLE serialized text, then write it as one `\n`-terminated line to
+/// `out` and flush. Every emission path in this module funnels through here so nothing can bypass
+/// the redaction pass (the protocol-boundary guarantee the design doc names).
+fn write_line(out: &mut impl Write, line: &ProtocolLine, redactor: &Redactor) {
+    let limit = std::env::var(STREAM_JSON_LINE_LIMIT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|limit| *limit > 0);
+    if let Some(text) = bounded_protocol_text(line, redactor, limit) {
+        let _ = writeln!(out, "{text}");
+        let _ = out.flush();
+    }
 }
 
 /// [`AgentSink`] that projects a turn onto the NDJSON protocol instead of rendering for a human
@@ -507,6 +572,98 @@ mod tests {
         );
         assert!(text.contains("\"type\":\"tool_call\""), "{text}");
         assert!(text.contains(&format!("\"v\":{SCHEMA_VERSION}")), "{text}");
+    }
+
+    #[test]
+    fn in_budget_protocol_line_is_unchanged() {
+        let redactor = Redactor::new();
+        let line = ProtocolLine::Error {
+            v: SCHEMA_VERSION,
+            session: "s1".into(),
+            message: "in budget".into(),
+        };
+        let original = protocol_line_text(&line, &redactor);
+
+        assert_eq!(
+            bounded_protocol_text(&line, &redactor, None),
+            Some(original.clone())
+        );
+        assert_eq!(
+            bounded_protocol_text(&line, &redactor, Some(original.len() + 1)),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn oversized_nonterminal_is_replaced_with_event_omitted() {
+        const SUPERVISOR_CAPTURE_LIMIT: usize = 1024 * 1024;
+        const SOURCE_LINE_LIMIT: usize = 240 * 1024;
+        let redactor = Redactor::new();
+        let marker_unit = "unique-oversized-tool-result-marker";
+        let marker = marker_unit.repeat(SUPERVISOR_CAPTURE_LIMIT / marker_unit.len() + 2);
+        let line = ProtocolLine::ToolResult {
+            v: SCHEMA_VERSION,
+            session: "s1".into(),
+            dispatch: 7,
+            name: "gather".into(),
+            is_error: false,
+            content: marker.clone(),
+            view: None,
+            duration_us: None,
+        };
+        let original = protocol_line_text(&line, &redactor);
+        assert!(original.len() > SUPERVISOR_CAPTURE_LIMIT);
+        let replacement = bounded_protocol_text(&line, &redactor, Some(SOURCE_LINE_LIMIT)).unwrap();
+        let value: Value = serde_json::from_str(&replacement).unwrap();
+
+        assert_eq!(value["type"], "event_omitted");
+        assert_eq!(value["original_type"], "tool_result");
+        assert_eq!(value["reason"], "event_too_large");
+        assert_eq!(value["actual_bytes"], original.len());
+        assert_eq!(value["limit_bytes"], SOURCE_LINE_LIMIT);
+        assert_eq!(value["sha256"], flux_lang::runtime::sha256_hex(&original));
+        assert!(!replacement.contains(&marker));
+        assert!(replacement.len() < SOURCE_LINE_LIMIT);
+    }
+
+    #[test]
+    fn oversized_turn_end_preserves_terminal_metadata_and_omits_payload() {
+        const LIMIT: usize = 512;
+        let redactor = Redactor::new();
+        let answer_marker = "unique-oversized-answer-marker".repeat(64);
+        let error_marker = "unique-oversized-error-marker".repeat(64);
+        let usage = Usage::default();
+        let line = ProtocolLine::TurnEnd {
+            v: SCHEMA_VERSION,
+            session: "s1".into(),
+            outcome: "error",
+            error: Some(error_marker.clone()),
+            answer: answer_marker.clone(),
+            usage: Some(usage.clone()),
+            cost_usd: Some(1.25),
+        };
+        let original = protocol_line_text(&line, &redactor);
+        let replacement = bounded_protocol_text(&line, &redactor, Some(LIMIT)).unwrap();
+        let value: Value = serde_json::from_str(&replacement).unwrap();
+
+        assert_eq!(value["type"], "turn_end");
+        assert_eq!(value["v"], SCHEMA_VERSION);
+        assert_eq!(value["session"], "s1");
+        assert_eq!(value["outcome"], "error");
+        assert_eq!(value["usage"], serde_json::to_value(usage).unwrap());
+        assert_eq!(value["cost_usd"], 1.25);
+        assert_eq!(value["answer"], "");
+        assert_eq!(value["error"], "omitted: event_too_large");
+        assert_eq!(value["payload_omitted"]["reason"], "event_too_large");
+        assert_eq!(value["payload_omitted"]["actual_bytes"], original.len());
+        assert_eq!(value["payload_omitted"]["limit_bytes"], LIMIT);
+        assert_eq!(
+            value["payload_omitted"]["sha256"],
+            flux_lang::runtime::sha256_hex(&original)
+        );
+        assert!(!replacement.contains(&answer_marker));
+        assert!(!replacement.contains(&error_marker));
+        assert!(replacement.len() < LIMIT);
     }
 
     #[test]
