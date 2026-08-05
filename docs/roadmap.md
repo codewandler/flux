@@ -99,25 +99,17 @@ envelope. Every story carries a generic example; its syntax remains illustrative
 AST/lowering decision is accepted. Design:
 [flux-lang-authoring-ergonomics](designs/flux-lang-authoring-ergonomics.md).
 
-### The first-class board — one fixed tool surface, pluggable backends (epic) — 🔄 **PROPOSED (A-148; L-130 filed; A-134/A-115/A-118 re-pointed)**
+### Native boards — explicit scope, profile, backend and planning documents (epic) — 🔄 **IN PROGRESS (A-148; board wave ready)**
 
-flux-roadmap Decision 0006 gave the family one datasource definition — a named, declared,
-**read-only** record surface (*operations do; datasources know*) — and the work board fails that
-test on purpose: it mutates. Today the board rides the `datasource` declaration through a
-`kind "board:…"` prefix hack, its subjects use an unprefixed grammar, and an embedder cannot bind
-one at all. This epic gives the board what the decision says it is: a first-class Flux concept with
-its own `board <name>` declaration (L-130, retiring the `board:*` kinds with a migration note), its
-own `board:<name>/item/<id>` subject namespace (shared with D-251's one-grammar normalization), and
-its own SDK seam (A-134, absorbed from the fleet-coordinator epic). The load-bearing constraint is
-what does *not* change: one small fixed 11-operation tool surface with a closed state machine,
-identical across every backend — memory and markdown today, vendor trackers later through the
-declared-surface pattern (connector-declared status↔state and per-verb operation mappings, Exchange
-tenant Board bindings, every write an admitted granted operation; A-115/A-118, re-pointed off the
-plugin path Milestone 5 deletes, Milestone 3+). The adoption story C-514 carried the vocabulary;
-this epic carries the split. Design: [first-class-board](designs/first-class-board.md).
-Datasource-side siblings filed with it: D-250 (one registry across indexed + live modes), D-252
-(Exchange-bound and catalogue `datasource` kinds), D-253 (protocol-line counterparties), D-254
-(data-pipelines exploration, [data-pipelines](designs/data-pipelines.md)).
+Flux-roadmap Decision 0010 keeps Decision 0006's separation—mutable boards are not datasources—but
+supersedes its universal execution lifecycle. A BoardRegistry now owns stable BoardRefs; session,
+repository and workspace scopes compose independently with general, planning and execution profiles
+and their backends. Planning boards additionally own vision, roadmap, decision and design documents
+outside the queue. The delivered eleven WorkBoard ops remain the execution profile. C-547 establishes
+the versioned human/JSON agent CLI, A-134 the registry and SDK seam, L-130 the declaration, C-548 the
+session store, C-549 Track-compatible repository planning and C-550 federated cross-repository
+scheduling. `flux board skill` renders the concise installed guide. Design:
+[native-board-fleet-cli](designs/native-board-fleet-cli.md).
 
 ### Flux syntax simplification — one way to write each thing (epic) — 🔄 **PROPOSED (L-102; L-103…L-112 filed, none started)**
 
@@ -844,45 +836,18 @@ write boundary in [zendesk-triage.md](zendesk-triage.md), is the contract the re
 the `zendesk.*` operation names are the only part expected to move.
 Design: [zendesk-automation.md](designs/zendesk-automation.md).
 
-### The fleet runs the track / impl-coord loop (epic) — 🔄 **IN PROGRESS (C-239; F1 C-236 + F3 C-238 in flight, C-240…C-246 filed)**
+### Native fleet — board wave to reviewed local integration (epic) — 🔄 **IN PROGRESS (C-239; fleet wave ready after board foundation)**
 
-0.36.0 shipped a fleet *coordinator* — a Program declares a board and hands items to remote agents
-over A2A with `runner`/`task_id` written back — but not the loop the `track` plugin actually runs:
-select a wave of independent items, give each an isolated worker that implements and runs targeted
-checks and commits on a scratch branch, review the returned diff **as evidence**, two rework rounds
-to the *same* worker, park after that, integrate serially on one wave branch, run the full gate once
-on the combined tree, publish only on green, then write the ledger. The load-bearing decision is
-where that contract lives: **the model reasons, the host enforces.** A `WaveCoordinator` owns the
-irreversible, order-sensitive actions — isolation, ordered integration, wave gate, publication fence
-and ledger — and the model owns only wave selection and diff review. The point is not tidiness: it
-means fenced ledger, one writer/worktree per story, targeted checks before handoff, one wave-boundary
-gate, never-publish-red and park-after-two hold *even when the model is wrong or lazy*, because they
-are host behaviour rather than instructions a prompt can lose. `fleet.integrate` is the sharpest
-instance — it can assemble an ordered candidate but cannot publish it or write completion bookkeeping
-without one successful configured full gate. Coordination *prose* deliberately stays out of flux: the
-wave-selection and review heuristics are content, and they live in a reference `coordinator.flux` and
-its guidance. Sequenced so the data path lands before anything reasons over it — **F1** makes the
-board readable (`board.query` with a real `output_schema`; today `render_compact` drops `runner`,
-`task_id`, `depends_on`, `repo` and `evidence`, so `each`/`match` has nothing typed to iterate, and
-C-235's JSON-quoted strings break even scraping the prose), **F2** makes it correct (a `Failed→Ready`
-retry currently keeps a dead `runner`/`task_id` and the next sweep chases a corpse), then F3–F5 make
-integration possible, F6–F8 make the worker real, F9 is the product and F10 makes a running fleet
-visible. **A code-read moved the scope boundary before any code landed**, and it is the most useful
-thing the design records: per-worker filesystem isolation does not exist for remote workers and is
-*designed out* (`git_worktree_enter` is caller-local by construction), and a worker cannot return a
-branch or a diff at all — `SpawnOutcome` has no artifact field and `flux-server` never populates
-`Task.artifacts` — so "review the diff as evidence" has no channel to a remote worker, and a branch
-*name* from another filesystem is useless anyway. **The full implementation loop is therefore a
-local-worker loop for now**, which is sound because local children get real isolation via C-100; the
-distributed half (Docker isolation, artifact return over A2A, discovery, worker auth) is the
-`agent-fleet-runtime` epic and is explicitly later. Two corrections went the other way: A2A session
-continuity on `contextId` **is** implemented, so F8's rework genuinely resumes the same worker; and
-`ProcessRuntime` is not an optimization but a **prerequisite for any wave larger than one**, because
-`FlowEngine`'s `turn_gate` means one worker serves one concurrent turn. Done looks like F9's offline
-end-to-end journey — a stub A2A worker, a `MemoryBoard`, two items, one integrating and one parking,
-no network and no real model — with every loop invariant pinned by a test instead of asserted in
-prose. Design: [designs/fleet-loop.md](designs/fleet-loop.md).
-
+Decision 0010 turns the delivered fleet primitives into a supported `flux fleet` product over local
+native sub-agents. The host enforces one writer/worktree per story, typed write-set fences,
+failing-first and targeted evidence, fresh review, two same-session reworks, dependency-ordered
+integration and one final full repository gate. Red preserves the exact candidate. Green leaves a
+local `fleet/<wave>` branch; only explicit `fleet apply` revalidates and merges it, and nothing
+pushes automatically. C-244 supplies the typed local handoff, C-245 rework, C-242 integration/apply,
+A-117 the durable supervisor and complete CLI, and C-551 bounded inspection, board statistics,
+reports and roadmap scriptless parity. Claude and Codex call the same versioned JSON CLI and can
+bootstrap from `flux fleet skill`; direct foreign-process and remote code workers remain later.
+Design: [native-board-fleet-cli](designs/native-board-fleet-cli.md).
 ### Unattended run integrity — survive provider transport failure, and be honest when you don't (epic) — 🔄 **DESIGNED (C-229; C-226…C-228 filed, none started)**
 
 Three stories filed separately turned out to be one failure at three depths, and grouping them said
@@ -1008,35 +973,14 @@ as a divergence rather than papering over. Done looks like a coordinator discove
 starting it, dispatching to it, watching it through `Ready → Busy → Exited`, and reclaiming its work
 — offline, in CI. Design: [designs/agent-fleet-runtime.md](designs/agent-fleet-runtime.md).
 
-### Fleet coordinator — flux orchestrating flux across repos (epic) — 🔄 **DESIGNED (A-111; A-112…A-118 filed, none started)**
+### Remote fleet coordinator transports (epic) — ⏸ **BACKLOG (A-111; after native fleet dogfood)**
 
-The ask was a first-level orchestration harness: cross-repo work, Jira, a global board, remote
-agents dispatched and monitored, status reported back — and the assumption was that it needed a
-second app beside the coding agent. Reading the tree said otherwise. **`flux-app` is already that
-harness**: it runs a `.flux` Program of agents/channels/datasources/triggers/journeys over a bus and
-a delivery supervisor, `flux-channels` already supplies cron/webhook/slack/a2a adapters, and
-`plugins/jira` already has issue CRUD, transitions and search. The coordinator is a *Program*, not a
-binary. What is actually missing is narrower and more interesting. The state source flux would want
-already exists in shape — `LiveDatasource` (`datasource/live.rs:60`) has a backend declare its
-entities, filters and external authority, validates it once, and then *generates* uniform ops with
-stable permission subjects, a tool group and an ambient signal — but it is **read-only**, and a board
-needs create/transition/claim/comment. So the centre of this epic is **A-113**, a write-capable
-`WorkBoard` sibling carrying a typed state machine (`Ready → Claimed → InProgress → Review → Done`,
-plus `Blocked`/`Failed`) whose `transition` rejects an illegal edge *without writing* — purpose-built
-rather than generic precisely so the coordinator can reason over dependency waves and stuck items
-instead of shuffling opaque rows, with markdown, Jira, in-memory and GitLab backends behind one
-contract suite. Two findings sharpened the rest. The A2A **server** task surface is already complete
-(A-53…A-57, `flux-server/src/a2a.rs`); the gap is the **client** — `A2aClient` has no `cancel` and
-its only caller is the `flux a2a` REPL, so no journey can dispatch anywhere (**A-116**). And run
-state dissolves entirely: `fleet.dispatch` writes the `task_id` back onto the board item, so the
-board *is* the run registry and crash recovery is "restart, sweep, re-derive". The load-bearing
-blocker is none of that: `flux-channels` documents that deliveries are serialized by the shared
-`App` and that "cross-channel parallelism needs per-delivery bus isolation" (`lib.rs:20`), so a
-coordinator whose nightly sweep blocks webhook intake is single-threaded by construction — **A-112**
-lands first, and it is likely a MINOR. Done looks like `flux run coordinator.flux --serve` driving an
-intake → dispatch → sweep → done cycle offline in CI against `MemoryBoard` and a stub worker. Design:
-[designs/fleet-coordinator.md](designs/fleet-coordinator.md).
-
+The original coordinator design delivered useful foundations—WorkBoard, generated board operations,
+outbound A2A control and concurrent app delivery—but its conclusion that the product is only a
+`coordinator.flux` reference Program over remote workers is superseded by Decision 0010. C-239 and
+A-117 now own the native local supervisor and CLI. A-111 retains only the later remote transport,
+isolation, discovery and authentication extension after the local handoff contract is proven.
+Design record: [fleet-coordinator](designs/fleet-coordinator.md).
 ### Website truth and identity — the public site tells the truth and looks like the product (epic) — 🔄 **DESIGNED (C-196; C-197…C-204 filed, none started)**
 
 A 2026-07-29 audit of all 64 pages under `website/docs/` against the tree at `0.33.1` found the
