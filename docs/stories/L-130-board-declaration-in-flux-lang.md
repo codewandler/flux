@@ -1,62 +1,41 @@
 ---
 id: L-130
-title: "A first-class `board` declaration — retire the `kind \"board:*\"` datasource spelling"
+title: "A first-class board declaration binds scope, profile and backend"
 pillar: Language
-status: backlog
+status: ready
+priority: 42
 epic: first-class-board
-design: docs/designs/first-class-board.md
+design: docs/designs/native-board-fleet-cli.md
 areas: [flux-lang, flux-cli, flux-capabilities]
-note: "Decision 0006: the board leaves the `datasource` slot — `board <name>` is its own declaration, and a datasource kind can no longer name something that mutates"
+note: "Decision 0010 declaration — `board <name>` registers an explicit binding; `kind board:*` receives one bounded migration release and never enters datasource registry"
 ---
 
-# A first-class `board` declaration — retire the `kind "board:*"` datasource spelling
+# A first-class board declaration binds scope, profile and backend
 
 ## Goal
 
-Give the work board its own Flux-Lang declaration so a Program writes
-
-```flux
-board tasks
-  kind "markdown"
-  path "./board"
-```
-
-instead of smuggling a write-capable surface through the read-only `datasource` slot with a
-`board:` kind prefix. This is the Flux-Lang half of Decision 0006's board split: *anything that
-mutates is not a datasource*.
+Give Flux-Lang a source-linked declaration for every board axis so a Program never infers purpose or
+lifetime from a backend string.
 
 ## Acceptance
 
-- [ ] `board <name>` is a first-class declaration (parser, analyzer, formatter, and the editor
-      mirrors per `crates/flux-lang/AGENTS.md`), binding the same `WorkBoard` backends the
-      `datasource` spelling binds today under the declaration's name as the operation prefix.
-      Failing-first test: a program declaring `board tasks` resolves `tasks.claim`; it cannot today.
-- [ ] `board` kinds are the bare backend names (`markdown`, `memory`); an unknown kind remains a
-      hard startup error naming the kinds that exist — no fall-through, matching the existing
-      datasource-kind rule.
-- [ ] The `kind "board:*"` datasource spelling is retired with a migration note for existing
-      programs: the loader's error (or a deprecation window decided in this story) tells the author
-      the exact `board <name>` replacement rather than failing generically. The decision — hard cut
-      vs. one deprecation release — is recorded here before implementation.
-- [ ] A `datasource` declaration can no longer bind a write-capable backend by any spelling, pinned
-      by test.
-- [ ] Board subjects use the `board:` namespace (`board:<name>/item/<id>`) — coordinated with D-251
-      so the grammar changes once.
-- [ ] `website/docs/agent/datasources.md`, `website/docs/agent/fleet.md` and
-      `website/docs/agent/programs.md` document the new declaration; the board-operation
-      enumeration guard in `crates/flux-cli/tests/website_contract.rs` stays green.
-- [ ] Standard gate green in both workspaces.
-
-## Progress
-
-- (not started)
+- [ ] Parser, analyzer, formatter, AST serialization, syntax reference and editor mirrors accept:
+      `board <name>` with required `scope`, `profile` and `kind`, plus backend-specific closed fields.
+- [ ] Program declarations register through A-134's registry and expose only the selected profile's
+      operations under the binding name. Failing-first test resolves two differently profiled boards.
+- [ ] Session scope binds the current session; repository scope validates a confined root; workspace
+      federation validates named members. Invalid combinations are source-spanned hard errors.
+- [ ] Planning document roots for vision, roadmap, decisions and designs are explicit repository or
+      workspace configuration and cannot escape the bound root.
+- [ ] `datasource kind "board:*"` never enters the datasource registry. For one release its startup
+      diagnostic prints the exact replacement declaration; ambiguity or unsupported legacy fields
+      refuse instead of guessing. The following removal release is documented.
+- [ ] Unknown kinds/profiles/scopes list supported values. Declaration order never selects a default.
+- [ ] Board authority subjects use A-134's `board:` grammar; no datasource-shaped board subject
+      remains in tests or public docs.
+- [ ] Website docs, generated references and config-completeness tests are updated. Targeted
+      language/CLI tests pass; the board wave owns the full gate.
 
 ## Notes
 
-- Filed 2026-08-04 by C-514 from Decision 0006. Design:
-  [first-class-board.md](../designs/first-class-board.md).
-- The website currently documents the `board:` prefix as deliberate namespacing
-  (`website/docs/agent/datasources.md` "Work boards"); that section moves to the new declaration
-  when this lands.
-- Coordinate with A-134 (SDK seam) so the Program-side and SDK-side names agree — both call the
-  concept `board`.
+- Depends on A-134. The old design's fixed-lifecycle language is superseded by Decision 0010.
