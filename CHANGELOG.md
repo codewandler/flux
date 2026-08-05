@@ -151,11 +151,14 @@ All notable changes to this project are documented in this file. The format is b
   `[Unreleased]` `Action needed` section as the pre-1.0 breaking signal, correcting the current
   preview from `0.55.1` to `0.56.0`. Promotion opens and merges a normal cut PR only after the exact
   head's `ci`, stages the resulting canonical-main SHA as the candidate, creates the annotated tag
-  through the promoter App, selects only new exact-tag/SHA workflow runs, verifies the live Release
-  and whole `/releases/latest` fleet, and deletes evidence last. New Releases have one exact
-  28-asset inventory; every archive sidecar and the eleven-entry checksum index are recomputed, all
-  downloaded bytes must match positive unique GitHub metadata, and every asset must carry the exact
-  tag/SHA release-workflow attestation.
+  through the isolated PAT-backed promotion step, selects only new exact-tag/SHA workflow runs,
+  verifies the live Release and whole `/releases/latest` fleet, and deletes evidence last. The
+  release trigger is bound to its content-identical canonical-main parent; if `main` advances during
+  the cut and checks, promotion accepts only a descendant and reconstructs the exact cut patch in an
+  isolated Git index against the actual PR base before candidate creation. New Releases have one
+  exact 28-asset inventory; every archive sidecar and the eleven-entry checksum index are recomputed,
+  all downloaded bytes must match positive unique GitHub metadata, and every asset must carry the
+  exact tag/SHA release-workflow attestation.
 
 - **The fleet delivery contract now validates one integrated wave instead of every child merge.**
   A named wave has at most one writer and isolated worktree per story, targeted checks at story

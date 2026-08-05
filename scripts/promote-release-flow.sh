@@ -48,6 +48,18 @@ SOURCE_SHA=$(git rev-parse HEAD^)
 [[ "$CUT_SHA" =~ ^[0-9a-f]{40}$ && "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "invalid local release history"
 [ "$SOURCE_SHA" = "$GITHUB_SHA" ] || fail "cut parent $SOURCE_SHA is not trigger SHA $GITHUB_SHA"
 
+# A normal PR merge into `release` has the old release tip as parent 1 and the frozen canonical-main
+# source as parent 2. The release merge must be content-identical to that main snapshot: `release`
+# contributes ancestry only, never a second implementation line. Main may advance while this build
+# runs, so promotion binds this parent and later proves the exact cut patch on the actual merge base
+# instead of comparing canonical main to the release-only merge commit.
+mapfile -t source_record < <(git rev-list --parents -n1 "$SOURCE_SHA")
+read -r -a source_parents <<<"${source_record[0]}"
+[ "${#source_parents[@]}" -eq 3 ] || fail "release trigger $SOURCE_SHA is not a two-parent PR merge"
+SOURCE_MAIN_SHA=${source_parents[2]}
+[ "$(git rev-parse "$SOURCE_SHA^{tree}")" = "$(git rev-parse "$SOURCE_MAIN_SHA^{tree}")" ] \
+  || fail "release trigger $SOURCE_SHA differs from canonical-main parent $SOURCE_MAIN_SHA"
+
 # The local tag is cut-script evidence only. The public tag is created later at the merged-main SHA.
 mapfile -t local_tags < <(git tag --points-at "$CUT_SHA" --list 'v*')
 [ "${#local_tags[@]}" -eq 1 ] && [ "${local_tags[0]}" = "$TAG" ] || fail "cut SHA must carry only local $TAG"
@@ -132,7 +144,10 @@ cleanup_notice() {
 trap cleanup_notice EXIT
 
 REMOTE_MAIN=$(remote_sha refs/heads/main)
-[ "$REMOTE_MAIN" = "$SOURCE_SHA" ] || fail "canonical main moved from trigger SHA $SOURCE_SHA to ${REMOTE_MAIN:-<missing>}"
+[[ "$REMOTE_MAIN" =~ ^[0-9a-f]{40}$ ]] || fail "canonical main is missing"
+git fetch --no-tags --quiet origin "$REMOTE_MAIN" || fail "could not fetch canonical main $REMOTE_MAIN"
+git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN" \
+  || fail "canonical main $REMOTE_MAIN does not descend from release source $SOURCE_MAIN_SHA"
 [ -z "$(remote_sha "$CUT_REF")" ] || fail "$CUT_REF already exists; promotion branches are fresh"
 [ -z "$(remote_sha "$CANDIDATE_REF")" ] || fail "$CANDIDATE_REF already exists; use the printed resume command"
 [ -z "$(remote_sha "$TAG_REF^{}")" ] || fail "$TAG_REF already exists; use the printed resume command"
@@ -160,7 +175,33 @@ MERGED_SHA=$(jq -r '.mergeCommit.oid' <<<"$pr")
 [ "$MERGED_SHA" != "$CUT_SHA" ] && [ "$MERGED_SHA" != "$SOURCE_SHA" ] || fail "merge result is not a new canonical commit"
 [ "$(release_gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$MERGED_SHA" ] || fail "merged SHA is not canonical main"
 git fetch --no-tags origin "$MERGED_SHA"
-[ "$(git rev-parse "$CUT_SHA^{tree}")" = "$(git rev-parse "$MERGED_SHA^{tree}")" ] || fail "merged main does not contain the exact cut diff"
+mapfile -t merged_record < <(git rev-list --parents -n1 "$MERGED_SHA")
+read -r -a merged_parents <<<"${merged_record[0]}"
+[ "${#merged_parents[@]}" -eq 3 ] || fail "release PR result $MERGED_SHA is not a two-parent merge"
+MERGED_BASE_SHA=${merged_parents[1]}
+MERGED_CUT_SHA=${merged_parents[2]}
+[ "$MERGED_CUT_SHA" = "$CUT_SHA" ] || fail "release PR merged $MERGED_CUT_SHA instead of exact cut $CUT_SHA"
+git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$MERGED_BASE_SHA" \
+  || fail "release PR base $MERGED_BASE_SHA does not descend from release source $SOURCE_MAIN_SHA"
+
+# Reproduce the content merge in an isolated index. This verifies the exact cut patch while
+# retaining any commits that legitimately reached main during the cut build and PR checks. A
+# conflict fails before candidate creation; a whole-tree comparison to CUT_SHA would incorrectly
+# reject every such descendant even when the cut itself merged byte-for-byte.
+expected_index=$(mktemp "${RUNNER_TEMP:-/tmp}/flux-release-merge-index.XXXXXX")
+rm -f "$expected_index"
+if ! GIT_INDEX_FILE="$expected_index" git read-tree -m \
+  "$SOURCE_MAIN_SHA" "$MERGED_BASE_SHA" "$CUT_SHA"; then
+  rm -f "$expected_index"
+  fail "exact cut diff does not apply cleanly to merged main base $MERGED_BASE_SHA"
+fi
+if ! EXPECTED_TREE=$(GIT_INDEX_FILE="$expected_index" git write-tree); then
+  rm -f "$expected_index"
+  fail "exact cut diff leaves an unresolved merge against main base $MERGED_BASE_SHA"
+fi
+rm -f "$expected_index"
+[ "$EXPECTED_TREE" = "$(git rev-parse "$MERGED_SHA^{tree}")" ] \
+  || fail "merged main does not contain the exact cut diff"
 
 merged_sha_for_resume=$MERGED_SHA
 echo "Staging merged canonical-main SHA $MERGED_SHA at $CANDIDATE_REF"

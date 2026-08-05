@@ -179,10 +179,13 @@ The separate `release-control` job is the only one with core promotion authority
 step receives the existing repository `RELEASE_TOKEN`, verifies that the PAT is usable before the
 first remote mutation, and then:
 
-1. imports and verifies the cut bundle, and re-derives every identity from the imported objects;
+1. imports and verifies the cut bundle, re-derives every identity from the imported objects, and
+   binds the release merge's content-identical second parent as the canonical-`main` source snapshot;
 2. pushes the cut to `refs/heads/release-cuts/vX.Y.Z`, opens the normal pull request to `main`, waits
    for that exact head's required `ci`, and merges it — `main` is never pushed directly or
-   force-pushed;
+   force-pushed. `main` may advance during the build and checks only when it remains a descendant of
+   the bound source; after the merge, an isolated Git index reconstructs the three-way result and
+   proves the exact cut patch was applied while retaining those concurrent commits;
 3. stages the resulting merged canonical-`main` SHA at `refs/heads/release-candidates/vX.Y.Z`;
 4. dispatches `.github/workflows/release.yml` from that exact ref; that workflow verifies its
    checked-out SHA, runs `scripts/release-full-gate.sh` once, and only then builds all five
