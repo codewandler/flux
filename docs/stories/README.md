@@ -87,6 +87,9 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
 
 ## Next (ready — take the top one unless the user named a story)
+- [C-542 — Granular time and token budgets with limits, visible in the TUI during execution](C-542-granular-time-token-budgets-visible-in-tui.md) · Core · budget = declared spend target, limit = hard stop; both per run and per granular unit, surfaced live in the TUI
+- [C-543 — Select the agent's loop from the TUI with a hotkey and a visualizing overlay](C-543-tui-loop-selector-with-visualizing-overlay.md) · Core · current loop name always visible; a hotkey opens a selector; choosing a loop shows a short overlay that visualizes the outer loop and renders its description
+- [C-544 — Create a new agent loop by prompting, available in the loop selector](C-544-create-agent-loops-by-prompting.md) · Core · \"create this <...> loop for me\" -> flux writes the *.flux file; the new loop then appears in the C-543 selector
 
 ### The agent-authored surface — panes the model opens, config it can safely change
 - [C-219 — The agent-authored surface — panes the model opens, config it can safely change (epic)](C-219-agent-authored-surface-epic.md) · Core · the tool→surface seam already exists twice (ToolProgressSink/SpawnActivitySink) and op.register already lets the model extend the harness one layer down — what's missing is the surface layer, and the whole risk is that a model-drawn region can imitate the approval sheet
