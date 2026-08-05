@@ -484,16 +484,23 @@ fn the_release_branch_is_the_automatic_apply_trigger() {
     );
 }
 
-/// The cut reaches protected main only through a normal green PR. The resulting new canonical SHA,
-/// not the local cut/tag or release-branch SHA, is then the candidate and one-time PAT tag target.
+/// The cut reaches canonical main only after an exact-SHA dispatch of the full CI workflow. The
+/// controller constructs one two-parent merge whose first parent is live main and pushes that
+/// fast-forward with the PAT; the resulting SHA is then the candidate and one-time PAT tag target.
 #[test]
 fn the_release_workflow_prepares_an_exact_sha_candidate_before_pushing_the_tag() {
     let code = release_flow_workflow_code();
+    let ci = workflow_code("ci.yml");
+    assert!(
+        ci.contains("workflow_dispatch:"),
+        "the controller cannot gate the exact staged cut unless ci.yml accepts a no-input dispatch"
+    );
     let stages = [
-        "release_gh pr create",
-        "wait_for_ci || fail",
-        "release_gh pr merge",
-        "git/ref/heads/main",
+        "CI_BASELINE=$(latest_run_id ci.yml)",
+        "actions_gh workflow run ci.yml",
+        "CI_RUN=$(wait_for_exact_dispatch_run ci.yml",
+        "git commit-tree \"$EXPECTED_TREE\"",
+        "git_with_release_token push \"$PUSH_URL\" \"$MERGED_SHA:refs/heads/main\"",
         "merged main does not contain the exact cut diff",
         "\"$MERGED_SHA:$CANDIDATE_REF\"",
         "scripts/release-candidate.sh verify",
@@ -514,7 +521,7 @@ fn the_release_workflow_prepares_an_exact_sha_candidate_before_pushing_the_tag()
         .collect::<Vec<_>>();
     assert!(
         indexes.windows(2).all(|pair| pair[0] < pair[1]),
-        "PR, merged-main candidate, PAT tag, exact runs, public/latest audit and cleanup must remain ordered: {indexes:?}"
+        "exact cut CI, merged-main candidate, PAT tag, exact runs, public/latest audit and cleanup must remain ordered: {indexes:?}"
     );
     assert!(!code.contains("HEAD:main") && !code.contains("--admin"));
     assert!(code.contains("[ -n \"${RELEASE_TOKEN:-}\" ]"));
@@ -770,9 +777,9 @@ fn release_workflows_require_no_app_or_environment_settings() {
 }
 
 /// GitHub deliberately suppresses workflow runs caused by refs pushed with `GITHUB_TOKEN`, so the
-/// promotion path needs a separately configured credential; otherwise a green auto-cut silently
-/// publishes nothing. C-559 uses the existing repository `RELEASE_TOKEN` only on the host-owned
-/// promotion step and keeps the ambient token limited to Actions dispatch and observation.
+/// promotion path needs a separately configured credential for git refs; otherwise a green auto-cut
+/// silently publishes nothing. C-559 uses the existing repository `RELEASE_TOKEN` for ref movement
+/// and the job-scoped Actions token only for exact workflow dispatch and observation.
 #[test]
 fn promotion_uses_the_step_scoped_release_token_outside_the_cut_job() {
     let workflow = workflow_code("release-flow.yml");
@@ -783,7 +790,7 @@ fn promotion_uses_the_step_scoped_release_token_outside_the_cut_job() {
     );
     assert!(
         workflow.contains("actions: write") && workflow.contains("contents: read"),
-        "the controller needs Actions write to dispatch/watch the candidate, while repository \
+        "the controller needs Actions write for exact CI/candidate dispatch while repository \
          contents stay read-only because only the step-scoped PAT moves refs"
     );
     assert!(
@@ -808,8 +815,7 @@ fn promotion_uses_the_step_scoped_release_token_outside_the_cut_job() {
     for required in [
         "RELEASE_CAN_PUSH=$(release_gh api",
         "git_with_release_token push \"$PUSH_URL\" \"$CUT_SHA:$CUT_REF\"",
-        "release_gh pr create",
-        "release_gh pr merge",
+        "git_with_release_token push \"$PUSH_URL\" \"$MERGED_SHA:refs/heads/main\"",
         "git_with_release_token push \"$PUSH_URL\" \"$MERGED_SHA:$CANDIDATE_REF\"",
         "git_with_release_token push \"$PUSH_URL\" \"$tag_object:$TAG_REF\"",
     ] {
@@ -819,10 +825,11 @@ fn promotion_uses_the_step_scoped_release_token_outside_the_cut_job() {
         );
     }
     assert!(
-        promoter.contains("actions_gh workflow run")
+        promoter.contains("actions_gh workflow run ci.yml")
             && !promoter.contains("actions_gh pr create")
             && !promoter.contains("actions_gh pr merge")
             && !promoter.contains("actions_gh api -X"),
-        "ambient GITHUB_TOKEN may dispatch/observe Actions, never mutate refs or pull requests"
+        "ambient GITHUB_TOKEN may dispatch/observe exact Actions runs but never mutates pull \
+         requests or git refs"
     );
 }

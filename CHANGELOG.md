@@ -113,8 +113,9 @@ All notable changes to this project are documented in this file. The format is b
   C-353 configuration proposal and the matching C-354/C-516 identity clauses). Plan, cut, build,
   receipt and verification work remains mutation-credential-free. `RELEASE_TOKEN` is scoped
   to the isolated core promotion, plugin tag-control and GitHub Release steps; it preflights before
-  mutation and performs PAT-authenticated tag pushes so both tag workflows run. The ambient
-  `GITHUB_TOKEN` is limited to exact candidate dispatch and Actions observation. Parsed adversarial
+  mutation and performs the exact cut, fast-forward main merge, candidate and tag ref pushes so both
+  tag workflows run. The ambient `GITHUB_TOKEN` owns only exact cut-CI/candidate dispatch and
+  Actions observation, with repository contents kept read-only. Parsed adversarial
   fixtures reject secret scope drift, model/build exposure, ambient-token tag creation, missing PAT
   tag triggering, combined publication authority and any restored App/Environment dependency.
 
@@ -136,12 +137,13 @@ All notable changes to this project are documented in this file. The format is b
   key, `RELEASE_TOKEN`, `MINISIGN_SECRET_KEY` or `CARGO_REGISTRY_TOKEN`. Pre-tag promotion and
   plugin tag control receive the existing `RELEASE_TOKEN` only on their host-owned steps; signing,
   GitHub Release publication and Cargo publication remain distinct tag-triggered jobs, so no job
-  combines those authorities. Plugin and crates.io
+  combines those authorities. Complete cut CI is dispatched on the exact staged SHA; the PAT is not
+  required to carry Pull requests API scope and the Actions token never moves a ref. Plugin and crates.io
   publication accept only an exact tag push — the retained plugin `workflow_dispatch` is
   structurally a build/validation path that cannot mint a token, create a tag, sign or publish, and
   `crates-io.yml` drops `workflow_dispatch` entirely. `scripts/check-release-authority.sh` enforces
   this by parsing the workflow/job/step graph — permissions, `on`, `if`, `needs`, `uses`, action
-  inputs and `env` — rather than by matching text, with 23 structural fixtures.
+  inputs and `env` — rather than by matching text, with 24 structural fixtures.
 
 - **The release-candidate receipt now binds the artifact bytes the publishing run must consume**
   (C-355). Receipt `flux-release-candidate-v3` records each of the seven expected `artifacts-*`
@@ -154,16 +156,17 @@ All notable changes to this project are documented in this file. The format is b
   special members, duplicate members and cross-archive collisions. `merge-multiple: true` is no
   longer the trust boundary.
 
-- **Core release promotion now binds preview, protected-main integration and public closure into one
+- **Core release promotion now binds preview, canonical-main integration and public closure into one
   gate** (C-516). `release_plan` reads fully framed commit messages and treats a non-empty
   `[Unreleased]` `Action needed` section as the pre-1.0 breaking signal, correcting the current
-  preview from `0.55.1` to `0.56.0`. Promotion opens and merges a normal cut PR only after the exact
-  head's `ci`, stages the resulting canonical-main SHA as the candidate, creates the annotated tag
+  preview from `0.55.1` to `0.56.0`. Promotion dispatches complete `ci.yml` on the exact staged cut
+  SHA, reconstructs its three-way result against live descendant `main`, and pushes one two-parent
+  fast-forward merge commit before staging that SHA as the candidate and creating the annotated tag
   through the isolated PAT-backed promotion step, selects only new exact-tag/SHA workflow runs,
   verifies the live Release and whole `/releases/latest` fleet, and deletes evidence last. The
   release trigger is bound to its content-identical canonical-main parent; if `main` advances during
   the cut and checks, promotion accepts only a descendant and reconstructs the exact cut patch in an
-  isolated Git index against the actual PR base before candidate creation. New Releases have one
+  isolated Git index against the live main base before candidate creation. New Releases have one
   exact 28-asset inventory; every archive sidecar and the eleven-entry checksum index are recomputed,
   all downloaded bytes must match positive unique GitHub metadata, and every asset must carry the
   exact tag/SHA release-workflow attestation.

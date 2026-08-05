@@ -25,19 +25,22 @@ not credential values or ownership.
 
 ## Active authority design
 
-- **Model and build work are credential-free for release mutation.** The release-flow `cut` job may
-  receive only the selected provider credential at the consuming step. Candidate planning, builds,
-  receipts, byte verification and assembly receive no release secret.
+- **The deterministic cut and all build work are credential-free for release mutation.** The
+  release-flow `cut` job receives no model provider or repository-write credential. Candidate
+  planning, builds, receipts, byte verification and assembly receive no release secret.
 - **`RELEASE_TOKEN` is the host mutation identity.** Only the core promotion step, plugin tag-control
   step and two GitHub Release create/upload steps name it. The core helper preflights the PAT before
-  mutation, then uses it for the exact cut ref, pull request, merge, merged-main candidate ref,
-  annotated-tag push and exact cleanup. The plugin helper uses it only to push the one absent exact
-  `plugins-vX.Y.Z` annotated tag at current canonical `main`.
+  mutation, then uses it for the exact cut ref, the constructed fast-forward two-parent main merge,
+  merged-main candidate ref, annotated-tag push and exact cleanup. The plugin helper uses it only to
+  push the one absent exact `plugins-vX.Y.Z` annotated tag at current canonical `main`.
 - **The ambient `GITHUB_TOKEN` cannot move repository state.** In core promotion it has
-  `contents: read` and `actions: write`; it dispatches the exact candidate workflow and observes
-  check runs and Actions runs. A PAT-authenticated git push creates each tag so the tag-triggered
-  workflows run. No direct or force push to `main`, force tag, tag update or tag recreation path
-  exists.
+  `contents: read` and `actions: write`; it dispatches the complete `ci.yml` on the exact staged cut,
+  then dispatches the exact candidate workflow and observes those Actions runs. A PAT-authenticated
+  git push creates each tag so the tag-triggered workflows run. The only main update is an ordinary
+  fast-forward of a locally constructed commit whose first parent is the just-read live main SHA,
+  whose second parent is the exact green cut, and whose tree is the isolated-index three-way result.
+  A concurrent move is rejected; arbitrary/force main pushes, force tags, tag updates and tag
+  recreation do not exist.
 - **Every secret remains step-scoped.** `MINISIGN_SECRET_KEY` appears only on plugin index signing;
   `CARGO_REGISTRY_TOKEN` only on the applicable Cargo publish step; provider keys only on their
   model/smoke consumers; and `RELEASE_TOKEN` only on the four host-owned consumers above. No
@@ -60,7 +63,7 @@ not credential values or ownership.
 | C-353 | Superseded by C-559. Its App, environments, rulesets, branch protection and external secret migration are not required or claimed. |
 | C-354 | Done. Its job/step isolation and tag-only publication remain; its App/Environment placement clauses are historical and superseded. |
 | C-355 | Done. Candidate receipt v3 and raw-byte verification are unchanged. |
-| C-516 | Done with C-559's PAT identity substitution; PR/merged-main SHA, exact runs, 28 assets and cleanup-last ordering are unchanged. |
+| C-516 | Done with C-559's settings-free exact-cut CI and fast-forward merged-main SHA; exact runs, 28 assets and cleanup-last ordering are unchanged. |
 | C-559 | Implements the active no-App/no-Environment authority contract and release-policy fixtures. |
 | C-356 / C-357 | Visible consumer-verification and governance residuals; neither blocks v0.56.0 publication. |
 
@@ -77,8 +80,8 @@ remain idempotent on rerun.
 `scripts/check-release-authority.sh` parses all four release workflows and rejects workflow/job
 secret scope, release authority beside model/build work, `GITHUB_TOKEN` tag creation, a missing PAT
 tag trigger, combined signing/GitHub/Cargo authority, or any restored App/Environment dependency.
-`scripts/test-promote-release-flow.sh` pins PAT preflight, PR/merge/candidate/tag ordering, ambient
-token limits, exact tag-run waits and cleanup-last behavior. Running
+`scripts/test-promote-release-flow.sh` pins PAT preflight, exact cut-CI/main-merge/candidate/tag
+ordering, ambient token limits, exact tag-run waits and cleanup-last behavior. Running
 `scripts/plugin-tag-control.sh --self-test` proves only a green current-main `ci` result plus usable PAT can push the one absent
 plugin tag. C-355 and C-516 retain their receipt, asset, live-release and fleet/latest suites.
 

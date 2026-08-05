@@ -14,7 +14,9 @@ note: "historical C-354 boundary implemented; App/environment clauses superseded
 > **Active placement is superseded by C-559.** The checked Acceptance below records C-354's
 > historical App/Environment implementation. The invariant that remains active is job/step
 > isolation: the existing repository `RELEASE_TOKEN` now appears only in core promotion, plugin tag
-> control and GitHub Release steps, with no App or GitHub Environment dependency.
+> control and GitHub Release steps, with no App or GitHub Environment dependency. Within core
+> promotion, the job-scoped Actions token owns only exact workflow dispatch/observation; the
+> step-scoped PAT alone moves git refs and pushes tags.
 
 ## Goal
 
@@ -92,6 +94,12 @@ Cargo publication use distinct tag-triggered jobs inside `release`.
 
 ## Progress
 
+- 2026-08-05 — live run `31038895447` corrected the active C-559 split: the configured PAT can move
+  refs but lacks Pull Request API scope, while Actions-created PR checks require manual approval.
+  The controller now grants the job-scoped Actions token only `actions: write`, retains
+  `contents: read`, dispatches complete CI on the staged cut, and uses the PAT for the exact
+  fast-forward merge plus remaining ref/tag pushes. No model or build job receives either mutation
+  authority.
 - 2026-08-05 — C-559 implemented the supersession. `release-flow.yml` passes `RELEASE_TOKEN` only
   to `scripts/promote-release-flow.sh`; `release-plugins.yml` passes it only to tag control and
   GitHub Release creation; all other publication credentials remain on their consuming steps.

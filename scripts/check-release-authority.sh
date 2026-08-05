@@ -25,6 +25,8 @@
 #   * `RELEASE_TOKEN` may appear only in the isolated core promotion, plugin tag-control and GitHub
 #     Release steps. Signing and Cargo publication keep their own secrets. No job holds two release
 #     authorities, and no job holds one beside unrelated GitHub write scope.
+#   * Core promotion gives its job-scoped Actions token only Actions write. It dispatches and
+#     observes exact-SHA gates; the step-scoped PAT alone moves git refs and pushes tags.
 #   * No release workflow may depend on a GitHub App variable/key, token mint, or Environment.
 #   * Publication jobs are reachable only from an exact version tag: their `if` must carry the
 #     tag-derived conjunct, and the value it reads must not be derivable from a dispatch input.
@@ -447,6 +449,12 @@ if flow.is_a?(Hash)
   if control.is_a?(Hash)
     require_conjunct(violations, 'release-flow.yml', 'release-control', control,
                      "github.event_name == 'push'")
+    permissions = effective_permissions(flow, control)
+    unless permissions['actions'] == 'write' && permissions['contents'] == 'read' &&
+           permissions['pull-requests'] != 'write'
+      violations << 'release-flow.yml: `release-control` must grant Actions write while Contents ' \
+                    'remains read-only and Pull requests write stays absent'
+    end
   else
     violations << 'release-flow.yml: promotion must live in one narrow job named `release-control`'
   end
@@ -616,6 +624,10 @@ when 'release-token-in-cut-step'
   flow = step(doc, 'cut', 'Run the credential-free release flow')
   (flow['env'] ||= {})['RELEASE_TOKEN'] = '${{ secrets.RELEASE_TOKEN }}'
   store(dest, 'release-flow.yml', doc)
+when 'controller-pr-write'
+  doc = load(dest, 'release-flow.yml')
+  doc['jobs']['release-control']['permissions']['pull-requests'] = 'write'
+  store(dest, 'release-flow.yml', doc)
 when 'app-token-publication'
   doc = load(dest, 'release.yml')
   create = step(doc, 'publish-github-release', 'Create GitHub Release')
@@ -739,6 +751,7 @@ inherited-write-permission
 provider-credential-reintroduced
 reintroduced-environment
 release-token-in-cut-step
+controller-pr-write
 app-token-publication
 reintroduced-app-variable
 missing-plugin-pat

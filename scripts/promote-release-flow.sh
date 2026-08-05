@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host-owned C-516/C-559 promotion: cut PR -> merged main -> candidate -> PAT tag -> public/latest audit.
+# Host-owned C-516/C-559 promotion: exact cut CI -> merged main -> candidate -> PAT tag -> public/latest audit.
 set -euo pipefail
 
 fail() { echo "error: $*" >&2; exit 1; }
@@ -96,16 +96,19 @@ latest_run_id() {
     --json databaseId --jq '([.[].databaseId] | max) // 0'
 }
 
-wait_for_ci() {
-  local attempt checks count status
+wait_for_exact_dispatch_run() {
+  local workflow=$1 baseline=$2 branch=$3 sha=$4 attempt runs count
   for ((attempt=1; attempt<=POLL_ATTEMPTS; attempt++)); do
-    checks=$(actions_gh api -H 'Accept: application/vnd.github+json' \
-      "repos/$GITHUB_REPOSITORY/commits/$CUT_SHA/check-runs") || return 2
-    count=$(jq '[.check_runs[] | select(.name == "ci" and .head_sha == $sha)] | length' --arg sha "$CUT_SHA" <<<"$checks")
-    if [ "$count" -gt 0 ]; then
-      status=$(jq -r '[.check_runs[] | select(.name == "ci" and .head_sha == $sha)] | max_by(.id) | [.status, (.conclusion // "")] | @tsv' --arg sha "$CUT_SHA" <<<"$checks")
-      [ "$status" != $'completed\tsuccess' ] || return 0
-      [[ "$status" != completed$'\t'* ]] || return 1
+    runs=$(actions_gh run list --repo "$GITHUB_REPOSITORY" --workflow "$workflow" \
+      --event workflow_dispatch --branch "$branch" --commit "$sha" --limit 100 \
+      --json databaseId,event,headBranch,headSha,status,conclusion,url) || return 2
+    count=$(jq '[.[] | select(.databaseId > $baseline and .event == "workflow_dispatch" and .headBranch == $branch and .headSha == $sha)] | length' \
+      --argjson baseline "$baseline" --arg branch "$branch" --arg sha "$sha" <<<"$runs")
+    [ "$count" -le 1 ] || { echo "ambiguous exact $workflow runs for $branch@$sha" >&2; return 1; }
+    if [ "$count" -eq 1 ]; then
+      jq -r '[.[] | select(.databaseId > $baseline and .event == "workflow_dispatch" and .headBranch == $branch and .headSha == $sha)] | .[0].databaseId' \
+        --argjson baseline "$baseline" --arg branch "$branch" --arg sha "$sha" <<<"$runs"
+      return 0
     fi
     [ "$attempt" -eq "$POLL_ATTEMPTS" ] || sleep "$POLL_INTERVAL_SECONDS"
   done
@@ -154,38 +157,25 @@ git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$REMOTE_MAIN" \
 
 echo "Staging deterministic cut $CUT_SHA on $CUT_BRANCH"
 git_with_release_token push "$PUSH_URL" "$CUT_SHA:$CUT_REF"
-PR_URL=$(release_gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$CUT_BRANCH" \
-  --title "release: cut $TAG" \
-  --body "Automated deterministic release cut for $TAG. The host controller will wait for the exact head's required ci aggregate before merging.")
-PR_NUMBER=${PR_URL##*/}
-[[ "$PR_NUMBER" =~ ^[0-9]+$ ]] || fail "could not resolve release PR number from $PR_URL"
-[ "$(release_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)" = "$CUT_SHA" ] || fail "release PR head differs from cut SHA"
-wait_for_ci || fail "required ci aggregate did not succeed for exact PR head $CUT_SHA"
+CI_BASELINE=$(latest_run_id ci.yml)
+actions_gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$CUT_BRANCH"
+CI_RUN=$(wait_for_exact_dispatch_run ci.yml "$CI_BASELINE" "$CUT_BRANCH" "$CUT_SHA") \
+  || fail "no unique exact ci.yml run appeared for $CUT_BRANCH@$CUT_SHA"
+actions_gh run watch "$CI_RUN" --repo "$GITHUB_REPOSITORY" --exit-status
+ci_verdict=$(actions_gh run view "$CI_RUN" --repo "$GITHUB_REPOSITORY" \
+  --json event,headBranch,headSha,status,conclusion)
+jq -e --arg branch "$CUT_BRANCH" --arg sha "$CUT_SHA" \
+  '.event == "workflow_dispatch" and .headBranch == $branch and .headSha == $sha and .status == "completed" and .conclusion == "success"' \
+  <<<"$ci_verdict" >/dev/null || fail "ci run $CI_RUN lost exact successful cut binding"
 
-release_gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --merge --delete-branch=false
-for ((attempt=1; attempt<=POLL_ATTEMPTS; attempt++)); do
-  pr=$(release_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state,headRefOid,mergeCommit) || fail "could not read merged release PR"
-  [ "$(jq -r .state <<<"$pr")" != MERGED ] || break
-  [ "$attempt" -eq "$POLL_ATTEMPTS" ] || sleep "$POLL_INTERVAL_SECONDS"
-done
-[ "$(jq -r .state <<<"$pr")" = MERGED ] || fail "release PR did not merge"
-[ "$(jq -r .headRefOid <<<"$pr")" = "$CUT_SHA" ] || fail "merged PR head changed"
-MERGED_SHA=$(jq -r '.mergeCommit.oid' <<<"$pr")
-[[ "$MERGED_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "GitHub returned no full merge SHA"
-[ "$MERGED_SHA" != "$CUT_SHA" ] && [ "$MERGED_SHA" != "$SOURCE_SHA" ] || fail "merge result is not a new canonical commit"
-[ "$(release_gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)" = "$MERGED_SHA" ] || fail "merged SHA is not canonical main"
-git fetch --no-tags origin "$MERGED_SHA"
-mapfile -t merged_record < <(git rev-list --parents -n1 "$MERGED_SHA")
-read -r -a merged_parents <<<"${merged_record[0]}"
-[ "${#merged_parents[@]}" -eq 3 ] || fail "release PR result $MERGED_SHA is not a two-parent merge"
-MERGED_BASE_SHA=${merged_parents[1]}
-MERGED_CUT_SHA=${merged_parents[2]}
-[ "$MERGED_CUT_SHA" = "$CUT_SHA" ] || fail "release PR merged $MERGED_CUT_SHA instead of exact cut $CUT_SHA"
+MERGED_BASE_SHA=$(remote_sha refs/heads/main)
+[[ "$MERGED_BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "canonical main disappeared after cut CI"
+git fetch --no-tags --quiet origin "$MERGED_BASE_SHA" || fail "could not fetch canonical main $MERGED_BASE_SHA"
 git merge-base --is-ancestor "$SOURCE_MAIN_SHA" "$MERGED_BASE_SHA" \
-  || fail "release PR base $MERGED_BASE_SHA does not descend from release source $SOURCE_MAIN_SHA"
+  || fail "canonical main $MERGED_BASE_SHA no longer descends from release source $SOURCE_MAIN_SHA"
 
 # Reproduce the content merge in an isolated index. This verifies the exact cut patch while
-# retaining any commits that legitimately reached main during the cut build and PR checks. A
+# retaining any commits that legitimately reached main during the cut build and exact CI. A
 # conflict fails before candidate creation; a whole-tree comparison to CUT_SHA would incorrectly
 # reject every such descendant even when the cut itself merged byte-for-byte.
 expected_index=$(mktemp "${RUNNER_TEMP:-/tmp}/flux-release-merge-index.XXXXXX")
@@ -200,7 +190,29 @@ if ! EXPECTED_TREE=$(GIT_INDEX_FILE="$expected_index" git write-tree); then
   fail "exact cut diff leaves an unresolved merge against main base $MERGED_BASE_SHA"
 fi
 rm -f "$expected_index"
-[ "$EXPECTED_TREE" = "$(git rev-parse "$MERGED_SHA^{tree}")" ] \
+MERGED_SHA=$(
+  printf 'release: merge deterministic cut %s\n' "$TAG" | \
+    GIT_AUTHOR_NAME='flux release flow' GIT_AUTHOR_EMAIL='release@codewandler.invalid' \
+    GIT_COMMITTER_NAME='flux release flow' GIT_COMMITTER_EMAIL='release@codewandler.invalid' \
+    git commit-tree "$EXPECTED_TREE" -p "$MERGED_BASE_SHA" -p "$CUT_SHA"
+) || fail "could not create the exact cut merge commit"
+[[ "$MERGED_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "git returned no full merge SHA"
+[ "$MERGED_SHA" != "$CUT_SHA" ] && [ "$MERGED_SHA" != "$SOURCE_SHA" ] \
+  || fail "merge result is not a new canonical commit"
+
+# This is an ordinary fast-forward push: parent 1 is the live main SHA read immediately above. If
+# main moves again, git rejects the non-fast-forward update and promotion stops before a candidate.
+git_with_release_token push "$PUSH_URL" "$MERGED_SHA:refs/heads/main"
+[ "$(remote_sha refs/heads/main)" = "$MERGED_SHA" ] || fail "merged SHA is not canonical main"
+git fetch --no-tags --quiet origin "$MERGED_SHA" || fail "could not fetch merged canonical main"
+mapfile -t merged_record < <(git rev-list --parents -n1 "$MERGED_SHA")
+read -r -a merged_parents <<<"${merged_record[0]}"
+[ "${#merged_parents[@]}" -eq 3 ] || fail "release result $MERGED_SHA is not a two-parent merge"
+[ "${merged_parents[1]}" = "$MERGED_BASE_SHA" ] \
+  || fail "release result does not retain exact canonical-main parent $MERGED_BASE_SHA"
+[ "${merged_parents[2]}" = "$CUT_SHA" ] \
+  || fail "release result does not retain exact cut parent $CUT_SHA"
+[ "$(git rev-parse "$MERGED_SHA^{tree}")" = "$EXPECTED_TREE" ] \
   || fail "merged main does not contain the exact cut diff"
 
 merged_sha_for_resume=$MERGED_SHA

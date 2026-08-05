@@ -12,10 +12,11 @@
 #     the narrow host-only `examples/release-cut.flux`, which has no `task`, network, general process,
 #     or general write operation. Its product is a git bundle containing exactly one cut commit and
 #     its annotated tag, with the release-branch trigger SHA as prerequisite.
-#   * `release-control` alone receives the existing step-scoped `RELEASE_TOKEN`. The host helper
-#     imports and verifies that bundle, opens the normal cut PR to `main`, waits for exact-head CI,
-#     merges, stages the merged SHA as a candidate, verifies its immutable receipt, pushes the
-#     annotated tag, watches publication, verifies the public release, and cleans up last.
+#   * `release-control` alone receives the existing step-scoped `RELEASE_TOKEN`. The PAT moves git
+#     refs and pushes the tag; the job-scoped Actions token dispatches/observes exact-SHA CI and
+#     candidate runs. The host helper imports and verifies the bundle, constructs one fast-forward
+#     two-parent merge only after cut CI, stages that SHA as a candidate, verifies its immutable
+#     receipt, watches publication, verifies the public release, and cleans up last.
 #
 # Manual dispatch remains non-publishing. `apply: false` previews the mechanically derived plan;
 # `apply: true` rehearses the full transaction and local gate in the ephemeral runner. Neither mode
