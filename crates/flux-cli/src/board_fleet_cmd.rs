@@ -5093,9 +5093,11 @@ worktree_root = ".flux/fleet/worktrees"
                         .map(|capability| (*capability).to_string())
                         .collect()
                 });
-            let (capabilities, operations) =
+            // A pre-check against the maximal grant, before any worktree is cut: an operation no
+            // bundle could ever provide is a defect in the loop, not a property of a repository.
+            let (_, grantable_operations) =
                 normalize_worker_capabilities(mode, &requested_capabilities)?;
-            validate_loop_capability_compatibility(&loop_binding, &operations)?;
+            validate_loop_capability_compatibility(&loop_binding, &grantable_operations)?;
             let template_fences = template
                 .map(|template| template.fences.clone())
                 .unwrap_or_default();
@@ -5143,6 +5145,31 @@ worktree_root = ".flux/fleet/worktrees"
                 let fences =
                     normalize_fences(template_fences.iter().cloned().chain(repository_fences));
                 let read_roots = Vec::<PathBuf>::new();
+                // C-605: resolve the toolchain half of the ceiling from the checkout this worker was
+                // actually assigned, so a repository with no Cargo manifest never receives `cargo_*`
+                // and a Node one receives `npm` from the very same declaration. `--dry-run` does not
+                // cut the worktree, so probe the source checkout it would be cut from instead —
+                // otherwise a dry run would report a ceiling no real dispatch would produce.
+                let probe_root = if worktree.is_dir() {
+                    worktree.clone()
+                } else {
+                    repository_id
+                        .and_then(|repository_id| {
+                            config
+                                .repositories
+                                .iter()
+                                .find(|repository| repository.id == repository_id)
+                        })
+                        .and_then(|repository| repository_root(root, repository).ok())
+                        .unwrap_or_else(|| root.to_path_buf())
+                };
+                let (capabilities, operations) = normalize_worker_capabilities_in(
+                    mode,
+                    &requested_capabilities,
+                    task_kind,
+                    Some(&probe_root),
+                )?;
+                validate_loop_capability_compatibility(&loop_binding, &operations)?;
                 let capability_set = capability_set_manifest(
                     mode,
                     &capabilities,
@@ -9794,9 +9821,73 @@ struct AgentTurnSpec {
 /// Every capability bundle name [`capability_operations`] resolves. Kept beside it and pinned by a
 /// drift test, because loop validation needs to reason about the *maximal* grantable ceiling and a
 /// bundle added without being listed here would silently narrow that reasoning.
-const CAPABILITY_BUNDLES: [&str; 11] = [
-    "read", "edit", "git-read", "git", "shell", "rust", "node", "go", "python", "make", "task",
+const CAPABILITY_BUNDLES: [&str; 12] = [
+    "read",
+    "edit",
+    "git-read",
+    "git",
+    "shell",
+    TOOLCHAIN_CAPABILITY,
+    "rust",
+    "node",
+    "go",
+    "python",
+    "make",
+    "task",
 ];
+
+/// The language-neutral validation capability (C-605).
+///
+/// A template that names `rust` is wrong the moment a member repository is not Rust, and Fleet
+/// instruction prose that enumerates `cargo_check`/`npm` is wrong in exactly the same way. Declaring
+/// `toolchain` says *what* the worker needs — the ability to validate the repository it was assigned —
+/// and [`toolchain_bundles_in`] answers *which* operations that is, from the assigned checkout.
+const TOOLCHAIN_CAPABILITY: &str = "toolchain";
+
+/// Toolchain bundles and the workspace-root marker whose presence surfaces each one.
+///
+/// `flux-tools` gates every toolchain group on a project signal that `flux_runtime::detect_signals`
+/// emits from exactly these markers, so an operation from an unmarked bundle is registered and never
+/// advertised. Granting it anyway is not harmless: `ai_segment` refuses a `tools:` entry the live
+/// ceiling does not contain, so a segment already holding an assignment dies mid-run on "tools outside
+/// the live capability ceiling".
+///
+/// `rust` belongs here with the rest. `cargo_*` is gated on `Cargo.toml` by the same mechanism as
+/// `npm` on `package.json`; treating it as unconditional was an assumption about which repositories a
+/// Fleet contains, not a property of the surfacing rule.
+const TOOLCHAIN_MARKERS: [(&str, &[&str]); 5] = [
+    ("rust", &["Cargo.toml"]),
+    ("node", &["package.json"]),
+    ("python", &["pyproject.toml", "requirements.txt"]),
+    ("go", &["go.mod"]),
+    ("make", &["Makefile", "makefile"]),
+];
+
+/// Whether `bundle` is a toolchain bundle whose marker is absent from `repository_root`.
+///
+/// Non-toolchain bundles (`read`, `git`, …) are never repository-conditional, so they answer `false`.
+fn toolchain_bundle_is_unsurfaced(repository_root: &Path, bundle: &str) -> bool {
+    TOOLCHAIN_MARKERS
+        .iter()
+        .find(|(name, _)| *name == bundle)
+        .is_some_and(|(_, markers)| {
+            !markers
+                .iter()
+                .any(|marker| repository_root.join(marker).exists())
+        })
+}
+
+/// The toolchain bundles `repository_root` actually surfaces, or all of them when no repository is
+/// known (config validation and template-less task kinds must not narrow a ceiling they cannot probe).
+fn toolchain_bundles_in(repository_root: Option<&Path>) -> Vec<&'static str> {
+    TOOLCHAIN_MARKERS
+        .iter()
+        .map(|(bundle, _)| *bundle)
+        .filter(|bundle| {
+            repository_root.is_none_or(|root| !toolchain_bundle_is_unsurfaced(root, bundle))
+        })
+        .collect()
+}
 
 const DEFAULT_STORY_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
 const REQUIRED_WRITER_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
@@ -9851,6 +9942,24 @@ fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
             "git_branch",
         ],
         "shell" => &["bash", "proc.run"],
+        // The repository-neutral union. `normalize_worker_capabilities_in` narrows it to the bundles
+        // the ASSIGNED checkout surfaces; this resolution answers only "what could `toolchain` ever
+        // mean", which is what `maximal_task_kind_operations` and config validation need.
+        TOOLCHAIN_CAPABILITY => &[
+            "cargo_check",
+            "cargo_build",
+            "cargo_test",
+            "cargo_clippy",
+            "cargo_fmt",
+            "npm",
+            "node_run",
+            "go_build",
+            "go_test",
+            "go_vet",
+            "python_run",
+            "pytest",
+            "make",
+        ],
         "rust" => &[
             "cargo_check",
             "cargo_build",
@@ -9897,6 +10006,23 @@ fn normalize_worker_capabilities_for(
     requested: &[String],
     task_kind: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
+    normalize_worker_capabilities_in(mode, requested, task_kind, None)
+}
+
+/// [`normalize_worker_capabilities_for`] against the repository the worker is actually assigned to.
+///
+/// `repository_root` is the checkout the worker will run in. Toolchain bundles resolve from it rather
+/// than being granted uniformly (C-605), so one shared template declaring `toolchain` is correct in a
+/// Rust repository, a Node one and a mixed one — and a repository with no Cargo manifest never
+/// receives `cargo_*`. `None` means "no assigned repository", which keeps the grant maximal: config
+/// validation and template-less task kinds must reason about what *could* be granted, not narrow a
+/// ceiling they cannot probe.
+fn normalize_worker_capabilities_in(
+    mode: FleetTaskMode,
+    requested: &[String],
+    task_kind: &str,
+    repository_root: Option<&Path>,
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut capabilities = requested
         .iter()
         .map(|capability| capability.trim().to_ascii_lowercase())
@@ -9932,8 +10058,28 @@ fn normalize_worker_capabilities_for(
 
     let mut operations = capabilities
         .iter()
-        .flat_map(|capability| capability_operations(capability).unwrap_or_default())
-        .map(|operation| (*operation).to_string())
+        .flat_map(|capability| {
+            if capability == TOOLCHAIN_CAPABILITY {
+                // Expand the neutral capability to the bundles this repository surfaces, so the
+                // declaration carries no language name at all.
+                return toolchain_bundles_in(repository_root)
+                    .into_iter()
+                    .flat_map(|bundle| capability_operations(bundle).unwrap_or_default())
+                    .copied()
+                    .collect::<Vec<_>>();
+            }
+            // An explicitly named language bundle is narrowed by the same probe: naming `rust`
+            // cannot conjure a toolchain the assigned checkout does not surface.
+            if repository_root
+                .is_some_and(|root| toolchain_bundle_is_unsurfaced(root, capability.as_str()))
+            {
+                return Vec::new();
+            }
+            capability_operations(capability)
+                .unwrap_or_default()
+                .to_vec()
+        })
+        .map(|operation| operation.to_string())
         .collect::<Vec<_>>();
     operations.extend(
         AGENT_LOOP_MACHINERY_OPERATIONS
@@ -10275,21 +10421,6 @@ fn worktree_holds_work(worktree: &Path, source: &Path, canonical_ref: &str) -> R
     Ok(true)
 }
 
-/// The non-Rust toolchain bundles and the workspace-root marker each one surfaces on.
-///
-/// `flux-tools` gates these groups on a project signal so they appear only where they make sense
-/// (`flux-tools/src/toolchains.rs`). A capability bundle can therefore *grant* `npm` while the
-/// assigned repository never *installs* it, and the mismatch is invisible until a segment already
-/// holding an assignment dies on "tools outside the live capability ceiling". Rust is absent
-/// deliberately: `cargo_*` is not conditional in the same way, and every repository in a Fleet is a
-/// Cargo workspace today — adding it here would assert a gate this table cannot verify.
-const CONDITIONAL_TOOLCHAIN_SIGNALS: [(&str, &[&str]); 4] = [
-    ("node", &["package.json"]),
-    ("python", &["pyproject.toml", "requirements.txt"]),
-    ("go", &["go.mod"]),
-    ("make", &["Makefile"]),
-];
-
 /// Per repository, the operations `binding` requires that the repository will not surface.
 ///
 /// Reported per repository rather than collapsed: a Fleet spans several checkouts, and an operation
@@ -10314,11 +10445,8 @@ fn unsurfaced_toolchain_operations(
             continue;
         }
         let mut missing = Vec::new();
-        for (bundle, markers) in CONDITIONAL_TOOLCHAIN_SIGNALS {
-            let surfaced = markers
-                .iter()
-                .any(|marker| repository_root.join(marker).exists());
-            if surfaced {
+        for (bundle, _) in TOOLCHAIN_MARKERS {
+            if !toolchain_bundle_is_unsurfaced(&repository_root, bundle) {
                 continue;
             }
             missing.extend(
@@ -10730,12 +10858,15 @@ fn addressed_turn_spec(
         format!("validation/gate: admitted agent {target} has no valid mode snapshot")
     })?;
     let configured_capabilities = value_string_list(agent, "capabilities", target)?;
-    let (capabilities, admitted_operations) = normalize_worker_capabilities_for(
+    // C-605: the same repository-derived resolution the admission used, so the digest below still
+    // reconciles and the live turn is granted exactly the toolchain its checkout surfaces.
+    let (capabilities, admitted_operations) = normalize_worker_capabilities_in(
         mode,
         &configured_capabilities,
         agent["task_kind"]
             .as_str()
             .unwrap_or(FLEET_IMPLEMENTATION_TASK_KIND),
+        Some(&worktree),
     )?;
     let fences = normalize_fences(value_string_list(agent, "fences", target)?);
     let capability_set = capability_set_manifest(
@@ -11445,7 +11576,7 @@ fn fleet_spawn(
     };
     capabilities.extend(options.capabilities.iter().cloned());
     let (capabilities, operations) =
-        normalize_worker_capabilities_for(mode, &capabilities, task_kind)?;
+        normalize_worker_capabilities_in(mode, &capabilities, task_kind, Some(root))?;
     validate_loop_capability_compatibility(&loop_binding, &operations)?;
     let mut fences = template
         .map(|template| template.fences.clone())
@@ -13826,6 +13957,83 @@ mod tests {
                 maximal.contains(&operation),
                 "`{operation}` is grantable but missing from the maximal set"
             );
+        }
+    }
+
+    /// C-605 (failing first): toolchain operations are surfaced by the ASSIGNED REPOSITORY, not
+    /// granted uniformly. `flux-tools` gates every toolchain group on a workspace marker
+    /// (`flux_runtime::detect_signals`), so a bundle that grants `cargo_test` where no `Cargo.toml`
+    /// exists names an operation the worker can never call — a mismatch that only shows up mid-turn
+    /// as "tools outside the live capability ceiling". The `toolchain` capability is the
+    /// language-neutral way to say "validate this repository however it is validated", so one shared
+    /// template is correct in a Rust repo, a Node repo and a mixed one.
+    #[test]
+    fn toolchain_operations_follow_the_assigned_repository() {
+        let node_only = reclaim_test_dir("c605-node");
+        std::fs::write(node_only.join("package.json"), "{}").expect("node marker");
+        let rust_only = reclaim_test_dir("c605-rust");
+        std::fs::write(rust_only.join("Cargo.toml"), "[workspace]\n").expect("rust marker");
+        let bare = reclaim_test_dir("c605-bare");
+        let kind = default_fleet_task_kind();
+        let neutral = ["read", "edit", "git", "toolchain"].map(str::to_string);
+
+        let (_, in_node) = normalize_worker_capabilities_in(
+            FleetTaskMode::Write,
+            &neutral,
+            &kind,
+            Some(&node_only),
+        )
+        .expect("a node repository admits the neutral toolchain capability");
+        assert!(
+            !in_node
+                .iter()
+                .any(|operation| operation.starts_with("cargo_")),
+            "a repository with no Cargo manifest must not receive cargo_*: {in_node:?}"
+        );
+        assert!(
+            in_node.contains(&"npm".to_string()),
+            "the same declaration must yield the node toolchain there: {in_node:?}"
+        );
+
+        let (_, in_rust) = normalize_worker_capabilities_in(
+            FleetTaskMode::Write,
+            &neutral,
+            &kind,
+            Some(&rust_only),
+        )
+        .expect("a rust repository admits the neutral toolchain capability");
+        assert!(
+            in_rust.contains(&"cargo_test".to_string()),
+            "the same declaration must yield the rust toolchain here: {in_rust:?}"
+        );
+        assert!(
+            !in_rust.iter().any(|operation| operation == "npm"),
+            "a repository with no package.json must not receive npm: {in_rust:?}"
+        );
+
+        // An explicitly named language bundle is narrowed by the same repository probe: naming
+        // `rust` cannot conjure a toolchain the assigned checkout does not surface.
+        let explicit = ["read", "edit", "git", "rust"].map(str::to_string);
+        let (_, explicit) =
+            normalize_worker_capabilities_in(FleetTaskMode::Write, &explicit, &kind, Some(&bare))
+                .expect("an explicit bundle is still a valid declaration");
+        assert!(
+            !explicit
+                .iter()
+                .any(|operation| operation.starts_with("cargo_")),
+            "an unsurfaced bundle must contribute nothing: {explicit:?}"
+        );
+
+        // With no assigned repository (config validation, an ad-hoc task kind) the grant stays
+        // maximal — validation must not narrow a ceiling it cannot probe.
+        let (_, unknown) =
+            normalize_worker_capabilities_in(FleetTaskMode::Write, &neutral, &kind, None)
+                .expect("an unprobed declaration is still valid");
+        assert!(unknown.contains(&"cargo_test".to_string()));
+        assert!(unknown.contains(&"npm".to_string()));
+
+        for scratch in [node_only, rust_only, bare] {
+            std::fs::remove_dir_all(&scratch).ok();
         }
     }
 
