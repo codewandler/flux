@@ -13,14 +13,14 @@ surface; use typed Board/Fleet operations or CLI services for lifecycle state, n
 
 Resolve the two roots explicitly:
 
-- Flux source/install root: usually `/home/timo/projects/flux`
-- Fleet root: usually `/home/timo/projects/flux-roadmap`
+- Flux source/install root: usually `<flux source root>`
+- Fleet root: usually `<fleet root>`
 - tmux target: `flux:fleet` (session `flux`, window `fleet`)
 
 Inspect before changing the running process:
 
 ```bash
-git -C /home/timo/projects/flux status --short --branch
+git -C <flux source root> status --short --branch
 tmux list-panes -t flux:fleet -F '#{session_name}:#{window_name}.#{pane_index} pid=#{pane_pid} current=#{pane_current_command} dead=#{pane_dead} path=#{pane_current_path}'
 tmux capture-pane -p -t flux:fleet -S -120
 ```
@@ -43,8 +43,17 @@ really a stale-binary artifact.
 After each coherent code change:
 
 1. Check for an in-flight wave: `flux fleet status`, and
-   `pgrep -af 'bin/flux .*run --stream-json'` (match the absolute path — worker argv starts with the
-   resolved executable, so a bare `flux run` pattern silently matches nothing).
+
+   ```bash
+   pgrep -af 'bin/flux .*run --stream-json' | grep -v 'zsh -c' || echo '(no worker)'
+   ```
+
+   Both halves matter, and each failed in practice. Match the **absolute path**: worker argv begins
+   with the resolved executable, so a bare `flux run` pattern silently matches nothing and you
+   conclude the fleet is idle while five workers are running. Then exclude the **shell wrapper**:
+   your own `pgrep` command line contains the pattern, so an unfiltered match is always true and a
+   guard written as `pgrep … && abort || install` silently takes the abort branch and never installs.
+   Verify the binary's mtime after `task install` rather than trusting the guard.
 2. If a wave is running, `flux fleet cancel <wave>`. Cancel is a ~50 ms SIGKILL of the worker process
    group, so first **snapshot every story worktree** — `git log origin/main..HEAD` *and* `git diff`.
    A worker recorded `failed` can still hold a complete commit.
@@ -55,17 +64,18 @@ After each coherent code change:
 5. Respawn the pane on the installed command:
 
 ```bash
-tmux respawn-pane -k -t flux:fleet -c /home/timo/projects/flux-roadmap \
+tmux respawn-pane -k -t flux:fleet -c <fleet root> \
   'env -u NO_COLOR COLORTERM=truecolor flux tui -m claude/opus --yes --fleet'
 ```
 
 6. Confirm the PID/current command changed, capture startup output, then re-dispatch the cancelled
    items.
 
-Name the model provider explicitly. `claude/opus` routes through the Claude subscription OAuth
-imported from `~/.claude/.credentials.json`; the bare alias `opus` resolves to `anthropic/opus` and
-bills the `ANTHROPIC_API_KEY`, which has no credit balance and fails the turn with HTTP 400 before
-any tool runs. Keep the TUI model and `.flux/fleet.toml`'s `[main]`/`[[agent_templates]]` models on
+Name the model provider explicitly rather than relying on a bare alias. A bare alias such as `opus`
+resolves to the `anthropic` provider and bills whatever API key is configured; a `claude/`-prefixed
+spec routes through the Claude subscription instead. If a turn dies with an HTTP 400 about credit
+balance before any tool runs, the alias picked a provider without funds — check `flux auth status`
+for which credential each provider resolves to, and name the provider you meant. Keep the TUI model and `.flux/fleet.toml`'s `[main]`/`[[agent_templates]]` models on
 the same provider prefix — a sub-agent role naming a different provider than its parent fails fast at
 spawn. Check `flux auth status` when a provider looks exhausted; a 429 `usage_limit_reached` is a
 quota fact to route around, not a defect to patch.
@@ -74,7 +84,7 @@ Create the target only when it is genuinely absent:
 
 ```bash
 tmux has-session -t flux 2>/dev/null || \
-  tmux new-session -d -s flux -n fleet -c /home/timo/projects/flux-roadmap
+  tmux new-session -d -s flux -n fleet -c <fleet root>
 ```
 
 If session `flux` exists but window `fleet` does not, create that window rather than another session.

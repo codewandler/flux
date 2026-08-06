@@ -23,6 +23,11 @@ only repository policy that must be known before acting. Product documentation s
   non-trivial design decisions in [docs/designs/](docs/designs/).
 - Add a failing-first test for behavioral changes. Keep the story/design and changelogs consistent
   with the finished behavior; user-visible changes also belong in `WHATS-NEW.md`.
+- Anything committed here is shared. **Describe the mechanism, never this machine or this account.**
+  No absolute paths from a developer's home directory (use a placeholder such as `<fleet root>`), no
+  credential file locations, and no assertions about a particular account's provider balance, quota or
+  billing state — those are conditions to check at runtime (`flux auth status`), not facts to record.
+  Reproductions keep the command and the error, not the operator's environment.
 - Before opening a pull request or entering any publication path, regenerate the committed public
   documentation mirror with `scripts/build-embedded-docs.sh`, commit
   `crates/flux-server/assets/public-docs.zip` when it changes, then run
