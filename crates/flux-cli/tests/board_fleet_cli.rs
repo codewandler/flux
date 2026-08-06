@@ -2223,6 +2223,151 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::remove_dir_all(root).ok();
 }
 
+/// Failing first: concurrent handoffs against one wave all land.
+///
+/// A handoff writes the wave record and its worker's record, and at width every worker reaches that point
+/// at once. The write used to be computed from the snapshot the call started with, so the loser of the
+/// compare-and-set lost its whole handoff — evidence, write set and commit — and the wave then looked as
+/// though that story had never been delivered. Two lost updates already cost a dispatch and a completed
+/// integration with a SINGLE worker running; N workers is the contention this closes.
+#[test]
+fn concurrent_handoffs_against_one_wave_all_land() {
+    let root = fixture("concurrent-handoffs");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    let ids = ["C-1", "C-2", "C-3", "C-4"];
+    for (index, id) in ids.iter().enumerate() {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: Story {index}\nstatus: ready\npriority: {}\n---\n\n# Story {index}\n\n## Acceptance\n\n- [ ] ship\n",
+                index + 1
+            ),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let items: Vec<String> = ids.iter().map(|id| format!("repo/{id}")).collect();
+    let mut argv: Vec<&str> = vec!["fleet", "run"];
+    argv.extend(items.iter().map(String::as_str));
+    argv.extend(["--prepare-only", "--output", "json"]);
+    let dispatched = flux(&root, &argv);
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(stories.len(), 4);
+
+    // Each story commits its own file, so the handoffs are independent in content and simultaneous in time.
+    let mut prepared = Vec::new();
+    for (index, story) in stories.iter().enumerate() {
+        let worktree = PathBuf::from(story["worktree"].as_str().unwrap());
+        let name = format!("file-{index}.txt");
+        fs::write(worktree.join(&name), "done\n").unwrap();
+        assert!(git(&worktree, &["add", &name]).status.success());
+        assert!(git(&worktree, &["commit", "-qm", &name]).status.success());
+        let commit = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        prepared.push((
+            story["board_ref"].as_str().unwrap().to_string(),
+            name,
+            commit,
+        ));
+    }
+
+    // Fire them at once. Any one losing its compare-and-set is the defect.
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|(item, name, commit)| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let output = flux(
+                    &root,
+                    &[
+                        "fleet",
+                        "handoff",
+                        "wave-2",
+                        &item,
+                        "--commit",
+                        &commit,
+                        "--write-set",
+                        &name,
+                        "--test-arg",
+                        "test",
+                        "--test-arg",
+                        "-f",
+                        "--test-arg",
+                        &name,
+                        "--failing-before",
+                        "--passing-after",
+                        "--summary",
+                        "one file",
+                        "--output",
+                        "json",
+                    ],
+                );
+                (
+                    item,
+                    output.status.success(),
+                    String::from_utf8_lossy(&output.stdout).to_string(),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for (item, ok, out) in &results {
+        assert!(ok, "{item} lost its handoff: {out}");
+    }
+
+    // And every one is recorded, not merely reported: the wave must hold four accepted handoffs.
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "integration",
+            "wave-2",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(inspected.status.success());
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    // The system's own aggregate is the strongest assertion available: a wave only reaches
+    // `handoffs-ready` when EVERY story in it holds an accepted handoff. Had any of the four lost its
+    // compare-and-set, the wave would still be waiting on that story.
+    assert_eq!(
+        inspected["data"]["data"]["status"], "handoffs-ready",
+        "every concurrent handoff must survive in state: {}",
+        inspected["data"]["data"]
+    );
+    fs::remove_dir_all(root).ok();
+}
+
 /// Failing first: a derived artifact is regenerated on the CANDIDATE, once, before the gate.
 ///
 /// Some checked-in artifacts are derived from many stories at once — a documentation mirror, a generated

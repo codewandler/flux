@@ -4434,7 +4434,7 @@ worktree_root = ".flux/fleet/worktrees"
                     )?;
                 }
                 let config = read_fleet_config(root)?;
-                write_fleet_state(root, &state)?;
+                write_fleet_state_waiting(root, &state)?;
                 append_fleet_event(
                     root,
                     "fleet.initialized",
@@ -9536,6 +9536,42 @@ fn write_fleet_state(root: &Path, state: &FleetState) -> Result<()> {
     }
     Ok(())
 }
+
+/// How long to keep trying for the state reservation before giving up.
+///
+/// A held reservation is not a conflict, it is a queue: the other writer is mid-write and will be done in
+/// microseconds. Distinguishing the two is the whole point — a *content* conflict means this mutation was
+/// computed against a state that no longer exists and must be recomputed, while a *reservation* conflict
+/// means nothing except "not yet". The old code told the caller to retry and then had no one do it, so a
+/// handoff simply failed; at width every worker reaches handoff at once, which turns a microsecond of
+/// contention into a lost delivery.
+const FLEET_STATE_RESERVATION_ATTEMPTS: usize = 200;
+const FLEET_STATE_RESERVATION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// [`write_fleet_state`], waiting out a reservation another writer holds.
+fn write_fleet_state_waiting(root: &Path, state: &FleetState) -> Result<()> {
+    let mut last = None;
+    for attempt in 0..FLEET_STATE_RESERVATION_ATTEMPTS {
+        match write_fleet_state(root, state) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Only reservation contention is worth waiting out. A stale revision or a lost update means
+                // the mutation itself is out of date, and sleeping cannot make it current — that is the
+                // caller's problem to solve by recomputing, which is what the rebase helpers do.
+                if !error.to_string().contains("holds the state reservation") {
+                    return Err(error);
+                }
+                last = Some(error);
+                if attempt + 1 < FLEET_STATE_RESERVATION_ATTEMPTS {
+                    std::thread::sleep(FLEET_STATE_RESERVATION_BACKOFF);
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        anyhow::anyhow!("conflict/precondition: fleet state reservation stayed held")
+    }))
+}
 fn append_fleet_event(root: &Path, kind: &str, data: Value) -> Result<()> {
     let data = redact_value(data);
     let line = format!(
@@ -9551,6 +9587,54 @@ fn append_fleet_event(root: &Path, kind: &str, data: Value) -> Result<()> {
     }
     Ok(())
 }
+/// Persist a mutation expressed as a DELTA, re-applying it if another writer wins the race.
+///
+/// The delta form is the whole point, and getting it wrong is instructive. Rebasing at record level —
+/// recompute my copy of the wave, then insert that copy onto fresh state — looks equivalent and is not: a
+/// wave record contains every story, so replacing it wholesale discards the sibling stories other workers
+/// updated in the same instant. Four concurrent handoffs each reported success and the wave ended holding
+/// one, because last writer won the whole record.
+///
+/// So the caller supplies `apply`, which performs its change against whatever state it is handed. The loop
+/// reads current state, applies the delta to THAT, and writes; on a compare-and-set failure it reads again
+/// and re-applies. Both failure branches are recomputable for the same reason: they mean the state moved,
+/// and neither is fixed by waiting.
+///
+/// Reserved for mutations that are genuinely re-appliable. Re-running an action that has already created
+/// worktrees or spent a gate would be far worse than losing its record, which is why integration rebases
+/// its own record instead of routing through here.
+fn persist_delta_mutation(
+    command: &FleetCommand,
+    root: &Path,
+    state: &mut FleetState,
+    kind: &str,
+    data: Value,
+    mut apply: impl FnMut(&mut FleetState) -> Result<()>,
+) -> Result<()> {
+    const ATTEMPTS: usize = 12;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            if let Ok(latest) = read_fleet_state(root) {
+                *state = latest;
+            }
+        }
+        apply(state)?;
+        state.revision += 1;
+        match persist_fleet_mutation(command, root, state, kind, data.clone()) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                let recomputable =
+                    message.contains("lost update") || message.contains("stale fleet revision");
+                if !recomputable || attempt + 1 == ATTEMPTS {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    unreachable!("the loop returns on its final attempt")
+}
+
 fn persist_fleet_mutation(
     command: &FleetCommand,
     root: &Path,
@@ -9559,7 +9643,7 @@ fn persist_fleet_mutation(
     data: Value,
 ) -> Result<()> {
     if !command.dry_run {
-        write_fleet_state(root, state)?;
+        write_fleet_state_waiting(root, state)?;
         append_fleet_event(root, kind, data)?;
     }
     Ok(())
@@ -10105,12 +10189,41 @@ const RECLAIMABLE_BUILD_DIRS: [&str; 2] = ["target", "node_modules"];
 /// for its duration, and ownership is recorded. Retrying the whole operation instead would be wrong,
 /// because it would re-run a gate that has already produced its verdict.
 fn commit_wave_record(state: &mut FleetState, root: &Path, wave_id: &str, wave: &Value) {
+    commit_records(state, root, &[(wave_id.to_string(), wave.clone())], &[]);
+}
+
+/// Land specific wave and agent records on CURRENT state, rebasing when another writer moved on.
+///
+/// The general form of [`commit_wave_record`], and the reason it generalises safely is the same: an
+/// operation owns the entities it is reporting on. A handoff owns one story's wave record and the worker
+/// that produced it; a turn owns one agent's record. No other writer touches those keys while the
+/// operation runs, so replacing them on a newer state loses nothing and preserves whatever else arrived.
+///
+/// This matters at width. A lost compare-and-set already discarded a dispatch and a completed integration
+/// with a single worker running; N workers reaching handoff together is precisely the contention this
+/// removes. What it deliberately does NOT do is retry the operation — re-running an action that has
+/// already created worktrees or spent a gate is worse than losing its record.
+///
+/// Deliberately not applied to `fleet.started`/`fleet.stopped`: those flip a global flag rather than an
+/// entity, so two racing callers are a genuine conflict an operator should hear about, not a write to
+/// reconcile.
+fn commit_records(
+    state: &mut FleetState,
+    root: &Path,
+    waves: &[(String, Value)],
+    agents: &[(String, Value)],
+) {
     if let Ok(latest) = read_fleet_state(root) {
         if latest.revision > state.revision {
             *state = latest;
         }
     }
-    state.waves.insert(wave_id.to_string(), wave.clone());
+    for (id, record) in waves {
+        state.waves.insert(id.clone(), record.clone());
+    }
+    for (id, record) in agents {
+        state.agents.insert(id.clone(), record.clone());
+    }
     state.revision += 1;
 }
 
@@ -11283,6 +11396,10 @@ fn execute_and_record_agent_turn(
                 agent["session"] = json!(session);
                 agent["last_turn"] = receipt.clone();
                 agent["last_error"] = Value::Null;
+                // Land this agent's record on current state: several workers finish within milliseconds
+                // of each other, and the loser of the compare-and-set used to lose its whole receipt.
+                let landed = agent.clone();
+                commit_records(state, root, &[], &[(spec.id.clone(), landed)]);
             }
             if let Some(intake_id) = intake_id {
                 if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -11314,6 +11431,9 @@ fn execute_and_record_agent_turn(
                 agent["supervisor_pid"] = Value::Null;
                 agent["last_error"] = json!(message);
                 record_failed_turn_evidence(agent, &error);
+                // A failed turn's evidence is the most expensive thing to lose, so land it the same way.
+                let landed = agent.clone();
+                commit_records(state, root, &[], &[(spec.id.clone(), landed)]);
             }
             if let Some(intake_id) = intake_id {
                 if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -13401,39 +13521,51 @@ fn fleet_handoff(
         "summary": input.summary,
         "status": "accepted",
     });
-    let mut updated_wave = wave;
-    let story =
-        &mut updated_wave["topology"]["repositories"][repository_index]["stories"][story_index];
-    if !story["handoffs"].is_array() {
-        story["handoffs"] = json!([]);
-    }
-    story["handoffs"]
-        .as_array_mut()
-        .unwrap()
-        .push(handoff.clone());
-    story["handoff"] = handoff.clone();
-    story["status"] = json!("handoff-accepted");
-    let all_handoffs = updated_wave["topology"]["repositories"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
-        .all(|story| story["status"].as_str() == Some("handoff-accepted"));
-    if all_handoffs {
-        updated_wave["status"] = json!("handoffs-ready");
-    }
-    state.waves.insert(input.wave.to_string(), updated_wave);
-    if let Some(agent) = state.agents.get_mut(&worker) {
-        agent["status"] = json!("handoff-accepted");
-        agent["commit"] = json!(input.commit);
-    }
-    state.revision += 1;
-    persist_fleet_mutation(
+    // Applied as a delta, because N workers reach this point at once and a wave record holds every story:
+    // recomputing a private copy and inserting it would discard whatever siblings landed meanwhile.
+    let wave_id = input.wave.to_string();
+    let handoff_entry = handoff.clone();
+    let worker_id = worker.clone();
+    let commit = input.commit.to_string();
+    persist_delta_mutation(
         command,
         root,
-        &state,
+        &mut state,
         "story.handoff.accepted",
         handoff.clone(),
+        move |state| {
+            let record = state
+                .waves
+                .get_mut(&wave_id)
+                .with_context(|| format!("not-found: wave {wave_id}"))?;
+            let story =
+                &mut record["topology"]["repositories"][repository_index]["stories"][story_index];
+            if !story["handoffs"].is_array() {
+                story["handoffs"] = json!([]);
+            }
+            story["handoffs"]
+                .as_array_mut()
+                .unwrap()
+                .push(handoff_entry.clone());
+            story["handoff"] = handoff_entry.clone();
+            story["status"] = json!("handoff-accepted");
+            // Recomputed against the CURRENT record, so the wave only advances once the last sibling has
+            // actually landed — whichever worker that turns out to be.
+            let all_handoffs = record["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+                .all(|story| story["status"].as_str() == Some("handoff-accepted"));
+            if all_handoffs {
+                record["status"] = json!("handoffs-ready");
+            }
+            if let Some(agent) = state.agents.get_mut(&worker_id) {
+                agent["status"] = json!("handoff-accepted");
+                agent["commit"] = json!(commit);
+            }
+            Ok(())
+        },
     )?;
     Ok((
         format!("{} handoff accepted at {}", input.item, input.commit),
