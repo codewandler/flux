@@ -89,6 +89,133 @@ fn guarded_git(root: &Path, args: &[&str]) -> Result<flux_system::ProcessOutput>
     guarded_run(root, &argv)
 }
 
+/// Did this validation run execute zero tests?
+///
+/// A filtered-to-nothing run is not a pass and not a failure — it is "the cited test does not exist
+/// here". Detected from the runner's own summary rather than the exit code, because `cargo test`
+/// reports `0 passed; 0 failed; N filtered out` and exits 0. Recognises the libtest summary shared by
+/// `cargo test`/`cargo nextest`; an unrecognised runner simply reports `false` and keeps the strict
+/// exit-code contract.
+fn ran_no_tests(evidence: &Value) -> bool {
+    let haystack = format!(
+        "{}{}",
+        evidence["stdout"].as_str().unwrap_or_default(),
+        evidence["stderr"].as_str().unwrap_or_default()
+    );
+    haystack.contains("0 passed; 0 failed")
+        || haystack.contains("0 tests run")
+        || haystack.contains("Starting 0 tests")
+}
+
+/// Sidecar carrying live worker activity, relative to the Fleet root.
+///
+/// A wave writes `state.json` exactly twice — once before the first worker starts, once after the
+/// last joins — so for the whole wave a surface has nothing new to render and an operator watching
+/// `flux tui --fleet` sees a frozen panel. The worker's NDJSON is already arriving on stdout; this
+/// file is where the supervisor lands a bounded projection of it as it arrives, so a surface can
+/// tail one path instead of deriving five per-worker store paths.
+pub(super) const FLEET_ACTIVITY_SIDECAR: &str = ".flux/fleet/activity.ndjson";
+/// Keep the sidecar bounded: it is a live view, not an archive. Full fidelity stays in each worker's
+/// own session store and in the turn receipt.
+const FLEET_ACTIVITY_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Append one bounded activity record for `agent_id`.
+///
+/// Deliberately structural only — event type, operation name, and a coarse outcome. Tool inputs and
+/// result bodies are never read, so a worker's secrets cannot reach this file through a field it does
+/// not touch (the same property A-79's `SpawnActivity` relies on). Best-effort: a surface losing an
+/// activity line must never fail a worker's turn, so every error here is swallowed.
+fn append_worker_activity(fleet_root: &Path, agent_id: &str, line: &str) {
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let kind = event["type"].as_str().unwrap_or("event");
+    // `turn_start` carries the whole prompt; it is stripped from receipts too. Skip it entirely.
+    if kind == "turn_start" {
+        return;
+    }
+    let subject = ["name", "operation", "stage", "original_type"]
+        .into_iter()
+        .find_map(|key| event[key].as_str())
+        .unwrap_or("—");
+    let outcome = if event["is_error"].as_bool() == Some(true) {
+        "error"
+    } else {
+        event["outcome"].as_str().unwrap_or("ok")
+    };
+    let record = json!({
+        "schema": "flux.fleet-activity/v1",
+        "agent": agent_id,
+        "type": kind,
+        "operation": bounded_text(subject, 80),
+        "outcome": outcome,
+    });
+    let path = fleet_root.join(FLEET_ACTIVITY_SIDECAR);
+    if std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) > FLEET_ACTIVITY_MAX_BYTES {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+/// Read the activity sidecar into the last few lines per worker, newest last.
+///
+/// Best-effort and bounded: a missing, truncated or partially written sidecar yields whatever parses,
+/// because a live view must never fail a snapshot the operator is waiting on.
+fn read_worker_activity(root: &Path) -> BTreeMap<String, Vec<String>> {
+    const MAX_PER_WORKER: usize = 20;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(root.join(FLEET_ACTIVITY_SIDECAR)) else {
+        return out;
+    };
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(agent) = record["agent"].as_str() else {
+            continue;
+        };
+        let summary = format!(
+            "{} · {} · {}",
+            record["type"].as_str().unwrap_or("event"),
+            record["operation"].as_str().unwrap_or("—"),
+            record["outcome"].as_str().unwrap_or("ok"),
+        );
+        let entries = out.entry(agent.to_string()).or_default();
+        entries.push(bounded_text(&summary, 300));
+        if entries.len() > MAX_PER_WORKER {
+            entries.remove(0);
+        }
+    }
+    out
+}
+
+/// Feed newly arrived stdout bytes to [`append_worker_activity`], one complete line at a time.
+/// Returns the unconsumed tail (a partial line) to be carried into the next poll.
+fn drain_activity_lines(pending: &mut String, chunk: &str, fleet_root: &Path, agent_id: &str) {
+    pending.push_str(chunk);
+    while let Some(newline) = pending.find('\n') {
+        let line = pending[..newline].trim().to_string();
+        pending.drain(..=newline);
+        if !line.is_empty() {
+            append_worker_activity(fleet_root, agent_id, &line);
+        }
+    }
+    // A single absurdly long line must not grow this buffer without bound.
+    if pending.len() > FLEET_STREAM_JSON_LINE_LIMIT {
+        pending.clear();
+    }
+}
+
 async fn guarded_agent_run_async(
     worktree: &Path,
     read_roots: &[PathBuf],
@@ -105,6 +232,26 @@ async fn guarded_agent_run_async(
             .add_read_root(root)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
+    // C-607: pin the worker's confinement here rather than inheriting whatever the operator's shell
+    // resolved. `flux fleet run` is operator-invoked and must stay unconfined itself — it creates
+    // worktrees in each member repository's shared git dir, outside any single workspace — but the
+    // turn it launches has no approval boundary at all, which is exactly C-262's criterion. Left to
+    // `from_env`, an operator with no `FLUX_SANDBOX` set resolved `Off` and the worker was spawned
+    // unwrapped, making the workspace path guard its only confinement of any kind (and that guard does
+    // not cover `bash`/`proc.run`, nor does the OS sandbox restrict reads on either backend).
+    // C-607 is NOT fixed here yet, deliberately. Forcing `SandboxMode::On` at this spawn site does
+    // confine the worker, but it also made every worker turn fail with
+    // `emitted an invalid event stream` — reproducibly, where the same story committed successfully
+    // without it. The parse error is masked by the context message (which shows only stderr, carrying
+    // the child's `trusting FLUX_SANDBOXED=1` startup warning), so the mechanism is not yet
+    // established: it may be the child's own startup output reaching stdout and corrupting the NDJSON
+    // protocol, or the wrapped spawn changing how output is delivered.
+    //
+    // Leaving the fleet unable to do any work is worse than the exposure this closes, so the posture
+    // stays inherited until the stream failure is understood. The exposure is real and documented in
+    // C-607: with no `FLUX_SANDBOX` set, a worker resolves `Off` and is spawned unwrapped, so the
+    // workspace path guard is its only confinement — and that guard does not cover `bash`/`proc.run`,
+    // which C-606 has now removed from the default story capabilities.
     let system = flux_system::System::new(workspace).with_sandbox(
         flux_system::sandbox::Sandbox::resolve(flux_system::sandbox::SandboxSettings::from_env()),
     );
@@ -124,8 +271,12 @@ async fn guarded_agent_run_async(
     let mut stderr = Vec::new();
     let mut dropping_stdout_line = false;
     let mut dropping_stderr_line = false;
+    let mut activity_pending = String::new();
     loop {
         let (out, err) = child.read_output();
+        // Project each complete line to the activity sidecar as it arrives. This poll loop is the
+        // only place that sees worker events before the process exits.
+        drain_activity_lines(&mut activity_pending, &out, &fleet_root, &agent_id);
         append_capped_line_buffer(
             &mut stdout,
             &mut dropping_stdout_line,
@@ -876,6 +1027,14 @@ struct MainAgentState {
     last_turn: Option<Value>,
     #[serde(default)]
     last_error: Option<String>,
+    /// The coordinator's recorded scope: mode, operation count, and the repository roots it holds.
+    ///
+    /// C-610. The ceiling was always enforced at spawn, but the record did not exist as a field at all,
+    /// so `state.json` described every constrained worker and stayed silent about the privileged agent.
+    /// An absent record is indistinguishable from an absent ceiling — auditing the fleet led to exactly
+    /// the wrong conclusion about which agent was confined. `default` keeps older state files loadable.
+    #[serde(default)]
+    capability_set: Option<Value>,
 }
 
 impl Default for MainAgentState {
@@ -889,6 +1048,7 @@ impl Default for MainAgentState {
             goals_revision: 0,
             last_turn: None,
             last_error: None,
+            capability_set: None,
         }
     }
 }
@@ -1079,9 +1239,10 @@ const fn default_template_instances() -> usize {
 /// The task kind that grants a template the dedicated wave-integrator catalogue. Declaring it in
 /// `fleet.toml` is the operator's explicit act; nothing else confers assemble authority.
 const FLEET_INTEGRATION_TASK_KIND: &str = "integration";
+const FLEET_IMPLEMENTATION_TASK_KIND: &str = "implementation";
 
 fn default_fleet_task_kind() -> String {
-    "implementation".into()
+    FLEET_IMPLEMENTATION_TASK_KIND.into()
 }
 fn default_canonical_ref() -> String {
     "origin/main".into()
@@ -1902,9 +2063,7 @@ fn fleet_tui_initial_snapshot(
     state: &FleetState,
     config: &FleetConfig,
 ) -> flux_tui::operations::FleetBoardSnapshot {
-    use flux_tui::operations::{
-        FleetBoardSnapshot, FleetCapacityView, FleetGoalView, FleetWaveView,
-    };
+    use flux_tui::operations::{FleetBoardSnapshot, FleetCapacityView, FleetGoalView};
 
     let is_active = |status: &str| matches!(status, "active" | "running" | "working");
     let active = state
@@ -1912,23 +2071,7 @@ fn fleet_tui_initial_snapshot(
         .values()
         .filter(|agent| agent["status"].as_str().is_some_and(is_active))
         .count();
-    let active_wave = state
-        .waves
-        .iter()
-        .find(|(_, wave)| {
-            !matches!(
-                wave["status"].as_str(),
-                Some("completed" | "failed" | "cancelled" | "parked")
-            )
-        })
-        .map(|(id, wave)| FleetWaveView {
-            id: id.clone(),
-            status: wave["status"].as_str().unwrap_or("unknown").to_string(),
-            items: value_strings(&wave["items"])
-                .into_iter()
-                .take(config.max_wave)
-                .collect(),
-        });
+    let active_wave = active_wave_view(state, config.max_wave);
     let goals = state
         .goals
         .values()
@@ -2058,6 +2201,11 @@ fn fleet_tui_refresh_token(root: &Path) -> Result<String> {
         ".flux/fleet.toml",
         ".flux/board.toml",
         ".flux/board-state.json",
+        // Without this the token cannot change for the entire duration of a wave: `state.json` is
+        // written once before the first worker starts and once after the last joins, and no other
+        // hashed path moves in between. The surface then takes zero snapshots while work happens,
+        // which is why a running wave looked frozen.
+        FLEET_ACTIVITY_SIDECAR,
         "ROADMAP.md",
         "VISION.md",
     ] {
@@ -2202,9 +2350,8 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
     fn snapshot(&self) -> Result<flux_tui::operations::FleetBoardSnapshot> {
         use flux_tui::operations::{
             BoardDecisionView, BoardItemView, DecisionOptionView, FleetBoardSnapshot,
-            FleetCapacityView, FleetFailureView, FleetGoalView, FleetIntakeView, FleetWaveView,
-            FleetWorkerView, MAX_DECISIONS, MAX_DOCUMENTS, MAX_FAILURES, MAX_INTAKE, MAX_ITEMS,
-            MAX_WORKERS,
+            FleetCapacityView, FleetFailureView, FleetGoalView, FleetIntakeView, FleetWorkerView,
+            MAX_DECISIONS, MAX_DOCUMENTS, MAX_FAILURES, MAX_INTAKE, MAX_ITEMS, MAX_WORKERS,
         };
         const MAX_GOALS: usize = 100;
         const MAX_HISTORY_DAYS: usize = 120;
@@ -2226,6 +2373,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             .values()
             .filter(|agent| agent["status"].as_str().is_some_and(fleet_status_is_active))
             .count();
+        let live_activity = read_worker_activity(&self.root);
         let mut workers = state
             .agents
             .iter()
@@ -2260,16 +2408,28 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                         .as_str()
                         .or_else(|| agent["last_turn"]["ack"].as_str())
                         .map(|value| bounded_text(value, 500)),
-                    activity: event_log_summaries(&agent["last_turn"]["events"]),
+                    // Prefer live sidecar activity while the worker is mid-turn; fall back to the
+                    // last turn's receipt once it has one. Without this a running worker shows the
+                    // events of its *previous* turn, which reads as stale rather than as progress.
+                    activity: live_activity
+                        .get(id.as_str())
+                        .cloned()
+                        .filter(|lines| !lines.is_empty())
+                        .unwrap_or_else(|| event_log_summaries(&agent["last_turn"]["events"])),
                     error: agent["last_error"]
                         .as_str()
                         .map(|value| bounded_text(value, 500)),
                 }
             })
             .collect::<Vec<_>>();
+        // Status first, then NEWEST WAVE first. Without the wave tiebreak the rail's five slots fill
+        // with `failed` workers (order 1, ahead of `completed`) left over from long-finished waves,
+        // burying the one worker that is actually running. Ordering by the wave's numeric suffix —
+        // not the id string — keeps `wave-99` behind `wave-100`.
         workers.sort_by(|left, right| {
             worker_status_order(&left.status)
                 .cmp(&worker_status_order(&right.status))
+                .then_with(|| wave_recency(&right.wave).cmp(&wave_recency(&left.wave)))
                 .then_with(|| left.id.cmp(&right.id))
         });
         let workers_total = workers.len();
@@ -2584,23 +2744,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             intake.drain(..intake.len() - MAX_INTAKE);
         }
 
-        let active_wave = state
-            .waves
-            .iter()
-            .find(|(_, wave)| {
-                !matches!(
-                    wave["status"].as_str(),
-                    Some("completed" | "failed" | "cancelled" | "parked")
-                )
-            })
-            .map(|(id, wave)| FleetWaveView {
-                id: id.clone(),
-                status: wave["status"].as_str().unwrap_or("unknown").to_string(),
-                items: value_strings(&wave["items"])
-                    .into_iter()
-                    .take(config.max_wave)
-                    .collect(),
-            });
+        let active_wave = active_wave_view(&state, config.max_wave);
         let goals = state
             .goals
             .values()
@@ -3364,6 +3508,15 @@ fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
         "bounded Fleet status projection exceeded {MAX_FLEET_STATUS_BYTES} bytes"
     );
     Ok(projection)
+}
+
+/// Sortable recency for a worker's wave, from the `wave-<n>` numeric suffix. An unattached worker
+/// sorts oldest so it never displaces a live wave's rows.
+fn wave_recency(wave: &Option<String>) -> u64 {
+    wave.as_deref()
+        .and_then(|wave| wave.rsplit('-').next())
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn worker_status_order(status: &str) -> u8 {
@@ -4542,20 +4695,35 @@ worktree_root = ".flux/fleet/worktrees"
             let config = root.join(".flux/fleet.toml");
             let mut errors = Vec::new();
             if !config.exists() {
-                errors.push("missing .flux/fleet.toml".to_string());
+                errors.push("missing .flux/fleet.toml (run `flux fleet init`)".to_string());
             }
+            let mut loops = Vec::new();
             let limits = if config.exists() {
                 let config = read_fleet_config(root)?;
+                loops = validate_fleet_loop_bindings(root, &config, &mut errors);
                 json!({"max_workers":config.max_workers,"max_wave":config.max_wave,"max_rework":config.max_rework})
             } else {
                 Value::Null
             };
-            let data = json!({"valid": errors.is_empty(), "errors": errors, "config":limits, "state": state});
+            let data = json!({"valid": errors.is_empty(), "errors": errors, "config":limits, "loops": loops, "state": state});
             if !data["valid"].as_bool().unwrap_or(false) {
-                bail!("validation/gate: missing .flux/fleet.toml (run `flux fleet init`)");
+                let errors = data["errors"]
+                    .as_array()
+                    .map(|errors| {
+                        errors
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+                bail!("validation/gate: {errors}");
             }
             Ok((
-                "fleet configuration valid".into(),
+                format!(
+                    "fleet configuration valid; {} loop binding(s) analyzed",
+                    loops.len()
+                ),
                 data,
                 vec![],
                 state.revision,
@@ -4573,6 +4741,25 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Start => {
             state.running = true;
             state.main_agent.status = "running".into();
+            // C-610: establish the coordinator's RECORDED scope when the fleet starts, which is exactly
+            // when its umbrella is defined. The ceiling itself has always been enforced at spawn
+            // (`--operation-ceiling` plus explicit `--add-dir` roots); what was missing was any record of
+            // it, so `state.json` described every constrained worker and said nothing about the
+            // privileged agent — and an absent record reads exactly like an absent ceiling.
+            let started_config = read_fleet_config(root)?;
+            let coordinator_roots = started_config
+                .repositories
+                .iter()
+                .map(|repository| repository_root(root, repository))
+                .collect::<Result<Vec<_>>>()?;
+            state.main_agent.capability_set = Some(capability_set_manifest(
+                FleetTaskMode::Write,
+                &["fleet-coordinator".to_string()],
+                &native_fleet_main_operation_ceiling(),
+                root,
+                &coordinator_roots,
+                &normalize_fences(Vec::new()),
+            ));
             state.revision += 1;
             persist_fleet_mutation(
                 command,
@@ -4812,14 +4999,61 @@ worktree_root = ".flux/fleet/worktrees"
                     config.max_wave
                 );
             }
-            let selected = if items.is_empty() {
-                select_ready_items(root, config.max_wave)?
-            } else {
+            let explicit = !items.is_empty();
+            let selected = if explicit {
                 validate_board_refs(items)?;
                 items.clone()
+            } else {
+                select_ready_items(root, config.max_wave)?
             };
             if selected.is_empty() {
                 bail!("not-found: no dependency-satisfied ready items");
+            }
+            // C-619: never dispatch work this Fleet has already delivered.
+            //
+            // The Board cannot be relied on to say so. It stays `ready` after a wave is gated and
+            // accepted, and a workspace board additionally REFUSES every mutation while its member
+            // checkout is off the configured canonical ref — which any delivered-but-unpushed work
+            // guarantees. So an unattended driver reading `board next` re-selects finished stories
+            // forever: `flux/C-569` was dispatched three times in eleven seconds after passing its full
+            // gate, each attempt costing a worker turn and gigabytes of build output.
+            //
+            // Fleet's own state is the authority here, and it is always available: a wave that reached
+            // `green` or `applied` delivered its items, full stop.
+            let delivered = delivered_board_items(&state);
+            let repeats = selected
+                .iter()
+                .filter(|item| delivered.contains_key(item.as_str()))
+                .map(|item| format!("{item} (wave {})", delivered[item.as_str()]))
+                .collect::<Vec<_>>();
+            // Explicit intent gets an error; an auto-selected wave gets the delivered items FILTERED
+            // OUT. Bailing on a selection the operator did not choose would let one finished story
+            // block a whole multi-item wave — the Board still lists delivered work as `ready`, so with
+            // several workers that is the common case, not the edge case.
+            let selected = if explicit || repeats.is_empty() {
+                selected
+            } else {
+                let remaining = selected
+                    .iter()
+                    .filter(|item| !delivered.contains_key(item.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    bail!(
+                        "not-found: every dependency-satisfied ready item was already delivered by a \
+                         gated wave: {}. Accumulate the accepted candidates instead (C-619)",
+                        repeats.join(", ")
+                    )
+                }
+                remaining
+            };
+            if explicit && !repeats.is_empty() {
+                bail!(
+                    "conflict/precondition: already delivered by a gated wave, so this dispatch would \
+                     re-implement finished work: {}. Accumulate the accepted candidate instead, or \
+                     transition the Board item once its checkout is back at its canonical ref (C-619)",
+                    repeats.join(", ")
+                )
             }
             let template = config
                 .agent_templates
@@ -4911,12 +5145,21 @@ worktree_root = ".flux/fleet/worktrees"
                     &read_roots,
                     &fences,
                 );
-                snapshot_fleet_loop_binding(
-                    &worktree,
-                    &loop_binding,
-                    FLEET_AGENT_LOOP_SOURCE,
-                    FLEET_AGENT_LOOP_BINDING,
-                )?;
+                // C-594: `--dry-run` promises to "validate and return the proposed result without
+                // writing", and `prepare_wave_worktrees` honours that by skipping `git worktree
+                // add`. Snapshotting the loop binding then tried to open a guarded workspace on a
+                // story worktree that deliberately does not exist, so EVERY dry run died with
+                // `workspace root …/stories/<ID>: No such file or directory` before returning a
+                // topology. The binding is already resolved and validated above; persisting its
+                // snapshot is a write, and writes are exactly what a dry run must not do.
+                if !command.dry_run {
+                    snapshot_fleet_loop_binding(
+                        &worktree,
+                        &loop_binding,
+                        FLEET_AGENT_LOOP_SOURCE,
+                        FLEET_AGENT_LOOP_BINDING,
+                    )?;
+                }
                 state.agents.insert(
                     worker.clone(),
                     json!({
@@ -5037,6 +5280,20 @@ worktree_root = ".flux/fleet/worktrees"
                             .collect::<Vec<_>>()
                     });
                     outcomes.extend(batch_outcomes);
+                }
+                // A wave runs for many minutes. During that window the coordinator or an operator may
+                // legitimately mutate Fleet state — a `fleet message`, a cancel, a decision. Applying
+                // these outcomes to the snapshot this call started with would then lose the
+                // compare-and-set in `write_fleet_state`, and the whole wave result is discarded:
+                // every receipt, every recorded session, and the record of workers that already
+                // committed. Refresh first and write the outcomes onto current state, exactly as the
+                // single-turn path does before recording. The wave and its agent records are already
+                // durable here (`wave.accepted` and `wave.agent-turns.delivered` both persisted
+                // above), so the refreshed state still contains everything this loop updates.
+                if let Ok(latest) = read_fleet_state(root) {
+                    if latest.revision > state.revision {
+                        state = latest;
+                    }
                 }
                 let mut receipts = Vec::new();
                 let mut errors = Vec::new();
@@ -8879,7 +9136,12 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
             &template.instructions,
             &format!("agent template {} instructions", template.id),
         )?;
-        normalize_worker_capabilities(template.mode, &template.capabilities).map_err(|error| {
+        normalize_worker_capabilities_for(
+            template.mode,
+            &template.capabilities,
+            template.task_kind.trim(),
+        )
+        .map_err(|error| {
             let message = error.to_string();
             let detail = message
                 .strip_prefix("validation/gate: ")
@@ -9433,7 +9695,27 @@ struct AgentTurnSpec {
     fleet_integrator: bool,
 }
 
-const DEFAULT_STORY_CAPABILITIES: [&str; 4] = ["read", "edit", "git", "shell"];
+/// What a story writer gets when no template narrows it further.
+///
+/// **No `shell`.** `bash` and `proc.run` take argv verbatim and never resolve through
+/// `Workspace::resolve*`, so one call defeats the whole ceiling — fences, typed effects,
+/// `permission_subjects` and the operation allow-list are all bypassable through arbitrary argv. And
+/// because the OS sandbox never restricts reads (Linux binds `--ro-bind / /`; macOS uses
+/// `(allow default)` and denies only `file-write*`/`network*`), the workspace guard is the *only* read
+/// guard — so a writer holding shell has unbounded read authority over the whole host, not merely its
+/// worktree.
+///
+/// Targeted validation is served by the typed toolchain bundles (`rust`, `node`, …), which carry real
+/// schemas and structured results. A template may still declare `shell` explicitly; this narrows the
+/// default, it does not remove the capability from the vocabulary.
+/// Every capability bundle name [`capability_operations`] resolves. Kept beside it and pinned by a
+/// drift test, because loop validation needs to reason about the *maximal* grantable ceiling and a
+/// bundle added without being listed here would silently narrow that reasoning.
+const CAPABILITY_BUNDLES: [&str; 11] = [
+    "read", "edit", "git-read", "git", "shell", "rust", "node", "go", "python", "make", "task",
+];
+
+const DEFAULT_STORY_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
 const REQUIRED_WRITER_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
 const AGENT_LOOP_MACHINERY_OPERATIONS: [&str; 9] = [
     "detect_intent",
@@ -9451,6 +9733,12 @@ fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
         "read" => &[
             "read",
+            // Batched reads belong in the same bundle as `read`, and their absence was a measured
+            // cost, not a theoretical one: wave-302's worker was instructed to "read them together
+            // rather than issuing sequential single reads", had no operation that could, and spent 30
+            // of its 60 model rounds on one-file-at-a-time reads — finishing with three rounds of
+            // headroom. A round is a provider call, so a missing batch operation is a budget leak.
+            "read_many",
             "glob",
             "grep",
             "search",
@@ -9496,9 +9784,35 @@ fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// Derive the admitted operation set for a task kind, on top of the capability bundles.
+///
+/// Native Fleet services are deliberately outside `capability_operations` — they are host-installed
+/// catalogues, not workspace tool bundles, exactly as the coordinator's are. The integration kind is
+/// the operator's explicit declaration that this agent assembles waves, so its two operations join
+/// the admitted set; without this the authored integrator loop names operations the ceiling does not
+/// contain and admission refuses.
+fn task_kind_native_operations(task_kind: &str) -> Vec<String> {
+    if task_kind == FLEET_INTEGRATION_TASK_KIND {
+        NATIVE_INTEGRATOR_OPERATIONS
+            .into_iter()
+            .map(|operation| operation.name().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 fn normalize_worker_capabilities(
     mode: FleetTaskMode,
     requested: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    normalize_worker_capabilities_for(mode, requested, default_fleet_task_kind().as_str())
+}
+
+fn normalize_worker_capabilities_for(
+    mode: FleetTaskMode,
+    requested: &[String],
+    task_kind: &str,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut capabilities = requested
         .iter()
@@ -9543,9 +9857,441 @@ fn normalize_worker_capabilities(
             .iter()
             .map(|operation| (*operation).to_string()),
     );
+    operations.extend(task_kind_native_operations(task_kind));
     operations.sort();
     operations.dedup();
     Ok((capabilities, operations))
+}
+
+/// Analyze every loop binding Fleet policy can select, and reconcile each against the ceiling of the
+/// templates bound to it — at `fleet validate` time, on the operator's terminal.
+///
+/// Before this, `fleet validate` asserted only that `.flux/fleet.toml` existed, so an authored loop
+/// carrying a static defect was first refused inside a *spawned worker*. The coordinator surfaces a
+/// child's stderr as `emitted an invalid event stream`, which buried the real diagnostic under
+/// startup notes and cost several waves before anyone read to the end of the line.
+///
+/// Analysis runs against the full built-in registry deliberately. That is a superset of any worker's
+/// live surface, so an operation missing from it truly does not exist and there are no false
+/// positives from workspace-conditional groups. The converse is NOT covered here: the non-Rust
+/// toolchain groups surface only on a root signal (`node` on `package.json`, `python` on
+/// `pyproject.toml`, `go` on `go.mod`), so a loop may name an operation this check accepts and the
+/// assigned repository never installs. That failure still appears at runtime as "tools outside the
+/// live capability ceiling".
+fn validate_fleet_loop_bindings(
+    root: &Path,
+    config: &FleetConfig,
+    errors: &mut Vec<String>,
+) -> Vec<Value> {
+    let registry = match fleet_loop_analysis_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            errors.push(format!(
+                "loop analysis registry failed to assemble: {error:#}"
+            ));
+            return Vec::new();
+        }
+    };
+    let mut analyzed = Vec::new();
+    let mut toolchain_checked = BTreeSet::new();
+    for (task_kind, profile_id) in &config.loop_policy {
+        let binding = match resolve_fleet_loop_binding(root, config, task_kind) {
+            Ok(binding) => binding,
+            Err(error) => {
+                errors.push(format!(
+                    "loop policy `{task_kind}` -> `{profile_id}` did not resolve: {error:#}"
+                ));
+                continue;
+            }
+        };
+        // A loop is only admissible through the templates that can actually select it, so reconcile
+        // each one's ceiling rather than the union: a single template missing an operation is a
+        // dispatch that would die mid-turn. The union of those ceilings is also what may be assumed
+        // during analysis — a granted operation is real even when no static registry can hold it.
+        let mut ceilings = Vec::new();
+        let mut assumed = std::collections::HashSet::new();
+        for template in config
+            .agent_templates
+            .iter()
+            .filter(|template| template.task_kind.trim() == task_kind.as_str())
+        {
+            match normalize_worker_capabilities_for(
+                template.mode,
+                &template.capabilities,
+                task_kind,
+            ) {
+                Ok((_, operations)) => {
+                    if let Err(error) =
+                        validate_loop_capability_compatibility(&binding, &operations)
+                    {
+                        errors.push(format!(
+                            "template `{}` cannot run loop profile `{profile_id}`: {error:#}",
+                            template.id
+                        ));
+                    } else {
+                        ceilings.push(json!({
+                            "template": template.id,
+                            "operation_count": operations.len(),
+                        }));
+                    }
+                    assumed.extend(operations);
+                }
+                Err(error) => errors.push(format!(
+                    "template `{}` has an invalid capability set: {error:#}",
+                    template.id
+                )),
+            }
+        }
+        // A task kind can carry a loop policy with no template bound to it — such a task is admitted
+        // ad hoc, with capabilities supplied by the request. Validation cannot know that ceiling, so
+        // it assumes the maximal grantable one and reports only operations no bundle could ever
+        // grant. Narrowing this to the empty set instead would fail every template-less task kind on
+        // operations that are, in fact, always available to it.
+        if ceilings.is_empty() {
+            assumed.extend(maximal_task_kind_operations(task_kind));
+        }
+        if let Err(error) = binding.validate_analysis(
+            &registry,
+            Vec::new(),
+            &assumed,
+            FLEET_LOOP_ANALYSIS_ITERATIONS,
+        ) {
+            errors.push(format!(
+                "loop profile `{profile_id}` (task kind `{task_kind}`) is not runnable: {error}"
+            ));
+            continue;
+        }
+        // Reported once per profile, not once per task kind: several kinds share one profile, and the
+        // repository surface does not vary between them.
+        let unsurfaced = unsurfaced_toolchain_operations(root, config, &binding);
+        if toolchain_checked.insert(profile_id.clone()) {
+            for (repository, operations) in &unsurfaced {
+                errors.push(format!(
+                    "loop profile `{profile_id}` names toolchain operation(s) repository \
+                     `{repository}` does not surface: {}",
+                    operations.join(", ")
+                ));
+            }
+        }
+        if !unsurfaced.is_empty() {
+            continue;
+        }
+        analyzed.push(json!({
+            "task_kind": task_kind,
+            "profile": profile_id,
+            "revision": binding.metadata().revision,
+            "required_operations": binding.metadata().required_operations,
+            "templates": ceilings,
+        }));
+    }
+    analyzed
+}
+
+/// Loop analysis only needs the `repeat` lowering to expand, not a realistic turn budget; a small
+/// bound keeps validation instant while still exercising every lowered node.
+const FLEET_LOOP_ANALYSIS_ITERATIONS: usize = 8;
+
+/// Every Board item a gated wave has already delivered, mapped to the wave that delivered it.
+///
+/// `green` and `applied` both count: `green` means the final gate passed on the assembled candidate, and
+/// `applied` means that candidate was additionally accepted and pinned. Neither state is reflected on
+/// the Board, so this is the only reliable answer to "has this already been built?".
+fn delivered_board_items(state: &FleetState) -> BTreeMap<String, String> {
+    let mut delivered = BTreeMap::new();
+    for (wave_id, wave) in &state.waves {
+        if !matches!(wave["status"].as_str(), Some("green" | "applied")) {
+            continue;
+        }
+        for item in wave["items"].as_array().into_iter().flatten() {
+            if let Some(item) = item.as_str() {
+                delivered.insert(item.to_string(), wave_id.clone());
+            }
+        }
+    }
+    delivered
+}
+
+/// The porcelain entries that represent the WORKER's uncommitted work, excluding Fleet's own artifacts.
+///
+/// Fleet snapshots the resolved loop binding into the worktree it hands over
+/// (`.flux/fleet/agent-loop.flux` + its receipt), so `git status --porcelain` reports `?? .flux/` in any
+/// repository whose ignore rules do not already cover it. `flux/.gitignore` happens to carry `.flux/*`;
+/// flux-exchange does not — so the same worker behaviour was clean in one repository and "dirty" in
+/// another. That refused a handoff for three fully committed stories (C-624).
+///
+/// Excluding the prefix is sound rather than merely convenient: `.flux/fleet/**` is a standing fence for
+/// story workers, so a worker writing there is already a fence violation caught elsewhere, and anything
+/// it legitimately produces lives outside that prefix.
+fn worker_dirt(porcelain: &str) -> Vec<&str> {
+    porcelain
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("").trim();
+            !(path == ".flux" || path == ".flux/" || path.starts_with(".flux/"))
+        })
+        .collect()
+}
+
+/// Regenerable build output that must never outlive the wave that produced it.
+const RECLAIMABLE_BUILD_DIRS: [&str; 2] = ["target", "node_modules"];
+
+/// Reclaim a terminal wave's disk footprint without ever destroying work.
+///
+/// Unattended operation makes this mandatory rather than tidy. One session's 24 waves accumulated
+/// **66 GB** under the worktree root and took an 848 GB volume to zero bytes free, which broke the next
+/// dispatch with no Fleet event and an empty log. 65 of those 66 GB were `target/` and `node_modules`:
+/// `max_workers` story worktrees plus an integration worktree each build the same Rust workspace
+/// independently, and the integration worktree alone reached 27 GB because the final gate is a full
+/// release gate.
+///
+/// The rule is asymmetric on purpose. Build output is deleted unconditionally — it is reproducible from
+/// the commit, and the wave is finished with it. A *worktree* is only removed when it holds nothing:
+/// no uncommitted change, and no commit that is not already reachable from the repository's canonical
+/// ref. Anything else is left exactly where it is, because a worktree is the only place a worker's
+/// unfinished work exists (wave-299 held a complete six-file implementation that its turn never
+/// committed). Failure to reclaim is reported, never fatal: a full disk must not also block the apply
+/// that frees it.
+fn reclaim_wave_storage(wave: &Value) -> Value {
+    let mut freed_dirs = Vec::new();
+    let mut removed = Vec::new();
+    let mut retained = Vec::new();
+    for repository in wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let canonical = repository["canonical_ref"]
+            .as_str()
+            .unwrap_or("origin/main");
+        let source = PathBuf::from(repository["source_root"].as_str().unwrap_or_default());
+        let worktrees = repository["stories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|story| story["worktree"].as_str())
+            .chain(repository["integration"]["worktree"].as_str())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        for worktree in worktrees {
+            if !worktree.is_dir() {
+                continue;
+            }
+            for name in RECLAIMABLE_BUILD_DIRS {
+                for found in build_dirs_under(&worktree, name) {
+                    if std::fs::remove_dir_all(&found).is_ok() {
+                        freed_dirs.push(display_path(&found));
+                    }
+                }
+            }
+            match worktree_holds_work(&worktree, &source, canonical) {
+                Ok(false) => {
+                    let path = worktree.display().to_string();
+                    let removal = guarded_git(&source, &["worktree", "remove", "--force", &path])
+                        .is_ok_and(|output| output.exit_code == 0);
+                    if removal || !worktree.is_dir() {
+                        removed.push(display_path(&worktree));
+                    } else {
+                        retained.push(json!({
+                            "worktree": display_path(&worktree),
+                            "reason": "git declined to remove the worktree",
+                        }));
+                    }
+                }
+                Ok(true) => retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": "holds uncommitted changes or commits absent from the canonical ref",
+                })),
+                Err(error) => retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": format!("could not be inspected, so it was left alone: {error:#}"),
+                })),
+            }
+        }
+    }
+    json!({
+        "build_dirs_removed": freed_dirs,
+        "worktrees_removed": removed,
+        "worktrees_retained": retained,
+    })
+}
+
+/// Locate reclaimable build directories at or just below a worktree root.
+///
+/// Bounded to two levels deliberately: a Rust workspace keeps `target/` at its root, and the nested
+/// cases that actually occur are one level down (`plugins/target`, `website/node_modules`). An
+/// unbounded walk would descend into the very trees being deleted.
+fn build_dirs_under(worktree: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let direct = worktree.join(name);
+    if direct.is_dir() {
+        found.push(direct);
+    }
+    if let Ok(entries) = std::fs::read_dir(worktree) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if !child.is_dir() || child.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            let nested = child.join(name);
+            if nested.is_dir() {
+                found.push(nested);
+            }
+        }
+    }
+    found
+}
+
+/// Whether a worktree still holds anything that exists nowhere else.
+///
+/// "Somewhere else" means the **source checkout's own HEAD** first, and the canonical ref second.
+/// Checking only the canonical ref was a real defect: `apply` merges into the local branch and never
+/// pushes, so `origin/main` never advances under autonomous operation and every worktree would be
+/// retained forever — reclamation that never reclaims. The local merge target is what proves the work
+/// is safe; the canonical ref still counts for a worktree whose commits arrived by some other route.
+///
+/// Errs toward `true`: an inspection that cannot answer is treated as holding work, so an unreadable
+/// or half-initialized worktree is retained rather than deleted.
+fn worktree_holds_work(worktree: &Path, source: &Path, canonical_ref: &str) -> Result<bool> {
+    // Same exclusion as `worker_dirt`: Fleet's own loop-binding snapshot is not the worker's work, and
+    // counting it would retain every worktree forever in any repository that does not ignore `.flux/`.
+    if git_output(worktree, &["status", "--porcelain"])
+        .is_none_or(|status| !worker_dirt(&status).is_empty())
+    {
+        return Ok(true);
+    }
+    let head = git_output(worktree, &["rev-parse", "HEAD"])
+        .context("validation/gate: could not resolve the worktree HEAD")?;
+    let head = head.trim();
+    if !source.is_dir() {
+        return Ok(true);
+    }
+    // Reachability from ANY ref, not just the canonical branch.
+    //
+    // Tying this to the canonical ref made reclamation dead code: nothing pushes, so `origin/main`
+    // never advances, and since C-619 `apply` no longer merges either — so no story commit is ever an
+    // ancestor of it and every worktree was retained forever while the disk filled. What actually
+    // matters is whether the commit survives the worktree's removal, and `git worktree remove` leaves
+    // branches and tags untouched. A commit named by any branch or tag is therefore safe; one reachable
+    // from nothing exists only inside this worktree and must be kept.
+    if git_output(source, &["for-each-ref", "--contains", head, "--count=1"])
+        .is_some_and(|refs| !refs.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    // Also safe when the canonical ref already contains it (a ref-less but merged commit).
+    if git_output(
+        source,
+        &["merge-base", "--is-ancestor", head, canonical_ref],
+    )
+    .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The non-Rust toolchain bundles and the workspace-root marker each one surfaces on.
+///
+/// `flux-tools` gates these groups on a project signal so they appear only where they make sense
+/// (`flux-tools/src/toolchains.rs`). A capability bundle can therefore *grant* `npm` while the
+/// assigned repository never *installs* it, and the mismatch is invisible until a segment already
+/// holding an assignment dies on "tools outside the live capability ceiling". Rust is absent
+/// deliberately: `cargo_*` is not conditional in the same way, and every repository in a Fleet is a
+/// Cargo workspace today — adding it here would assert a gate this table cannot verify.
+const CONDITIONAL_TOOLCHAIN_SIGNALS: [(&str, &[&str]); 4] = [
+    ("node", &["package.json"]),
+    ("python", &["pyproject.toml", "requirements.txt"]),
+    ("go", &["go.mod"]),
+    ("make", &["Makefile"]),
+];
+
+/// Per repository, the operations `binding` requires that the repository will not surface.
+///
+/// Reported per repository rather than collapsed: a Fleet spans several checkouts, and an operation
+/// that is fine in one is a mid-turn failure in another, so the operator needs to know which.
+fn unsurfaced_toolchain_operations(
+    root: &Path,
+    config: &FleetConfig,
+    binding: &flux_agent::AgentLoopBinding,
+) -> Vec<(String, Vec<String>)> {
+    let required = binding
+        .metadata()
+        .required_operations
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut findings = Vec::new();
+    for repository in &config.repositories {
+        let repository_root = root.join(&repository.root);
+        // A checkout that is not present yet cannot be judged; `fleet refresh` materializes it, and
+        // failing here would make validation depend on checkout order.
+        if !repository_root.is_dir() {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for (bundle, markers) in CONDITIONAL_TOOLCHAIN_SIGNALS {
+            let surfaced = markers
+                .iter()
+                .any(|marker| repository_root.join(marker).exists());
+            if surfaced {
+                continue;
+            }
+            missing.extend(
+                capability_operations(bundle)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|operation| required.contains(**operation))
+                    .map(|operation| (*operation).to_string()),
+            );
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            findings.push((repository.id.clone(), missing));
+        }
+    }
+    findings
+}
+
+/// The widest operation set any agent of `task_kind` could be granted: every capability bundle, the
+/// agent-loop machinery, and the task kind's native Fleet operations. Used only to reason about a
+/// task kind with no bound template — never to grant anything.
+fn maximal_task_kind_operations(task_kind: &str) -> Vec<String> {
+    let mut operations = CAPABILITY_BUNDLES
+        .iter()
+        .flat_map(|capability| capability_operations(capability).unwrap_or_default())
+        .map(|operation| (*operation).to_string())
+        .collect::<Vec<_>>();
+    operations.extend(
+        AGENT_LOOP_MACHINERY_OPERATIONS
+            .iter()
+            .map(|operation| (*operation).to_string()),
+    );
+    operations.extend(task_kind_native_operations(task_kind));
+    operations.sort();
+    operations.dedup();
+    operations
+}
+
+/// Assemble the statically knowable operations any Fleet agent could be given, for analysis only.
+///
+/// A worker's real registry is built during agent assembly and needs a provider, a surface and a
+/// session, so it cannot be reproduced here. This unions the three packs that *are* static —
+/// workspace built-ins, the dev/knowledge pack, and the authored-loop control plane that owns
+/// `ai_segment`.
+///
+/// The native Fleet operations are deliberately absent: `task_kind_native_operations` already folds
+/// them into every template ceiling, so they reach analysis as assumed operations. Registering tool
+/// instances here as well would add a second registration seam for a registry that is discarded
+/// after validation and never dispatches anything.
+fn fleet_loop_analysis_registry() -> Result<flux_runtime::ToolRegistry> {
+    let mut registry = flux_runtime::ToolRegistry::new();
+    flux_tools::try_register_builtins(&mut registry)?;
+    flux_tools::try_register_dev_builtins(&mut registry)?;
+    flux_tools::install_reflect(&mut registry)?;
+    Ok(registry)
 }
 
 fn validate_loop_capability_compatibility(
@@ -9803,6 +10549,9 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         .iter()
         .map(|repository| repository_root(root, repository))
         .collect::<Result<Vec<_>>>()?;
+    // The manifest is built from the same list the child is actually given, so the record cannot drift
+    // from the grant.
+    let read_roots_recorded = read_roots.clone();
     let instructions = match config.main.instructions.as_deref() {
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
@@ -9830,7 +10579,24 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         resume_session,
         enforce_operation_ceiling: true,
         admitted_operations: native_fleet_main_operation_ceiling(),
-        capability_set: Value::Null,
+        // C-610: RECORD the coordinator's scope, do not merely enforce it.
+        //
+        // The ceiling above is real — `--operation-ceiling` plus explicit `--add-dir` roots reach the
+        // child — but leaving the manifest `Null` meant `state.json` carried no mode, no operation count
+        // and no root count for `main`, while every worker carried all three. An operator inspecting the
+        // fleet could therefore audit the constrained agents and not the privileged one, and an absent
+        // record is indistinguishable from an absent ceiling: reading that state, I concluded the
+        // coordinator was unconfined when in fact it was confined and merely unaudited. The umbrella
+        // model — the coordinator holds every repository root, each worker exactly one — is only
+        // verifiable if both halves are written down.
+        capability_set: capability_set_manifest(
+            FleetTaskMode::Write,
+            &["fleet-coordinator".to_string()],
+            &native_fleet_main_operation_ceiling(),
+            root,
+            &read_roots_recorded,
+            &normalize_fences(Vec::new()),
+        ),
         shell_capability: false,
         context_origin,
     })
@@ -9881,8 +10647,13 @@ fn addressed_turn_spec(
         format!("validation/gate: admitted agent {target} has no valid mode snapshot")
     })?;
     let configured_capabilities = value_string_list(agent, "capabilities", target)?;
-    let (capabilities, admitted_operations) =
-        normalize_worker_capabilities(mode, &configured_capabilities)?;
+    let (capabilities, admitted_operations) = normalize_worker_capabilities_for(
+        mode,
+        &configured_capabilities,
+        agent["task_kind"]
+            .as_str()
+            .unwrap_or(FLEET_IMPLEMENTATION_TASK_KIND),
+    )?;
     let fences = normalize_fences(value_string_list(agent, "fences", target)?);
     let capability_set = capability_set_manifest(
         mode,
@@ -9940,6 +10711,55 @@ fn addressed_turn_spec(
         capability_set,
         context_origin,
     })
+}
+
+/// Wave statuses that mean work is genuinely in flight.
+///
+/// Deliberately a closed *allow* list rather than a list of terminal states. The previous inverse
+/// form (`!matches!(status, "completed" | "failed" | "cancelled" | "parked")`) silently treated every
+/// status it had not heard of as active — so `agent-turn-failed`, `green`, `red` and `conflict` all
+/// counted, and a long-dead failed wave kept claiming the header.
+const ACTIVE_WAVE_STATUSES: [&str; 4] = [
+    "accepted",
+    "awaiting-handoffs",
+    "handoffs-ready",
+    "integrating",
+];
+
+/// The wave the operator is currently watching: the newest one still in flight.
+///
+/// `state.waves` is a `BTreeMap`, so iterating it yields *lexicographic* key order and `.find()`
+/// returned the OLDEST match. Combined with the open-ended status test above, `wave-257` (status
+/// `agent-turn-failed`) pinned the header while `wave-286` was actually running — the same panel
+/// disagreeing with its own worker list. Order by the numeric suffix so `wave-99` and `wave-100`
+/// compare correctly too.
+fn active_wave_view(
+    state: &FleetState,
+    max_wave: usize,
+) -> Option<flux_tui::operations::FleetWaveView> {
+    use flux_tui::operations::FleetWaveView;
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| {
+            wave["status"]
+                .as_str()
+                .is_some_and(|status| ACTIVE_WAVE_STATUSES.contains(&status))
+        })
+        .max_by_key(|(id, _)| {
+            id.rsplit('-')
+                .next()
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .map(|(id, wave)| FleetWaveView {
+            id: id.clone(),
+            status: wave["status"].as_str().unwrap_or("unknown").to_string(),
+            items: value_strings(&wave["items"])
+                .into_iter()
+                .take(max_wave)
+                .collect(),
+        })
 }
 
 fn agent_store_path(worktree: &Path, id: &str) -> Result<PathBuf> {
@@ -10212,13 +11032,26 @@ fn execute_agent_turn_with_runtime(
         ),
     }
     .with_context(|| format!("transient-worker: agent {} could not start", spec.id))?;
+    // Report WHY the stream was invalid, not just what the child said on stderr. The previous message
+    // interpolated only stderr, so a parse failure surfaced as
+    // `emitted an invalid event stream: note: sandbox: …` — the sandbox note is unrelated boilerplate
+    // present on every run, and the actual cause (malformed JSON on a named line, or a stream with no
+    // terminal `turn_end`) was invisible. That masking cost two waves and blocked C-607's diagnosis,
+    // because it made an unrelated correlation look causal.
     let (events, session, terminal, stream_budget) =
-        parse_fleet_agent_events(&output.stdout, &spec.id, FLEET_AGENT_EVENT_LIMIT).with_context(
-            || {
-                format!(
-                    "transient-worker: agent {} emitted an invalid event stream: {}",
+        parse_fleet_agent_events(&output.stdout, &spec.id, FLEET_AGENT_EVENT_LIMIT).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "transient-worker: agent {} emitted an invalid event stream: {error:#}{}",
                     spec.id,
-                    clipped_redacted(output.stderr.as_bytes())
+                    if output.stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; child stderr: {}",
+                            clipped_redacted(output.stderr.as_bytes())
+                        )
+                    }
                 )
             },
         )?;
@@ -10518,7 +11351,8 @@ fn fleet_spawn(
         None => Vec::new(),
     };
     capabilities.extend(options.capabilities.iter().cloned());
-    let (capabilities, operations) = normalize_worker_capabilities(mode, &capabilities)?;
+    let (capabilities, operations) =
+        normalize_worker_capabilities_for(mode, &capabilities, task_kind)?;
     validate_loop_capability_compatibility(&loop_binding, &operations)?;
     let mut fences = template
         .map(|template| template.fences.clone())
@@ -11803,8 +12637,14 @@ fn fleet_handoff(
     if ancestor.exit_code != 0 {
         bail!("conflict/precondition: handoff commit does not descend from its pinned wave base")
     }
-    if git_output(&worktree, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
-        bail!("conflict/precondition: story worktree is dirty at handoff")
+    if git_output(&worktree, &["status", "--porcelain"])
+        .is_some_and(|status| !worker_dirt(&status).is_empty())
+    {
+        bail!(
+            "conflict/precondition: story worktree is dirty at handoff: {}",
+            worker_dirt(&git_output(&worktree, &["status", "--porcelain"]).unwrap_or_default())
+                .join(", ")
+        )
     }
     let claimed = normalize_write_set(input.write_set)?;
     let observed = diff_write_set(&worktree, base, input.commit)?;
@@ -11863,7 +12703,7 @@ fn fleet_handoff(
         Value::Null
     } else {
         let evidence = run_typed_argv(&integration_worktree, input.test_argv)?;
-        if evidence["success"].as_bool() != Some(false) {
+        if evidence["success"].as_bool() != Some(false) && !ran_no_tests(&evidence) {
             bail!(
                 "validation/gate: failing-before validation unexpectedly passed on the pinned base"
             )
@@ -11874,8 +12714,33 @@ fn fleet_handoff(
     if after["success"].as_bool() != Some(true) {
         bail!("validation/gate: passing-after validation failed at the returned commit")
     }
-    if git_output(&worktree, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
-        bail!("validation/gate: targeted validation left the story worktree dirty")
+    // A test-first commit adds its test, so the SAME argv matches nothing at the pinned base — and a
+    // runner that filters to zero tests reports success (`cargo test <new name>` prints
+    // "0 passed; 0 failed; N filtered out" and exits 0). Demanding a non-zero exit there rejects the
+    // normal TDD shape outright, which is why no commit in this pipeline could ever be handed off.
+    //
+    // "Nothing ran at base, and the same argv runs and passes at the commit" IS failing-first
+    // evidence: the absence of the test is the pre-state. It is only accepted together with the
+    // passing-after check above and the requirement that the commit actually ran tests — so a typo'd
+    // or non-existent test name still fails, because it would match nothing at the commit either.
+    if !documentation_only && ran_no_tests(&before) && ran_no_tests(&after) {
+        bail!(
+            "validation/gate: targeted validation matched no test at the base or the commit — cite \
+             an argv that actually runs the failing-first test"
+        )
+    }
+    // Same exclusion as the pre-handoff check: Fleet's own loop-binding snapshot is not something the
+    // validation run produced. Fixing only the earlier check moved this refusal later rather than
+    // removing it — wave-346's `exchange/X-138` passed the first gate and failed here on the identical
+    // `?? .flux/` entry (C-624).
+    if git_output(&worktree, &["status", "--porcelain"])
+        .is_some_and(|status| !worker_dirt(&status).is_empty())
+    {
+        bail!(
+            "validation/gate: targeted validation left the story worktree dirty: {}",
+            worker_dirt(&git_output(&worktree, &["status", "--porcelain"]).unwrap_or_default())
+                .join(", ")
+        )
     }
 
     let matching_workers = state
@@ -12206,9 +13071,21 @@ fn integrate_wave(
     }
     let order = integration_order(root, &items)?;
     let mut seen_workers = BTreeSet::new();
-    let mut seen_paths = BTreeMap::<String, String>::new();
+    // Keyed by (repository, path), not by path alone.
+    //
+    // A write set is repository-relative, so a single map made every common filename collide across
+    // repositories: `wave-346` was refused with `unsafe write-set overlap on "CHANGELOG.md" between
+    // flux/C-562 and exchange/X-138` — two different files in two different checkouts, each correctly
+    // updated by its own story. Every multi-repo wave would hit this, since `CHANGELOG.md`,
+    // `docs/stories/README.md` and similar exist in all of them. The overlap check itself is worth
+    // keeping: two stories in the SAME repository editing one file is a real integration hazard.
+    let mut seen_paths = BTreeMap::<(String, String), String>::new();
     for item in &items {
         let (repository_index, story_index) = wave_story_indices(&wave, item)?;
+        let repository_id = wave["topology"]["repositories"][repository_index]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let story = &wave["topology"]["repositories"][repository_index]["stories"][story_index];
         let handoff = &story["handoff"];
         if story["status"].as_str() != Some("handoff-accepted")
@@ -12228,8 +13105,13 @@ fn integrate_wave(
             .flatten()
             .filter_map(Value::as_str)
         {
-            if let Some(other) = seen_paths.insert(path.to_string(), item.clone()) {
-                bail!("conflict/precondition: unsafe write-set overlap on {path:?} between {other} and {item}")
+            if let Some(other) =
+                seen_paths.insert((repository_id.clone(), path.to_string()), item.clone())
+            {
+                bail!(
+                    "conflict/precondition: unsafe write-set overlap in repository {repository_id} on \
+                     {path:?} between {other} and {item}"
+                )
             }
         }
     }
@@ -12443,28 +13325,74 @@ fn apply_wave(
             candidate.to_string(),
         ));
     }
+    // C-619: ACCEPT the candidate; do not merge it here.
+    //
+    // This used to `git merge --no-ff` in the repository's *source checkout* — which Fleet keeps
+    // DETACHED at the pinned base, so the merge commit landed on no branch at all. `main` never moved,
+    // the merge was reachable only from that worktree's HEAD, and the next `fleet refresh` would strand
+    // it. "Applied locally" claimed something that had not happened.
+    //
+    // Main is written exactly once, by the gated accumulation snapshot, so acceptance is the whole job
+    // here. What acceptance must guarantee is that the candidate CANNOT BE LOST: it is pinned with an
+    // annotated tag that outlives the wave, the integration branch, and any worktree reclamation, and
+    // the tag name is reported so a human can always find accepted-but-unmerged work.
     let mut merged = Vec::new();
-    if !command.dry_run {
-        for (repository_id, source, branch, candidate) in &targets {
-            let output = guarded_git(source, &["merge", "--no-ff", "--no-edit", branch])?;
-            if output.exit_code != 0 {
-                bail!("validation/gate: local merge for {repository_id} failed; candidate {candidate} was preserved: {}", clipped_redacted(output.stderr.as_bytes()));
-            }
-            merged.push(json!({"repository":repository_id,"candidate":candidate,"head":git_output(source,&["rev-parse","HEAD"])}));
+    for (repository_id, source, branch, candidate) in &targets {
+        let tag = format!("fleet/accepted/{wave}/{repository_id}");
+        if command.dry_run {
+            merged.push(json!({
+                "repository": repository_id,
+                "candidate": candidate,
+                "accepted_tag": tag,
+                "preview": true,
+            }));
+            continue;
         }
-    } else {
-        merged.extend(targets.iter().map(|(repository, _, _, candidate)| json!({"repository":repository,"candidate":candidate,"preview":true})));
+        // `-f`: acceptance is idempotent, so re-applying the same wave must not fail on an existing tag.
+        let output = guarded_git(
+            source,
+            &[
+                "tag",
+                "-f",
+                "-a",
+                &tag,
+                candidate,
+                "-m",
+                &format!(
+                    "Fleet accepted {wave} candidate {candidate} for {repository_id} after a green final gate; awaiting gated accumulation into the canonical branch."
+                ),
+            ],
+        )?;
+        if output.exit_code != 0 {
+            bail!(
+                "validation/gate: could not pin {repository_id} candidate {candidate} with tag {tag}; refusing to accept work that could be lost: {}",
+                clipped_redacted(output.stderr.as_bytes())
+            )
+        }
+        merged.push(json!({
+            "repository": repository_id,
+            "candidate": candidate,
+            "accepted_tag": tag,
+            "branch": branch,
+        }));
     }
     state.revision += 1;
     let mut updated = record;
     updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
     updated["apply_eligible"] = json!(command.dry_run);
     updated["applied"] = json!(merged);
+    let reclaimed = if command.dry_run {
+        Value::Null
+    } else {
+        reclaim_wave_storage(&updated)
+    };
     state.waves.insert(wave.to_string(), updated);
-    let data = json!({"wave":wave,"repositories":merged,"merged_locally":!command.dry_run,"pushed":false,"released":false,"deployed":false});
+    let data = json!({"wave":wave,"repositories":merged,"merged_locally":false,"accepted":!command.dry_run,"pushed":false,"released":false,"deployed":false,"reclaimed":reclaimed});
     persist_fleet_mutation(command, root, &state, "wave.applied", data.clone())?;
     Ok((
-        format!("{wave} applied locally; nothing was pushed"),
+        format!(
+            "{wave} accepted and pinned by tag; awaiting gated accumulation — nothing was merged or pushed"
+        ),
         data,
         vec![],
         state.revision,
@@ -12608,6 +13536,464 @@ mod tests {
                 "`{forbidden}` must not be reachable by the integrator; ceiling was {ceiling:?}"
             );
         }
+    }
+
+    /// C-610: the umbrella invariant, both halves. The coordinator holds every configured repository root
+    /// and its own native operation ceiling; a story worker holds exactly one root — its assignment.
+    ///
+    /// Recording matters as much as enforcing. The coordinator's ceiling was always applied at spawn
+    /// (`--operation-ceiling` + explicit `--add-dir`), but its manifest was `Null`, so `state.json` showed
+    /// mode/ops/roots for every worker and nothing for the privileged agent. An absent record reads
+    /// exactly like an absent ceiling — it led me to report the coordinator as unconfined when it was
+    /// confined and merely unaudited.
+    #[test]
+    fn the_coordinator_records_every_root_and_a_worker_records_exactly_one() {
+        let roots = vec![
+            PathBuf::from("/fleet/sources/flux"),
+            PathBuf::from("/fleet/sources/exchange"),
+            PathBuf::from("/fleet/sources/connectors"),
+        ];
+        let coordinator = capability_set_manifest(
+            FleetTaskMode::Write,
+            &["fleet-coordinator".to_string()],
+            &native_fleet_main_operation_ceiling(),
+            Path::new("/fleet"),
+            &roots,
+            &normalize_fences(Vec::new()),
+        );
+        assert_eq!(coordinator["read_root_count"], json!(roots.len()));
+        assert!(
+            coordinator["operation_count"].as_u64().unwrap_or_default() > 0,
+            "the coordinator's ceiling must be recorded, not left absent: {coordinator}"
+        );
+
+        // A worker's own manifest names one root at most — its worktree is its world.
+        let (_, worker_ops) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &DEFAULT_STORY_CAPABILITIES.map(str::to_string),
+            &default_fleet_task_kind(),
+        )
+        .expect("the default story ceiling is valid");
+        let worker = capability_set_manifest(
+            FleetTaskMode::Write,
+            &DEFAULT_STORY_CAPABILITIES.map(str::to_string),
+            &worker_ops,
+            Path::new("/fleet/worktrees/w/flux/stories/C-1"),
+            &[],
+            &normalize_fences(Vec::new()),
+        );
+        assert_eq!(
+            worker["read_root_count"],
+            json!(0),
+            "a worker must not carry sibling roots"
+        );
+        assert!(
+            coordinator["read_root_count"].as_u64() > worker["read_root_count"].as_u64(),
+            "the umbrella is asymmetric by design: coordinator spans roots, worker does not"
+        );
+    }
+
+    /// A write set is repository-relative, so overlap detection must be scoped per repository. Keying by
+    /// bare path made every common filename collide across repositories: `wave-346` was refused with
+    /// `unsafe write-set overlap on "CHANGELOG.md" between flux/C-562 and exchange/X-138` — two distinct
+    /// files, each correctly updated by its own story. Every multi-repo wave would hit it.
+    #[test]
+    fn write_set_overlap_is_scoped_per_repository() {
+        let mut seen = BTreeMap::<(String, String), String>::new();
+
+        // The same relative path in two different repositories is not an overlap.
+        assert!(seen
+            .insert(("flux".into(), "CHANGELOG.md".into()), "flux/C-562".into())
+            .is_none());
+        assert!(
+            seen.insert(
+                ("exchange".into(), "CHANGELOG.md".into()),
+                "exchange/X-138".into()
+            )
+            .is_none(),
+            "a shared filename across repositories must not read as a conflict"
+        );
+
+        // The same path twice within ONE repository still is — that hazard must stay caught.
+        assert_eq!(
+            seen.insert(("flux".into(), "CHANGELOG.md".into()), "flux/C-542".into()),
+            Some("flux/C-562".to_string()),
+            "two stories editing one file in one repository is a real integration hazard"
+        );
+    }
+
+    /// C-624 (failing first): Fleet writes its own loop-binding snapshot into the worktree it hands to a
+    /// worker, so `.flux/` shows as untracked wherever a repository does not already ignore it. Counting
+    /// that as the worker's dirt refused the handoff of three fully committed stories in wave-346, in
+    /// flux-exchange but not in flux — a difference caused entirely by an unrelated `.gitignore` line.
+    #[test]
+    fn fleet_own_loop_binding_snapshot_is_not_worker_dirt() {
+        assert!(
+            worker_dirt("?? .flux/\n").is_empty(),
+            "the harness's own snapshot must never read as the worker's uncommitted work"
+        );
+        assert!(worker_dirt("?? .flux\n").is_empty());
+        assert!(worker_dirt("?? .flux/fleet/agent-loop.flux\n").is_empty());
+        assert!(worker_dirt("").is_empty());
+
+        // Real work still counts, including a path that merely starts with the same letters.
+        assert_eq!(worker_dirt(" M crates/flux-core/src/budget.rs\n").len(), 1);
+        assert_eq!(worker_dirt("?? .fluxfoo/thing.rs\n").len(), 1);
+        assert_eq!(
+            worker_dirt("?? .flux/\n M crates/flux-core/src/budget.rs\n").len(),
+            1,
+            "a mixed status must report only the worker's own entry"
+        );
+    }
+
+    /// C-619 (failing first): a gated wave's items must be recognized as delivered from Fleet state
+    /// alone. The Board keeps them `ready` and a workspace board refuses every mutation while its member
+    /// checkout is off the canonical ref, so `board next` re-selects finished work indefinitely —
+    /// `flux/C-569` was dispatched three times in eleven seconds after passing its full gate.
+    #[test]
+    fn a_gated_waves_items_count_as_delivered_from_fleet_state_alone() {
+        let mut state = FleetState::default();
+        for (wave, status, item) in [
+            ("wave-100", "accepted", "flux/C-1"),
+            ("wave-200", "agent-turn-failed", "flux/C-2"),
+            ("wave-300", "green", "flux/C-3"),
+            ("wave-400", "applied", "flux/C-4"),
+            ("wave-500", "cancelled", "flux/C-5"),
+        ] {
+            state
+                .waves
+                .insert(wave.to_string(), json!({"status": status, "items": [item]}));
+        }
+
+        let delivered = delivered_board_items(&state);
+
+        assert_eq!(
+            delivered.get("flux/C-3").map(String::as_str),
+            Some("wave-300")
+        );
+        assert_eq!(
+            delivered.get("flux/C-4").map(String::as_str),
+            Some("wave-400")
+        );
+        for undelivered in ["flux/C-1", "flux/C-2", "flux/C-5"] {
+            assert!(
+                !delivered.contains_key(undelivered),
+                "`{undelivered}` has not been gated and must remain dispatchable: {delivered:?}"
+            );
+        }
+    }
+
+    /// Reclamation must be bounded and must never reach into a `.git` directory. An unbounded walk
+    /// would descend into the very trees it is deleting, and `.git` is not build output.
+    #[test]
+    fn build_dir_discovery_is_bounded_and_skips_git() {
+        let temp = reclaim_test_dir("build-dirs");
+        let root = temp.as_path();
+        for path in [
+            "target/debug",
+            "plugins/target/debug",
+            "website/node_modules/pkg",
+            "crates/deep/nested/target",
+            ".git/target",
+        ] {
+            std::fs::create_dir_all(root.join(path)).expect("fixture dirs");
+        }
+
+        let targets = build_dirs_under(root, "target");
+        assert!(targets.contains(&root.join("target")), "{targets:?}");
+        assert!(
+            targets.contains(&root.join("plugins/target")),
+            "{targets:?}"
+        );
+        assert!(
+            !targets.contains(&root.join(".git/target")),
+            "`.git` must never be treated as build output: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&root.join("crates/deep/nested/target")),
+            "discovery must stay within two levels: {targets:?}"
+        );
+        assert_eq!(
+            build_dirs_under(root, "node_modules"),
+            vec![root.join("website/node_modules")]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not
+    /// reason enough to add one to a binary crate.
+    fn reclaim_test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "flux-reclaim-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).expect("scratch dir");
+        path
+    }
+
+    /// The asymmetry that keeps reclamation safe: a directory that cannot be inspected as a git
+    /// worktree counts as holding work, so it is retained rather than deleted. wave-299 held a
+    /// complete six-file implementation its turn never committed; losing that to a cleanup would be
+    /// worse than any disk cost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uninspectable_worktree_counts_as_holding_work() {
+        let temp = reclaim_test_dir("uninspectable");
+        assert!(
+            worktree_holds_work(&temp, &temp, "origin/main").unwrap_or(true),
+            "a non-repository must never be reported as safe to delete"
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// `CAPABILITY_BUNDLES` must stay the exact domain of `capability_operations`. A bundle added to
+    /// one and not the other would silently shrink the maximal ceiling loop validation reasons about,
+    /// turning a valid template-less task kind into a spurious "not runnable" refusal.
+    #[test]
+    fn capability_bundle_list_matches_the_resolver() {
+        for bundle in CAPABILITY_BUNDLES {
+            assert!(
+                capability_operations(bundle).is_some(),
+                "`{bundle}` is listed but does not resolve"
+            );
+        }
+        // The maximal set must be a genuine superset of what any single template can be granted.
+        let maximal = maximal_task_kind_operations(&default_fleet_task_kind());
+        let (_, story) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &DEFAULT_STORY_CAPABILITIES.map(str::to_string),
+            &default_fleet_task_kind(),
+        )
+        .expect("the default story ceiling is valid");
+        for operation in story {
+            assert!(
+                maximal.contains(&operation),
+                "`{operation}` is grantable but missing from the maximal set"
+            );
+        }
+    }
+
+    /// C-606 (failing first): a story writer must not get arbitrary shell by default. `bash` and
+    /// `proc.run` resolve no paths, and the OS sandbox never restricts reads on either backend, so the
+    /// workspace guard is the only read guard — a writer holding shell can read the whole host. Every
+    /// worker up to `wave-286-worker-1` ran with `['edit','git','read','shell']`.
+    #[test]
+    fn a_story_writer_gets_no_shell_by_default() {
+        assert!(
+            !DEFAULT_STORY_CAPABILITIES.contains(&"shell"),
+            "shell bypasses the only read guard that exists: {DEFAULT_STORY_CAPABILITIES:?}"
+        );
+        // The writer-mode floor is still satisfied, so a default wave still admits a usable writer.
+        for required in REQUIRED_WRITER_CAPABILITIES {
+            assert!(
+                DEFAULT_STORY_CAPABILITIES.contains(&required),
+                "`{required}` is required for write mode"
+            );
+        }
+        // Narrowing the default must not remove the capability from the vocabulary — an operator can
+        // still grant it deliberately.
+        assert!(
+            capability_operations("shell").is_some_and(|ops| ops.contains(&"bash")),
+            "an explicit template may still declare shell"
+        );
+        // And the typed alternative a writer should use instead is available.
+        assert!(capability_operations("rust").is_some_and(|ops| ops.contains(&"cargo_test")));
+    }
+
+    /// The handoff gate could never accept a test-first commit. It re-runs the cited argv at the
+    /// pinned base and demands a non-zero exit — but the new test does not exist there, and
+    /// `cargo test <new name>` reports `0 passed; 0 failed; N filtered out` and exits 0. Verified
+    /// against the real runner before changing the gate.
+    #[test]
+    fn a_filtered_to_nothing_run_is_neither_a_pass_nor_a_failure() {
+        let cargo_no_match = json!({
+            "success": true,
+            "stdout": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 340 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(ran_no_tests(&cargo_no_match));
+
+        let real_failure = json!({
+            "success": false,
+            "stdout": "test result: FAILED. 3 passed; 1 failed; 0 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(
+            !ran_no_tests(&real_failure),
+            "a genuine failure is not 'no tests'"
+        );
+
+        let real_pass = json!({
+            "success": true,
+            "stdout": "test result: ok. 4 passed; 0 failed; 0 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(
+            !ran_no_tests(&real_pass),
+            "a genuine pass is not 'no tests'"
+        );
+
+        // An unrecognised runner keeps the strict exit-code contract rather than being waved through.
+        let opaque = json!({"success": true, "stdout": "done", "stderr": ""});
+        assert!(!ran_no_tests(&opaque));
+    }
+
+    /// Live activity must reach a surface DURING a wave. Failing first: a wave writes `state.json`
+    /// twice, so nothing the refresh token hashed could change while workers ran and the panel was
+    /// frozen for the whole wave.
+    #[test]
+    fn worker_activity_projects_live_and_carries_no_payload() {
+        let root = fleet_tui_fixture("activity");
+        let events = [
+            // `turn_start` carries the whole prompt and must be skipped outright.
+            json!({"type":"turn_start","v":1,"input":"SECRET PROMPT"}).to_string(),
+            json!({"type":"tool_call","name":"read","input":{"path":"/etc/shadow"}}).to_string(),
+            json!({"type":"tool_result","name":"read","content":"hunter2","is_error":false})
+                .to_string(),
+            json!({"type":"tool_result","name":"bash","content":"boom","is_error":true})
+                .to_string(),
+        ];
+        for line in &events {
+            append_worker_activity(&root, "wave-9-worker-1", line);
+        }
+
+        let sidecar = fs::read_to_string(root.join(FLEET_ACTIVITY_SIDECAR)).unwrap();
+        assert!(
+            !sidecar.contains("SECRET PROMPT"),
+            "turn_start is skipped: {sidecar}"
+        );
+        assert!(
+            !sidecar.contains("hunter2"),
+            "result bodies never reach the sidecar: {sidecar}"
+        );
+        assert!(
+            !sidecar.contains("/etc/shadow"),
+            "tool inputs never reach the sidecar: {sidecar}"
+        );
+
+        let activity = read_worker_activity(&root);
+        let lines = activity
+            .get("wave-9-worker-1")
+            .expect("worker has activity");
+        assert_eq!(
+            lines.len(),
+            3,
+            "turn_start skipped, three structural records kept"
+        );
+        assert!(lines.iter().any(|line| line.contains("read")));
+        assert!(
+            lines.iter().any(|line| line.contains("error")),
+            "a failing op is visible as an error: {lines:?}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Partial lines arrive across polls; a record must only be emitted once its newline lands.
+    #[test]
+    fn activity_lines_are_only_emitted_when_complete() {
+        let root = fleet_tui_fixture("activity-partial");
+        let mut pending = String::new();
+        let whole = json!({"type":"tool_call","name":"grep"}).to_string();
+        let (head, tail) = whole.split_at(whole.len() / 2);
+
+        drain_activity_lines(&mut pending, head, &root, "w1");
+        assert!(
+            read_worker_activity(&root).is_empty(),
+            "a half-arrived line must not be projected"
+        );
+
+        drain_activity_lines(&mut pending, &format!("{tail}\n"), &root, "w1");
+        assert_eq!(read_worker_activity(&root).get("w1").map(Vec::len), Some(1));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The rail shows only five worker rows. Failed workers outrank completed ones, so without a
+    /// recency tiebreak four corpses from long-finished waves filled those slots and buried the one
+    /// running worker — observed live with `… 27 more` beneath them.
+    #[test]
+    fn current_wave_workers_outrank_older_corpses_of_the_same_status() {
+        assert!(
+            wave_recency(&Some("wave-286".into())) > wave_recency(&Some("wave-99".into())),
+            "numeric suffix, not string order"
+        );
+        assert_eq!(wave_recency(&None), 0, "an unattached worker sorts oldest");
+        assert!(
+            wave_recency(&Some("wave-286".into())) > wave_recency(&Some("wave-257".into())),
+            "the running wave's workers come first within a status class"
+        );
+    }
+
+    /// The header/rail must name the wave that is actually running. Observed live: `wave-257`
+    /// (`agent-turn-failed`) held the header while `wave-286` ran, because the old test was the
+    /// inverse of a short terminal list — so any unrecognised status counted as active — and
+    /// `BTreeMap::iter().find()` returned the OLDEST match.
+    #[test]
+    fn the_active_wave_is_the_newest_one_still_in_flight() {
+        let mut state = FleetState::default();
+        let wave = |status: &str| json!({"status": status, "items": ["flux/C-1"]});
+        state
+            .waves
+            .insert("wave-257".into(), wave("agent-turn-failed"));
+        state.waves.insert("wave-260".into(), wave("cancelled"));
+        state.waves.insert("wave-99".into(), wave("accepted"));
+        state.waves.insert("wave-286".into(), wave("accepted"));
+
+        let active = active_wave_view(&state, 10).expect("an in-flight wave is selected");
+
+        assert_eq!(
+            active.id, "wave-286",
+            "the newest in-flight wave wins, and wave-99 must not out-sort wave-286 lexically"
+        );
+        assert_eq!(active.status, "accepted");
+    }
+
+    /// A failed or finished wave is not "active" — the header should fall silent rather than pin a
+    /// stale id.
+    #[test]
+    fn no_wave_is_active_when_every_wave_has_stopped() {
+        let mut state = FleetState::default();
+        for (id, status) in [
+            ("wave-1", "agent-turn-failed"),
+            ("wave-2", "cancelled"),
+            ("wave-3", "green"),
+            ("wave-4", "applied"),
+        ] {
+            state
+                .waves
+                .insert(id.into(), json!({"status": status, "items": []}));
+        }
+
+        assert!(active_wave_view(&state, 10).is_none());
+    }
+
+    /// C-596: the integration task kind admits the native assemble operations. Without this the
+    /// authored integrator loop names `fleet.integrate`/`fleet.status`, the derived ceiling omits
+    /// them because native Fleet services live outside the capability bundles, and admission refuses
+    /// with "incompatible with its capability ceiling".
+    #[test]
+    fn the_integration_task_kind_admits_the_native_assemble_operations() {
+        let capabilities = ["read".to_string(), "edit".to_string(), "git".to_string()];
+
+        let (_, integrator) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &capabilities,
+            FLEET_INTEGRATION_TASK_KIND,
+        )
+        .expect("an integrator template normalizes");
+        assert!(integrator.contains(&"fleet.integrate".to_string()));
+        assert!(integrator.contains(&"fleet.status".to_string()));
+
+        // A story worker with the very same capabilities gets neither.
+        let (_, writer) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &capabilities,
+            FLEET_IMPLEMENTATION_TASK_KIND,
+        )
+        .expect("a writer template normalizes");
+        assert!(
+            !writer.contains(&"fleet.integrate".to_string()),
+            "assemble authority comes from the task kind, never from capabilities"
+        );
     }
 
     /// C-596: assemble authority follows the admitted record into the child process. A story worker

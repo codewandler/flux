@@ -1314,7 +1314,31 @@ pub(super) fn workspace_with_flow_roots(
     cwd: &std::path::Path,
     create_global: bool,
 ) -> Result<Workspace> {
+    workspace_with_flow_roots_scoped(cwd, create_global, true)
+}
+
+/// As [`workspace_with_flow_roots`], but able to withhold the host-global roots entirely.
+///
+/// C-608: `~/.flux/flows` and `~/.flux/ops` are registered as `@named` roots, and named roots are
+/// **write-capable** — they sit alongside the primary root in the write path, and
+/// `SpawnPolicy::for_workspace` adds them to the sandbox writable set too. For a host running several
+/// confined agents concurrently that is a shared read/write channel that lives outside every
+/// workspace, is invisible to any commit diff, and needs only `read`+`edit` to use
+/// (`write("@global_flows/x")`).
+///
+/// An agent under an enforced operation ceiling cannot author global flows or ops anyway — `flow_*`
+/// and `op.register` are not in any capability bundle it can hold — so the roots buy it nothing and
+/// cost isolation. Withhold them rather than trying to make a named root read-only, which the
+/// `Workspace` model has no way to express.
+pub(super) fn workspace_with_flow_roots_scoped(
+    cwd: &std::path::Path,
+    create_global: bool,
+    global_roots: bool,
+) -> Result<Workspace> {
     let mut workspace = Workspace::from_env(cwd).context("workspace")?;
+    if !global_roots {
+        return Ok(workspace);
+    }
     if let Some(home) = std::env::var_os("HOME") {
         let flux_dir = std::path::PathBuf::from(home).join(".flux");
         for (name, sub) in [("global_flows", "flows"), ("global_ops", "ops")] {
@@ -1862,6 +1886,39 @@ fn resolve_permissions(
 /// The operation is registered only after the explicit Fleet root has been validated and captures
 /// that root in its host-owned tool instance, so model input cannot widen this grant to another
 /// file or workspace. Operator-authored deny rules still win in [`PermissionManager::check`].
+#[cfg(test)]
+mod evidence_scope_tests {
+    use super::*;
+
+    /// C-608 (failing first): the host-global flow/op roots are `@named` roots, which are
+    /// write-capable and shared by every concurrent agent on the host — a cross-agent read/write
+    /// channel outside every workspace and invisible to any commit diff. A ceiling-confined agent
+    /// must not receive them.
+    #[test]
+    fn a_ceiling_confined_agent_gets_no_host_global_roots() {
+        let cwd = std::env::temp_dir();
+
+        let confined = workspace_with_flow_roots_scoped(&cwd, false, false)
+            .expect("a confined workspace builds");
+        assert!(
+            confined.named_roots().next().is_none(),
+            "a confined agent must hold no writable named root"
+        );
+
+        // An ordinary agent is unchanged: it still gets the roots when HOME provides them.
+        let ordinary = workspace_with_flow_roots_scoped(&cwd, false, true)
+            .expect("an ordinary workspace builds");
+        if std::env::var_os("HOME")
+            .is_some_and(|home| std::path::PathBuf::from(home).join(".flux/flows").is_dir())
+        {
+            assert!(
+                ordinary.named_roots().next().is_some(),
+                "an unconfined agent keeps its global flow roots"
+            );
+        }
+    }
+}
+
 fn preauthorize_attached_native_fleet_main(perms: &mut PermissionManager) {
     for operation in super::board_fleet_cmd::native_fleet_main_read_operations() {
         perms.add_allow(operation);
@@ -2168,8 +2225,16 @@ pub(super) async fn build_agent_with(
     // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
     // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
     // is the legacy location, still read during the ops→flows unification.
+    // An agent running under an enforced operation ceiling (a Fleet worker) gets no host-global
+    // flow/op roots: they are write-capable named roots shared by every concurrent agent on the host,
+    // and a ceiling-confined agent cannot author flows or ops regardless. See C-608.
     let system = Arc::new(
-        System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
+        System::new(workspace_with_flow_roots_scoped(
+            &cwd,
+            !flags.operation_ceiling,
+            !flags.operation_ceiling,
+        )?)
+        .with_sandbox(resolved_sandbox()),
     );
     let fleet_research_loop = if attached_native_fleet_main {
         let selection = super::board_fleet_cmd::configured_main_research_loop(&cwd)?;
@@ -2253,6 +2318,17 @@ pub(super) async fn build_agent_with(
             // copy of these ceilings (same numbers, own concurrency budget); sharing one budget
             // across the delegation boundary deadlocks, see `ResourceLimits::independent_copy`.
             .with_resource_limits(resource_limits.clone());
+    // C-612: the operator's `[permissions] deny` list must survive delegation. Children inherit
+    // **denials only** — never the allow list, which would widen a child beyond what the operator
+    // granted the parent. A child executor previously got an empty `PermissionManager`, which
+    // resolves every subject to `Ask`, and `SubAgentApprover` allows anything non-destructive; a deny
+    // rule therefore evaporated at this boundary while still reading as enforced.
+    if !cfg.permissions.deny.is_empty() {
+        sub_agents = sub_agents.with_permissions(Arc::new(PermissionManager::from_rules(
+            &[],
+            &cfg.permissions.deny,
+        )));
+    }
     if let Some(agent_loop) = fleet_research_loop {
         sub_agents = sub_agents.with_agent_loop(agent_loop);
     }

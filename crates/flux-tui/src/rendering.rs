@@ -10,6 +10,19 @@ fn option_label(value: &serde_json::Value) -> String {
 }
 
 /// A centered sub-rect `w`×`h` (clamped to `area`).
+/// Columns available to transcript *text* inside a transcript `Rect` of `area_width`.
+///
+/// The vertical scrollbar is rendered as an overlay into the transcript's own `Rect`
+/// (`ScrollbarOrientation::VerticalRight`), so the rightmost column is the bar's, not text's.
+/// Wrapping to the full width lets the bar overwrite a real character — observed live as
+/// `"…the current revi"` + `"ion, active worker c"`, i.e. the `s` of "revision" gone, with nothing
+/// on screen to show a character was dropped. Reserved unconditionally: making it depend on whether
+/// the bar is currently visible would reflow the whole transcript the moment content grows past the
+/// viewport.
+pub(crate) fn transcript_text_width(area_width: u16) -> u16 {
+    area_width.saturating_sub(1)
+}
+
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let w = w.min(area.width);
     let h = h.min(area.height);
@@ -229,10 +242,19 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // C-157: an empty session shows a short orientation card instead of running the transcript
     // viewport at all — the card must never populate the layout cache, participate in focus
     // (C-111), or set scroll bookkeeping, so it stays entirely outside `transcript_viewport`.
+    //
+    // The scrollbar below is drawn as an OVERLAY into this same `Rect`, so its column belongs to the
+    // scrollbar, not to text. Wrapping to the full width silently destroys the character that lands
+    // there — a path, a SHA or a word loses a letter with nothing on screen to indicate it. Reserve
+    // the column unconditionally rather than only when the bar is visible, so text does not reflow
+    // the instant content grows past the viewport.
     if state.entries.is_empty() {
         render_empty_state_card(frame, state, transcript_area);
     } else {
-        let visible = state.transcript_viewport(transcript_area.width, transcript_area.height);
+        let visible = state.transcript_viewport(
+            transcript_text_width(transcript_area.width),
+            transcript_area.height,
+        );
         frame.render_widget(Paragraph::new(visible), transcript_area);
 
         // Keep the overlaid track visible whenever content exists above the viewport. Follow mode
@@ -1010,6 +1032,89 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    /// The overlaid scrollbar owns the transcript's rightmost column, so text must not be wrapped
+    /// into it. Failing first: wrapping to the full width let the bar overwrite a real character,
+    /// observed live as `"…the current revi"` + `"ion, active worker c"` — the `s` of "revision"
+    /// silently gone. A dropped character in a path, a SHA or command output is a correctness bug,
+    /// not a cosmetic one, because nothing on screen indicates the loss.
+    #[test]
+    fn transcript_text_never_wraps_into_the_scrollbar_column() {
+        const WIDTH: u16 = 80;
+        let body: String = (0..4000u32)
+            .map(|i| (b'a' + (i % 26) as u8) as char)
+            .collect();
+        let mut state = ChatState::new("mock".into());
+        state.entries.push(crate::Entry::User {
+            text: body,
+            prior_elapsed: None,
+            show_separator: false,
+        });
+        state.mark_transcript_dirty();
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(WIDTH, 24)).unwrap();
+        terminal.draw(|frame| render(frame, &state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // The scrollbar is drawn AFTER the text, so it owns the last column either way — a stray
+        // glyph there proves nothing. The real damage is a character consumed by the wrap and then
+        // painted over. With a repeating alphabet as the body, that shows up as a SKIP across a row
+        // boundary: the last visible letter of one row should be followed by the next letter of the
+        // cycle at the start of the row below.
+        //
+        // Only rows that are actually body rows are considered — the header and composer contain
+        // ordinary prose whose letters are not part of the sequence.
+        let body_runs = (0..buffer.area.height)
+            .filter_map(|y| {
+                let letters = (0..WIDTH)
+                    .filter_map(|x| {
+                        buffer[(x, y)]
+                            .symbol()
+                            .chars()
+                            .next()
+                            .filter(char::is_ascii_lowercase)
+                    })
+                    .collect::<Vec<_>>();
+                (letters.len() >= 40).then_some((y, letters))
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            body_runs.len() >= 3,
+            "expected several wrapped body rows to inspect, got {}",
+            body_runs.len()
+        );
+
+        let step = |c: char| if c == 'z' { 'a' } else { (c as u8 + 1) as char };
+        let mut skips = Vec::new();
+        for pair in body_runs.windows(2) {
+            let (upper_row, upper) = &pair[0];
+            let (lower_row, lower) = &pair[1];
+            let (Some(last), Some(first)) = (upper.last(), lower.first()) else {
+                continue;
+            };
+            if *first != step(*last) {
+                skips.push((*upper_row, *last, *lower_row, *first));
+            }
+        }
+        assert!(
+            skips.is_empty(),
+            "wrapped transcript dropped a character into the scrollbar column at row \
+             boundaries (upper_row, last, lower_row, first): {skips:?}"
+        );
+    }
+
+    /// The reserved column is unconditional, so the transcript does not reflow the instant content
+    /// grows past the viewport and the scrollbar appears.
+    #[test]
+    fn the_scrollbar_column_is_reserved_at_every_width() {
+        for width in [0u16, 1, 2, 40, 114, 148] {
+            assert_eq!(
+                transcript_text_width(width),
+                width.saturating_sub(1),
+                "width {width} must reserve exactly one column and never underflow"
+            );
+        }
     }
 
     #[test]

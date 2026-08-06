@@ -172,8 +172,69 @@ pub fn format_result(name: &str, content: &str, is_error: bool) -> Option<String
                 if lines == 1 { "" } else { "s" }
             ))
         }
+        // Native Board/Fleet operations answer with a bounded envelope whose first ~100 characters
+        // are `{"data":{"bounded":true,"byte_limit":262144,...` — the same prefix for every call, so
+        // the raw head is the least informative possible summary while also being the widest. Report
+        // the shape instead; the full envelope stays one expand away.
+        name if name.starts_with("board.") || name.starts_with("fleet.") => {
+            summarize_control_plane(name, content)
+        }
         _ => None,
     }
+}
+
+/// Count-and-identity summary for a `board.*` / `fleet.*` envelope.
+///
+/// Deliberately reports only counts and short identifiers already present in the payload — never a
+/// free-text field — so a summary line cannot become a channel for unbounded or attacker-shaped text
+/// in the transcript.
+fn summarize_control_plane(name: &str, content: &str) -> Option<String> {
+    let envelope: Value = serde_json::from_str(content).ok()?;
+    // Both `flux.fleet-inspect/v1` and the board views nest the useful body under `data.data`.
+    let body = envelope
+        .get("data")
+        .map(|data| data.get("data").unwrap_or(data))?;
+
+    let count = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_array)
+            .map(|items| items.len())
+    };
+    let number = |key: &str| body.get(key).and_then(Value::as_u64);
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(items) = count("items") {
+        parts.push(format!("{items} item{}", if items == 1 { "" } else { "s" }));
+    }
+    if let Some(agents) = count("agents").or_else(|| number("agents").map(|n| n as usize)) {
+        parts.push(format!(
+            "{agents} worker{}",
+            if agents == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(waves) = number("waves") {
+        parts.push(format!("{waves} wave{}", if waves == 1 { "" } else { "s" }));
+    }
+    if let Some(program) = count("program") {
+        parts.push(format!(
+            "{program} program row{}",
+            if program == 1 { "" } else { "s" }
+        ));
+    }
+    if let Some(revision) = envelope.get("revision").and_then(Value::as_u64) {
+        parts.push(format!("r{revision}"));
+    }
+    if parts.is_empty() {
+        // Still better than the envelope head: say it answered, and how big the answer was.
+        let bytes = content.len();
+        parts.push(if bytes < 1024 {
+            format!("{bytes} B")
+        } else {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        });
+    }
+    let _ = name;
+    Some(parts.join(" · "))
 }
 
 /// The kind of an expanded-detail line, so the surface can color it (diff add/del, metadata, plain).
@@ -478,6 +539,55 @@ pub mod budget {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A `fleet.status` card used to summarize as the first ~100 chars of its envelope —
+    /// `{"data":{"bounded":true,"byte_limit":262144,…` — identical for every control-plane call and
+    /// the widest possible line. Report the shape instead.
+    #[test]
+    fn control_plane_results_summarize_shape_not_envelope_head() {
+        let envelope = json!({
+            "revision": 276,
+            "data": {"data": {"agents": 31, "waves": 16, "goals": 0}}
+        })
+        .to_string();
+
+        let summary = format_result("fleet.status", &envelope, false)
+            .expect("a control-plane envelope summarizes");
+
+        assert!(summary.contains("31 workers"), "{summary}");
+        assert!(summary.contains("16 waves"), "{summary}");
+        assert!(summary.contains("r276"), "{summary}");
+        assert!(
+            !summary.contains("byte_limit"),
+            "the envelope head must not leak: {summary}"
+        );
+    }
+
+    /// Board reads report how many items came back, not the first bytes of the payload.
+    #[test]
+    fn board_results_report_item_counts() {
+        let envelope =
+            json!({"data": {"items": [{"id": "flux/C-1"}, {"id": "flux/C-2"}]}}).to_string();
+
+        let summary =
+            format_result("board.next", &envelope, false).expect("a board envelope summarizes");
+
+        assert!(summary.contains("2 items"), "{summary}");
+    }
+
+    /// A payload that carries none of the known shapes still beats the raw head, and an error result
+    /// keeps the existing behaviour of showing the real message.
+    #[test]
+    fn control_plane_falls_back_to_a_size_and_never_summarizes_errors() {
+        let opaque = json!({"data": {"something_else": true}}).to_string();
+        let summary = format_result("board.show", &opaque, false).expect("falls back");
+        assert!(
+            summary.ends_with(" B") || summary.ends_with("KB"),
+            "{summary}"
+        );
+
+        assert_eq!(format_result("fleet.status", "boom", true), None);
+    }
 
     #[test]
     fn bash_shows_the_command() {

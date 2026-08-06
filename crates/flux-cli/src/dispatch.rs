@@ -163,6 +163,12 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         // Operator-facing reads, reports and local file writes. None of them starts a turn, none is
         // reachable from a model, and each runs in the foreground on argv the operator typed —
         // there is no autonomous execution here for the profile to bound.
+        // C-607: `flux fleet …` stays here, but for a narrower reason than the comment below gives.
+        // The *orchestrator* is operator-invoked and does legitimate repository management outside any
+        // one workspace — `git worktree add` into each member repository's shared git dir — so
+        // confining the dispatch process itself breaks wave preparation. The turns it starts are
+        // confined at the spawn site instead (`guarded_agent_run_async`), which is where the posture
+        // belongs: the worker is the thing with no approval boundary, not the command that launched it.
         Commands::Render { .. }
         | Commands::Board(..)
         | Commands::Fleet(..)

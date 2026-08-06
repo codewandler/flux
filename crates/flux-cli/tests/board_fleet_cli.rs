@@ -438,7 +438,22 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
             }
         }
     }
-    assert!(fleet_root.join("result.txt").is_file());
+    // C-619: the documented examples end at `fleet apply`, which accepts rather than merges — so the
+    // merged file must be absent and the accepted tag present. Asserting the tag keeps this test's
+    // point (the whole documented sequence really runs end to end) without asserting the one step the
+    // contract deliberately no longer performs.
+    assert!(
+        !fleet_root.join("result.txt").is_file(),
+        "apply must not merge into the source checkout"
+    );
+    let tags = git(
+        &fleet_root,
+        &["tag", "--list", &format!("fleet/accepted/{wave}/*")],
+    );
+    assert!(
+        !String::from_utf8_lossy(&tags.stdout).trim().is_empty(),
+        "apply must pin the candidate with an accepted tag"
+    );
     fs::remove_dir_all(fleet_root).ok();
 }
 
@@ -1856,14 +1871,32 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
         String::from_utf8_lossy(&applied.stderr)
     );
     let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
-    assert_eq!(applied["data"]["merged_locally"], true);
+    // C-619: apply ACCEPTS the candidate, it does not merge it.
+    //
+    // The old contract merged in the repository's source checkout, which Fleet keeps DETACHED at the
+    // pinned base — so the merge commit landed on no branch, `main` never moved, and the only thing
+    // reachable from it was that worktree's HEAD. Acceptance now pins the candidate with an annotated
+    // tag that outlives the wave, the integration branch and worktree reclamation; `main` is written
+    // exactly once, later, by the gated accumulation snapshot.
+    assert_eq!(applied["data"]["accepted"], true);
+    assert_eq!(applied["data"]["merged_locally"], false);
     assert_eq!(applied["data"]["pushed"], false);
     assert_eq!(applied["data"]["released"], false);
     assert_eq!(applied["data"]["deployed"], false);
-    assert_eq!(
-        fs::read_to_string(root.join("result.txt")).unwrap(),
-        "implemented\n"
+    assert!(
+        !root.join("result.txt").exists(),
+        "apply must not merge into the source checkout"
     );
+    // What acceptance must guarantee is that the work cannot be lost: the tag resolves, and the story's
+    // content is reachable through it even though no branch points at the candidate.
+    let tag = "fleet/accepted/wave-2/repo";
+    let shown = git(&root, &["show", &format!("{tag}:result.txt")]);
+    assert!(
+        shown.status.success(),
+        "accepted tag {tag} must resolve: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "implemented\n");
 }
 
 #[test]

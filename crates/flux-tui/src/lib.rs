@@ -6951,6 +6951,14 @@ mod tests {
         let content = screen(&terminal);
         assert!(!content.contains('%'), "{content}");
         assert!(state.last_max_scroll.get() > 0);
+        // C-341 originally asserted `width == 60` — "the overlaid scrollbar must not consume
+        // transcript width". That invariant is what produced silent text corruption: the bar is
+        // drawn into the transcript's own `Rect` *after* the text, so any character wrapped into the
+        // last column was overwritten with nothing on screen to show a character had been lost
+        // (observed live as "…the current revi" + "ion, active worker c"). A scrollbar cannot
+        // overlay full-width text without destroying some of it, so the column is now reserved.
+        // Losing one column of width is strictly better than losing characters out of paths, SHAs
+        // and command output.
         assert_eq!(
             state
                 .transcript_layout
@@ -6958,8 +6966,8 @@ mod tests {
                 .as_ref()
                 .expect("overflow laid out")
                 .width,
-            60,
-            "the overlaid scrollbar must not consume transcript width"
+            59,
+            "the scrollbar column is reserved so wrapped text can never land under the bar"
         );
         let buffer = terminal.backend().buffer();
         let follow_thumb = (1..10)

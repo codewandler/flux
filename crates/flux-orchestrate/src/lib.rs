@@ -155,6 +155,9 @@ pub struct LocalSpawner {
     /// [`ResourceLimits::independent_copy`] (same numbers, own concurrency budget — a shared one
     /// deadlocks). Default (unconfigured) leaves children unbounded, exactly as before.
     resource_limits: ResourceLimits,
+    /// C-612: the operator's permission rules, so a denial survives delegation. `None` keeps the
+    /// prior empty-manager behaviour.
+    permissions: Option<Arc<PermissionManager>>,
     /// Current delegation depth (0 = a top-level agent's direct child). A child is a leaf when
     /// `depth + 1 >= max_depth`. The default `max_depth = 1` keeps every sub-agent a leaf.
     depth: usize,
@@ -185,6 +188,7 @@ impl LocalSpawner {
             auth: None,
             audit: None,
             resource_limits: ResourceLimits::new(),
+            permissions: None,
             depth: 0,
             max_depth: 1,
         }
@@ -209,6 +213,18 @@ impl LocalSpawner {
     /// is `N × max_live_agents`; with only the per-agent number set, it is still unbounded.
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
+        self
+    }
+
+    /// C-612: carry the operator's permission rules into every sub-agent.
+    ///
+    /// A child executor was built with `PermissionManager::new()` — empty. Since an empty manager
+    /// resolves every subject to `Ask` and `SubAgentApprover` answers `Allow` for anything
+    /// non-destructive, an operator's `[permissions] deny` rule evaporated at the delegation boundary
+    /// while still reading as enforced. `None` preserves that prior behaviour for embedders who
+    /// configured no permissions at all.
+    pub fn with_permissions(mut self, permissions: Option<Arc<PermissionManager>>) -> Self {
+        self.permissions = permissions;
         self
     }
 
@@ -327,6 +343,9 @@ impl LocalSpawner {
             // C-299: the ceiling descends through nested delegation too — a grandchild counts
             // against the same budget as the agent that started the chain.
             resource_limits: self.resource_limits.clone(),
+            // C-612: descends through nested delegation for the same reason the resource ceiling does
+            // — a grandchild must not escape a denial its ancestor was subject to.
+            permissions: self.permissions.clone(),
             depth,
             max_depth: self.max_depth,
         }
@@ -519,14 +538,17 @@ impl Spawner for LocalSpawner {
         // would make the child queue behind the very call awaiting it: a deadlock bounded only by
         // the queue timeout. Hence per agent — same numbers, own budget.
         // See `ResourceLimits::independent_copy`.
-        let executor = Executor::new_with_authorization(
-            registry,
-            PermissionManager::new(),
-            approver,
-            ctx,
-            authorization,
-        )
-        .with_resource_limits(self.resource_limits.independent_copy());
+        // C-612: the operator's rules, not an empty manager. An empty one resolves every subject to
+        // `Ask`, and `SubAgentApprover` allows anything non-destructive — so a `[permissions] deny`
+        // used to be silently lost here.
+        let permissions = self
+            .permissions
+            .as_ref()
+            .map(|manager| manager.as_ref().clone())
+            .unwrap_or_default();
+        let executor =
+            Executor::new_with_authorization(registry, permissions, approver, ctx, authorization)
+                .with_resource_limits(self.resource_limits.independent_copy());
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
@@ -710,6 +732,9 @@ pub struct SubAgents {
     /// [`with_resource_limits`](Self::with_resource_limits) — the SDK's client builders and the CLI
     /// fill it in from what the host/operator configured, so a delegating host does not have to.
     pub resource_limits: ResourceLimits,
+    /// C-612: the operator's permission rules, carried into every sub-agent so a `[permissions] deny`
+    /// is not silently lost at the delegation boundary. `None` keeps the prior behaviour.
+    pub permissions: Option<Arc<PermissionManager>>,
 }
 
 impl SubAgents {
@@ -737,7 +762,14 @@ impl SubAgents {
             audit: None,
             max_depth: 1,
             resource_limits: ResourceLimits::new(),
+            permissions: None,
         }
+    }
+
+    /// C-612: carry the operator's permission rules into every sub-agent.
+    pub fn with_permissions(mut self, permissions: Arc<PermissionManager>) -> Self {
+        self.permissions = Some(permissions);
+        self
     }
 
     /// Give every sub-agent the parent runtime's resource ceilings (C-299) — **per agent**, see
@@ -838,7 +870,8 @@ impl SubAgents {
         .with_max_depth(self.max_depth)
         // C-299: carry the parent's ceilings down. Unset is `ResourceLimits::new()` (unbounded),
         // so a host that configured nothing sees no behaviour change.
-        .with_resource_limits(self.resource_limits);
+        .with_resource_limits(self.resource_limits)
+        .with_permissions(self.permissions);
         if let Some(agent_loop) = self.agent_loop {
             spawner = spawner.with_agent_loop(agent_loop);
         }
@@ -1526,6 +1559,48 @@ mod tests {
             text: text.into(),
             ..Default::default()
         }
+    }
+
+    /// C-612 (failing first): an operator's permission rules must reach a sub-agent. The child
+    /// executor was built with `PermissionManager::new()` — empty — which resolves every subject to
+    /// `Ask`; `SubAgentApprover` then allows anything non-destructive, so a `[permissions] deny` rule
+    /// was silently lost at the delegation boundary while still reading as enforced.
+    #[test]
+    fn a_permission_manager_reaches_children_and_descends_through_nesting() {
+        let denied = Arc::new(PermissionManager::from_rules(&[], &["bash".to_string()]));
+
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_permissions(Some(denied.clone()));
+        assert!(
+            spawner.permissions.is_some(),
+            "the spawner carries the operator's rules"
+        );
+
+        // And it descends: a grandchild must not escape a denial its ancestor was subject to, for the
+        // same reason the resource ceiling descends.
+        let nested = spawner.at_depth(1, ToolRegistry::new(), temp_system());
+        assert!(
+            nested.permissions.is_some(),
+            "permissions descend through nested delegation"
+        );
+
+        // Absent stays absent — embedders who configured nothing keep the prior behaviour.
+        let unconfigured = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        assert!(unconfigured.permissions.is_none());
     }
 
     #[tokio::test]

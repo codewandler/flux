@@ -53,6 +53,49 @@ Do not select cognition/model families merely \
 to reason, calculate, summarize, cite, or write an answer: you already do those things. Select them \
 only when the user explicitly asks for a separate model-backed operation.";
 
+/// The execution contract for an operator-authored `ai_segment`.
+///
+/// [`EXPLORE_SYSTEM`] is the *planner's* contract: it tells the model to hand a plan back for someone
+/// else to run. That framing is correct for the adaptive CLI path but wrong here, because
+/// `EngineLoopHost::run_scoped_segment` consumes a finalized batch itself — `approve_batch` then
+/// `execute_batch` — and loops with the execution report, so an authored segment can act, observe the
+/// result, and keep going within one turn.
+///
+/// What it must NOT do is deny the staging step. An effectful call is not run inline: it is captured
+/// into `state.proposed` with the tool result "captured as proposed action N; not executed", and only
+/// `FINALIZE_PLAN` turns that batch into real execution. A first attempt at this prompt asserted that
+/// effects "REALLY EXECUTE" and told the model not to hand back a plan; a live Fleet worker then made
+/// 68 calls, staged its writes, never called `finalize_plan`, and finished having changed nothing —
+/// worse than the planner prompt it replaced, which at least taught the ritual.
+///
+/// So this contract states both halves: staging is real, and finalizing executes for real. The
+/// evidence discipline is copied from [`EXPLORE_SYSTEM`] verbatim; only the execution contract
+/// differs.
+const SEGMENT_SYSTEM: &str = "You are Flux executing an authored segment. The tools below are the \
+only operations available to you and each carries its real input schema. They are the operations \
+the segment's author chose for this exact assignment; if the assignment needs one that is absent, \
+say so rather than working around it. Use gather tools to inspect evidence before acting; cite exact \
+source identifiers from tool calls/results and never invent facts or paths. A filesystem path is \
+known only when the request supplied it or a tool result listed it. If no exact relevant path is \
+known, first inventory the workspace once with `glob`, set `pattern` to `*`, and omit `path`; never \
+guess a likely filename. Keep a checklist of every input fact and governing rule the assignment \
+needs, and read an authoritative source for each. Search hits only locate sources--read the source \
+itself. Minimize provider rounds without skipping evidence: emit independent gather calls together \
+in one response. Batch only independent gather calls; never batch writes or destructive work. \
+A gather call runs immediately and returns its real result. An effectful call — a write, edit, \
+command or commit — is STAGED instead: its tool result says `captured as proposed action N; not \
+executed`. That is normal and expected, not a refusal and not a permission problem. Staged work runs \
+only when you call `finalize_plan` by itself, with no other call in the same response. \
+Doing so executes the whole staged batch for real against the workspace, and the execution report \
+comes back to you, so you can inspect what happened and continue working in this same turn. Stage \
+and finalize as many times as the assignment needs. \
+You are here to carry the assignment to its stated completion, not to propose it to someone else: if \
+you have staged actions and stop without calling `finalize_plan`, nothing you staged will ever \
+happen and the assignment fails silently. Never report a staged action as if it had already \
+happened — finalize it, read the report, then report what actually occurred with the evidence that \
+proves it. If the assignment genuinely cannot be completed, stop and state precisely which fact, \
+operation or decision is missing.";
+
 const EXPLORE_SYSTEM: &str = "You are Flux's staged planning agent. The tools below are the only \
 operations selected for this request and each carries its real input schema. Use gather tools to \
 inspect evidence before answering; cite exact source identifiers from tool calls/results and never \
@@ -3109,8 +3152,14 @@ fn intent_contract_json(declaration: &IntentDeclaration) -> Value {
 }
 
 fn explore_segments(ctx: &StagedContext, declaration: &IntentDeclaration) -> Vec<SystemSegment> {
+    // An authored segment executes; the adaptive planner proposes. Same signal `adaptive_explore`
+    // uses for `authored_segment`.
     let mut segments = vec![SystemSegment {
-        text: EXPLORE_SYSTEM.into(),
+        text: if ctx.authored_ceiling.is_some() {
+            SEGMENT_SYSTEM.into()
+        } else {
+            EXPLORE_SYSTEM.to_string()
+        },
         cache: true,
     }];
     if let Some(base) = ctx.base_system.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -6127,6 +6176,63 @@ mod tests {
         assert!(error.contains("maximum is 4"), "error was: {error}");
         assert_eq!(state.declaration.families, initial_families);
         assert_eq!(state.selected, initial_selected);
+    }
+
+    /// C-597 (failing first): an authored segment executes its effects, so it must not inherit the
+    /// planner's capture contract. A live Fleet worker read that contract and complied — 35
+    /// read-only calls, no effect attempted, and a reply that it "captures actions for approval
+    /// instead of executing them" while holding write/edit/bash/git_commit in its ceiling.
+    #[test]
+    fn an_authored_segment_is_told_its_effects_execute_not_that_they_are_captured() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        let declaration = IntentDeclaration::default();
+
+        let adaptive = explore_segments(&context, &declaration);
+        let adaptive_text = adaptive[0].text.clone();
+
+        context.authored_ceiling = Some(HashSet::from(["inspect".to_string()]));
+        let authored = explore_segments(&context, &declaration);
+        let authored_text = authored[0].text.clone();
+
+        assert_ne!(
+            authored_text, adaptive_text,
+            "an authored segment gets its own contract"
+        );
+        // The planner's deferral language must be absent — it is what suppressed the effects.
+        for planner_only in [
+            "may capture an action instead of executing it",
+            "call finalize_plan",
+            "Never claim a captured action already happened",
+        ] {
+            assert!(
+                !authored_text.contains(planner_only),
+                "authored segment must not be told `{planner_only}`"
+            );
+        }
+        // The contract must teach the staging ritual, because effectful calls really are captured
+        // and only `finalize_plan` executes them. A prompt that merely asserts "effects execute"
+        // makes the model stage writes and stop, changing nothing (observed on Fleet wave-275).
+        assert!(
+            authored_text.contains(FINALIZE_PLAN),
+            "the authored contract must name `{FINALIZE_PLAN}`, or staged work never runs"
+        );
+        assert!(
+            authored_text.contains("STAGED"),
+            "the authored contract must say effectful calls are staged, not run inline"
+        );
+        assert!(
+            authored_text.contains("captured as proposed action"),
+            "the contract should quote the exact tool result the model will see"
+        );
+        // Evidence discipline is preserved, not traded away for execution.
+        for kept in [
+            "never invent facts or paths",
+            "Search hits only locate sources",
+        ] {
+            assert!(authored_text.contains(kept), "`{kept}` must survive");
+        }
+        // The adaptive planner is untouched.
+        assert!(adaptive_text.contains("may capture an action instead of executing it"));
     }
 
     /// C-595 (failing first): an authored segment that crosses the retained-history ceiling must

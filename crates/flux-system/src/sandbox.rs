@@ -769,7 +769,32 @@ fn linked_worktree_writable_roots(worktree: &Path) -> Vec<PathBuf> {
     if !standard_layout {
         return Vec::new();
     }
-    vec![admin, common]
+    // C-609: grant the admin dir plus only the shared subpaths a commit actually writes — objects,
+    // refs, packed-refs, the ref log and the index/config machinery — rather than the whole common
+    // dir. Granting `common` wholesale also grants `common/worktrees/<other>/…`, which is where every
+    // *sibling* worktree's admin directory lives; on a Fleet host that includes each sibling agent's
+    // session store (`flux-fleet/sessions/<id>/events.db`), so the writable sets of concurrently
+    // running agents were unioned rather than isolated. Necessary for `git commit`; the sibling reach
+    // was not intended.
+    let mut roots = vec![admin];
+    for shared in [
+        "objects",
+        "refs",
+        "packed-refs",
+        "logs",
+        "config",
+        "HEAD",
+        "index",
+        // `git worktree add` creates a NEW admin directory here, so the parent must be writable even
+        // though sibling admin dirs beneath it are exactly what should not be. Path-granularity is all
+        // the spawn policy has, so this is the honest limit of what it can express: the *narrowing*
+        // that matters (isolating agent session stores) is achieved by relocating them, not by fencing
+        // this directory. Tracked in C-609's notes.
+        "worktrees",
+    ] {
+        roots.push(common.join(shared));
+    }
+    roots
 }
 
 fn read_gitdir_pointer(dot_git: &Path, base: &Path) -> Option<PathBuf> {
@@ -2414,11 +2439,27 @@ mod tests {
             "linked-worktree admin dir must be writable: {:?}",
             policy.writable
         );
+        let common = main_git.canonicalize().unwrap();
+        // C-609: the shared subpaths a commit needs are writable …
+        for shared in ["objects", "refs", "packed-refs"] {
+            assert!(
+                policy.writable.contains(&common.join(shared)),
+                "`{shared}` must be writable for a commit: {:?}",
+                policy.writable
+            );
+        }
+        // … but NOT the common dir wholesale, because that also grants
+        // `common/worktrees/<sibling>/…` — every sibling worktree's admin dir, which on a Fleet host
+        // holds each concurrent agent's own session store.
         assert!(
-            policy.writable.contains(&main_git.canonicalize().unwrap()),
-            "linked-worktree common dir must be writable for refs/objects: {:?}",
+            !policy.writable.contains(&common),
+            "granting the whole common dir unions sibling agents' writable sets: {:?}",
             policy.writable
         );
+        // `worktrees` IS writable: `git worktree add` must create a new admin dir under it. Path
+        // granularity cannot express "create new children but do not touch existing siblings", so
+        // isolating agent session stores is a relocation problem, not a fencing one (C-609 notes).
+        assert!(policy.writable.contains(&common.join("worktrees")));
     }
 
     #[test]

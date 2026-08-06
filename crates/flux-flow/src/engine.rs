@@ -355,7 +355,43 @@ impl AgentLoopBinding {
         Ok(())
     }
 
+    /// Analyze this binding exactly as engine assembly does, without constructing an engine or a
+    /// provider.
+    ///
+    /// `FlowEngine::new` lowers the loop and runs `analyze_flow` over it; before this existed that
+    /// analysis was reachable *only* by assembling an engine, so an authored loop carrying a purely
+    /// static error — an unbound `match` subject, an operation the registry does not have — was
+    /// refused for the first time inside an already-spawned worker process. A Fleet coordinator
+    /// reads that child's stderr, so the diagnostic surfaced as an unparseable event stream and the
+    /// real message was never shown. Callers that admit an authored loop should run this first.
+    /// `assumed_operations` names operations the caller can prove are granted but that no static
+    /// registry can hold — the datasource pack needs configured sources, and the language toolchains
+    /// surface on a workspace signal. They resolve with an unconstrained signature, so structural
+    /// analysis still runs while argument checks on those names degrade to permissive.
+    pub fn validate_analysis(
+        &self,
+        registry: &flux_runtime::ToolRegistry,
+        composites: Vec<flux_lang::program::CompositeOpDecl>,
+        assumed_operations: &std::collections::HashSet<String>,
+        max_iterations: usize,
+    ) -> Result<()> {
+        self.validate_runtime_with_assumed(registry, assumed_operations)?;
+        let lowered = load_agent_loop_with_iterations(self.spec().clone(), max_iterations)?;
+        let catalog = OpRegistry::new(registry)
+            .with_owned_composites(composites)
+            .with_assumed_ops(assumed_operations.clone());
+        analyze_loop_against(&lowered, &catalog)
+    }
+
     fn validate_runtime(&self, registry: &flux_runtime::ToolRegistry) -> Result<()> {
+        self.validate_runtime_with_assumed(registry, &std::collections::HashSet::new())
+    }
+
+    fn validate_runtime_with_assumed(
+        &self,
+        registry: &flux_runtime::ToolRegistry,
+        assumed_operations: &std::collections::HashSet<String>,
+    ) -> Result<()> {
         self.validate_shape()?;
         if self.metadata.runner != AgentLoopRunnerKind::NativeFlux {
             return Err(Error::Other(format!(
@@ -390,7 +426,10 @@ impl AgentLoopBinding {
             .metadata
             .required_operations
             .iter()
-            .filter(|operation| !available.contains(operation.as_str()))
+            .filter(|operation| {
+                !available.contains(operation.as_str())
+                    && !assumed_operations.contains(operation.as_str())
+            })
             .cloned()
             .collect::<Vec<_>>();
         if !missing.is_empty() {
@@ -2647,7 +2686,11 @@ fn validate_agent_loop(
     composites: Vec<flux_lang::program::CompositeOpDecl>,
 ) -> Result<()> {
     let catalog = OpRegistry::new(tools).with_owned_composites(composites);
-    flux_lang::analyze::analyze_flow(ast, &catalog, &std::collections::HashSet::new()).map_err(
+    analyze_loop_against(ast, &catalog)
+}
+
+fn analyze_loop_against(ast: &DraftAst, catalog: &dyn flux_lang::opspec::OpCatalog) -> Result<()> {
+    flux_lang::analyze::analyze_flow(ast, catalog, &std::collections::HashSet::new()).map_err(
         |diagnostics| {
             Error::Other(format!(
                 "agent loop failed validation: {}",
@@ -3901,6 +3944,58 @@ mod tests {
             error,
             "agent loop profile `future` requires unsupported runtime features: agent-loop/telepathy/v9"
         );
+    }
+
+    /// A statically invalid authored loop must be refused by `validate_analysis`, not first by an
+    /// already-spawned worker. `validate_runtime` alone accepts this source — it only reconciles
+    /// declared operations and features — so the analysis pass is what closes the gap.
+    #[test]
+    fn analysis_refuses_an_unbound_match_subject_that_runtime_validation_accepts() {
+        let invalid = "flow work -> string\n  \
+             $probe = parse(\"{\\\"verdict\\\":\\\"DONE\\\"}\", as: \"json\")\n  \
+             match $probe.verdict\n    \
+             case \"DONE\"\n      \
+             $out = fmt(\"done\")\n    \
+             default\n      \
+             $out = fmt(\"more\")\n  \
+             return $out\n";
+        let binding =
+            AgentLoopBinding::native_flux("implementation", "1", "profile:x@1", "work", invalid)
+                .unwrap();
+
+        // The gap: shape and runtime reconciliation both pass, so admission used to let this
+        // through and the child was the first thing to reject it.
+        binding
+            .validate_runtime(&ToolRegistry::new())
+            .expect("runtime validation cannot see a static analysis error");
+
+        let error = binding
+            .validate_analysis(&ToolRegistry::new(), Vec::new(), &Default::default(), 8)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("agent loop failed validation"),
+            "expected an analysis refusal, got: {error}"
+        );
+        assert!(
+            error.contains("`match` subject must be a literal or a bound symbol"),
+            "the refusal must name the actual defect, got: {error}"
+        );
+
+        // Binding the field access first is exactly the fix, and it must now pass.
+        let valid = "flow work -> string\n  \
+             $probe = parse(\"{\\\"verdict\\\":\\\"DONE\\\"}\", as: \"json\")\n  \
+             $verdict = $probe.verdict\n  \
+             match $verdict\n    \
+             case \"DONE\"\n      \
+             $out = fmt(\"done\")\n    \
+             default\n      \
+             $out = fmt(\"more\")\n  \
+             return $out\n";
+        AgentLoopBinding::native_flux("implementation", "1", "profile:x@1", "work", valid)
+            .unwrap()
+            .validate_analysis(&ToolRegistry::new(), Vec::new(), &Default::default(), 8)
+            .expect("a bound match subject analyzes cleanly");
     }
 
     #[tokio::test]

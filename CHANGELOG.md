@@ -55,6 +55,44 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A running wave is now visible while it runs** (C-599, C-602). A wave wrote durable state exactly
+  twice — once before its first worker started, once after the last joined — and the surface's refresh
+  token hashed only those files, so `flux tui --fleet` took zero snapshots for a wave's entire
+  duration and a working fleet looked frozen. The supervisor now projects each worker's stream to a
+  bounded activity sidecar as it arrives, the refresh token includes it, and a worker's rail entry
+  shows live progress instead of its previous turn's events. The projection is structural only —
+  event type, operation name, coarse outcome — so tool inputs, result bodies and the prompt never
+  reach it.
+- **The transcript no longer silently drops characters** (C-341 revised). The vertical scrollbar is
+  drawn as an overlay into the transcript's own rect, so any character wrapped into the last column
+  was overwritten with nothing on screen to indicate the loss — a path, SHA or command output read off
+  the screen could simply be wrong. That column is now reserved. This reverses C-341's "the overlaid
+  scrollbar must not consume transcript width": one column of width is a smaller price than corrupted
+  text.
+- **Board and Fleet results summarize their shape instead of their envelope** (C-599). Every
+  `board.*`/`fleet.*` card previewed the first bytes of a bounded envelope — the identical
+  `{"data":{"bounded":true,"byte_limit":262144,…` prefix for every call, and the widest possible line.
+  Cards now read `31 workers · 16 waves · r276`, with the full envelope one expand away.
+- **The Fleet header names the wave that is actually running** (C-599). Active-wave selection tested
+  the inverse of a four-item terminal list, so any unrecognised status — including
+  `agent-turn-failed` — counted as active, and `BTreeMap` iteration returned the oldest match. A
+  long-dead failed wave held the header while another ran, with the same panel's worker list
+  disagreeing. Selection is now a closed allow-list of in-flight statuses, newest first by wave
+  number. Worker rows also prefer the current wave within a status class, so finished workers stop
+  crowding out the running one.
+- **`flux fleet run --dry-run` validates without writing** (C-594). It promised "validate and return
+  the proposed result without writing" and skipped worktree creation accordingly — then wrote a loop
+  binding snapshot into a story worktree that deliberately did not exist, so every dry run failed with
+  `workspace root …/stories/<ID>: No such file or directory` before returning a topology.
+- **An operator-authored segment is no longer told its actions are only captured** (C-597). Every
+  `ai_segment` inherited the adaptive planner's system prompt, which states that Flux may capture an
+  action instead of executing it and directs the model to hand a plan back through `finalize_plan`.
+  That is correct for the plan-then-approve CLI path and wrong for an authored segment, where effects
+  really do execute through the approve/execute batch path — and Fleet story workers complied with
+  the prompt: one made 35 read-only calls, attempted no effect, and reported it could not run
+  anything, while holding `write`, `edit`, `bash` and `git_commit` in its admitted ceiling. Authored
+  segments now carry an execution contract instead; the evidence and grounding discipline is
+  unchanged, and the adaptive planner's prompt is untouched.
 - **An authored segment that reaches its history ceiling no longer destroys the turn** (C-595).
   A Fleet story worker committed its complete deliverable and then had the whole turn discarded by a
   retained-history budget it crossed by 0.43%, so Fleet reported the one story that actually

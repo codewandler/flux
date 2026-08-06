@@ -318,6 +318,57 @@ impl Workspace {
 
     /// Add a **read-only** allowed root (canonicalized; must exist) — reads/globs/greps may reach under
     /// it, writes stay confined to the primary root (C-21). Chainable.
+    /// Derive a **strictly narrower** view of this workspace (C-613).
+    ///
+    /// The counterpart the model was missing. `add_read_root`, `add_named_root` and
+    /// `set_unconfined(true)` all widen, and [`Workspace::with_root`] deliberately *preserves* the
+    /// access posture, so before this there was no way to hand a child less than the parent held —
+    /// which is why a `task` sub-agent inherited the parent's read roots and `unconfined` flag whole.
+    ///
+    /// Narrowing only, by construction:
+    /// - the new primary root must be at or below the current one, and must already be reachable
+    ///   through it (so this cannot be used to jump sideways);
+    /// - read roots are **intersected** with `keep_read_roots` — an entry not already held is
+    ///   ignored rather than granted;
+    /// - `@named` roots are dropped, because they are write-capable and a narrowing derive must not
+    ///   carry write reach forward implicitly;
+    /// - `unconfined` can only be cleared, never set. A narrowing of an unconfined workspace yields a
+    ///   confined one.
+    ///
+    /// Composes monotonically for the same reason `Executor::push_cap_scope` does: repeated narrowing
+    /// can only shrink, so a grandchild cannot recover reach an ancestor removed.
+    pub fn narrowed(&self, root: impl AsRef<Path>, keep_read_roots: &[PathBuf]) -> Result<Self> {
+        let requested = root.as_ref();
+        let root = requested
+            .canonicalize()
+            .map_err(|e| Error::Config(format!("narrowed root {}: {e}", requested.display())))?;
+        // Reachable through the current view, so narrowing cannot become a lateral move. An
+        // unconfined parent is exempt from the containment test but still yields a confined child.
+        if !self.unconfined && !root.starts_with(&self.root) {
+            return Err(Error::Config(format!(
+                "narrowed root {} is not inside the current workspace root {}",
+                root.display(),
+                self.root.display()
+            )));
+        }
+        let keep = keep_read_roots
+            .iter()
+            .filter_map(|path| path.canonicalize().ok())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            root,
+            // Write-capable; a narrowing derive does not carry them forward.
+            named: HashMap::new(),
+            read_roots: self
+                .read_roots
+                .iter()
+                .filter(|held| keep.iter().any(|wanted| wanted == *held))
+                .cloned()
+                .collect(),
+            unconfined: false,
+        })
+    }
+
     pub fn add_read_root(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let p = path
             .as_ref()
@@ -2993,6 +3044,75 @@ mod tests {
 
         // A missing target stays a hard error — never a silently mis-rooted workspace.
         assert!(ws.with_root(dir_b.join("missing")).is_err());
+    }
+
+    /// C-613 (failing first): `Workspace` had only widening operations, so nothing could hand a child
+    /// less than the parent held — which is why a `task` sub-agent inherited the parent's read roots
+    /// and `unconfined` flag whole. `narrowed` is the missing counterpart, and it must only ever
+    /// shrink.
+    #[test]
+    fn narrowed_only_ever_shrinks_the_view() {
+        let (base, _guard) = temp_workspace();
+        let inner = base.join("inner");
+        let kept = base.join("kept-read");
+        let dropped = base.join("dropped-read");
+        let sideways = base.join("sideways");
+        for dir in [&inner, &kept, &dropped, &sideways] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut ws = Workspace::new(&base).unwrap();
+        ws.add_read_root(&kept).unwrap();
+        ws.add_read_root(&dropped).unwrap();
+        ws.add_named_root("global_flows", &sideways).unwrap();
+        ws.set_unconfined(true);
+
+        let child = ws.narrowed(&inner, std::slice::from_ref(&kept)).unwrap();
+
+        assert_eq!(child.root(), inner.canonicalize().unwrap());
+        assert!(
+            child.read_roots().contains(&kept.canonicalize().unwrap()),
+            "an explicitly kept read root survives"
+        );
+        assert!(
+            !child
+                .read_roots()
+                .contains(&dropped.canonicalize().unwrap()),
+            "a read root not kept is dropped, not inherited"
+        );
+        assert!(
+            !child.has_named_root("global_flows"),
+            "named roots are write-capable and must not carry forward through a narrowing"
+        );
+        assert!(
+            !child.is_unconfined(),
+            "narrowing an unconfined workspace yields a confined one"
+        );
+
+        // A read root the parent never held cannot be granted by asking for it.
+        let forged = ws
+            .narrowed(&inner, std::slice::from_ref(&sideways))
+            .unwrap();
+        assert!(
+            forged.read_roots().is_empty(),
+            "narrowing intersects; it never grants: {:?}",
+            forged.read_roots()
+        );
+
+        // Narrowing composes monotonically — a grandchild cannot recover the dropped root.
+        let grandchild = child
+            .narrowed(&inner, &[kept.clone(), dropped.clone()])
+            .unwrap();
+        assert!(!grandchild
+            .read_roots()
+            .contains(&dropped.canonicalize().unwrap()));
+
+        // A confined parent refuses a lateral move.
+        let confined = Workspace::new(&inner).unwrap();
+        assert!(
+            confined.narrowed(&sideways, &[]).is_err(),
+            "narrowing cannot escape the current root"
+        );
     }
 
     /// C-97: `System::rerooted` keeps the resolved sandbox (posture object identity is opaque, so
