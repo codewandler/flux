@@ -2,10 +2,10 @@
 id: C-615
 title: "Refuse an unrunnable Fleet loop at validate time, not inside a spawned worker"
 pillar: "Core"
-status: ready
-priority: 20
+status: done
 epic: fleet-harness-throughput
 areas: [flux-cli, flux-flow]
+done_override: "Implemented and tested in main: AgentLoopBinding::validate_analysis runs the same analysis pass engine assembly runs, with an assumed-operations registry; test analysis_refuses_an_unbound_match_subject_that_runtime_validation_accepts. Four waves died on a static loop defect before this existed."
 ---
 
 # Refuse an unrunnable Fleet loop at validate time, not inside a spawned worker

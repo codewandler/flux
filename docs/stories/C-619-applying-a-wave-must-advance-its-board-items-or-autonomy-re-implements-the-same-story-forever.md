@@ -2,10 +2,10 @@
 id: C-619
 title: "Applying a wave must advance its Board items, or autonomy re-implements the same story forever"
 pillar: "Core"
-status: ready
-priority: 4
+status: done
 epic: fleet-harness-throughput
 areas: [flux-cli]
+done_override: "Implemented and tested in main: applying a wave accepts the candidate with an annotated fleet/accepted/<wave>/<repo> tag instead of merging in a detached source checkout where the merge landed on no branch; delivered items are also filtered from re-dispatch. Tests updated to the tag contract."
 ---
 
 # Applying a wave must advance its Board items, or autonomy re-implements the same story forever

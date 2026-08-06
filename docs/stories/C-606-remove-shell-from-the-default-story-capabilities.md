@@ -2,12 +2,12 @@
 id: C-606
 title: "Remove shell from the default story capabilities"
 pillar: "Core"
-status: ready
-priority: 6
+status: done
 epic: agent-evidence-scope
 areas: [flux-cli]
 design: docs/designs/agent-evidence-scope.md
 note: "bash/proc.run call no path resolver; with reads unrestricted at every other layer this is host-wide read authority"
+done_override: "Implemented and tested in main: DEFAULT_STORY_CAPABILITIES excludes shell (board_fleet_cmd.rs:9948) with a failing-first test at board_fleet_cmd.rs:14328. Acceptance boxes were never ticked, which left the story dispatchable — the same gap made the fleet re-implement C-612 from scratch."
 ---
 
 # Remove shell from the default story capabilities

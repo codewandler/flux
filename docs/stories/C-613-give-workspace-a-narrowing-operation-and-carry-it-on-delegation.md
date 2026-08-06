@@ -2,12 +2,12 @@
 id: C-613
 title: "Give Workspace a narrowing operation and carry it on delegation"
 pillar: "Core"
-status: ready
-priority: 13
+status: done
 epic: agent-evidence-scope
 areas: [flux-system]
 design: docs/designs/agent-evidence-scope.md
 note: "extends D-05 in the one direction it never needed: a child that should see less than its parent"
+done_override: "Implemented and tested in main: Workspace gained a strictly-narrowing constructor (flux-system/src/lib.rs:321) with a failing-first test at lib.rs:3060."
 ---
 
 # Give Workspace a narrowing operation and carry it on delegation

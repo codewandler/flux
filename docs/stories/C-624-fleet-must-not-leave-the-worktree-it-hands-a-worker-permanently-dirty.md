@@ -2,10 +2,10 @@
 id: C-624
 title: "Fleet must not leave the worktree it hands a worker permanently dirty"
 pillar: "Core"
-status: ready
-priority: 5
+status: done
 epic: fleet-harness-throughput
 areas: [flux-cli]
+done_override: "Implemented and tested in main: Fleet's own loop-binding snapshot no longer counts as the worker's uncommitted work, at both the pre-handoff and post-validation gates; test fleet_own_loop_binding_snapshot_is_not_worker_dirt."
 ---
 
 # Fleet must not leave the worktree it hands a worker permanently dirty
