@@ -55,6 +55,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Changed
 
+- **A Fleet agent no longer pays disk for incremental compilation it can never reuse.** Each story gets
+  a fresh worktree and a fresh target directory that is discarded when the wave is reclaimed, so
+  incremental artifacts were written and then deleted without ever being read — roughly half of a
+  checkout's build output. Disk, not model concurrency, is what caps how many workers can run, so this
+  is directly a width change. `CARGO_INCREMENTAL` also joins the forwarded environment allow-list,
+  without which the variable was dropped between the agent process and the `cargo` it runs and setting
+  it had no effect at all. `CARGO_TARGET_DIR` is deliberately *not* forwarded: it is a path, and one
+  shared target directory is locked exclusively by cargo, which would serialize the parallelism the
+  fleet exists to provide. An operator's own rebuilds keep incremental compilation.
 - **`flux board create` commits the document it creates**, path-scoped, with `--no-commit` to opt out.
   Items are resolved at a git ref wherever a board is federated — a workspace member's stories are read
   with `ls-tree`/`show` at its `canonical_ref` — so an uncommitted document is invisible to every read

@@ -2532,6 +2532,17 @@ impl System {
             "RUSTUP_HOME",
             "CARGO_HOME",
             "RUSTUP_TOOLCHAIN",
+            // A build-shape knob, not a location. A Fleet worker's target directory is created for one
+            // story and discarded with its worktree, so incremental artifacts are never reused and are
+            // pure disk cost — roughly half of a checkout's build output. Without this entry the
+            // variable was dropped between the agent process and the `cargo` it runs, so setting it had
+            // no effect at all.
+            //
+            // `CARGO_TARGET_DIR` is deliberately NOT here, for the same reason `FLUX_ADD_DIRS` is not:
+            // it is a path, and forwarding an operator's value would point every concurrent worker at
+            // one shared target directory — which cargo locks exclusively, serializing exactly the
+            // parallelism the fleet exists to provide.
+            "CARGO_INCREMENTAL",
             // The nested-sandbox marker (D-130) is deliberately NOT here. It used to be, forwarded
             // like any other allow-listed value, which is what left it forgeable: a caller-supplied
             // `FLUX_SANDBOXED` landed after this loop and there was nothing after *that* unless the

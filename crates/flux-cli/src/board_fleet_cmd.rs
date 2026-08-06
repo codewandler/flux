@@ -11090,11 +11090,21 @@ fn execute_agent_turn_with_runtime(
     let store = spec.store.clone();
     let prompt = render_agent_turn_prompt(spec, goals);
     let argv = agent_turn_argv(&std::env::current_exe()?, spec, prompt);
-    let environment = if spec.shell_capability {
-        vec![("FLUX_ENABLE_BASH".to_string(), "1".to_string())]
-    } else {
-        Vec::new()
-    };
+    // An agent's build output is throwaway, so it must not pay for incremental compilation.
+    //
+    // Each story gets a fresh worktree and a fresh target directory that is discarded when the wave is
+    // reclaimed, so incremental artifacts are written and then deleted without ever being reused. They
+    // are roughly half of a checkout's build output, and disk — not model concurrency — is what actually
+    // caps how many workers can run: a measured ~7 GB per story worktree against a filesystem with tens
+    // of gigabytes free is the difference between one worker and several.
+    //
+    // Set here rather than in a shared cargo config because it is only true for one-shot builders. An
+    // operator's own rebuilds legitimately want incremental compilation, and this must not take it away
+    // from them.
+    let mut environment = vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())];
+    if spec.shell_capability {
+        environment.push(("FLUX_ENABLE_BASH".to_string(), "1".to_string()));
+    }
     let output = match runtime {
         Some(runtime) => guarded_agent_run_on(
             runtime,
