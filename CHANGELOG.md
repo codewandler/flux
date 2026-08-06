@@ -20,6 +20,17 @@ All notable changes to this project are documented in this file. The format is b
   loser of a race no longer loses its receipt — including the failure evidence of a failed turn, which is
   the most expensive thing to drop.
 
+### Added
+
+- **`/restart` in the terminal UI** relaunches flux on the currently installed binary, reusing the exact
+  command line and resuming the same durable session. It exists because the alternative is a four-step dance
+  performed by hand — confirm nothing is in flight, stop the surface, install, respawn — whose last step is
+  the one everybody forgets, and a surface stopped for an install and never restarted looks exactly like a
+  crash. The replacement happens only after the terminal has been handed back, since a process that replaces
+  itself on the alternate screen leaves its successor drawing into a screen it never set up. Arguments are
+  reused verbatim: a restart that quietly changed the model, the fleet root or the posture would be a
+  different session wearing the same name.
+
 ## [0.58.0] - 2026-08-07
 
 ### Added

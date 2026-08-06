@@ -12,6 +12,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### New
+
+- **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
+  terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
+  no retyping the command you started with.
+
 ## [0.58.0] - 2026-08-07
 
 ### New

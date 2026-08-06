@@ -287,6 +287,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or switch model"),
     ("effort", "show or set reasoning effort"),
     ("quit", "exit flux"),
+    (
+        "restart",
+        "relaunch on the installed binary, resuming this session",
+    ),
     ("usage", "live usage; `history` opens the observatory"),
     ("insights", "summarize current-session facts"),
     ("compact", "compact session context"),
@@ -3519,6 +3523,34 @@ fn fmt_tool_timing(outcome: &ToolOutcome) -> String {
 /// table overlaid by `~/.flux/pricing.toml` (same loader the CLI uses). Reads `FLUX_VERBOSE`
 /// (exported by `flux tui -v`, value-parsed — see [`flag_on`]) once at startup: verbose starts
 /// tool cards expanded and shows their output in full instead of capped at [`MAX_DETAIL`] lines.
+/// Set by `/restart`, read once the terminal has been handed back.
+///
+/// A restart cannot happen from inside the event loop: the loop owns the terminal in raw mode on the
+/// alternate screen, and a process that replaces itself there leaves the next one drawing into a screen it
+/// never set up. So the command only records the intent and asks the loop to end normally, and the re-exec
+/// happens after `TerminalGuard::restore` — the same teardown a quit performs.
+static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Replace this process with the same command line, so a freshly installed binary takes over.
+///
+/// Exists because the alternative is a documented four-step dance an operator performs by hand — confirm
+/// nothing is in flight, stop the surface, install, respawn — and the step everybody forgets is the last
+/// one. A surface stopped for an install and never restarted looks exactly like a crash.
+///
+/// The durable session is on disk, so the replacement resumes the same conversation; nothing about the
+/// restart is a fresh start except the executable. Arguments are reused verbatim, which is what makes this
+/// safe to offer at all: a restart that quietly changed the model, the fleet root or the posture would be a
+/// different session wearing the same name.
+#[cfg(unix)]
+fn exec_replacement() -> anyhow::Result<std::convert::Infallible> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()
+        .map_err(|error| anyhow::Error::new(error).context("resolve the running executable"))?;
+    let mut command = std::process::Command::new(exe);
+    command.args(std::env::args_os().skip(1));
+    Err(anyhow::Error::new(command.exec()).context("replace this process"))
+}
+
 pub async fn run(
     agent: FlowEngine,
     session_id: String,
@@ -3615,7 +3647,23 @@ pub async fn run_with_options(
     )
     .await;
     let restore = guard.restore(terminal.backend_mut());
-    result.and(restore)
+    let outcome = result.and(restore);
+    // Only after the terminal is back in the shell's hands. A failed exec is reported rather than
+    // swallowed: the operator is left in a working shell believing a restart happened, which is worse than
+    // an error they can read.
+    if RESTART_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        outcome?;
+        #[cfg(unix)]
+        {
+            let error = exec_replacement().expect_err("exec only returns on failure");
+            return Err(error);
+        }
+        #[cfg(not(unix))]
+        return Err(anyhow::anyhow!(
+            "restart is only implemented where a process can replace itself; quit and relaunch"
+        ));
+    }
+    outcome
 }
 
 /// The [`ChatState`] the event loop draws from, assembled from the engine, the session and the
@@ -5250,6 +5298,15 @@ async fn handle_command(
         }
         "usage" => state.usage_open = true,
         "quit" | "exit" => return Ok(true),
+        "restart" => {
+            RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.push(Entry::Notice {
+                text: "restarting on the installed binary — this session resumes from its durable store"
+                    .into(),
+                sev: Sev::Info,
+            });
+            return Ok(true);
+        }
         "queue" => {
             if state.queue.is_empty() {
                 state.push(Entry::Notice {
