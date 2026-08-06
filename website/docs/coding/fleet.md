@@ -26,14 +26,16 @@ epics, story status, milestones or the program schedule.
 |---|---|---|
 | Fleet | One local execution supervisor rooted at a workspace. | Fleet config plus runtime journal |
 | Main coordinator | The single reserved agent that accepts requirements and orchestrates dispatch. It selects from the Board; it does not replace Board authority. | Fleet runtime state |
-| Worker | One admitted sub-agent with one role, capability ceiling, persistent session and bounded assignment. In the normal story path, worker and sub-agent are 1:1. | Fleet admission/runtime state |
+| Worker | One admitted sub-agent with one role, capability ceiling, persistent session and bounded assignment. In the normal story path, worker and sub-agent are 1:1. Its recorded status is reconciled against the process supervising its turn, so a worker whose supervisor is gone reads `interrupted` rather than staying busy forever. | Fleet admission/runtime state |
 | Configured wave | Board-owned repository-local dispatch template. It has no worker, worktree or runtime lifecycle. | `.flux/board.toml` |
-| Dispatched wave instance | One pinned execution of selected BoardRefs, with integration bases, workers, receipts, reviews, gate and apply status. | `.flux/fleet/state.json` and events |
-| Handoff | Typed candidate result for one story: exact commit, write set and test evidence. It is not completion. | Fleet runtime state/events |
+| Dispatched wave instance | One pinned execution of selected BoardRefs, with integration bases, workers, receipts, reviews, gate and apply status. Integration cherry-picks each story's **whole commit range** from its pinned base to its cited commit, because a worker legitimately makes several commits and applying only the cited one silently drops the rest. A failed integration is retryable once its cause is fixed. | `.flux/fleet/state.json` and events |
+| Handoff | Typed candidate result for one story: exact commit, write set and test evidence. The host re-runs the cited argv at the pinned base and at the commit, in a checkout pinned at that base which integration never touches. It verifies *the argv it is given*, so a commit can still break a different test in the same story — a green handoff is not a green story, which is what the repository gate is for. It is not completion. | Fleet runtime state/events |
 | Review | Fresh read-only assessment of the exact candidate commit and story contract. A result is PASS, REWORK or PARK. | Fleet runtime state/events |
-| Gate | Repository command run against the assembled wave candidate. Green makes the wave apply-eligible; it does not publish it. | Fleet receipt/runtime state |
-| Apply | Explicit local integration of a green candidate into the configured checkout. | Git plus Fleet runtime state |
-| Release/deploy | Separate publication boundary after apply. Fleet never implies either from a green gate. | Release/deployment system |
+| Candidate preparation | Optional per-repository step that regenerates whatever the repository derives from a whole candidate, run after every cherry-pick and before the gate. Its output is committed into the candidate. | Fleet receipt/runtime state |
+| Gate | Repository command run against the assembled wave candidate. Green makes the wave apply-eligible; it does not publish it. One gate run per candidate: a retry that recomputes an identical candidate is refused rather than re-gated. | Fleet receipt/runtime state |
+| Accept (apply) | Pins a green candidate with an annotated `fleet/accepted/<wave>/<repository>` tag. It does not merge, does not touch a working tree, and does not require the canonical ref to have stood still. | Git tag plus Fleet runtime state |
+| Land | Writing the canonical branch from accepted candidates, re-gated against whatever that branch has become. Separate from acceptance, because a candidate is green against the base it was gated on. | Git plus the operator |
+| Release/deploy | Separate publication boundary after landing. Fleet never implies either from a green gate. | Release/deployment system |
 
 The word “wave” should therefore be qualified when it matters: a **configured wave** is planning
 configuration; a **dispatched wave instance** is mutable execution state.
@@ -109,8 +111,18 @@ id = "web"
 root = "../web"
 canonical_ref = "origin/main"
 board = "product"
+# Optional. Regenerates whatever this repository derives from a whole candidate, once, after every
+# cherry-pick and before the gate. Committed into the candidate so it survives into the accepted tag.
+prepare = ["npm", "run", "build:docs"]
 gate = ["npm", "test"]
 ```
+
+A `prepare` step exists because some checked-in artifacts are derived from the whole wave rather than
+from any one story — a documentation mirror, a generated index, an aggregated manifest. No story can
+produce a correct one: two stories regenerating the same artifact collide, and regenerating it on
+either branch alone yields an artifact missing the other story's contribution. Preparation runs at the
+only point where the inputs are complete. A preparation failure is that repository's failure, so a
+stale derived artifact never reaches the gate disguised as the stories being wrong.
 
 Instruction paths are confined under the fleet root. Validation rejects duplicate/reserved ids,
 another coordinator role, invalid instance limits, overlapping roots, missing boards, invalid refs,
@@ -418,11 +430,49 @@ flux fleet status --output json
 flux fleet inspect integration wave-7 --output json
 flux fleet integrate wave-7 --if-revision 17 --idempotency-key integrate-wave-7 --output json
 flux fleet apply wave-7 --if-revision 18 --idempotency-key apply-wave-7 --output json
+flux fleet apply wave-7 --only api --output json
 ```
 
-`apply` revalidates the base, board revisions, gate record, and repository cleanliness, then merges
-locally in repository order. It never pushes, opens a pull request, tags, releases, deploys, or
-deletes a worktree. Those are separate operator decisions.
+`apply` **accepts** a candidate: it checks that the repository recorded exactly one green final gate
+and that the candidate branch still points at the commit that was gated, then pins that commit with
+an annotated `fleet/accepted/<wave>/<repository>` tag. It does not merge, and it does not require the
+canonical ref to have stood still — ordinary work continues while a wave is gated, and a candidate is
+no less valid for it. The tag is what makes accepted-but-unlanded work impossible to lose.
+
+Acceptance is deliberately not landing. Writing the canonical branch is a separate step with its own
+verification, because a candidate is green against *the base it was gated on* — the acceptance record
+names that base, and whether the canonical ref has moved since, precisely so the landing step knows it
+must re-gate.
+
+`apply <wave> --only <repository>` accepts one repository's candidate from a wave whose other
+repositories failed. Integration assembles and gates one candidate per repository, so a wave can hold
+a green candidate beside a conflicted one; without this, an independent repository's delivered work
+would be stranded by a collision it had no part in. A named apply reports what it left behind and does
+not change the wave's own verdict.
+
+`apply` never pushes, opens a pull request, pushes a tag, releases, deploys, or deletes a worktree.
+Those are separate operator decisions.
+
+## Reclaiming storage
+
+A wave's build directories are the largest thing the fleet leaves on disk, and disk is what actually
+caps how many workers can run. Acceptance reclaims automatically; `fleet reclaim` covers the waves
+that ended some other way.
+
+```sh
+flux fleet reclaim --dry-run --output json   # what would be freed
+flux fleet reclaim wave-7 --output json      # one wave
+flux fleet reclaim --output json             # every wave that is not in flight
+```
+
+Build output is regenerable and always goes. A **worktree** is removed only for a wave that is applied
+or cancelled — an unfinished wave keeps its shape, because a worktree that happens to be empty is not
+the same as one that is no longer needed, and a wave with deliverable work and nowhere to assemble a
+candidate cannot be repaired. A worktree that still holds a commit or an uncommitted change is
+retained with the reason, and a branch is deleted only when git agrees it holds nothing unique.
+
+A wave that can still advance is refused rather than reclaimed: deleting a build it is about to use
+would cost work rather than space.
 
 ## Restart and resume
 
