@@ -898,6 +898,14 @@ pub(super) enum FleetAction {
     /// Merge a recorded green local candidate. Never pushes, releases or deploys.
     Apply {
         wave: String,
+        /// Accept only this repository's candidate, from a wave whose other repositories failed.
+        ///
+        /// Integration is per repository and produces one candidate each, so a wave can hold a green
+        /// candidate beside a conflicted one. Without this, that green candidate was unreachable: apply
+        /// demanded the whole wave be green, and an independent repository's delivered work was stranded
+        /// by a collision it had no part in.
+        #[arg(long)]
+        only: Option<String>,
     },
     Status,
     Schedule,
@@ -5757,7 +5765,9 @@ worktree_root = ".flux/fleet/worktrees"
                 state.revision,
             ))
         }
-        FleetAction::Apply { wave } => apply_wave(command, root, state, wave),
+        FleetAction::Apply { wave, only } => {
+            apply_wave(command, root, state, wave, only.as_deref())
+        }
         FleetAction::Call { operation } => fleet_call(command, root, state, operation, request),
     }
 }
@@ -13451,6 +13461,9 @@ fn integrate_wave(
     let repository_count = wave["topology"]["repositories"]
         .as_array()
         .map_or(0, Vec::len);
+    // Per-repository outcomes, so one repository's failure does not decide the others.
+    let mut failures: Vec<Value> = Vec::new();
+    let mut conflicted = false;
     for repository_index in 0..repository_count {
         let repository_id = wave["topology"]["repositories"][repository_index]["id"]
             .as_str()
@@ -13470,7 +13483,10 @@ fn integrate_wave(
             || git_output(&integration_worktree, &["status", "--porcelain"])
                 .is_some_and(|s| !s.is_empty())
         {
-            bail!("conflict/precondition: integration worktree for {repository_id} is not clean at its pinned base")
+            // Also per repository: one repository's dirty integration worktree says nothing about
+            // another's, and aborting here discarded candidates that were fine.
+            failures.push(json!({"repository": repository_id, "reason": "integration worktree is not clean at its pinned base"}));
+            continue;
         }
         let repo_items = order
             .iter()
@@ -13501,6 +13517,7 @@ fn integrate_wave(
                     wave["status"] = json!("conflict");
                     wave["apply_eligible"] = json!(false);
                     wave["conflict"] = json!({"story":item,"commit":commit,"files":conflicts,"stderr":clipped_redacted(output.stderr.as_bytes()),"candidate":candidate});
+                    wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"conflict","runs":0,"reason":format!("integration conflict in {item}"),"candidate":candidate});
                     state.waves.insert(wave_id.to_string(), wave.clone());
                     state.revision += 1;
                     persist_fleet_mutation(
@@ -13510,9 +13527,23 @@ fn integrate_wave(
                         "wave.integration.conflict",
                         wave["conflict"].clone(),
                     )?;
-                    bail!("validation/gate: integration conflict in {item}; candidate history and conflict evidence were preserved")
+                    // Record and move on, rather than aborting integration for every repository.
+                    //
+                    // A conflict is a property of ONE repository's commits. Bailing here meant a
+                    // flux-internal collision also discarded an exchange candidate whose stories were
+                    // independent and perfectly integrable — the wave was assembled per repository from
+                    // the start, so nothing about that abort was necessary. The wave still ends as a
+                    // failure and stays ineligible for a blanket apply; what changes is that the healthy
+                    // repositories now have gated candidates, which `apply --only` can accept.
+                    failures.push(json!({"repository": repository_id, "reason": format!("integration conflict in {item}")}));
+                    conflicted = true;
+                    break;
                 }
             }
+        }
+        if conflicted {
+            conflicted = false;
+            continue;
         }
         let candidate = if command.dry_run {
             base.clone()
@@ -13540,7 +13571,8 @@ fn integrate_wave(
                 "wave.gate.red",
                 json!({"wave":wave_id,"repository":repository_id,"reason":"missing final gate argv"}),
             )?;
-            bail!("validation/gate: repository {repository_id} has no runnable final gate")
+            failures.push(json!({"repository": repository_id, "reason": "no runnable final gate"}));
+            continue;
         }
         let gate = if command.dry_run {
             json!({"argv":gate_argv,"success":true,"exit_code":Value::Null,"stdout":"","stderr":"","preview":true})
@@ -13562,8 +13594,37 @@ fn integrate_wave(
                 "wave.gate.red",
                 json!({"wave":wave_id,"repository":repository_id,"candidate":candidate,"gate":wave["topology"]["repositories"][repository_index]["gate"]}),
             )?;
-            bail!("validation/gate: final gate failed for {repository_id}; exact candidate {candidate} was preserved")
+            failures.push(json!({"repository": repository_id, "candidate": candidate, "reason": "final gate failed"}));
+            continue;
         }
+    }
+    if !failures.is_empty() {
+        // The wave failed, and every repository that did not is now sitting on a gated candidate that
+        // `apply --only <repository>` can accept. Naming them in the error is the difference between
+        // "this wave is stuck" and "this half of it is ready".
+        let green = wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|repository| repository["gate"]["status"].as_str() == Some("green"))
+            .filter_map(|repository| repository["id"].as_str())
+            .collect::<Vec<_>>();
+        let stuck = failures
+            .iter()
+            .filter_map(|failure| failure["repository"].as_str())
+            .collect::<Vec<_>>();
+        bail!(
+            "validation/gate: integration failed for {}{}",
+            stuck.join(", "),
+            if green.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} produced a green candidate and can be accepted with `fleet apply {wave_id} --only <repository>`",
+                    green.join(", ")
+                )
+            }
+        )
     }
     wave["status"] = json!("green");
     wave["apply_eligible"] = json!(true);
@@ -13584,23 +13645,48 @@ fn apply_wave(
     root: &Path,
     mut state: FleetState,
     wave: &str,
+    only: Option<&str>,
 ) -> Result<(String, Value, Vec<String>, u64)> {
     let record = state
         .waves
         .get(wave)
         .cloned()
         .with_context(|| format!("not-found: wave {wave}"))?;
-    if !record["apply_eligible"].as_bool().unwrap_or(false)
-        || record["status"].as_str() != Some("green")
+    // Whole-wave eligibility is required only for a whole-wave apply.
+    //
+    // `--only` names one repository, and each repository's candidate is assembled and gated on its own,
+    // so the wave rollup says nothing about whether THAT candidate is good. The per-repository green
+    // gate is still demanded below, unchanged — this relaxes which waves may be asked, not what counts
+    // as accepted.
+    if only.is_none()
+        && (!record["apply_eligible"].as_bool().unwrap_or(false)
+            || record["status"].as_str() != Some("green"))
     {
         bail!("conflict/precondition: wave {wave} has no recorded green final gate");
     }
     let repositories = record["topology"]["repositories"]
         .as_array()
         .context("validation/gate: green wave has no repository topology")?;
+    if let Some(only) = only {
+        if !repositories
+            .iter()
+            .any(|repository| repository["id"].as_str() == Some(only))
+        {
+            bail!("not-found: wave {wave} has no repository {only}")
+        }
+    }
     let mut targets = Vec::new();
+    let mut skipped = Vec::new();
     for repository in repositories {
         let repository_id = repository["id"].as_str().unwrap_or("default");
+        if only.is_some_and(|only| only != repository_id) {
+            // Named apply: report what was left behind rather than silently accepting a subset.
+            skipped.push(json!({
+                "repository": repository_id,
+                "gate": repository["gate"]["status"].as_str().unwrap_or("none"),
+            }));
+            continue;
+        }
         if repository["gate"]["status"].as_str() != Some("green")
             || repository["gate"]["runs"].as_u64() != Some(1)
         {
@@ -13699,16 +13785,21 @@ fn apply_wave(
     }
     state.revision += 1;
     let mut updated = record;
-    updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
-    updated["apply_eligible"] = json!(command.dry_run);
+    // A named apply does not finish the wave, so it must not change the wave's own verdict or reclaim
+    // its storage: the repositories left behind still need their worktrees and their builds to be
+    // retried. `fleet reclaim` handles them once the wave really is done.
+    if only.is_none() {
+        updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
+        updated["apply_eligible"] = json!(command.dry_run);
+    }
     updated["applied"] = json!(merged);
-    let reclaimed = if command.dry_run {
+    let reclaimed = if command.dry_run || only.is_some() {
         Value::Null
     } else {
         reclaim_wave_storage(&updated)
     };
     state.waves.insert(wave.to_string(), updated);
-    let data = json!({"wave":wave,"repositories":merged,"merged_locally":false,"accepted":!command.dry_run,"pushed":false,"released":false,"deployed":false,"reclaimed":reclaimed});
+    let data = json!({"wave":wave,"repositories":merged,"only":only,"skipped":skipped,"merged_locally":false,"accepted":!command.dry_run,"pushed":false,"released":false,"deployed":false,"reclaimed":reclaimed});
     persist_fleet_mutation(command, root, &state, "wave.applied", data.clone())?;
     Ok((
         format!(

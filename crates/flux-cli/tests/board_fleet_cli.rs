@@ -2131,6 +2131,56 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
         !retry.status.success(),
         "a red wave cannot spend a second gate run"
     );
+
+    // Failing first: a NAMED apply is judged per repository, not by the wave rollup.
+    //
+    // Integration assembles and gates one candidate per repository, so a wave can hold a green candidate
+    // beside a conflicted one — and apply demanding the whole wave be green stranded that green candidate
+    // behind a collision it had no part in. The two refusals must therefore be distinguishable: the
+    // whole-wave apply is refused by the rollup, while `--only` reaches the per-repository gate check and
+    // is refused by THAT. Here the one repository is genuinely red, so both refuse — but for different,
+    // observable reasons, which is exactly the contract change.
+    let whole = flux(&root, &["fleet", "apply", "wave-2", "--output", "json"]);
+    assert!(!whole.status.success());
+    let whole: serde_json::Value = serde_json::from_slice(&whole.stdout).unwrap();
+    assert!(
+        whole["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has no recorded green final gate"),
+        "whole-wave apply is refused by the rollup: {}",
+        whole["error"]["message"]
+    );
+
+    let named = flux(
+        &root,
+        &[
+            "fleet", "apply", "wave-2", "--only", "repo", "--output", "json",
+        ],
+    );
+    assert!(!named.status.success());
+    let named: serde_json::Value = serde_json::from_slice(&named.stdout).unwrap();
+    assert!(
+        named["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lacks exactly one recorded green final gate"),
+        "a named apply must reach the per-repository gate check: {}",
+        named["error"]["message"]
+    );
+
+    // Naming a repository the wave does not contain is a not-found, not a silent no-op that reports
+    // success for accepting nothing.
+    let absent = flux(
+        &root,
+        &[
+            "fleet", "apply", "wave-2", "--only", "absent", "--output", "json",
+        ],
+    );
+    assert!(!absent.status.success());
+    let absent: serde_json::Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert_eq!(absent["error"]["class"], "not-found");
+
     fs::remove_dir_all(root).ok();
 }
 

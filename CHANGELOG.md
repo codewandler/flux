@@ -86,6 +86,16 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **One repository's integration failure no longer discards another's candidate** (C-630). Integration
+  assembles and gates one candidate per repository, but the first repository to conflict, gate red, miss
+  a gate argv, or hold a dirty integration worktree aborted the run for all of them — so a
+  flux-internal collision threw away an exchange candidate whose stories were independent and perfectly
+  integrable. Each repository's outcome is now recorded on its own, the error names both the repositories
+  that failed and the ones that produced a green candidate, and `fleet apply <wave> --only <repository>`
+  accepts a named candidate from a wave that is not wholly green. The per-repository green-gate
+  requirement is unchanged: this relaxes which waves may be asked, not what counts as accepted. A named
+  apply reports what it left behind, does not change the wave's own verdict, and does not reclaim storage
+  the remaining repositories still need.
 - **A dispatch is no longer discarded by a concurrent write.** Creating a wave already happened on disk
   — a worktree and a branch per story — before the state write. If the coordinator or an operator wrote
   Fleet state in that window, the compare-and-set lost and the whole dispatch was thrown away with its
