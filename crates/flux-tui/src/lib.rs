@@ -1129,6 +1129,7 @@ impl ChatState {
             cost_usd: None,
             cost_model: None,
             cost_unpriced: false,
+            budget: None,
             steps: 0,
             last_elapsed: None,
             model_call_start: None,
@@ -1414,6 +1415,35 @@ impl ChatState {
                 None if flux_core::is_metered_cloud_spec(model) => self.cost_unpriced = true,
                 None => {}
             }
+        }
+    }
+
+    /// C-542: fold the engine's published budget projection into the surface.
+    ///
+    /// The projection *is* the number: this stores the enforcing ledger's snapshot and re-derives
+    /// nothing, so the header cannot disagree with the breach that stops the run. A crossed line
+    /// arrives with the event that crossed it, so the ledger's one-warning-per-dimension rule is
+    /// exactly what the transcript shows — a target is announced once, not once per model call.
+    pub(crate) fn record_budget(
+        &mut self,
+        projection: flux_core::BudgetProjection,
+        warning: Option<flux_core::BudgetBreach>,
+        exhausted: Option<flux_core::BudgetBreach>,
+    ) {
+        self.budget = Some(projection);
+        if let Some(breach) = warning {
+            self.push(Entry::Notice {
+                text: format!("⚠ budget target crossed — {breach}; execution continues"),
+                sev: Sev::Warn,
+            });
+        }
+        if let Some(breach) = exhausted {
+            self.push(Entry::Notice {
+                text: format!(
+                    "⛔ budget limit reached — {breach}; stopping at the next safe boundary"
+                ),
+                sev: Sev::Err,
+            });
         }
     }
 
@@ -2676,6 +2706,12 @@ impl ChatState {
         if self.auto_approve {
             right.push(vec![Span::styled("auto-ok", t.warn_style())]);
         }
+        // C-542: the live budget segment sits directly below `auto-ok` in precedence — a declared
+        // ceiling the run is about to hit outranks cumulative counters. Its figures are the engine's
+        // published projection; the surface adds nothing up itself.
+        if let Some(segment) = self.budget_segment() {
+            right.push(segment);
+        }
         // C-139: `↑` is now every prompt token the session sent (fresh + both cache tiers, summed
         // per model call), so the cache segment's hit % is a share OF it. The old `↑` was the
         // fresh-input side of each turn's last round, and `cache` was read+write added together —
@@ -2733,13 +2769,74 @@ impl ChatState {
         if self.operations.is_none() {
             right.push(vec![Span::styled("standalone", t.muted_style())]);
         }
-        // Segment order [auto-ok, tokens, cache, cost, shell, gather, effort, standalone];
+        // Segment order [auto-ok, budget, tokens, cache, cost, shell, gather, effort, standalone];
         // bar_line drops from the end, so optional identity/badges shed first and auto-ok survives
         // the longest (C-102/C-116).
         for seg in right.iter_mut().skip(1) {
             seg.insert(0, Span::styled(" · ", t.muted_style()));
         }
         bar_line(left, right, width)
+    }
+
+    /// C-542: the header's live budget segment — `budget Σ1.6k/4.0k tok`, `budget 3/10 calls`,
+    /// `budget 12.0s/1.0m`.
+    ///
+    /// Every figure comes from the enforcing [`flux_core::BudgetLedger`]'s published projection, so
+    /// this surface and the stop that actually fires cannot drift apart. `None` when nothing is
+    /// declared: an undeclared dimension renders nothing rather than a reassuring zero ceiling.
+    fn budget_segment(&self) -> Option<Vec<Span<'static>>> {
+        let t = &self.theme;
+        let projection = self.budget.as_ref()?;
+        // One bounded segment shows the dimension nearest its declared figure — the one that will
+        // bite first. Five competing ratios would not survive a narrow bar anyway.
+        let dimension = flux_core::BudgetDimension::ALL
+            .into_iter()
+            .filter(|dimension| projection.declared(*dimension).is_some())
+            .max_by(|a, b| {
+                projection
+                    .fraction(*a)
+                    .unwrap_or(0.0)
+                    .total_cmp(&projection.fraction(*b).unwrap_or(0.0))
+            })?;
+        let declared = projection.declared(dimension)?;
+        let spent = projection.spent.get(dimension);
+        let figures = match dimension {
+            flux_core::BudgetDimension::WallTime => format!(
+                "{}/{}",
+                fmt_elapsed(Duration::from_millis(spent)),
+                fmt_elapsed(Duration::from_millis(declared))
+            ),
+            flux_core::BudgetDimension::ModelCalls => format!("{spent}/{declared} calls"),
+            flux_core::BudgetDimension::InputTokens => {
+                format!("↑{}/{} tok", fmt_count(spent), fmt_count(declared))
+            }
+            flux_core::BudgetDimension::OutputTokens => {
+                format!("↓{}/{} tok", fmt_count(spent), fmt_count(declared))
+            }
+            flux_core::BudgetDimension::TotalTokens => {
+                format!("Σ{}/{} tok", fmt_count(spent), fmt_count(declared))
+            }
+        };
+        // The distinction the whole vocabulary turns on stays legible: a crossed hard limit is a stop
+        // line and says `limit`; a crossed target is a warning and says that instead.
+        let (suffix, style) = if projection
+            .exhausted
+            .is_some_and(|breach| breach.dimension == dimension)
+        {
+            (" limit", t.err_style())
+        } else if projection
+            .warnings
+            .iter()
+            .any(|breach| breach.dimension == dimension)
+        {
+            (" over target", t.warn_style())
+        } else {
+            ("", t.muted_style())
+        };
+        Some(vec![Span::styled(
+            format!("budget {figures}{suffix}"),
+            style,
+        )])
     }
 
     /// The bottom footer bar: an animated spinner + phase + elapsed while running, else keybinding
@@ -3134,6 +3231,9 @@ impl ChatState {
         self.turn_rounds.clear();
         self.cost_usd = None;
         self.cost_unpriced = false;
+        // C-542: the budget projection belongs to the run whose ledger published it, so projecting a
+        // different session drops it rather than showing another run's spend.
+        self.budget = None;
         // C-221: panes are session-scoped, so projecting a different session (`/resume`) drops them
         // rather than attributing one session's panes to another.
         self.panes.clear();
@@ -3793,6 +3893,11 @@ where
                 UiEvent::BackgroundUsage { model, usage } => {
                     state.record_background_usage(&model, &usage);
                 }
+                UiEvent::Budget {
+                    projection,
+                    warning,
+                    exhausted,
+                } => state.record_budget(*projection, warning, exhausted),
                 UiEvent::Retry {
                     attempt,
                     max_attempts,
@@ -11083,6 +11188,141 @@ mod tests {
             }
             _ => panic!("expected UiEvent::Intent"),
         }
+    }
+
+    /// One measured model call, in the shared budget vocabulary (C-542). The real
+    /// [`flux_core::BudgetLedger`] produces every figure these tests assert on, so a surface number
+    /// can never be a hand-summed total that disagrees with what actually stops a run.
+    fn budget_call(event_id: &str, total_tokens: u64) -> flux_core::BudgetUsageEvent {
+        flux_core::BudgetUsageEvent {
+            event_id: event_id.into(),
+            scope: flux_core::BudgetScope::Segment,
+            attribution: flux_core::BudgetAttribution {
+                run_id: "run-1".into(),
+                session_id: Some("s-1".into()),
+                turn_id: Some(1),
+                segment: Some("explore".into()),
+            },
+            spend: flux_core::BudgetSpend {
+                model_calls: 1,
+                total_tokens,
+                ..flux_core::BudgetSpend::default()
+            },
+            rollup: false,
+        }
+    }
+
+    /// C-542: the engine's published budget projection is the single source of budget numbers. The
+    /// sink decodes it as its own `UiEvent` — projection plus the crossing that rides the event that
+    /// crossed it — instead of the surface re-deriving totals from raw usage.
+    #[test]
+    fn channel_sink_forwards_the_live_budget_projection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelSink { tx, action_id: 1 };
+        let mut ledger = flux_core::BudgetLedger::new(flux_core::BudgetEnvelope {
+            scope: flux_core::BudgetScope::Run,
+            target: flux_core::BudgetLimits::with_total_tokens(100),
+            limit: flux_core::BudgetLimits::with_total_tokens(400),
+        });
+        let outcome = ledger.record(&budget_call("call-1", 150));
+
+        sink.observation(&flux_evidence::Observation::new(
+            flux_evidence::KIND_BUDGET_PROJECTION,
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "projection": ledger.projection(),
+                "warning": outcome.warning,
+            }),
+        ));
+        match untag(rx.try_recv().expect("a Budget event was sent")) {
+            UiEvent::Budget {
+                projection,
+                warning,
+                exhausted,
+            } => {
+                assert_eq!(projection.spent.total_tokens, 150);
+                assert_eq!(
+                    projection.declared(flux_core::BudgetDimension::TotalTokens),
+                    Some(400),
+                    "the surface renders the ledger's own declared figure"
+                );
+                let warning = warning.expect("the crossed target rides its own event");
+                assert_eq!(warning.limit, 100);
+                assert!(exhausted.is_none(), "a target is never a stop line");
+            }
+            _ => panic!("expected UiEvent::Budget"),
+        }
+    }
+
+    /// C-542: budget consumption is visible **while the run executes** — the header shows spent
+    /// versus declared and updates as spend accrues, and the two words the vocabulary turns on stay
+    /// distinguishable: a crossed target warns, a crossed hard limit is the stop line.
+    #[test]
+    fn header_shows_live_budget_consumption_and_separates_target_from_limit() {
+        let header = |state: &ChatState| -> String {
+            state
+                .header_line(140)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let transcript = |state: &ChatState| -> String {
+            state
+                .transcript_lines(140)
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+                .collect()
+        };
+        let mut state = ChatState::new("mock".into());
+        assert!(
+            !header(&state).contains("budget"),
+            "an undeclared budget renders nothing at all, never a zero ceiling"
+        );
+
+        let mut ledger = flux_core::BudgetLedger::new(flux_core::BudgetEnvelope {
+            scope: flux_core::BudgetScope::Run,
+            target: flux_core::BudgetLimits::with_total_tokens(1_000),
+            limit: flux_core::BudgetLimits::with_total_tokens(4_000),
+        });
+        let outcome = ledger.record(&budget_call("call-1", 400));
+        state.record_budget(ledger.projection(), outcome.warning, outcome.exhausted);
+        let running = header(&state);
+        assert!(running.contains("budget Σ400/4.0k tok"), "{running}");
+        assert!(!running.contains("target"), "{running}");
+
+        // Spend accrues: the header follows the ledger, and crossing the target warns visibly
+        // without claiming the run stopped.
+        let outcome = ledger.record(&budget_call("call-2", 1_200));
+        state.record_budget(ledger.projection(), outcome.warning, outcome.exhausted);
+        let over_target = header(&state);
+        assert!(
+            over_target.contains("budget Σ1.6k/4.0k tok"),
+            "{over_target}"
+        );
+        assert!(over_target.contains("over target"), "{over_target}");
+        assert!(
+            transcript(&state).contains("budget target crossed"),
+            "{}",
+            transcript(&state)
+        );
+        assert!(
+            !transcript(&state).contains("budget limit reached"),
+            "a target must not be reported as a stop: {}",
+            transcript(&state)
+        );
+
+        // The hard limit is the stop line, and both surfaces say so.
+        let outcome = ledger.record(&budget_call("call-3", 3_000));
+        state.record_budget(ledger.projection(), outcome.warning, outcome.exhausted);
+        let exhausted = header(&state);
+        assert!(exhausted.contains("budget Σ4.6k/4.0k tok"), "{exhausted}");
+        assert!(exhausted.contains("limit"), "{exhausted}");
+        assert!(
+            transcript(&state).contains("budget limit reached"),
+            "{}",
+            transcript(&state)
+        );
     }
 
     #[test]

@@ -376,7 +376,11 @@ pub struct BudgetOutcome {
 
 /// A serializable snapshot of spent versus declared for one scope — the single source CLI, TUI and
 /// C-571's Fleet ledger project.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// [`Default`] is the honest empty snapshot: nothing spent and nothing declared, so
+/// [`Self::is_declared`] is `false` and [`Self::declared`] is `None` for every dimension. It is not a
+/// zero ceiling.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BudgetProjection {
     pub scope: BudgetScope,
     pub spent: BudgetSpend,
