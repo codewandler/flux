@@ -2329,6 +2329,14 @@ pub(super) async fn build_agent_with(
             &cfg.permissions.deny,
         )));
     }
+    // C-612 (the other half of the same boundary): `[tools] disable` must bind delegated work too.
+    // The child executor carried no disabled set, so an op the operator disabled stayed advertised to
+    // every sub-agent's model and dispatched for real. The ORIGINAL expressions travel, not this
+    // executor's resolved names — a child's catalog is narrowed by role ∩ scope, so the spawner
+    // resolves them against the registry the child actually gets.
+    if !cfg.tools.disable.is_empty() {
+        sub_agents = sub_agents.with_disabled_patterns(cfg.tools.disable.clone());
+    }
     if let Some(agent_loop) = fleet_research_loop {
         sub_agents = sub_agents.with_agent_loop(agent_loop);
     }

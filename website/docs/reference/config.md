@@ -169,6 +169,11 @@ execute writes while reasoning.
 otherwise the operation prompts. Entries may be operation names (`read`, `search`) or scoped shell
 subjects such as `Bash(git:*)`. Reads are pre-allowed by the local defaults.
 
+Deny rules reach sub-agents: a `task`-delegated child inherits the **denials only** (never the allow
+list, which would widen a child past what the operator granted its parent), and they descend through
+bounded nested delegation. A sub-agent runs non-interactively, so a subject that merely *prompts* for
+the top-level agent is auto-approved for the child — only a deny rule refuses it there.
+
 For `flux app run`, these host rules are evaluated **inside** any `permissions` ceiling declared by
 the `.flux` program and its owning agent. A local deny still wins; a local allow can approve a scoped
 invocation but cannot restore an operation the app source removed.
@@ -306,6 +311,11 @@ dispatched directly too — so a cached plan or a resumed session can't call it 
 *authorization policy* (`[[policy.grants]]`, permission rules, approval) remains the actual security
 control. If the two ever disagree, the policy wins: `[tools] disable` narrows what is offered and
 dispatchable, never what an already-granted call may do.
+
+**It binds delegated work too.** The list travels into every `task`-spawned sub-agent (and, through
+bounded nested delegation, into their children), where it is re-resolved against that child's own
+narrowed catalog — so a disabled op is neither advertised to a sub-agent's model nor dispatchable by
+it. Before this it stopped at the delegation boundary.
 
 ## Second opinion (`[consult]`)
 

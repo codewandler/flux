@@ -158,6 +158,9 @@ pub struct LocalSpawner {
     /// C-612: the operator's permission rules, so a denial survives delegation. `None` keeps the
     /// prior empty-manager behaviour.
     permissions: Option<Arc<PermissionManager>>,
+    /// C-612: the operator's authored `[tools] disable` expressions, so an op the operator disabled
+    /// is disabled for sub-agents too. Empty (the default) keeps the prior behaviour.
+    disabled_patterns: Vec<String>,
     /// Current delegation depth (0 = a top-level agent's direct child). A child is a leaf when
     /// `depth + 1 >= max_depth`. The default `max_depth = 1` keeps every sub-agent a leaf.
     depth: usize,
@@ -189,6 +192,7 @@ impl LocalSpawner {
             audit: None,
             resource_limits: ResourceLimits::new(),
             permissions: None,
+            disabled_patterns: Vec::new(),
             depth: 0,
             max_depth: 1,
         }
@@ -225,6 +229,19 @@ impl LocalSpawner {
     /// configured no permissions at all.
     pub fn with_permissions(mut self, permissions: Option<Arc<PermissionManager>>) -> Self {
         self.permissions = permissions;
+        self
+    }
+
+    /// C-612: carry the operator's `[tools] disable` expressions into every sub-agent.
+    ///
+    /// The child executor was built with no disabled set at all, so an op an operator had disabled
+    /// stayed advertised to a sub-agent's model and dispatched for real — `[tools] disable` bound the
+    /// agent the operator was watching and nothing it delegated to. These are the ORIGINAL authored
+    /// expressions (exact names or `family.*` globs), not the parent's resolved set: a child's catalog
+    /// is a different one (role ∩ scope narrowing, plus its own agent ops), so the names are resolved
+    /// against the child registry at spawn. Empty keeps the prior behaviour.
+    pub fn with_disabled_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.disabled_patterns = patterns;
         self
     }
 
@@ -346,6 +363,7 @@ impl LocalSpawner {
             // C-612: descends through nested delegation for the same reason the resource ceiling does
             // — a grandchild must not escape a denial its ancestor was subject to.
             permissions: self.permissions.clone(),
+            disabled_patterns: self.disabled_patterns.clone(),
             depth,
             max_depth: self.max_depth,
         }
@@ -549,6 +567,23 @@ impl Spawner for LocalSpawner {
         let executor =
             Executor::new_with_authorization(registry, permissions, approver, ctx, authorization)
                 .with_resource_limits(self.resource_limits.independent_copy());
+        // C-612: `[tools] disable` reaches the child too — before this the child executor carried no
+        // disabled set at all, so an op the operator disabled stayed in the child's advertised catalog
+        // and dispatched for real. Resolve the operator's expressions against the CHILD's own registry
+        // (role ∩ cap_scope narrowing plus its own agent ops make it a different catalog from the
+        // parent's) and keep the original expressions as well, so an op introduced by a later catalog
+        // generation is disabled at that generation's turn boundary — the same pair the top-level
+        // executor installs.
+        let executor = if self.disabled_patterns.is_empty() {
+            executor
+        } else {
+            let resolved = executor
+                .registry()
+                .resolve_disabled(&self.disabled_patterns);
+            executor
+                .with_disabled_ops(resolved.disabled)
+                .with_disabled_patterns(self.disabled_patterns.clone())
+        };
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
@@ -735,6 +770,9 @@ pub struct SubAgents {
     /// C-612: the operator's permission rules, carried into every sub-agent so a `[permissions] deny`
     /// is not silently lost at the delegation boundary. `None` keeps the prior behaviour.
     pub permissions: Option<Arc<PermissionManager>>,
+    /// C-612: the operator's authored `[tools] disable` expressions, carried into every sub-agent so
+    /// a disabled op is disabled for delegated work too. Empty keeps the prior behaviour.
+    pub disabled_patterns: Vec<String>,
 }
 
 impl SubAgents {
@@ -763,12 +801,20 @@ impl SubAgents {
             max_depth: 1,
             resource_limits: ResourceLimits::new(),
             permissions: None,
+            disabled_patterns: Vec::new(),
         }
     }
 
     /// C-612: carry the operator's permission rules into every sub-agent.
     pub fn with_permissions(mut self, permissions: Arc<PermissionManager>) -> Self {
         self.permissions = Some(permissions);
+        self
+    }
+
+    /// C-612: carry the operator's `[tools] disable` expressions into every sub-agent — see
+    /// [`LocalSpawner::with_disabled_patterns`].
+    pub fn with_disabled_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.disabled_patterns = patterns;
         self
     }
 
@@ -871,7 +917,8 @@ impl SubAgents {
         // C-299: carry the parent's ceilings down. Unset is `ResourceLimits::new()` (unbounded),
         // so a host that configured nothing sees no behaviour change.
         .with_resource_limits(self.resource_limits)
-        .with_permissions(self.permissions);
+        .with_permissions(self.permissions)
+        .with_disabled_patterns(self.disabled_patterns);
         if let Some(agent_loop) = self.agent_loop {
             spawner = spawner.with_agent_loop(agent_loop);
         }
@@ -4255,6 +4302,55 @@ mod tests {
             system.read_file("PINGED.marker").await.is_err(),
             "the injected deny-all approver must block the child's ping"
         );
+    }
+
+    /// C-612 (failing first): the operator's `[tools] disable` must reach a sub-agent. The child
+    /// executor was built with no disabled set at all, so an op the operator disabled stayed
+    /// advertised to the child's model and dispatched for real. `PINGED.marker` exists iff the
+    /// disabled op actually executed inside the child — assert on the effect, not on configuration.
+    #[tokio::test]
+    async fn disabled_ops_reach_the_sub_agent_and_descend_through_nesting() {
+        let system = unique_system("c612-disable");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        )
+        .with_disabled_patterns(vec!["ping".to_string()]);
+
+        let outcome = spawner
+            .spawn(
+                SpawnRequest::new("scout", "scout the repo"),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            system.read_file("PINGED.marker").await.is_err(),
+            "an op the operator disabled must not execute inside a sub-agent"
+        );
+        assert!(
+            outcome.is_ok(),
+            "the refusal is a tool-level error, not a dead turn: {:?}",
+            outcome.err()
+        );
+
+        // And it descends: a grandchild must not resurrect an op an ancestor's operator disabled.
+        let nested = spawner.at_depth(1, ToolRegistry::new(), system.clone());
+        assert_eq!(nested.disabled_patterns, vec!["ping".to_string()]);
     }
 
     /// WS3 (isolation): a sub-agent inherits the parent's workspace-confined `System`, so a child op
