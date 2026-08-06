@@ -81,3 +81,8 @@ sub-agent, Fleet and served start says exactly which behavior harness it is runn
 
 - This supplies the binding operators need to run their own authored sub-agent loops and the stable
   identity C-543 displays and switches. Postponed C-567 is optional policy/convenience work.
+
+
+## Comments
+
+- Rescued from wave-299's dead worker and committed on its story branch as 5edcb8ed (940 new lines plus 204 changed). The repository gate then refused the candidate: role::tests::a_role_resolves_its_own_loop_binding_and_never_the_parents panics with `role 'triage' has an invalid agent loop: invalid explicit agent loop: parse error: line 1`. The test's inline authored loop is `return "done"`, which is not a parseable Flux-Lang program on its own — it has no flow declaration. Either the fixture is wrong or an authored role loop is meant to accept a bare expression; deciding that by inference would produce a green test asserting the wrong thing, so the story stays open. The work is preserved on fleet/wave-299/flux/story/C-569 and is NOT in 0.57.0. Note also that the handoff gate accepted this commit because the cited test (loop_binding_census) passes — a handoff verifies the argv it is given, so a commit can break a different test in the same story and only the repository gate will say so.
