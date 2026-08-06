@@ -10,7 +10,9 @@ use std::sync::Arc;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use flux_core::{Chunk, Error, Message, Result, Usage};
+use flux_core::{
+    AgentLoopBindingMetadata, AgentLoopRunnerKind, Chunk, Error, Message, Result, Usage,
+};
 use flux_events::{AssistantMessage, EventStore, SessionLog, Tail, ValidHistory};
 use flux_provider::{Effort, Provider, Request};
 use flux_runtime::{
@@ -78,6 +80,383 @@ impl AgentLoopSpec {
     }
 }
 
+/// Runtime feature implemented by this engine's native Flux-Lang loop host.
+pub const NATIVE_AGENT_LOOP_RUNTIME_FEATURE: &str = "agent-loop/native-flux/v1";
+/// Runtime contract for literal-catalog `ai_segment` stages inside an authored loop.
+pub const AI_SEGMENT_AGENT_LOOP_RUNTIME_FEATURE: &str = "agent-loop/ai-segment/v1";
+
+/// A resolved behavior harness: receipt-safe identity plus the exact source admitted for execution.
+///
+/// `metadata` is safe to copy into start/status/terminal receipts. `source` and `spec` stay at the
+/// runtime boundary and are intentionally not serializable as part of the binding, so a receipt can
+/// never accidentally become a second prompt/program store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentLoopBinding {
+    metadata: AgentLoopBindingMetadata,
+    source: String,
+    spec: AgentLoopSpec,
+}
+
+impl AgentLoopBinding {
+    /// Resolve an existing executable selector into an explicit binding. This is the compatibility
+    /// boundary for SDK callers that still set `AgentSpec::agent_loop` directly: omission/default
+    /// becomes the versioned built-in, while an authored AST receives a canonical inline identity.
+    pub fn from_spec(spec: AgentLoopSpec) -> Self {
+        match spec {
+            AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive) => {
+                let source = builtin_agent_loop().to_string();
+                let ast = flux_lang::parse::parse(&source)
+                    .expect("the compiled-in adaptive agent loop must parse");
+                Self::from_parts(
+                    "adaptive",
+                    "1",
+                    "builtin:adaptive@1",
+                    "agent-loop",
+                    source,
+                    AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive),
+                    &ast,
+                )
+            }
+            AgentLoopSpec::Flux(ast) => {
+                let source = flux_lang::format::format(&ast);
+                let digest = flux_lang::runtime::sha256_hex(&source);
+                let entry = ast.name.clone().unwrap_or_else(|| "custom".into());
+                Self::from_parts(
+                    "inline",
+                    "1",
+                    &format!("inline:sha256:{digest}"),
+                    &entry,
+                    source,
+                    AgentLoopSpec::Flux(ast.clone()),
+                    &ast,
+                )
+            }
+        }
+    }
+
+    /// Parse and resolve one operator-authored native Flux profile.
+    pub fn native_flux(
+        profile: impl Into<String>,
+        revision: impl Into<String>,
+        source_ref: impl Into<String>,
+        entry_point: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Result<Self> {
+        let profile = profile.into();
+        let revision = revision.into();
+        let source_ref = source_ref.into();
+        let entry_point = entry_point.into();
+        let source = source.into();
+        let ast = flux_lang::parse::parse(&source).map_err(|error| {
+            Error::Other(format!(
+                "agent loop profile `{profile}` has invalid source: {error}"
+            ))
+        })?;
+        let binding = Self::from_parts(
+            &profile,
+            &revision,
+            &source_ref,
+            &entry_point,
+            source,
+            AgentLoopSpec::Flux(ast.clone()),
+            &ast,
+        );
+        binding.validate_shape()?;
+        Ok(binding)
+    }
+
+    /// Resolve a native profile that declares additional runtime contracts. The native and
+    /// statically inferred feature ids are retained automatically; unsupported ids are refused by
+    /// engine assembly before a provider call.
+    pub fn native_flux_with_features(
+        profile: impl Into<String>,
+        revision: impl Into<String>,
+        source_ref: impl Into<String>,
+        entry_point: impl Into<String>,
+        source: impl Into<String>,
+        required_runtime_features: impl IntoIterator<Item = String>,
+    ) -> Result<Self> {
+        let mut binding = Self::native_flux(profile, revision, source_ref, entry_point, source)?;
+        binding
+            .metadata
+            .required_runtime_features
+            .extend(required_runtime_features);
+        binding.metadata.required_runtime_features.sort();
+        binding.metadata.required_runtime_features.dedup();
+        Ok(binding)
+    }
+
+    /// Reconstruct a previously admitted native binding and refuse any metadata/source drift.
+    pub fn from_metadata_and_source(
+        admitted: AgentLoopBindingMetadata,
+        source: impl Into<String>,
+    ) -> Result<Self> {
+        if admitted.runner != AgentLoopRunnerKind::NativeFlux {
+            return Err(Error::Other(format!(
+                "unsupported agent loop runner `{}` for native Flux execution",
+                runner_name(admitted.runner)
+            )));
+        }
+        let admitted = admitted.canonicalized();
+        let source = source.into();
+        let builtin = Self::from_spec(AgentLoopSpec::default());
+        if admitted == *builtin.metadata() && source == builtin.source() {
+            return Ok(builtin);
+        }
+        let resolved = Self::native_flux_with_features(
+            admitted.profile.clone(),
+            admitted.revision.clone(),
+            admitted.source_ref.clone(),
+            admitted.entry_point.clone(),
+            source,
+            admitted.required_runtime_features.clone(),
+        )?;
+        if resolved.metadata != admitted {
+            return Err(Error::Other(loop_binding_mismatch(
+                &admitted,
+                &resolved.metadata,
+            )));
+        }
+        Ok(resolved)
+    }
+
+    pub fn metadata(&self) -> &AgentLoopBindingMetadata {
+        &self.metadata
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn spec(&self) -> &AgentLoopSpec {
+        &self.spec
+    }
+
+    pub fn into_spec(self) -> AgentLoopSpec {
+        self.spec
+    }
+
+    fn from_parts(
+        profile: &str,
+        revision: &str,
+        source_ref: &str,
+        entry_point: &str,
+        source: String,
+        spec: AgentLoopSpec,
+        ast: &DraftAst,
+    ) -> Self {
+        let mut required_operations = Vec::new();
+        flux_lang::analyze::for_each_node(&ast.body, &mut |node| {
+            if let Node::Call { op, args } = node {
+                required_operations.push(op.clone());
+                // `ai_segment`'s literal tool catalogue is part of the loop contract even though
+                // those operations are dispatched by the model stage rather than represented as
+                // top-level call nodes. Capture it so a missing worker operation refuses at
+                // assembly, before the segment opens its first provider stream.
+                if op == "ai_segment" {
+                    for arg in args {
+                        match arg {
+                            Node::Obj { fields } => {
+                                if let Some(tools) = fields.get("tools") {
+                                    match tools.as_ref() {
+                                        Node::List { items } => {
+                                            for item in items {
+                                                if let Node::Lit { value } = item {
+                                                    if let Some(operation) = value.as_str() {
+                                                        required_operations
+                                                            .push(operation.to_string());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Node::Lit { value } => {
+                                            if let Some(tools) = value.as_array() {
+                                                required_operations.extend(
+                                                    tools.iter().filter_map(|tool| {
+                                                        tool.as_str().map(str::to_string)
+                                                    }),
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            Node::Lit { value } => {
+                                if let Some(tools) =
+                                    value.get("tools").and_then(serde_json::Value::as_array)
+                                {
+                                    required_operations.extend(
+                                        tools
+                                            .iter()
+                                            .filter_map(|tool| tool.as_str().map(str::to_string)),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+        required_operations.sort();
+        required_operations.dedup();
+        let mut required_runtime_features = vec![NATIVE_AGENT_LOOP_RUNTIME_FEATURE.into()];
+        if required_operations
+            .iter()
+            .any(|operation| operation == "ai_segment")
+        {
+            required_runtime_features.push(AI_SEGMENT_AGENT_LOOP_RUNTIME_FEATURE.into());
+        }
+        required_runtime_features.sort();
+        required_runtime_features.dedup();
+        Self {
+            metadata: AgentLoopBindingMetadata {
+                schema: AgentLoopBindingMetadata::SCHEMA.into(),
+                profile: profile.into(),
+                revision: revision.into(),
+                runner: AgentLoopRunnerKind::NativeFlux,
+                source_ref: source_ref.into(),
+                source_sha256: flux_lang::runtime::sha256_hex(&source),
+                entry_point: entry_point.into(),
+                required_operations,
+                required_runtime_features,
+            },
+            source,
+            spec,
+        }
+    }
+
+    fn validate_shape(&self) -> Result<()> {
+        let mut missing = Vec::new();
+        for (name, value) in [
+            ("profile", self.metadata.profile.as_str()),
+            ("revision", self.metadata.revision.as_str()),
+            ("source_ref", self.metadata.source_ref.as_str()),
+            ("entry_point", self.metadata.entry_point.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                missing.push(name);
+            }
+        }
+        if !missing.is_empty() {
+            return Err(Error::Other(format!(
+                "agent loop binding is missing required fields: {}",
+                missing.join(", ")
+            )));
+        }
+        let found = flux_lang::runtime::sha256_hex(&self.source);
+        if found != self.metadata.source_sha256 {
+            return Err(Error::Other(format!(
+                "agent loop source digest mismatch for profile `{}`: admitted {}, found {}",
+                self.metadata.profile, self.metadata.source_sha256, found
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_runtime(&self, registry: &flux_runtime::ToolRegistry) -> Result<()> {
+        self.validate_shape()?;
+        if self.metadata.runner != AgentLoopRunnerKind::NativeFlux {
+            return Err(Error::Other(format!(
+                "unsupported agent loop runner `{}` for native Flux execution",
+                runner_name(self.metadata.runner)
+            )));
+        }
+        let unsupported = self
+            .metadata
+            .required_runtime_features
+            .iter()
+            .filter(|feature| {
+                !matches!(
+                    feature.as_str(),
+                    NATIVE_AGENT_LOOP_RUNTIME_FEATURE | AI_SEGMENT_AGENT_LOOP_RUNTIME_FEATURE
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            return Err(Error::Other(format!(
+                "agent loop profile `{}` requires unsupported runtime features: {}",
+                self.metadata.profile,
+                unsupported.join(", ")
+            )));
+        }
+        let available = registry
+            .names()
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let missing = self
+            .metadata
+            .required_operations
+            .iter()
+            .filter(|operation| !available.contains(operation.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(Error::Other(format!(
+                "agent loop profile `{}` requires missing operations: {}",
+                self.metadata.profile,
+                missing.join(", ")
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn runner_name(runner: AgentLoopRunnerKind) -> &'static str {
+    match runner {
+        AgentLoopRunnerKind::NativeFlux => "native-flux",
+        AgentLoopRunnerKind::BackendProfile => "backend-profile",
+    }
+}
+
+fn loop_binding_mismatch(
+    admitted: &AgentLoopBindingMetadata,
+    found: &AgentLoopBindingMetadata,
+) -> String {
+    for (field, admitted, found) in [
+        ("schema", admitted.schema.as_str(), found.schema.as_str()),
+        ("profile", admitted.profile.as_str(), found.profile.as_str()),
+        (
+            "revision",
+            admitted.revision.as_str(),
+            found.revision.as_str(),
+        ),
+        (
+            "source_ref",
+            admitted.source_ref.as_str(),
+            found.source_ref.as_str(),
+        ),
+        (
+            "source_sha256",
+            admitted.source_sha256.as_str(),
+            found.source_sha256.as_str(),
+        ),
+        (
+            "entry_point",
+            admitted.entry_point.as_str(),
+            found.entry_point.as_str(),
+        ),
+    ] {
+        if admitted != found {
+            return format!(
+                "agent loop binding mismatch in `{field}`: admitted `{admitted}`, found `{found}`"
+            );
+        }
+    }
+    if admitted.required_operations != found.required_operations {
+        return format!(
+            "agent loop binding mismatch in `required_operations`: admitted {:?}, found {:?}",
+            admitted.required_operations, found.required_operations
+        );
+    }
+    format!(
+        "agent loop binding mismatch in `required_runtime_features`: admitted {:?}, found {:?}",
+        admitted.required_runtime_features, found.required_runtime_features
+    )
+}
+
 /// C-87: the hard cap on distinct sessions the per-session `sticky_groups` map retains on a
 /// long-lived shared engine. Generous — realistic interleaving stays well under it, so the
 /// cross-session cache-stability invariant holds — while still turning unbounded growth into a bound.
@@ -137,6 +516,8 @@ pub struct FlowEngine {
     pub flow: Arc<FlowStore>,
     /// The agent loop itself, written in Flux-Lang. The bootstrap runs this each turn.
     pub agent_loop: DraftAst,
+    /// Resolved identity and immutable admitted source for `agent_loop`.
+    pub agent_loop_binding: AgentLoopBinding,
     /// The installed authored-loop host; `set_turn` points it at the current session + sink.
     pub loop_host: Arc<crate::loop_host::EngineLoopHost>,
     /// Dynamic composite ops loaded from global/project stores or registered by this agent.
@@ -338,6 +719,40 @@ impl FlowEngine {
         cwd: std::path::PathBuf,
         agent_loop: AgentLoopSpec,
     ) -> Result<Self> {
+        Self::assemble_with_binding(
+            provider,
+            executor,
+            events,
+            flow,
+            model,
+            system_prompt,
+            max_tokens,
+            max_iterations,
+            skills,
+            compact_threshold_chars,
+            groups,
+            cwd,
+            AgentLoopBinding::from_spec(agent_loop),
+        )
+    }
+
+    /// Assemble an engine from a fully resolved agent-loop binding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_binding(
+        provider: Arc<dyn Provider>,
+        executor: Executor,
+        events: Arc<EventStore>,
+        flow: FlowStore,
+        model: String,
+        system_prompt: String,
+        max_tokens: u32,
+        max_iterations: usize,
+        skills: Vec<flux_skill::Skill>,
+        compact_threshold_chars: usize,
+        groups: Vec<flux_evidence::ToolGroup>,
+        cwd: std::path::PathBuf,
+        agent_loop_binding: AgentLoopBinding,
+    ) -> Result<Self> {
         let flow = Arc::new(flow);
         let composites = Arc::new(DynamicComposites::load(
             executor.context().system().as_ref(),
@@ -379,7 +794,9 @@ impl FlowEngine {
         // and a global file referencing an uninstalled plugin must not brick startup). The
         // exclusions are surfaced per turn as a `composites.pruned` observation.
         let pruned_composites = composites.prune_unresolvable(executor.registry());
-        let agent_loop = load_agent_loop_with_iterations(agent_loop, max_iterations)?;
+        agent_loop_binding.validate_runtime(executor.registry())?;
+        let agent_loop =
+            load_agent_loop_with_iterations(agent_loop_binding.spec().clone(), max_iterations)?;
         validate_agent_loop(
             &agent_loop,
             executor.registry(),
@@ -391,6 +808,7 @@ impl FlowEngine {
             events,
             flow,
             agent_loop,
+            agent_loop_binding,
             loop_host,
             composites,
             pruned_composites,
@@ -537,6 +955,25 @@ impl FlowEngine {
         scope_override: Option<Arc<crate::cassette::CassetteScope>>,
     ) -> Result<TurnLifecycle> {
         let skill_input = user_message.unwrap_or_default();
+        // A session's first recorded binding is its behavior admission. Rebuilding an SDK/server
+        // engine with a changed role/file must not silently switch a live conversation; callers
+        // either reconstruct the recorded source (CLI/Fleet do) or mint an explicit new session.
+        if let Some(admitted) = self
+            .events
+            .turns(session_id)
+            .ok()
+            .and_then(|turns| turns.last().and_then(|turn| turn.loop_binding.clone()))
+        {
+            if !admitted.equivalent_to(self.agent_loop_binding.metadata()) {
+                return Err(Error::Other(format!(
+                    "agent loop binding change from `{}`@{} to `{}`@{} requires a new session",
+                    admitted.profile,
+                    admitted.revision,
+                    self.agent_loop_binding.metadata().profile,
+                    self.agent_loop_binding.metadata().revision,
+                )));
+            }
+        }
         // C-318: this is the catalog adoption boundary. `begin_turn_lifecycle` is reached only
         // after the engine's single-active-turn gate is held; take the generation before any turn
         // bookkeeping so every later surface, schema, validation, and dispatch shares it.
@@ -568,10 +1005,11 @@ impl FlowEngine {
         log.open_turn(opening)?;
         let turn_id = self
             .events
-            .begin_turn(
+            .begin_turn_with_loop_binding(
                 session_id,
                 label,
                 &flux_core::canonical_model_spec(Some(self.provider.name()), &self.model),
+                Some(self.agent_loop_binding.metadata().clone()),
             )
             .unwrap_or(-1);
         self.executor.observe(flux_evidence::Observation::new(
@@ -748,13 +1186,14 @@ impl FlowEngine {
         sink.text_delta(&terminal.answer);
         let usage =
             self.record_resume_usage(session_id, accounting.turn_id, accounting.subagent_base);
-        let _ = self.events.end_turn(
+        let _ = self.events.end_turn_with_loop_binding(
             session_id,
             accounting.turn_id,
             terminal.outcome,
             terminal.steps,
             &terminal.answer,
             usage.clone(),
+            Some(self.agent_loop_binding.metadata().clone()),
         );
         self.finish_turn(
             session_id,
@@ -3335,6 +3774,180 @@ mod tests {
     }
 
     #[test]
+    fn omitted_loop_resolves_to_versioned_bounded_adaptive_binding() {
+        let binding = AgentLoopBinding::from_spec(AgentLoopSpec::default());
+        let metadata = binding.metadata();
+
+        assert_eq!(metadata.schema, AgentLoopBindingMetadata::SCHEMA);
+        assert_eq!(metadata.profile, "adaptive");
+        assert_eq!(metadata.revision, "1");
+        assert_eq!(metadata.runner, AgentLoopRunnerKind::NativeFlux);
+        assert_eq!(metadata.source_ref, "builtin:adaptive@1");
+        assert_eq!(metadata.source_sha256.len(), 64);
+        assert_eq!(metadata.entry_point, "agent-loop");
+        for operation in [
+            "detect_intent",
+            "explore",
+            "approve_batch",
+            "execute_batch",
+            "present_results",
+        ] {
+            assert!(
+                metadata
+                    .required_operations
+                    .iter()
+                    .any(|found| found == operation),
+                "missing {operation}: {:?}",
+                metadata.required_operations
+            );
+        }
+        let receipt = serde_json::to_value(metadata).unwrap();
+        let encoded = receipt.to_string();
+        assert!(!encoded.contains("The model declares intent"), "{encoded}");
+        assert!(!encoded.contains("repeat 50"), "{encoded}");
+    }
+
+    #[test]
+    fn exact_builtin_snapshot_reconstructs_builtin_lowering_semantics() {
+        let admitted = AgentLoopBinding::from_spec(AgentLoopSpec::default());
+        let reconstructed = AgentLoopBinding::from_metadata_and_source(
+            admitted.metadata().clone(),
+            admitted.source(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reconstructed.spec(),
+            AgentLoopSpec::Builtin(BuiltinAgentLoop::Adaptive)
+        ));
+        assert_eq!(reconstructed.metadata(), admitted.metadata());
+    }
+
+    #[test]
+    fn authored_binding_captures_ai_segment_tool_contract_and_refuses_digest_drift() {
+        let source = r#"flow work -> string
+  $turn = ai_segment({ goal: "work", tools: ["read", "edit"], max_rounds: 2 })
+  return $turn.result
+"#;
+        let binding = AgentLoopBinding::native_flux(
+            "implementation",
+            "7",
+            "fleet-profile:implementation@7",
+            "work",
+            source,
+        )
+        .unwrap();
+        assert_eq!(
+            binding.metadata().required_operations,
+            vec!["ai_segment", "edit", "read"]
+        );
+
+        let mut admitted = binding.metadata().clone();
+        admitted.source_sha256 = "0".repeat(64);
+        let error = AgentLoopBinding::from_metadata_and_source(admitted, source)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("source_sha256"), "{error}");
+        assert!(error.contains("admitted"), "{error}");
+    }
+
+    #[test]
+    fn reconstructed_binding_accepts_legacy_set_order_and_canonicalizes_it() {
+        let source = r#"flow work -> string
+  $turn = ai_segment({ goal: "work", tools: ["read", "edit"], max_rounds: 2 })
+  return $turn.result
+"#;
+        let binding = AgentLoopBinding::native_flux(
+            "implementation",
+            "1",
+            "fleet-profile:implementation@1",
+            "work",
+            source,
+        )
+        .unwrap();
+        let mut legacy = binding.metadata().clone();
+        legacy.required_operations.reverse();
+        legacy.required_runtime_features.reverse();
+
+        let reconstructed =
+            AgentLoopBinding::from_metadata_and_source(legacy.clone(), source).unwrap();
+
+        assert!(legacy.equivalent_to(reconstructed.metadata()));
+        assert_eq!(
+            reconstructed.metadata().required_runtime_features,
+            vec![
+                AI_SEGMENT_AGENT_LOOP_RUNTIME_FEATURE.to_string(),
+                NATIVE_AGENT_LOOP_RUNTIME_FEATURE.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_runtime_feature_is_an_exact_pre_start_refusal() {
+        let binding = AgentLoopBinding::native_flux_with_features(
+            "future",
+            "1",
+            "profile:future@1",
+            "work",
+            "flow work -> string\n  return \"done\"\n",
+            vec!["agent-loop/telepathy/v9".into()],
+        )
+        .unwrap();
+        let error = binding
+            .validate_runtime(&ToolRegistry::new())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "agent loop profile `future` requires unsupported runtime features: agent-loop/telepathy/v9"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_start_and_terminal_receipts_repeat_the_resolved_binding() {
+        let (mut engine, events, requests) =
+            scripted_engine(Vec::new(), AgentLoopSpec::Flux(idle_agent_loop()));
+        let session = events.create_session("scripted/test-model").unwrap();
+        let mut sink = CollectSink::default();
+
+        engine
+            .run_turn(&session, "identify the loop", &mut sink)
+            .await
+            .unwrap();
+        assert!(requests.lock().unwrap().is_empty());
+        let expected = engine.agent_loop_binding.metadata().clone();
+        let stored = events.load_stream(&session, None).unwrap();
+        let started = stored.iter().find_map(|event| match &event.kind {
+            flux_events::EventKind::TurnStarted { loop_binding, .. } => loop_binding.clone(),
+            _ => None,
+        });
+        let ended = stored.iter().find_map(|event| match &event.kind {
+            flux_events::EventKind::TurnEnded { loop_binding, .. } => loop_binding.clone(),
+            _ => None,
+        });
+        assert_eq!(started.as_ref(), Some(&expected));
+        assert_eq!(ended.as_ref(), Some(&expected));
+        let turn = events.turns(&session).unwrap().pop().unwrap();
+        assert_eq!(turn.loop_binding, Some(expected));
+
+        engine.agent_loop_binding = AgentLoopBinding::native_flux(
+            "changed",
+            "2",
+            "profile:changed@2",
+            "changed",
+            "flow changed -> string\n  return \"changed\"\n",
+        )
+        .unwrap();
+        let error = engine
+            .run_turn(&session, "silently switch", &mut sink)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires a new session"), "{error}");
+        assert_eq!(events.turns(&session).unwrap().len(), 1);
+    }
+
+    #[test]
     fn outer_loop_iteration_bounds_reject_zero_and_values_above_the_practical_cap() {
         let zero = load_agent_loop_with_iterations(AgentLoopSpec::default(), 0)
             .unwrap_err()
@@ -3392,6 +4005,58 @@ mod tests {
 
         assert_eq!(sink.text, "All 49 observations were gathered.");
         assert_eq!(requests.lock().unwrap().len(), 50);
+    }
+
+    #[tokio::test]
+    async fn ai_segment_current_turn_excludes_retained_history_and_uses_authored_token_cap() {
+        let loop_spec = AgentLoopSpec::Flux(
+            flux_lang::parse::parse(
+                r#"flow coordinator -> string
+  $segment = ai_segment({ goal: "Coordinate only", tools: ["echo"], max_rounds: 4, current_turn: true, max_tokens: 1200 })
+  return $segment.result
+"#,
+            )
+            .expect("test loop parses"),
+        );
+        let (engine, events, requests) = scripted_engine(
+            vec![prose("first response"), prose("second response")],
+            loop_spec,
+        );
+        let session = events.create_session("scripted/test-model").unwrap();
+
+        engine
+            .run_turn(
+                &session,
+                "old request that must not survive",
+                &mut CollectSink::default(),
+            )
+            .await
+            .unwrap();
+        engine
+            .run_turn(
+                &session,
+                "current fleet request",
+                &mut CollectSink::default(),
+            )
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].max_tokens, 1_200);
+        let messages = requests[1]
+            .messages
+            .iter()
+            .map(Message::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(messages.contains("Coordinate only"), "{messages}");
+        assert!(messages.contains("current fleet request"), "{messages}");
+        assert!(
+            !messages.contains("old request that must not survive"),
+            "{messages}"
+        );
+        assert!(!messages.contains("first response"), "{messages}");
     }
 
     #[tokio::test]

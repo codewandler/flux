@@ -240,6 +240,7 @@ reconcile them later.
 | `fleet.start` | `item[, worktree, context_id, model]` | Start a flux worker for one board item and return the endpoint to dispatch to. `worktree` confines it to an isolated checkout; the returned context id resumes the same worker session later. Reaching the returned endpoint needs `--allow-private-net`, since it is a loopback address |
 | `fleet.worker_status` | `worker_id` | Report whether a worker is starting, live, or dead — with its exit code and the tail of its own output when it died. The worker's liveness, not a task's state |
 | `fleet.stop` | `worker_id` | Stop a worker started by `fleet.start`. An already-exited worker succeeds; an unknown worker id is an error |
+| `fleet.agents` | `[limit]` | On an explicitly attached native Fleet main only, list bounded durable worker admissions and current statuses without requiring known worker ids. This is separate from transient A2A/process workers |
 
 The `worker` address is an argument, not configuration, so it is model-reachable and gated as such.
 Every call resolves the endpoint through the same egress guard as `web.fetch` before any request,
@@ -251,6 +252,35 @@ behind `flux serve`'s bearer token is not reachable yet.
 
 `fleet.status` is never served from the operation cache — observing the change since the last poll is
 the point of a status call.
+
+`fleet.agents` is installed only for the main agent started by `flux tui --fleet`. Its result is
+capped at 100 worker records, reports the untruncated total, and omits worker instructions and turn
+bodies. The validated attachment pre-authorizes this read, while an operator-authored deny rule
+still wins.
+
+That attachment replaces the colliding transient `fleet.status` and `fleet.cancel` tools and closes
+the model-facing catalog to these native coordinator services plus bounded research `task`:
+
+| op | arguments | description |
+|---|---|---|
+| `board.show` | `{}` | Show the authoritative workspace Board and planning documents |
+| `board.get` | `id` | Read one exact namespaced item |
+| `board.next` | `[limit]` | List dependency-satisfied ready items in deterministic order |
+| `board.check` | `{}` | Validate Board configuration and story contracts |
+| `board.start` / `board.unblock` | `id[, guards]` | Apply the exact guarded Board transition |
+| `board.block` | `id, reason[, guards]` | Block an item and record why |
+| `board.comment` / `board.evidence` | `id, text[, guards]` | Append durable item context or evidence |
+| `fleet.status` | `{}` | Read a compact durable lifecycle snapshot without historical turn bodies |
+| `fleet.schedule` | `{}` | Read the dependency-aware schedule derived from the Board |
+| `fleet.run` | `items[, prepare_only, guards]` | Prepare and launch a wave for 1–10 exact Board refs |
+| `fleet.message` | `target, message[, wait, guards]` | Deliver an acknowledged message |
+| `fleet.cancel` / `fleet.resume` | `target[, guards]` | Control one exact durable target |
+
+Safe native reads are pre-authorized unless an operator deny wins. Mutations keep revision,
+idempotency, and acknowledgement guards. The parent has no general coding tools; its `task` child is
+independently limited to read-only workspace and git inspection, without shell, edits, git writes,
+Board/Fleet mutation, or nested delegation. `[main].research_loop` forces the operator-authored
+child loop, overriding generic role-loop defaults such as `create_plan`.
 
 **Work board operations are not in this catalog**, because they do not exist until a program asks for
 them. A first-class `board` declaration generates the board operations named after *that

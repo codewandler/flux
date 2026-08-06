@@ -6,7 +6,7 @@ status: in-progress
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-agent, flux-flow, flux-runtime, flux-orchestrate, flux-cli]
-note: "bind behavior at agent start; Fleet adds workhorse/reviewer loops, typed progress/yield and hierarchical budgets"
+note: "bind behavior at agent start; configured Fleet loops add review, typed progress/yield and hierarchical budgets"
 ---
 
 # Every agent starts under an explicit loop harness
@@ -22,9 +22,8 @@ reviewers, research tasks and future backends receive purpose-specific loops, re
 - [ ] Every agent creation path resolves and snapshots the explicit loop binding contracted by
       [C-569](C-569-resolve-loop-binding-at-every-agent-start.md); no running agent carries “use
       whatever default this constructor happens to choose.”
-- [ ] Fleet selects a workhorse loop from explicit task kind/template policy and the five-writer,
-      three-repository proof completes implementation handoffs under
-      [C-567](C-567-run-codex-fleet-writers-as-fresh-workhorses.md).
+- [ ] Fleet's five-writer, three-repository proof completes implementation handoffs under explicit
+      operator-authored bindings from C-569; no dedicated Fleet workhorse story is required.
 - [ ] A worker can durably report meaningful progress and cooperatively yield at a safe checkpoint,
       and its parent/main can acknowledge and resume it without parsing prose
       ([C-570](C-570-agent-progress-and-cooperative-yield.md)).
@@ -59,6 +58,6 @@ reviewers, research tasks and future backends receive purpose-specific loops, re
 
 ## Notes
 
-- This epic supersedes the Codex-specific direction in C-567; the uncommitted experiment remains
-  preserved as evidence, not as the product boundary.
+- C-567 is postponed optional policy/convenience work. Operators can run their own authored
+  sub-agent loops through C-569 without waiting for it.
 - Decision 0010's one-writer, fresh-review, host-verification and publication fences remain intact.

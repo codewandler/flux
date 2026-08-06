@@ -6,7 +6,7 @@ status: backlog
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-flow, flux-runtime, flux-orchestrate, flux-cli]
-depends_on: [C-567, C-570]
+depends_on: [C-570]
 note: "fresh tool-free review over story contract + exact diff; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling"
 ---
 

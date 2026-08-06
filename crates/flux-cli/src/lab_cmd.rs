@@ -6,10 +6,11 @@
 //! those fixtures offline — deny-all approver, never-called provider, zero network, $0 — and exits
 //! non-zero if any of them regressed, so it can be a CI gate.
 //!
-//! A fixture is an ordinary `Storage::dir` store (`events.db` + `flow.db`) plus the Test Kit's own
-//! `model.jsonl` / `plan.flux.snap` / `scenario.toml`. That is deliberate: `flux replay|fork|diff
-//! --store tests/scenarios/<name>` opens one with the existing session tools, no fixture-specific
-//! code path anywhere.
+//! A fixture is an ordinary `Storage::dir` store (`events.db` + `flow.db` + the admitted
+//! `agent-loops/<sha256>.flux` source snapshot) plus the Test Kit's own `model.jsonl` /
+//! `plan.flux.snap` / `scenario.toml`. That is deliberate: `flux replay|fork|diff --store
+//! tests/scenarios/<name>` opens one with the existing session tools, no fixture-specific code path
+//! anywhere.
 
 use super::*;
 

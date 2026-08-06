@@ -871,9 +871,9 @@ glue only after the four-repository installed-CLI fixture passes.
 Every agent start resolves behavior independently of model/backend/membership. The ordinary Flux
 default becomes the recorded `builtin:adaptive@1` binding; roles and tasks resolve their own allowed
 profile and never inherit a parent's loop or conversation implicitly. Fleet roles have no ambient
-adaptive fallback: C-569 establishes the common versioned binding, C-567 maps explicit assignment
-kinds to a native implementation workhorse, C-570 adds acknowledged progress and cooperative yield,
-and C-572 composes a fresh read-only reviewer loop plus same-writer repair over the existing typed
+adaptive fallback: C-569 establishes the common versioned binding used by operator-authored loops,
+C-570 adds acknowledged progress and cooperative yield, and C-572 composes a fresh read-only
+reviewer loop plus same-writer repair over the existing typed
 PASS/REWORK/PARK and two-round host rules.
 
 C-587 turns each frozen candidate into mandatory self-improvement evidence: tool-free code review

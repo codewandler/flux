@@ -920,11 +920,23 @@ impl EventStore {
     /// Begin a turn and return its `turn_id` (the `TurnStarted` event's `global_seq`). Use
     /// `.unwrap_or(-1)` at call sites to stay non-fatal — telemetry must never block a turn.
     pub fn begin_turn(&self, stream: &str, user_input: &str, model: &str) -> Result<i64> {
+        self.begin_turn_with_loop_binding(stream, user_input, model, None)
+    }
+
+    /// Begin a turn with the source-free identity of its admitted behavior harness.
+    pub fn begin_turn_with_loop_binding(
+        &self,
+        stream: &str,
+        user_input: &str,
+        model: &str,
+        loop_binding: Option<flux_core::AgentLoopBindingMetadata>,
+    ) -> Result<i64> {
         let stored = self.append(
             stream,
             NewEvent::new(EventKind::TurnStarted {
                 user_input: user_input.to_string(),
                 model: model.to_string(),
+                loop_binding,
             }),
         )?;
         Ok(stored.global_seq)
@@ -1226,6 +1238,21 @@ impl EventStore {
         answer: &str,
         usage: Option<Usage>,
     ) -> Result<()> {
+        self.end_turn_with_loop_binding(stream, turn_id, outcome, iterations, answer, usage, None)
+    }
+
+    /// Close a turn and repeat its admitted behavior identity in the terminal receipt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn end_turn_with_loop_binding(
+        &self,
+        stream: &str,
+        turn_id: i64,
+        outcome: &str,
+        iterations: u32,
+        answer: &str,
+        usage: Option<Usage>,
+        loop_binding: Option<flux_core::AgentLoopBindingMetadata>,
+    ) -> Result<()> {
         if turn_id < 0 {
             return Ok(());
         }
@@ -1236,6 +1263,7 @@ impl EventStore {
                 iterations,
                 answer: answer.to_string(),
                 usage,
+                loop_binding,
             })
             .in_turn(turn_id),
         )?;

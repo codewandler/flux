@@ -120,6 +120,22 @@ impl ToolResult {
     }
 }
 
+/// Redact one tool-result face without corrupting structured JSON. Applying a text regex after
+/// serialization can consume JSON escape characters along with a credential-shaped value, turning
+/// an otherwise valid object into an opaque string at the Flux-Lang boundary. Preserve byte-exact
+/// output when no redaction fires; when it does, walk valid JSON as values and serialize it again.
+fn redact_tool_result_text(redactor: &Redactor, input: &str) -> String {
+    let redacted = redactor.redact(input);
+    if redacted == input {
+        return input.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        return redacted;
+    };
+    flux_core::redact_json_total(&mut value, &|text| redactor.redact(text));
+    serde_json::to_string(&value).unwrap_or(redacted)
+}
+
 /// What a sub-agent run produced: its final text plus enough to roll its spend into the parent turn
 /// (C-06). `model` is the role's resolved model (whatever `AgentSpec::into_engine` ran it as —
 /// the role's own override, or the spawner's default); `usage` is the child's accumulated per-turn
@@ -4824,8 +4840,10 @@ impl Executor {
         let result = match executed {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
-                r.content = self.ctx.redactor.redact(&r.content);
-                r.view = r.view.map(|v| self.ctx.redactor.redact(&v));
+                r.content = redact_tool_result_text(&self.ctx.redactor, &r.content);
+                r.view = r
+                    .view
+                    .map(|view| redact_tool_result_text(&self.ctx.redactor, &view));
                 r
             }
             Err(e) => ToolResult::error(self.ctx.redactor.redact(&e.to_string())),
@@ -4884,6 +4902,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn structured_tool_result_redaction_preserves_valid_json() {
+        let input = json!({
+            "kind": "intent",
+            "state": {
+                "message": "before api_key=sk-main-secret\".into()); after",
+                "nested": ["keep-me"],
+            },
+        })
+        .to_string();
+        let redacted = redact_tool_result_text(&Redactor::new(), &input);
+        let parsed: Value = serde_json::from_str(&redacted)
+            .expect("redaction must preserve the structured operation contract");
+
+        assert_eq!(parsed["kind"], "intent");
+        assert_eq!(parsed["state"]["nested"][0], "keep-me");
+        assert!(!redacted.contains("sk-main-secret"));
+    }
+
+    #[test]
+    fn tool_result_redaction_keeps_unmodified_json_byte_exact() {
+        let input = "{ \"kind\": \"intent\", \"state\": {} }";
+        assert_eq!(redact_tool_result_text(&Redactor::new(), input), input);
+    }
 
     #[derive(Default)]
     struct RecordingProgressSink(Mutex<Vec<ToolProgress>>);

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use flux_core::{render_knowledge_blocks, ContextBlock, Error, Result};
 use flux_events::EventStore;
 use flux_flow::engine::FlowEngine;
-pub use flux_flow::engine::{AgentLoopSpec, BuiltinAgentLoop};
+pub use flux_flow::engine::{AgentLoopBinding, AgentLoopSpec, BuiltinAgentLoop};
 use flux_flow::state::FlowStore;
 pub use flux_flow::{AdaptiveLoopPolicy, AgentStagePolicy};
 use flux_provider::{Effort, Provider};
@@ -376,6 +376,10 @@ pub struct AgentSpec {
     pub effort: Option<Effort>,
     /// The explicit Flux-Lang outer loop. Defaults to the shipped adaptive preset.
     pub agent_loop: AgentLoopSpec,
+    /// Optional caller-resolved identity for `agent_loop`. When omitted, the common assembly
+    /// boundary resolves the versioned adaptive or canonical inline binding before the engine can
+    /// run. A supplied binding must carry the same executable spec.
+    pub agent_loop_binding: Option<AgentLoopBinding>,
     /// Evidence-gated tool groups (empty disables gating — every op advertised).
     pub groups: Vec<flux_evidence::ToolGroup>,
     /// Built-in intent/exploration cognition policy, including the logical-run model-call ceiling.
@@ -419,6 +423,7 @@ impl Default for AgentSpec {
             thinking: false,
             effort: None,
             agent_loop: AgentLoopSpec::default(),
+            agent_loop_binding: None,
             groups: Vec::new(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             ambient_signals: Vec::new(),
@@ -705,7 +710,19 @@ impl AgentSpec {
         resolve_adaptive_policy(provider.name(), &mut adaptive_policy)?;
         let tool_names = executor.registry().names();
         let system_prompt = self.effective_system_prompt_for_tools(&tool_names);
-        let engine = FlowEngine::assemble_with_loop(
+        let agent_loop_binding = match self.agent_loop_binding {
+            Some(binding) => {
+                if binding.spec() != &self.agent_loop {
+                    return Err(flux_core::Error::Other(format!(
+                        "agent loop binding/spec mismatch for profile `{}`",
+                        binding.metadata().profile
+                    )));
+                }
+                binding
+            }
+            None => AgentLoopBinding::from_spec(self.agent_loop),
+        };
+        let engine = FlowEngine::assemble_with_binding(
             provider,
             executor,
             events,
@@ -718,7 +735,7 @@ impl AgentSpec {
             self.compact_threshold_chars,
             self.groups,
             self.cwd,
-            self.agent_loop,
+            agent_loop_binding,
         )?;
         engine.loop_host.set_adaptive_policy(adaptive_policy);
         Ok(engine

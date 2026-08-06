@@ -107,6 +107,13 @@ routing, native-schema exploration, batch approval/execution, local repair, and 
 another loop explicitly with `ClientBuilder::agent_loop`; an ejected `agent-loop.flux` is not loaded
 merely because the file exists.
 
+Every client resolves that selection to an `AgentLoopBinding` before its first provider call. An
+omitted selection becomes the explicit `adaptive@1` binding; embedders that already admitted an
+exact authored loop can pass `ClientBuilder::agent_loop_binding`. The binding includes bounded
+profile, revision, source digest, runner, entry point and runtime requirements, while retaining the
+validated source in-process. Reusing a durable session with a different binding is refused rather
+than silently changing its behavior.
+
 Custom typed stages are ordinary guarded operations. `stage_fn::<I, O, _, _, _>` derives unrelated
 input and output schemas, so the Flux analyzer sees the real `O` type at call sites:
 

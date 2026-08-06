@@ -177,7 +177,13 @@ records its chosen outcome and rationale.
 
 Control commands provide durable acknowledgement levels: `accepted` after journalling, `delivered`
 after the persistent agent session acknowledges steering, and `completed` at a terminal turn. Status
-uses an independent read path while a worker is busy. Activity is redacted before persistence.
+uses an independent read path while a worker is busy. Its default projection is bounded current
+lifecycle metadata and explicit inspect references; it never embeds retained answers, tool events,
+intake bodies or repository content. Terminal lifecycle state wins over stale receipt/error text for
+active and attention counts. Activity is redacted before persistence.
+Targeted inspection applies an explicit item limit and a fixed structural byte budget after
+redaction. It prioritizes terminal identity/outcome fields and emits source-referenced omission
+records instead of truncating serialized JSON or copying retained evidence into a default view.
 
 ## Scriptless parity
 
@@ -198,9 +204,9 @@ Board wave: C-547 (machine CLI contract), A-134 (registry/profile core), L-130 (
 Fleet wave: C-244 (typed handoff), C-245 (same-session rework), C-242 (integration and explicit
 apply), A-117 (durable supervisor and fleet CLI), C-551 (inspection, reporting and roadmap parity).
 
-Fleet dogfood hardening: C-569 (resolved loop binding), C-567 (workhorse task-kind policy), C-570
-(progress/yield), C-572 (review/repair loops), C-542/C-571 (local and hierarchical budgets), then
-C-565's five-writer proof.
+Fleet dogfood hardening: C-569 (resolved operator-authored loop binding), C-570 (progress/yield),
+C-572 (review/repair loops), C-542/C-571 (local and hierarchical budgets), then C-565's five-writer
+proof. Postponed C-567 is optional policy/convenience work, not a prerequisite.
 
 Generic task-agent backends and Codex/Claude/Hermes/Pi CLI harness adapters, authenticated remote
 A2A fleet members, a polished board/fleet TUI, vendor boards, containers, automatic publication and

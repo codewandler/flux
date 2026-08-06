@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
@@ -42,6 +42,36 @@ fn fixture(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&root);
     fs::create_dir_all(root.join("docs/stories")).unwrap();
     root
+}
+
+const TEST_FLEET_LOOP_POLICY: &str = r#"
+[loop_profiles.implementation]
+revision = "1"
+source = ".flux/fleet/loops/implementation.flux"
+entry = "work"
+
+[loop_profiles.research]
+revision = "1"
+source = ".flux/fleet/loops/research.flux"
+entry = "research"
+
+[loop_policy]
+implementation = "implementation"
+research = "research"
+"#;
+
+fn install_test_fleet_loops(root: &Path) {
+    fs::create_dir_all(root.join(".flux/fleet/loops")).unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/implementation.flux"),
+        "flow work -> string\n  $turn = ai_segment({ goal: \"implement the exact assignment\", tools: [\"read\", \"write\"], max_rounds: 8, current_turn: true })\n  return $turn.result\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/research.flux"),
+        "flow research -> string\n  $turn = ai_segment({ goal: \"research the exact request\", tools: [\"read\"], max_rounds: 4, current_turn: true })\n  return $turn.result\n",
+    )
+    .unwrap();
 }
 
 fn flux(root: &PathBuf, args: &[&str]) -> std::process::Output {
@@ -118,9 +148,10 @@ fn one_story_wave(name: &str) -> (PathBuf, PathBuf) {
     )
     .unwrap();
     fs::create_dir_all(root.join(".flux")).unwrap();
+    install_test_fleet_loops(&root);
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -262,6 +293,7 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     )
     .unwrap();
     fs::create_dir_all(fleet_root.join(".flux/fleet/agents")).unwrap();
+    fs::create_dir_all(fleet_root.join(".flux/fleet/loops")).unwrap();
     fs::write(
         fleet_root.join(".flux/fleet/main.md"),
         "Coordinate the offline fixture.\n",
@@ -273,8 +305,23 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     )
     .unwrap();
     fs::write(
+        fleet_root.join(".flux/fleet/loops/main.flux"),
+        "flow fleet-main -> string\n  return \"fixture main\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet/loops/research.flux"),
+        "flow fleet-research -> string\n  return \"fixture research\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet/loops/implementation.flux"),
+        "flow work -> string\n  return \"fixture worker\"\n",
+    )
+    .unwrap();
+    fs::write(
         fleet_root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ntask_kind = \"implementation\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&fleet_root, &["init", "-q"]).status.success());
@@ -1475,6 +1522,7 @@ fn session_board_cli_reopens_the_event_projection_and_conflicts_stale_writers() 
 #[test]
 fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
     let root = fixture("agent-admission");
+    install_test_fleet_loops(&root);
     fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
     fs::write(
         root.join(".flux/fleet/main.md"),
@@ -1488,7 +1536,7 @@ fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\ncapabilities = [\"read\"]\nmax_instances = 1\n",
+        format!("schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ntask_kind = \"research\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\ncapabilities = [\"read\"]\nmax_instances = 1\n"),
     )
     .unwrap();
     assert!(flux(&root, &["fleet", "start"]).status.success());
@@ -1556,6 +1604,7 @@ fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
 #[test]
 fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() {
     let root = fixture("missing-worker-capabilities");
+    install_test_fleet_loops(&root);
     fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
     fs::write(
         root.join(".flux/fleet/agents/story-worker.md"),
@@ -1564,7 +1613,7 @@ fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() 
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\"]\nmax_instances = 1\n",
+        format!("schema = \"flux.fleet/v1\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ntask_kind = \"implementation\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\"]\nmax_instances = 1\n"),
     )
     .unwrap();
 
@@ -1582,6 +1631,7 @@ fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() 
 #[test]
 fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
     let root = fixture("wave-topology");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     fs::write(
         root.join("docs/stories/C-1-story.md"),
@@ -1591,7 +1641,7 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
     fs::create_dir_all(root.join(".flux")).unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -1627,9 +1677,48 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
         String::from_utf8_lossy(&dispatched.stderr)
     );
     let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    assert_eq!(dispatched["data"]["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(dispatched["data"]["agents"][0]["id"], "wave-2-worker-1");
+    assert_eq!(dispatched["data"]["agents"][0]["role"], "writer");
+    assert_eq!(
+        dispatched["data"]["agents"][0]["task_kind"],
+        "implementation"
+    );
+    assert_eq!(
+        dispatched["data"]["agents"][0]["loop_binding"]["profile"],
+        "implementation"
+    );
+    assert_eq!(
+        dispatched["data"]["agents"][0]["loop_binding"]["source_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     let repository = &dispatched["data"]["topology"]["repositories"][0];
     assert_eq!(repository["base_commit"], base);
     assert_eq!(repository["stories"][0]["base_commit"], base);
+
+    let census = flux(&root, &["fleet", "agents", "--output", "json"]);
+    assert!(census.status.success());
+    let census: serde_json::Value = serde_json::from_slice(&census.stdout).unwrap();
+    assert_eq!(census["data"]["schema"], "flux.fleet-agents/v1");
+    assert_eq!(census["data"]["workers_total"], 1);
+    assert_eq!(
+        census["data"]["workers"]["wave-2-worker-1"]["id"],
+        "wave-2-worker-1"
+    );
+    assert_eq!(
+        census["data"]["workers"]["wave-2-worker-1"]["task_kind"],
+        "implementation"
+    );
+    assert!(census["data"]["workers"]["wave-2-worker-1"]
+        .get("instructions")
+        .is_none());
+    assert!(census["data"]["workers"]["wave-2-worker-1"]
+        .get("last_turn")
+        .is_none());
+
     let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
     let story = PathBuf::from(repository["stories"][0]["worktree"].as_str().unwrap());
     assert!(integration.is_dir());
@@ -1647,11 +1736,13 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
         base
     );
     assert_eq!(repository["stories"][0]["board_ref"], "repo/C-1");
+    assert_eq!(repository["stories"][0]["wave"], "wave-2");
 }
 
 #[test]
 fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     let root = fixture("wave-integration");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     fs::write(
         root.join("docs/stories/C-1-story.md"),
@@ -1661,7 +1752,7 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     fs::create_dir_all(root.join(".flux")).unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\nfences = [\".flux/fleet/**\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\nfences = [\".flux/fleet/**\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -1778,6 +1869,7 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
 #[test]
 fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate() {
     let root = fixture("combined-only-red");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     for (id, title, priority) in [("C-1", "One", 1), ("C-2", "Two", 2)] {
         fs::write(
@@ -1791,7 +1883,7 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::create_dir_all(root.join(".flux")).unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"test ! -f one.txt || test ! -f two.txt\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"test ! -f one.txt || test ! -f two.txt\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -2086,15 +2178,25 @@ fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
 #[test]
 fn fleet_delivers_to_a_real_durable_main_agent_session() {
     let root = fixture("durable-main-turn");
-    fs::create_dir_all(root.join(".flux/fleet")).unwrap();
+    fs::create_dir_all(root.join(".flux/fleet/loops")).unwrap();
     fs::write(
         root.join(".flux/fleet/main.md"),
         "Act as the only main coordinator and acknowledge the request.\n",
     )
     .unwrap();
     fs::write(
+        root.join(".flux/fleet/loops/main.flux"),
+        "flow fleet-main -> string\n  result = task({ role: \"scout\", task: \"read-only fixture research\" })\n  return result\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/research.flux"),
+        "flow fleet-research -> string\n  return \"acknowledged\"\n",
+    )
+    .unwrap();
+    fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n",
+        "schema = \"flux.fleet/v1\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n",
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -2129,6 +2231,7 @@ fn fleet_delivers_to_a_real_durable_main_agent_session() {
     );
     let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["data"]["receipt"]["ack"], "completed");
+    assert_eq!(first["data"]["receipt"]["answer"], "acknowledged");
     assert_eq!(first["data"]["receipt"]["session"], "s_1");
     assert!(first["data"]["receipt"]["events"]
         .as_array()
@@ -2171,6 +2274,7 @@ fn fleet_delivers_to_a_real_durable_main_agent_session() {
 #[test]
 fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     let root = fixture("real-story-agent");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     fs::write(
         root.join("docs/stories/C-1-story.md"),
@@ -2190,7 +2294,7 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ntask_kind = \"implementation\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -2226,6 +2330,14 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     assert_eq!(receipts[1]["context_origin"]["session_mode"], "fresh");
     assert_ne!(receipts[0]["store"], receipts[1]["store"]);
     for receipt in receipts {
+        assert_eq!(receipt["loop_binding"]["profile"], "implementation");
+        assert_eq!(
+            receipt["loop_binding"]["source_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         let context = serde_json::to_string(&receipt["context_origin"]).unwrap();
         assert!(!context.contains("Work only in the assigned story worktree"));
         assert!(!context.contains("flux-mock"));
@@ -2316,10 +2428,22 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
         continued["data"]["receipt"]["context_origin"]["worker_contract_sha256"],
         first_worker_contract
     );
-    let status = flux(&root, &["fleet", "status", "--output", "json"]);
-    assert!(status.status.success());
-    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    let admitted = &status["data"]["state"]["agents"][first_agent];
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "worker",
+            first_agent,
+            "--limit",
+            "100",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(inspected.status.success());
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let admitted = &inspected["data"]["data"];
     assert_eq!(
         admitted["capabilities"],
         serde_json::json!(["edit", "git", "read", "shell"])

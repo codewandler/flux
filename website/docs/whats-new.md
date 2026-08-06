@@ -31,6 +31,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **The Fleet main agent is now a coordinator, not a general coding agent.** It can read and manage
+  the configured Board and Fleet, list all durable workers, and delegate bounded read-only research.
+  It no longer receives shell, file-editing, git-writing, web/plugin, pane, evaluation, or transient
+  process-worker tools. Safe status and planning reads do not ask for approval, and Fleet status is
+  compact even when old waves have accumulated. Free-form questions use the Fleet's authored loop
+  with only the current request instead of growing an adaptive history budget.
+
+- **Fleet workers now run the loop their task kind selected at admission.** Operator-authored loop
+  profiles replace the general adaptive explorer for implementation, research, review, repair and
+  decision work. Flux validates that loop against the worker's tools before starting and preserves
+  its exact digest across messages, restart, resume and rework. Status and terminal receipts show
+  the bounded loop identity, and dispatch responses include the worker ids the coordinator needs.
+
 - **Fleet supervision opens immediately, even in a large workspace.** Board and Fleet views load in
   the background, so refreshing them no longer freezes typing or rendering. If a later refresh
   fails, the last working view stays visible and is clearly marked stale.
@@ -39,6 +52,19 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
   review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
   eligibility, worktree, rework and publication boundaries.
+
+### Action needed
+
+- **Fleet configurations must name the main coordinator loop.** Add
+  `loop = ".flux/fleet/loops/main-coordinator.flux"` and
+  `research_loop = ".flux/fleet/loops/research.flux"` under `[main]`, and keep both Flux-Lang files
+  in the Fleet root. `flux tui --fleet` now refuses a missing or invalid binding rather than
+  falling back to the general adaptive agent loop for either the coordinator or its research task.
+
+- **Fleet worker templates must declare loop policy.** Add operator-authored `[loop_profiles.*]`
+  entries, map each supported task kind under `[loop_policy]`, and set `task_kind` on each agent
+  template. Flux refuses an unbound or capability-incompatible worker before creating its worktree
+  or making a model request.
 
 ## [0.56.0] - 2026-08-05
 

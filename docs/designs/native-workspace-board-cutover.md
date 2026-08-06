@@ -42,7 +42,7 @@ outcome = "Resolve one explicit loop binding at every agent start."
 id = "flux-fleet-worker-boundaries-1"
 state = "active"
 repository = "flux"
-items = ["flux/C-569", "flux/C-567"]
+items = ["flux/C-569", "flux/C-570"]
 depends_on = []
 ```
 

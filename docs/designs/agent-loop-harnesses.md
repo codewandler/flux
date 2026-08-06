@@ -3,7 +3,6 @@
 **Status:** proposed, active Fleet stop-line · **Epic:**
 [C-568](../stories/C-568-explicit-agent-loop-harnesses-epic.md) · **Stories:**
 [C-569](../stories/C-569-resolve-loop-binding-at-every-agent-start.md),
-[C-567](../stories/C-567-run-codex-fleet-writers-as-fresh-workhorses.md),
 [C-570](../stories/C-570-agent-progress-and-cooperative-yield.md),
 [C-571](../stories/C-571-hierarchical-fleet-budget-ledger.md),
 [C-572](../stories/C-572-fleet-review-and-rework-loops.md),
@@ -16,8 +15,9 @@
 Every agent starts under a resolved, versioned loop harness that says how it behaves. The ordinary
 Flux default remains the authored adaptive loop, but `None` never reaches a running agent: the start
 boundary resolves it to `builtin:adaptive@1` and records that exact binding. A Fleet writer instead
-uses a purpose-built workhorse loop; a fresh reviewer uses a reviewer loop; a decision or research
-task may use another declared profile.
+uses an operator-authored implementation loop selected by policy; a fresh reviewer uses another
+operator-authored profile; a decision or research task may use another declared profile. Fleet does
+not ship or silently select a dedicated implementation workhorse in this tranche.
 
 The loop is independent of where the agent executes. Native Flux can execute arbitrary validated
 Flux-Lang loops. A task-agent backend advertises which loop forms and reporting semantics it can
@@ -74,6 +74,8 @@ AgentLoopBinding
 
 The durable receipt stores the bounded metadata and digests, never the loop source, prompt, tool
 catalogue or report bodies. Resume, message, rework and recovery reconstruct the recorded binding.
+Required operations and runtime features are canonical sorted sets; reconstruction treats legacy
+insertion order as equivalent but does not weaken any other identity field.
 Changing the project file, role or Fleet template affects later starts only; changing a running
 worker requires an explicit new admission/session transition.
 
@@ -106,30 +108,36 @@ declared default applies. BoardRef identity and Board profile/backend remain unc
 This keeps future Jira, Trello and other Board backends orthogonal. They provide items and mapped
 metadata; they are not agent-loop runners and Board does not become a datasource.
 
-Illustrative configuration shape, not yet a frozen TOML schema:
+The implemented Fleet configuration keeps profiles and policy at the execution-policy root:
 
 ```toml
-[fleet.loop_profiles.workhorse]
-source = ".flux/loops/fleet-workhorse.flux"
+[loop_profiles.implementation]
+revision = "1"
+source = ".flux/loops/team-implementation.flux"
 entry = "work"
 
-[fleet.loop_profiles.reviewer]
+[loop_profiles.reviewer]
+revision = "1"
 source = ".flux/loops/fleet-review.flux"
 entry = "review"
 
-[fleet.loop_policy]
-implementation = "workhorse"
-documentation = "workhorse"
+[loop_policy]
+implementation = "implementation"
+documentation = "implementation"
 review = "reviewer"
-repair = "workhorse"
+repair = "implementation"
 ```
 
-Admission snapshots the selected profile, source digest and entry point beside the existing model,
-mode, capability, worktree and fence snapshot.
+Each agent template also declares its default `task_kind`. Admission resolves that kind through the
+policy, validates the loop against the admitted operation ceiling, and snapshots the selected
+profile, revision, exact source, source digest, runner, entry point, required operations and runtime
+features beside the existing model, mode, capability, worktree and fence snapshot. Subsequent
+message, resume and rework starts reconstruct those snapshots rather than rereading mutable policy.
 
-## The Fleet workhorse and review pipeline
+## The operator-authored implementation and review pipeline
 
-The shipped workhorse loop is intentionally small:
+The example operator-authored implementation loop is intentionally small. It illustrates the
+required lifecycle shape; Flux does not ship this profile or make its policy choices universal:
 
 ```text
 read assignment contract
@@ -159,7 +167,9 @@ frozen candidate
   -> host parks after the existing two-rework ceiling
 ```
 
-The workhorse reports `candidate_ready` before these fresh agents begin; `handoff_ready` is a
+The implementation loop must invoke its configured acknowledged terminal signal. A successful model
+answer without that signal remains incomplete. It reports `candidate_ready` before these fresh
+agents begin; `handoff_ready` is a
 host-derived state only after review passes and the mandatory reflection receipt is stored. The
 reviewer receives exactly the story contract, normalized diff, candidate identity and diff digest—no
 writer conversation, repository tools or ambient checkout. The reflector receives the original
@@ -352,20 +362,21 @@ coordinator still grants BoardRef, mode, capabilities, fences, budget and lease.
 ## Delivery order
 
 1. **C-569** — resolve and snapshot `AgentLoopBinding` on every start path.
-2. **C-567** — bind Fleet task kinds to native workhorse loop profiles and prove five writers can
-   implement instead of recursively explore.
-3. **C-570** — add durable typed progress and cooperative yield.
-4. **C-572** — run fresh diff-and-story-only review and same-session repair through explicit loops.
-5. **C-587** — run mandatory structured reflection beside review and persist the central improvement
+2. **C-570** — add durable typed progress and cooperative yield.
+3. **C-572** — run fresh diff-and-story-only review and same-session repair through explicit loops.
+4. **C-587** — run mandatory structured reflection beside review and persist the central improvement
    projection before handoff can complete.
-6. **C-575 + C-542 + C-571** — record physical usage, unify local time/token projections, then add
+5. **C-575 + C-542 + C-571** — record physical usage, unify local time/token projections, then add
    Fleet reservation/settlement.
-7. **C-583** — expose revisioned desired Fleet capacity plus safe drain through one operation/CLI
+6. **C-583** — expose revisioned desired Fleet capacity plus safe drain through one operation/CLI
    contract, keeping nested task children distinct from Fleet workers.
-8. **C-573** — tune allowed model/effort/concurrency/reservations from freshness-labelled metrics.
-9. **C-552/C-553** — extend the generic backend and foreign CLI adapters against the settled loop,
+7. **C-573** — tune allowed model/effort/concurrency/reservations from freshness-labelled metrics.
+8. **C-552/C-553** — extend the generic backend and foreign CLI adapters against the settled loop,
    report and budget contracts.
-10. **C-130** — enforce monetary and rolling per-principal caps through the shared ledger.
+9. **C-130** — enforce monetary and rolling per-principal caps through the shared ledger.
+
+C-567 is postponed optional policy/convenience work. An operator can author and select a Fleet
+sub-agent loop through C-569 without it.
 
 C-543/C-544 can follow C-569 without waiting for Fleet budgets. C-556/C-557 consume
 C-570/C-571/C-573's typed projections instead of inventing another progress calculation.

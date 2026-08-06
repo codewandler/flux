@@ -6,7 +6,7 @@ status: backlog
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-flow, flux-runtime, flux-orchestrate, flux-events, flux-cli]
-depends_on: [C-567, C-570, C-572]
+depends_on: [C-570, C-572]
 note: "after implementation freezes, async tool-free review(story+diff) and reflection(request+transcript+outcome) are mandatory; reflections feed a central improvement corpus"
 ---
 

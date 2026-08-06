@@ -75,6 +75,11 @@ const FLEET_OP_SOURCE: &str = "flux-cli fleet dispatch";
 /// lumped them under one label could not say which of the two a registration widened.
 const FLEET_LIFECYCLE_SOURCE: &str = "flux-cli fleet lifecycle";
 
+/// The attached native Fleet main's durable-control-plane pack. The source scanner sees this
+/// constant identifier at the registration seam; the runtime value lives beside the production
+/// assembly in `execution.rs`.
+const NATIVE_FLEET_MAIN_SOURCE: &str = "NATIVE_FLEET_MAIN_SOURCE";
+
 /// The domain the census binds a representative work board under (A-131).
 ///
 /// A board's real domain is the Program's `datasource` name, so no fixed name is *the* production
@@ -141,6 +146,11 @@ fn production_catalog() -> ToolRegistry {
         &events,
     )
     .expect("the CLI tool packs register");
+    crate::execution::install_native_fleet_main_tools(
+        &mut registry,
+        crate::board_fleet_cmd::native_fleet_main_tools_for_catalog(),
+    )
+    .expect("the attached native Fleet-main pack installs over legacy name collisions");
 
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         Arc::new(flux_capabilities::MemoryBackend::new());
@@ -689,12 +699,13 @@ struct RegistrationCall {
     arguments: Vec<String>,
 }
 
-fn covered_registration_sources() -> [String; 6] {
+fn covered_registration_sources() -> [String; 7] {
     [
         "\"flux-cli cognition pack\"".to_string(),
         format!("{TASK_OP_SOURCE:?}"),
         format!("{FLEET_OP_SOURCE:?}"),
         format!("{FLEET_LIFECYCLE_SOURCE:?}"),
+        NATIVE_FLEET_MAIN_SOURCE.to_string(),
         "ConsultTool".to_string(),
         "WakeupTool".to_string(),
     ]

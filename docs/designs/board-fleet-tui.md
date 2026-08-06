@@ -49,6 +49,14 @@ Attachment supplies a cheap truthful seed immediately; full projections run on a
 and are coalesced while one refresh is in flight. A cheap token over authoritative durable inputs
 lets the event loop skip unchanged rebuilds without treating the token itself as projected state.
 
+The explicitly attached main agent may read the same durable projection through bounded native
+operations. `fleet.agents` enumerates admitted native workers without requiring an id and exposes
+only bounded identity/status fields. It is not the legacy `fleet.worker_status` operation, which
+observes one transient A2A/process worker already known to that in-process runtime. Ordinary chat
+agents and story workers do not receive the native-main operation. The validated attachment
+pre-authorizes this one bounded read, so the coordinator does not need a human approval to inspect
+its own worker roster; an operator-authored deny rule remains authoritative.
+
 The view model has hard caps for rows and detail bytes. It includes total counts and truncation
 markers, so a large Fleet cannot look smaller merely because the TUI bounded it. Statistics carry
 the `flux.board-stats/v1` values; the TUI formats those values and never recomputes completion.
@@ -71,7 +79,7 @@ one requires a second explicit Enter and uses the Board decision operation.
 
 ## Authority and failure posture
 
-Observation is read-only. The surface cannot dispatch, cancel, apply, push, publish, release,
+Observation and native worker enumeration are read-only. The surface cannot dispatch, cancel, apply, push, publish, release,
 deploy, delete a worktree or change story state. Requirements and confirmed decisions are the only
 write paths in this epic, and each produces a durable acknowledgement. A read or refresh failure
 keeps the last good snapshot with a stale/error marker rather than clearing workers or rendering

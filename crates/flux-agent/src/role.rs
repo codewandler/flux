@@ -45,14 +45,41 @@ impl Role {
     /// tool selection, and the model falls back to `default_model` when the role doesn't override it.
     /// Turn settings (`max_tokens`, `max_iterations`, …) take spec defaults; the caller can override.
     pub fn to_spec(&self, default_model: &str) -> Result<AgentSpec> {
-        let agent_loop = match self.agent_loop.as_deref() {
-            Some(source) => crate::AgentLoopSpec::parse(source).map_err(|error| {
-                Error::Other(format!(
-                    "role `{}` has an invalid agent loop: {error}",
-                    self.name
-                ))
-            })?,
-            None => crate::AgentLoopSpec::default(),
+        let (agent_loop, agent_loop_binding) = match self.agent_loop.as_deref() {
+            Some(source) if source.trim().eq_ignore_ascii_case("adaptive") => {
+                let spec = crate::AgentLoopSpec::default();
+                let binding = crate::AgentLoopBinding::from_spec(spec.clone());
+                (spec, Some(binding))
+            }
+            Some(source) => {
+                let spec = crate::AgentLoopSpec::parse(source).map_err(|error| {
+                    Error::Other(format!(
+                        "role `{}` has an invalid agent loop: {error}",
+                        self.name
+                    ))
+                })?;
+                let entry = match &spec {
+                    crate::AgentLoopSpec::Flux(ast) => {
+                        ast.name.clone().unwrap_or_else(|| "custom".into())
+                    }
+                    crate::AgentLoopSpec::Builtin(_) => "agent-loop".into(),
+                };
+                let binding = crate::AgentLoopBinding::native_flux(
+                    format!("role:{}", self.name),
+                    "1",
+                    format!("role:{}@1", self.name),
+                    entry,
+                    source,
+                )
+                .map_err(|error| {
+                    Error::Other(format!(
+                        "role `{}` has an invalid agent loop binding: {error}",
+                        self.name
+                    ))
+                })?;
+                (spec, Some(binding))
+            }
+            None => (crate::AgentLoopSpec::default(), None),
         };
         Ok(AgentSpec {
             model: self
@@ -65,6 +92,7 @@ impl Role {
             thinking: self.thinking.unwrap_or(false),
             effort: self.effort,
             agent_loop,
+            agent_loop_binding,
             ..AgentSpec::default()
         })
     }
@@ -348,6 +376,24 @@ mod tests {
         // `tools: []` is the most-restrictive declaration and must parse to Some([]), not None.
         let r = parse_role("---\ntools: []\n---\nbody", "locked");
         assert_eq!(r.tools, Some(Vec::new()));
+    }
+
+    #[test]
+    fn authored_role_loop_resolves_its_own_binding_identity() {
+        let role = parse_role(
+            "---\nname: implementer\nloop: |\n  flow work -> string\n    return \"done\"\n---\nImplement the assignment.",
+            "fallback",
+        );
+        let spec = role.to_spec("mock").unwrap();
+        let binding = spec.agent_loop_binding.expect("explicit role loop binding");
+
+        assert_eq!(binding.metadata().profile, "role:implementer");
+        assert_eq!(binding.metadata().revision, "1");
+        assert_eq!(binding.metadata().entry_point, "work");
+        assert!(binding
+            .metadata()
+            .source_ref
+            .starts_with("role:implementer@1"));
     }
 
     #[test]

@@ -105,7 +105,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ### explicit agent-loop harnesses, progress and hierarchical budgets
 - [C-569 — Every agent start resolves and snapshots an explicit loop binding](C-569-resolve-loop-binding-at-every-agent-start.md) · Core · general omission resolves to builtin adaptive; task/Fleet/backend starts carry a versioned binding and never inherit a parent's loop implicitly
-- [C-567 — Fleet workers use assignment-selected authored workhorse loops](C-567-run-codex-fleet-writers-as-fresh-workhorses.md) · Core · five-writer dogfood stop-line — select a native workhorse loop by explicit task kind instead of adding a Codex-specific runner
+- [C-567 — Fleet workers use assignment-selected operator-authored loops](C-567-run-codex-fleet-writers-as-fresh-workhorses.md) · Core · postponed convenience policy — configured sub-agents can already select operator-authored loops through C-569
 - [C-542 — One time/token budget vocabulary with hard limits and live projections](C-542-granular-time-token-budgets-visible-in-tui.md) · Core · foundation for C-571 — budget target versus hard limit, common envelope/usage events and live TUI projection
 
 ### Watch the agent think — the loop as a live thread, expandable down to the graph

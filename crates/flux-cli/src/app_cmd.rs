@@ -971,7 +971,7 @@ const TUI_BUILTIN_COMMANDS: &[&str] = &[
 ];
 
 pub(super) async fn run_tui(
-    flags: AgentFlags,
+    mut flags: AgentFlags,
     fleet_root: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let auto_approve = flags.yes;
@@ -984,6 +984,9 @@ pub(super) async fn run_tui(
     let panes = flux_tui::PaneQueue::new();
     let interactions = flux_tui::InteractionQueue::new();
     let fleet = fleet_root.as_deref().map(prepare_fleet_tui).transpose()?;
+    if let Some(fleet) = fleet.as_ref() {
+        flags.agent_loop = Some(fleet.agent_loop.clone());
+    }
     let (agent, session_id, model_spec, _spawner) = if let Some(fleet) = fleet.as_ref() {
         build_agent_with_surface_at(
             &flags,
@@ -993,6 +996,7 @@ pub(super) async fn run_tui(
             AgentBuildLocation {
                 workspace_root: fleet.root.clone(),
                 store_dir: fleet.store.clone(),
+                fleet_main: true,
             },
         )
         .await?

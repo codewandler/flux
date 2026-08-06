@@ -25,6 +25,9 @@
 //!
 //! `tests/scenarios/<name>/` is a plain [`Storage::dir`] (`events.db` + an empty `flow.db` — also
 //! openable by `flux replay`/`flux sessions`/`flux diff`), plus:
+//! - `agent-loops/<sha256>.flux` — the exact admitted loop source needed to resume the recorded
+//!   session. Recording refuses source changed by the client's redactor rather than committing a
+//!   secret or changing the digest.
 //! - `model.jsonl` — one JSON line per recorded model call (see [`ModelCallRecord`]), redacted
 //!   before it is ever written to disk.
 //! - `plan.flux.snap` — the canonical Flux-Lang text of every accepted plan in the recorded turn
@@ -330,6 +333,31 @@ fn write_manifest(dir: &Path, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn write_agent_loop_snapshot(
+    dir: &Path,
+    binding: &crate::AgentLoopBinding,
+    redactor: &Redactor,
+) -> Result<()> {
+    let source = binding.source();
+    if redactor.redact(source) != source {
+        return Err(flux_core::Error::Other(
+            "Scenario::record: admitted agent loop source contains registered secret material; \
+             refusing to write a commit-safe fixture"
+                .into(),
+        ));
+    }
+    let root = dir.join("agent-loops");
+    if root.exists() {
+        std::fs::remove_dir_all(&root)?;
+    }
+    std::fs::create_dir_all(&root)?;
+    std::fs::write(
+        root.join(format!("{}.flux", binding.metadata().source_sha256)),
+        source,
+    )?;
+    Ok(())
+}
+
 /// Read back a fixture's `model.jsonl` — D-176's `Scenario::check` loads a fixture's recorded model
 /// calls into its [`ServingProvider`].
 fn read_model_calls(dir: &Path) -> Result<Vec<ModelCallRecord>> {
@@ -607,7 +635,7 @@ impl Scenario {
         let records: Arc<Mutex<Vec<ModelCallRecord>>> = Arc::new(Mutex::new(Vec::new()));
         let recording = Arc::new(RecordingProvider {
             inner: client.assembly.provider.clone(),
-            redactor,
+            redactor: redactor.clone(),
             records: records.clone(),
         });
 
@@ -648,6 +676,7 @@ impl Scenario {
             path.join("flow.db"),
             fixture_events.clone(),
         )?);
+        write_agent_loop_snapshot(path, &engine.agent_loop_binding, &redactor)?;
 
         let live_calls = records.lock().unwrap().len();
         write_model_calls(path, &records.lock().unwrap())?;
