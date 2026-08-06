@@ -36,6 +36,19 @@ All notable changes to this project are documented in this file. The format is b
   show story states, eligibility, isolated worktrees, review/rework and the separate publication
   boundary.
 
+- **`flux fleet status` and `flux fleet dashboard` are now bounded projections** (C-562). The
+  default `flux.fleet-status/v1` view reports main state, active/attention/settled worker counts,
+  wave and item state, exact `BoardRef`s, repositories, current sessions, last transition/error
+  summaries and the current revision inside a reviewed fixed byte budget, instead of copying
+  retained `last_turn` receipts, intake receipts and historical event arrays into the default
+  output — the shape that reached 2,694,752 bytes on the 2026-08-05 roadmap dogfood run. Redaction
+  runs before budgeting, oversized values and trimmed arrays become payload-free
+  `flux.fleet-status-omitted/v1` records, and detail stays behind the explicitly bounded
+  `flux fleet inspect` route. Status and the TUI dashboard now share one worker-liveness
+  derivation, so a completed, failed, cancelled or interrupted process is never counted as active
+  because a stale receipt said `working`, while a delivered continuation is not settled by the
+  receipt of its previous turn.
+
 ### Fixed
 
 - Concurrent `fleet.isolate` calls now serialize Git's shared worktree-administration mutation

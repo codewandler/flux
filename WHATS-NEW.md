@@ -39,6 +39,14 @@
   review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
   eligibility, worktree, rework and publication boundaries.
 
+- **Fleet status stays small and readable however long the fleet has been running.** The default
+  status and dashboard report what is happening now — running state, live and attention-needing
+  workers, waves, work items, repositories, sessions and the last failure summary — inside a fixed
+  size, and end by naming the next useful inspection or recovery command. Retained turn history,
+  answers and tool output are no longer pasted into that view; ask for them with
+  `flux fleet inspect`, which keeps its own explicit limits and reports what it left out. A worker
+  that finished, failed, was cancelled or was interrupted is no longer counted as active.
+
 ## [0.56.0] - 2026-08-05
 
 ### New

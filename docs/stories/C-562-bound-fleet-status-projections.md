@@ -20,22 +20,26 @@ failed/continued turns, while preserving detailed evidence behind explicitly bou
 
 ## Acceptance
 
-- [ ] Failing first, a hermetic state shaped like the 2026-08-05 roadmap dogfood run produces a
+- [x] Failing first, a hermetic state shaped like the 2026-08-05 roadmap dogfood run produces a
       multi-megabyte `fleet status` because `last_turn`, intake receipts and historical event arrays
       are copied into the default projection. The fixed JSON and human projections remain below a
       reviewed fixed byte budget independent of retained history count and payload size.
-- [ ] Default status reports main state, active/attention worker counts, wave/item state, exact
+- [x] Default status reports main state, active/attention worker counts, wave/item state, exact
       BoardRefs, repositories, current sessions, last transition/error summaries and current
       revision without embedding answers, tool events, diffs or repository contents.
-- [ ] `inspect worker|result|activity|wave` remains the route to detail, honors its explicit item and
+- [x] `inspect worker|result|activity|wave` remains the route to detail, honors its explicit item and
       byte bounds, and returns omission metadata/references when retained evidence is larger.
-- [ ] Dashboard and status agree on active workers. A completed, failed, cancelled or interrupted
+- [x] Dashboard and status agree on active workers. A completed, failed, cancelled or interrupted
       process is never counted as active merely because an old receipt said `working`.
-- [ ] Redaction happens before projection budgeting; adversarial secrets and one huge event cannot
+- [x] Redaction happens before projection budgeting; adversarial secrets and one huge event cannot
       appear in the default output or its omission metadata.
-- [ ] Stable JSON fixtures cover empty, one active worker, five concurrent workers, repeated failures
+- [x] Stable JSON fixtures cover empty, one active worker, five concurrent workers, repeated failures
       and a long-lived state file; human output names the next useful inspect/recovery command.
 
 ## Notes
 
 - Observed output: 2,694,752 bytes at roadmap Fleet revision 150 on 2026-08-05.
+- Evidence: `cargo test -p flux-cli fleet_` (35 passed) plus
+  `cargo test -p flux-cli --test board_fleet_cli fleet_run_launches_a_real_local_story_agent_in_its_child_worktree`.
+  The hermetic dogfood fixture retains more than 2,500,000 bytes of state while the default
+  projection stays inside 65,536 bytes and the human projection inside 4,096 bytes.

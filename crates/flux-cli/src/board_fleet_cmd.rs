@@ -11998,8 +11998,7 @@ mod tests {
         assert_eq!(data["waves"]["total"], 7);
         assert_eq!(data["intake"]["total"], 12);
         assert_eq!(
-            data["workers"]["listed"][0]["board_ref"],
-            "flux/C-560",
+            data["workers"]["listed"][0]["board_ref"], "flux/C-560",
             "status lost the exact BoardRef"
         );
         assert!(
@@ -12044,7 +12043,11 @@ mod tests {
         for index in 1..=5 {
             five.agents.insert(
                 format!("wave-2-worker-{index}"),
-                working(&format!("flux/C-56{index}"), "wave-2", &format!("s_{index}")),
+                working(
+                    &format!("flux/C-56{index}"),
+                    "wave-2",
+                    &format!("s_{index}"),
+                ),
             );
         }
         let mut failures = FleetState {

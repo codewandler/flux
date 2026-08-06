@@ -2333,10 +2333,7 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
         .iter()
         .find(|worker| worker["id"] == first_agent)
         .unwrap_or_else(|| panic!("{first_agent} missing from {listed:?}"));
-    assert_eq!(
-        row["board_ref"],
-        receipts[0]["context_origin"]["board_ref"]
-    );
+    assert_eq!(row["board_ref"], receipts[0]["context_origin"]["board_ref"]);
     let projected = status.to_string();
     assert!(
         !projected.contains("Work only in the assigned story worktree"),
