@@ -10315,6 +10315,7 @@ fn reclaim_wave_storage(wave: &Value) -> Value {
             .flatten()
             .filter_map(|story| story["worktree"].as_str())
             .chain(repository["integration"]["worktree"].as_str())
+            .chain(repository["verify"]["worktree"].as_str())
             .map(PathBuf::from)
             .collect::<Vec<_>>();
         for worktree in worktrees {
@@ -12698,6 +12699,18 @@ fn prepare_wave_worktrees(
         let integration_path = repository_dir.join("integration");
         let integration_branch = format!("fleet/{wave}/{repository_id}/integration");
         validate_new_worktree_target(&repository_root, &integration_path, &integration_branch)?;
+        // A checkout pinned at the base, which integration NEVER touches.
+        //
+        // "The cited test fails at the pinned base" was verified in the INTEGRATION worktree, whose
+        // content is whatever the last integration attempt left in it — cherry-picks of this and other
+        // stories. So the pre-state a handoff was judged against depended on unrelated history: a
+        // re-handoff was refused with "unexpectedly passed on the pinned base" because a previous attempt
+        // had already applied that very story there, and in the opposite arrangement the same flaw would
+        // ACCEPT a handoff whose test never failed at the base at all. Evidence measured against a
+        // mutable shared tree is not evidence.
+        let verify_path = repository_dir.join("verify");
+        let verify_branch = format!("fleet/{wave}/{repository_id}/verify");
+        validate_new_worktree_target(&repository_root, &verify_path, &verify_branch)?;
         let mut stories = Vec::new();
         for board_ref in story_refs {
             let (_, item_id) = board_ref.split_once('/').expect("validated BoardRef");
@@ -12721,6 +12734,7 @@ fn prepare_wave_worktrees(
                 &integration_branch,
                 &base,
             )?;
+            add_git_worktree(&repository_root, &verify_path, &verify_branch, &base)?;
             for story in &stories {
                 add_git_worktree(
                     &repository_root,
@@ -12736,6 +12750,7 @@ fn prepare_wave_worktrees(
             "canonical_ref": canonical_ref,
             "base_commit": base,
             "integration": {"branch": integration_branch, "worktree": display_path(&integration_path)},
+            "verify": {"branch": verify_branch, "worktree": display_path(&verify_path)},
             "stories": stories,
             "final_gate": gate,
             "candidate_prepare": prepare,
@@ -13085,10 +13100,18 @@ fn fleet_handoff(
             .as_str()
             .context("validation/gate: repository has no integration worktree")?,
     );
+    // Measure the pre-state where the pre-state actually is. Waves dispatched before the verification
+    // worktree existed fall back to the integration worktree, which is how this was always done — wrong,
+    // but no worse for them than it already was.
+    let base_worktree = repository["verify"]["worktree"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| integration_worktree.clone());
     let before = if documentation_only {
         Value::Null
     } else {
-        let evidence = run_typed_argv(&integration_worktree, input.test_argv)?;
+        let evidence = run_typed_argv(&base_worktree, input.test_argv)?;
         if evidence["success"].as_bool() != Some(false) && !ran_no_tests(&evidence) {
             bail!(
                 "validation/gate: failing-before validation unexpectedly passed on the pinned base"
@@ -13696,16 +13719,34 @@ fn integrate_wave(
             conflicted = false;
             continue;
         }
-        // Prepare the candidate before gating it: regenerate whatever is derived from the wave as a
-        // whole. A failure here is the repository's failure, recorded like any other, and never silently
-        // skipped — a stale derived artifact that reaches the gate reads as the stories being wrong.
-        let prepare_argv = wave["topology"]["repositories"][repository_index]["candidate_prepare"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        // The gate and the preparation step are OPERATOR POLICY, so read them from current config and
+        // fall back to what the wave snapshotted.
+        //
+        // Everything else in a topology is pinned on purpose — the base, the branches, the write sets —
+        // because it is the story's contract. These two are not: they say how this repository is checked,
+        // which is the operator's to correct. Pinned, a wave dispatched against a broken or incomplete
+        // gate could never be fixed, only abandoned: `wave-346` was snapshotted before a preparation step
+        // existed, so the fix for its failure was unreachable by any retry and the delivered work would
+        // have needed re-dispatching to be judged by rules that already existed on disk.
+        let current_repository = read_fleet_config(root).ok().and_then(|config| {
+            config
+                .repositories
+                .into_iter()
+                .find(|candidate| candidate.id == repository_id)
+        });
+        let prepare_argv = current_repository
+            .as_ref()
+            .map(|repository| repository.prepare.clone())
+            .filter(|prepare| !prepare.is_empty())
+            .unwrap_or_else(|| {
+                wave["topology"]["repositories"][repository_index]["candidate_prepare"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
         if !prepare_argv.is_empty() && !command.dry_run {
             let prepared = run_typed_argv(&integration_worktree, &prepare_argv)?;
             if prepared["success"].as_bool() != Some(true) {
@@ -13748,13 +13789,19 @@ fn integrate_wave(
             git_output(&integration_worktree, &["rev-parse", "HEAD"])
                 .context("validation/gate: candidate commit missing after preparation")?
         };
-        let gate_argv = wave["topology"]["repositories"][repository_index]["final_gate"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let gate_argv = current_repository
+            .as_ref()
+            .map(|repository| repository.gate.clone())
+            .filter(|gate| !gate.is_empty())
+            .unwrap_or_else(|| {
+                wave["topology"]["repositories"][repository_index]["final_gate"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
         if gate_argv.is_empty() {
             wave["status"] = json!("red");
             wave["apply_eligible"] = json!(false);
