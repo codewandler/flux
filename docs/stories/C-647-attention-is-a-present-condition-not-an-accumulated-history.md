@@ -30,11 +30,11 @@ a fleet which has ever had a problem can never run unattended again.
 
 ## Acceptance
 
-- [ ] Failing first, a test proves that a  or  worker belonging to a wave that is
+- [ ] Failing first, a test proves that a `cancelled` or `failed` worker belonging to a wave that is
       terminal does not raise present attention, while the same record in a live wave does.
 - [ ] An error recorded on an agent is superseded by a later successful turn on that agent, so
-       describes the last outcome rather than the worst one ever seen.
-- [ ]  distinguishes *actionable now* from *happened once*: open decisions and live
+      `last_error` describes the last outcome rather than the worst one ever seen.
+- [ ] `attention_required` distinguishes *actionable now* from *happened once*: open decisions and live
       failures raise it; history does not.
-- [ ] The count an operator sees matches the number of things they can actually do something about, so a
-      surface showing "25 need attention" is never mostly archaeology.
+- [ ] The count an operator sees matches the number of things they can act on, so a surface reporting
+      "25 need attention" is never mostly archaeology.
