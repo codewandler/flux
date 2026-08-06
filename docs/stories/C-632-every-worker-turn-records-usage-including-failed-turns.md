@@ -23,3 +23,8 @@ no sequence numbers, and a proven torn write from concurrent appenders. Budget-p
 - [ ] Every agent.turn.completed and agent.turn.failed event carries usage: rounds consumed vs limit and token counts.
 - [ ] activity records carry ts, turn id and seq, and concurrent appends cannot tear (locked append or single writer).
 - [ ] The TUI/status surfaces remaining round budget for a live worker.
+
+
+## Comments
+
+- docs/designs/D-255-fleet-measurement-the-system-the-workers-and-the-assignments.md names this story as the first telemetry dependency; align usage field names with the OpenTelemetry GenAI semantic conventions (gen_ai.usage.input_tokens / output_tokens) so fleet telemetry is readable by standard backends.

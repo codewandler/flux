@@ -1,5 +1,11 @@
 # Design — Score the fleet per agent with service levels
 
+Measurement foundation: `docs/designs/D-255-fleet-measurement-the-system-the-workers-and-the-assignments.md`
+defines the metric catalogue this epic scores against — three measurement targets (system, worker
+profiles, assignments), the evidence base and external research behind each metric, and the
+telemetry substrate (C-632/C-633/C-627/C-602) the numbers require. This design defines scoring,
+objectives and enforcement over that catalogue.
+
 ## Why
 
 The fleet has no notion of how well it is working. Every judgement made about it so far has been
