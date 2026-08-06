@@ -13071,21 +13071,26 @@ fn integrate_wave(
     }
     let order = integration_order(root, &items)?;
     let mut seen_workers = BTreeSet::new();
-    // Keyed by (repository, path), not by path alone.
+    // A shared path is NOT refused here, because a shared path is not a conflict.
     //
-    // A write set is repository-relative, so a single map made every common filename collide across
-    // repositories: `wave-346` was refused with `unsafe write-set overlap on "CHANGELOG.md" between
-    // flux/C-562 and exchange/X-138` — two different files in two different checkouts, each correctly
-    // updated by its own story. Every multi-repo wave would hit this, since `CHANGELOG.md`,
-    // `docs/stories/README.md` and similar exist in all of them. The overlap check itself is worth
-    // keeping: two stories in the SAME repository editing one file is a real integration hazard.
-    let mut seen_paths = BTreeMap::<(String, String), String>::new();
+    // This used to reject any wave in which two stories' write sets intersected, which is a proxy for
+    // "these commits will not combine" — and a bad one in both directions. It was first keyed by path
+    // alone, so `CHANGELOG.md` in one repository "collided" with `CHANGELOG.md` in another: two
+    // different files in two different checkouts, each correctly updated by its own story, and every
+    // multi-repository wave hit it. Keying by (repository, path) fixed that, and left the deeper
+    // problem: within one repository the proxy refuses work that combines perfectly well. `wave-346`
+    // was parked because two stories each appended an entry to one changelog. Nearly every harness
+    // story edits the same hub module, so the proxy is precisely what makes more than one story per
+    // repository per wave impossible.
+    //
+    // The real test already runs a few lines below: each accepted commit is cherry-picked into the
+    // integration worktree, and a genuine conflict fails there — recording the conflicting files, the
+    // git stderr and the preserved candidate, which is strictly better evidence than a path
+    // intersection. Disjoint edits to one file now integrate; overlapping edits are refused by git
+    // rather than guessed at. Semantic incompatibility was never in the proxy's reach either way, and
+    // remains the final gate's job.
     for item in &items {
         let (repository_index, story_index) = wave_story_indices(&wave, item)?;
-        let repository_id = wave["topology"]["repositories"][repository_index]["id"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
         let story = &wave["topology"]["repositories"][repository_index]["stories"][story_index];
         let handoff = &story["handoff"];
         if story["status"].as_str() != Some("handoff-accepted")
@@ -13096,23 +13101,10 @@ fn integrate_wave(
         let worker = handoff["worker"]
             .as_str()
             .context("validation/gate: handoff missing worker")?;
+        // One writer per story stays a real invariant: two stories from one worker share a session and
+        // a worktree, so their commits are not independently attributable.
         if !seen_workers.insert(worker.to_string()) {
             bail!("conflict/precondition: worker {worker} owns more than one story in the wave")
-        }
-        for path in handoff["write_set"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            if let Some(other) =
-                seen_paths.insert((repository_id.clone(), path.to_string()), item.clone())
-            {
-                bail!(
-                    "conflict/precondition: unsafe write-set overlap in repository {repository_id} on \
-                     {path:?} between {other} and {item}"
-                )
-            }
         }
     }
     wave["status"] = json!("integrating");
@@ -13590,35 +13582,6 @@ mod tests {
         assert!(
             coordinator["read_root_count"].as_u64() > worker["read_root_count"].as_u64(),
             "the umbrella is asymmetric by design: coordinator spans roots, worker does not"
-        );
-    }
-
-    /// A write set is repository-relative, so overlap detection must be scoped per repository. Keying by
-    /// bare path made every common filename collide across repositories: `wave-346` was refused with
-    /// `unsafe write-set overlap on "CHANGELOG.md" between flux/C-562 and exchange/X-138` — two distinct
-    /// files, each correctly updated by its own story. Every multi-repo wave would hit it.
-    #[test]
-    fn write_set_overlap_is_scoped_per_repository() {
-        let mut seen = BTreeMap::<(String, String), String>::new();
-
-        // The same relative path in two different repositories is not an overlap.
-        assert!(seen
-            .insert(("flux".into(), "CHANGELOG.md".into()), "flux/C-562".into())
-            .is_none());
-        assert!(
-            seen.insert(
-                ("exchange".into(), "CHANGELOG.md".into()),
-                "exchange/X-138".into()
-            )
-            .is_none(),
-            "a shared filename across repositories must not read as a conflict"
-        );
-
-        // The same path twice within ONE repository still is — that hazard must stay caught.
-        assert_eq!(
-            seen.insert(("flux".into(), "CHANGELOG.md".into()), "flux/C-542".into()),
-            Some("flux/C-562".to_string()),
-            "two stories editing one file in one repository is a real integration hazard"
         );
     }
 

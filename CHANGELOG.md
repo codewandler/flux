@@ -55,6 +55,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Two stories in one repository may now write the same file.** Integration refused any wave whose
+  stories' write sets intersected — a proxy for "these commits will not combine", and within one
+  repository wrong far more often than right. A wave of two delivered stories was parked because each
+  had appended an entry to one changelog, exactly as the worker contract asked; and since nearly every
+  story in a subsystem edits the same module, the proxy made more than one story per repository per
+  wave impossible. The real test already followed: each accepted commit is cherry-picked into the
+  integration worktree, where a genuine conflict fails with the conflicting files, git's own stderr and
+  the preserved candidate. Disjoint edits to one file now integrate; overlapping edits are refused by
+  git rather than guessed at. One writer per story remains enforced.
 - **A running wave is now visible while it runs** (C-599, C-602). A wave wrote durable state exactly
   twice — once before its first worker started, once after the last joined — and the surface's refresh
   token hashed only those files, so `flux tui --fleet` took zero snapshots for a wave's entire

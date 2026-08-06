@@ -2036,6 +2036,155 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::remove_dir_all(root).ok();
 }
 
+/// Failing first: two stories in ONE repository that both write the SAME file integrate, as long as
+/// their commits actually combine.
+///
+/// Integration used to refuse the wave outright whenever two write sets intersected. That is a proxy
+/// for "these commits will not combine", and within one repository it is wrong far more often than it
+/// is right: `wave-346` was parked because two delivered stories each appended an entry to one
+/// changelog, exactly as the worker contract told them to. Nearly every harness story also edits the
+/// same hub module, so the proxy made more than one story per repository per wave impossible — the
+/// width the fleet exists to provide.
+///
+/// The real test is the cherry-pick that follows, which fails on a genuine conflict and records the
+/// conflicting files and git's own stderr. Disjoint edits to one file must therefore reach the gate.
+#[test]
+fn two_stories_sharing_one_file_integrate_when_their_commits_combine() {
+    let root = fixture("shared-path-combines");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    for (id, title, priority) in [("C-1", "One", 1), ("C-2", "Two", 2)] {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: ready\npriority: {priority}\n---\n\n# {title}\n\n## Acceptance\n\n- [ ] ship\n"
+            ),
+        )
+        .unwrap();
+    }
+    // A shared append-only ledger, long enough that edits at opposite ends are separated by more than
+    // git's three lines of diff context — which is precisely the shape of a changelog.
+    let filler = (1..=20)
+        .map(|n| format!("- entry {n}\n"))
+        .collect::<String>();
+    fs::write(root.join("LEDGER.md"), format!("# Ledger\n\n{filler}")).unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"grep -q 'from one' LEDGER.md && grep -q 'from two' LEDGER.md\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "repo/C-2",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for (index, marker) in ["from one", "from two"].iter().enumerate() {
+        let story = PathBuf::from(stories[index]["worktree"].as_str().unwrap());
+        let ledger = story.join("LEDGER.md");
+        let text = fs::read_to_string(&ledger).unwrap();
+        // One story edits the head of the file, the other its tail.
+        let edited = if index == 0 {
+            text.replacen("# Ledger\n", &format!("# Ledger\n\n- {marker}\n"), 1)
+        } else {
+            format!("{text}- {marker}\n")
+        };
+        fs::write(&ledger, edited).unwrap();
+        assert!(git(&story, &["add", "LEDGER.md"]).status.success());
+        assert!(git(&story, &["commit", "-qm", marker]).status.success());
+        let commit = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let item = format!("repo/C-{}", index + 1);
+        let handoff = flux(
+            &root,
+            &[
+                "fleet",
+                "handoff",
+                "wave-2",
+                &item,
+                "--commit",
+                &commit,
+                // The identical write set for both stories: the case that used to be refused.
+                "--write-set",
+                "LEDGER.md",
+                "--test-arg",
+                "grep",
+                "--test-arg",
+                "-q",
+                "--test-arg",
+                marker,
+                "--test-arg",
+                "LEDGER.md",
+                "--failing-before",
+                "--passing-after",
+                "--summary",
+                "appended one ledger entry",
+                "--output",
+                "json",
+            ],
+        );
+        assert!(
+            handoff.status.success(),
+            "{}",
+            String::from_utf8_lossy(&handoff.stdout)
+        );
+    }
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "a shared path is not a conflict: stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    assert_eq!(
+        integrated["data"]["topology"]["repositories"][0]["gate"]["runs"],
+        1
+    );
+    // Both entries are in the one candidate, so the combination really happened rather than one story
+    // silently winning.
+    let integration = PathBuf::from(
+        integrated["data"]["topology"]["repositories"][0]["integration"]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    let combined = fs::read_to_string(integration.join("LEDGER.md")).unwrap();
+    assert!(combined.contains("- from one"), "{combined}");
+    assert!(combined.contains("- from two"), "{combined}");
+    fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     let (root, story) = one_story_wave("rework-budget");
