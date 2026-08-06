@@ -10348,16 +10348,28 @@ fn reclaim_wave_storage(wave: &Value) -> Value {
             .as_str()
             .unwrap_or("origin/main");
         let source = PathBuf::from(repository["source_root"].as_str().unwrap_or_default());
+        // Carry each worktree's branch alongside it: removing the checkout without removing the ref
+        // leaves the ref forever. Forty empty `fleet/wave-*` branches had accumulated in one repository,
+        // one set per wave ever dispatched, which makes `git branch` useless as a view of real work — the
+        // same absent-owner pattern as the build directories, one level up.
         let worktrees = repository["stories"]
             .as_array()
             .into_iter()
             .flatten()
-            .filter_map(|story| story["worktree"].as_str())
-            .chain(repository["integration"]["worktree"].as_str())
-            .chain(repository["verify"]["worktree"].as_str())
-            .map(PathBuf::from)
+            .map(|story| (story["worktree"].as_str(), story["branch"].as_str()))
+            .chain(std::iter::once((
+                repository["integration"]["worktree"].as_str(),
+                repository["integration"]["branch"].as_str(),
+            )))
+            .chain(std::iter::once((
+                repository["verify"]["worktree"].as_str(),
+                repository["verify"]["branch"].as_str(),
+            )))
+            .filter_map(|(worktree, branch)| {
+                Some((PathBuf::from(worktree?), branch.map(str::to_string)))
+            })
             .collect::<Vec<_>>();
-        for worktree in worktrees {
+        for (worktree, branch) in worktrees {
             if !worktree.is_dir() {
                 continue;
             }
@@ -10381,6 +10393,12 @@ fn reclaim_wave_storage(wave: &Value) -> Value {
                     let removal = guarded_git(&source, &["worktree", "remove", "--force", &path])
                         .is_ok_and(|output| output.exit_code == 0);
                     if removal || !worktree.is_dir() {
+                        // `-d`, never `-D`: git refuses to delete a branch holding commits that are not
+                        // reachable elsewhere, so this can prune the empty scaffolding and cannot spend
+                        // delivered work. A refusal is the correct outcome and is left unrecorded noise-free.
+                        if let Some(branch) = branch.as_deref() {
+                            let _ = guarded_git(&source, &["branch", "-d", branch]);
+                        }
                         removed.push(display_path(&worktree));
                     } else {
                         retained.push(json!({
