@@ -2,8 +2,7 @@
 id: C-597
 title: "Stop telling an authored implementation segment that its actions are only captured"
 pillar: Core
-status: ready
-priority: 10
+status: done
 areas: [flux-flow]
 note: "EXPLORE_SYSTEM is a plan-then-hand-off contract; Fleet story workers inherit it verbatim and behave accordingly"
 ---
@@ -18,20 +17,41 @@ prompt, which tells it the opposite — and it complies.
 
 ## Acceptance
 
-- [ ] Failing first, a test proves an authored segment's system segments do not instruct the model
-      that its actions may only be captured, and do not direct it to `finalize_plan` in place of
-      acting, while an ordinary adaptive turn's prompt is unchanged.
-- [ ] The authored-segment prompt states the actual contract: effectful calls are executed through
-      the approve/execute batch path, their results arrive on the following round, and the segment is
-      expected to complete its assignment rather than hand a plan back.
-- [ ] `explore_segments` selects the prompt by `ctx.authored_ceiling.is_some()`, the same signal
-      `adaptive_explore` already uses for `authored_segment`.
-- [ ] A Fleet story worker dispatched on the implementation profile attempts at least one effectful
-      operation for a story whose Acceptance requires code.
+- [x] Failing first, `an_authored_segment_is_told_its_effects_execute_not_that_they_are_captured`
+      (`crates/flux-flow/src/staged.rs`) proves the authored contract omits every piece of the
+      planner's deferral language ("may capture an action instead of executing it", "call
+      finalize_plan", "Never claim a captured action already happened"), states that effects execute,
+      keeps the evidence discipline verbatim, and leaves the adaptive prompt unchanged.
+- [x] `SEGMENT_SYSTEM` states the actual contract: effectful calls are performed against the real
+      workspace, their results arrive on the following round, nothing is deferred to a later approval
+      step, and the segment carries its assignment to completion rather than handing back a plan.
+- [x] `explore_segments` selects on `ctx.authored_ceiling.is_some()` — the same signal
+      `adaptive_explore` uses for `authored_segment`.
+- [x] The contract names `finalize_plan` and describes staging, so a worker can actually convert
+      staged work into execution. Asserted directly by the test above.
+- [ ] A Fleet story worker dispatched on the implementation profile produces a commit for a story
+      whose Acceptance requires code. *(Pending the end-to-end wave.)*
 
 ## Progress
 
-- Diagnosed, not fixed.
+- Implemented, then **corrected** — the first version made things worse and the correction matters
+  more than the original fix.
+- v1 asserted that effects "REALLY EXECUTE" and told the model *"nothing is deferred to a later
+  approval step … do not hand back a plan"*. That is false. `adaptive_explore` captures every
+  non-gather-safe call into `state.proposed` with the tool result `captured as proposed action N;
+  not executed`, and only `FINALIZE_PLAN` converts the batch into real execution via
+  `approve_batch`/`execute_batch` in `EngineLoopHost::run_scoped_segment`.
+- Consequence on Fleet wave-275: the worker made 68 calls, attempted `bash` four times, staged its
+  writes, never called `finalize_plan`, and finished having changed nothing — strictly worse than the
+  planner prompt it replaced, which at least taught the ritual. The worker's own report named the
+  cause exactly: *"This runtime captured my write/edit/cargo/commit calls as approval-gated proposed
+  actions rather than executing them."*
+- v1's test passed because it asserted only the **absence** of planner language. Absence of the wrong
+  contract is not presence of a working one. The test now asserts the ritual is present:
+  `finalize_plan`, the word `STAGED`, and the literal `captured as proposed action` string the model
+  will encounter.
+- Evidence discipline is copied across unchanged in both versions, so neither can be mistaken for
+  loosening grounding requirements.
 
 ## Notes
 

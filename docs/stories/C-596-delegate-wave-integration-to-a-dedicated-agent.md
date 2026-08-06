@@ -2,7 +2,9 @@
 id: C-596
 title: "Delegate wave integration to a dedicated agent instead of an operator-only CLI verb"
 pillar: Core
+epic: fleet-harness-throughput
 status: ready
+priority: 15
 areas: [flux-cli]
 note: "integrate/apply/handoff/rework are in nobody's model-facing catalog, so a green wave can only move forward if a human types the command"
 ---

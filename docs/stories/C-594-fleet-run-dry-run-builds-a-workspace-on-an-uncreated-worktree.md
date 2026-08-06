@@ -2,7 +2,9 @@
 id: C-594
 title: "Make `flux fleet run --dry-run` validate a wave without a real worktree"
 pillar: Core
+epic: fleet-harness-throughput
 status: ready
+priority: 40
 areas: [flux-cli, flux-orchestrate, flux-system]
 note: "--dry-run plans the wave, deliberately skips worktree creation, then builds a Workspace on the directory it did not create"
 ---
@@ -17,21 +19,26 @@ way to find out whether a wave is dispatchable is to dispatch it for real.
 
 ## Acceptance
 
-- [ ] Failing first, a test proves `flux fleet run --dry-run <item>` returns the proposed wave
-      topology and exits zero on a workspace whose `worktree_root` contains no wave directory.
-- [ ] The dry-run path does not canonicalize or otherwise require a per-story worktree that it
-      deliberately did not create; it plans against the configured roots only.
+- [ ] **Outstanding:** a regression test for `--dry-run` returning a topology and exiting zero. The
+      fix is verified by manual reproduction (the exact failing command now succeeds), not by a test —
+      a fixture needs member repos and stories, so it is real work rather than an oversight.
+- [x] The dry-run path no longer requires a per-story worktree it deliberately did not create.
 - [ ] `--dry-run` still writes nothing: `worktree_root` gains no directory and fleet state's
       revision is unchanged across the call.
-- [ ] The live (non-dry-run) path is unchanged and still creates the worktrees it uses.
+- [x] The live path is unchanged: the `!command.dry_run` guard only skips persisting the snapshot.
 
 ## Progress
 
-- Diagnosed, not yet fixed.
+- Fixed. `prepare_wave_worktrees` already skipped `git worktree add` under `--dry-run`; the write that
+  broke it was `snapshot_fleet_loop_binding`, which opened a guarded workspace on a story worktree
+  that deliberately did not exist. The binding is resolved and validated regardless; only persisting
+  its snapshot is skipped, because that is a write.
+- Diagnosis took two minutes rather than another strace session because `Workspace::new` now names the
+  offending path.
 
 ## Notes
 
-- Reproduced on flux 0.56.0 against `/home/timo/projects/flux-roadmap`:
+- Reproduced on flux 0.56.0 against `<fleet root>`:
 
   ```
   $ flux fleet run --dry-run flux/C-542
