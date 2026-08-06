@@ -14,6 +14,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **A run's time and token budget is now visible while the run happens.** When a budget is set, the
+  terminal UI header shows how much of it has been spent against what was declared and keeps updating
+  as spend accrues; plain `flux run` says when a line is crossed. The two kinds of line stay distinct:
+  a target is a warning and the run continues, while a hard ceiling stops the run at the next safe
+  boundary and names exactly which figure was exceeded — wall time, model calls, or tokens. Work
+  already in flight is never reported as stopped, and a budget nobody declared shows nothing rather
+  than a reassuring zero.
+
 - **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain
   `flux board` selects the configured workspace, validates every repository story and dependency,
   and reports the active milestone, ordered work and configured waves. `flux fleet schedule` reads
@@ -35,6 +43,14 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
   review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
   eligibility, worktree, rework and publication boundaries.
+
+- **Fleet status stays small and readable however long the fleet has been running.** The default
+  status and dashboard report what is happening now — running state, live and attention-needing
+  workers, waves, work items, repositories, sessions and the last failure summary — inside a fixed
+  size, and end by naming the next useful inspection or recovery command. Retained turn history,
+  answers and tool output are no longer pasted into that view; ask for them with
+  `flux fleet inspect`, which keeps its own explicit limits and reports what it left out. A worker
+  that finished, failed, was cancelled or was interrupted is no longer counted as active.
 
 ## [0.56.0] - 2026-08-05
 
