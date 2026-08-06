@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every
+  worker reaches handoff at once. A held state reservation is a queue, not a conflict — the error even said
+  "retry" and nothing did, so a handoff simply failed. A compare-and-set failure means the state moved and
+  must be recomputed, in both of its branches, not waited out. And recomputing has to be expressed as a
+  *delta*: a wave record holds every story, so recomputing a private copy and inserting it discards the
+  sibling stories other workers updated in the same instant — four concurrent handoffs each reported success
+  and the wave ended holding one. Handoff is now applied as a delta against whatever state is current, so a
+  wave advances to `handoffs-ready` only once the last sibling has genuinely landed.
+- **A worker's turn record lands on current state** rather than on the snapshot its call started from, so the
+  loser of a race no longer loses its receipt — including the failure evidence of a failed turn, which is
+  the most expensive thing to drop.
+
 ## [0.58.0] - 2026-08-07
 
 ### Added
@@ -47,20 +61,6 @@ All notable changes to this project are documented in this file. The format is b
 - **The Board pane renders items as collapsed boxes** grouped by status and ordered as `board next` orders
   them, paging to the selection so the rows built stay bounded by terminal height rather than by board
   size (C-620).
-
-### Fixed
-
-- **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every
-  worker reaches handoff at once. A held state reservation is a queue, not a conflict — the error even said
-  "retry" and nothing did, so a handoff simply failed. A compare-and-set failure means the state moved and
-  must be recomputed, in both of its branches, not waited out. And recomputing has to be expressed as a
-  *delta*: a wave record holds every story, so recomputing a private copy and inserting it discards the
-  sibling stories other workers updated in the same instant — four concurrent handoffs each reported success
-  and the wave ended holding one. Handoff is now applied as a delta against whatever state is current, so a
-  wave advances to `handoffs-ready` only once the last sibling has genuinely landed.
-- **A worker's turn record lands on current state** rather than on the snapshot its call started from, so the
-  loser of a race no longer loses its receipt — including the failure evidence of a failed turn, which is
-  the most expensive thing to drop.
 
 ## [0.57.0] - 2026-08-06
 
