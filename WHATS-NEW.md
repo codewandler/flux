@@ -17,6 +17,14 @@
 
 ### New
 
+- **A run's time and token budget is now visible while the run happens.** When a budget is set, the
+  terminal UI header shows how much of it has been spent against what was declared and keeps updating
+  as spend accrues; plain `flux run` says when a line is crossed. The two kinds of line stay distinct:
+  a target is a warning and the run continues, while a hard ceiling stops the run at the next safe
+  boundary and names exactly which figure was exceeded — wall time, model calls, or tokens. Work
+  already in flight is never reported as stopped, and a budget nobody declared shows nothing rather
+  than a reassuring zero.
+
 - **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain
   `flux board` selects the configured workspace, validates every repository story and dependency,
   and reports the active milestone, ordered work and configured waves. `flux fleet schedule` reads
