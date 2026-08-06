@@ -4219,9 +4219,11 @@ fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
     }
 
     /// Architecture guard: no production (non-test) tool/runtime/plugin path may construct a raw
-    /// std or Tokio process command. `flux-system` owns exactly two reviewed construction points:
-    /// the canonical std builder and its Tokio conversion. Allowances are single-use, so a second
-    /// constructor even inside either function fails.
+    /// std or Tokio process command. `flux-system` owns the two reviewed construction points every
+    /// effect goes through — the canonical std builder and its Tokio conversion — and the only
+    /// admitted constructor outside it is the TUI's self re-exec, which replaces this process
+    /// rather than running anything (see its entry below). Allowances are single-use, so a second
+    /// constructor even inside an already-allowed function fails.
     #[test]
     fn no_raw_process_command_outside_system() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -4238,6 +4240,23 @@ fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
                 "crates/flux-system/src/lib.rs",
                 "build_tokio_command",
                 ProcessApi::Tokio,
+            ),
+            // `/restart` replaces the TUI process with the newly installed binary. It is the one
+            // process construction that must NOT go through the seam above, because that builder
+            // exists to run an *effect* under policy: it scrubs the environment down to `SAFE_ENV`,
+            // forces the working directory to the workspace root, and may wrap the argv in the
+            // sandbox. A re-exec has to preserve the process exactly — same executable, same argv,
+            // same environment, same directory — or the session that comes back is a different one
+            // wearing the same name, which is precisely what the restart contract forbids.
+            //
+            // It is admissible because it governs nothing: the program is `current_exe()` and the
+            // arguments are this process's own `args_os()`, so no untrusted input reaches it, and
+            // `exec` produces no child to confine — the successor inherits the same authority the
+            // operator already had.
+            (
+                "crates/flux-tui/src/lib.rs",
+                "exec_replacement",
+                ProcessApi::Std,
             ),
         ];
         let mut allowance_use = vec![0usize; ALLOW.len()];
