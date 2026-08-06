@@ -75,6 +75,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Fleet state can now tell a live worker from a dead one.** A turn runs synchronously in the process
+  that recorded `working`, so that process dying is the one case where no terminal status is ever
+  written: a worker read `working` for hours with nothing behind it, inflating the active count, keeping
+  its wave out of reaping, and forcing the driver to reimplement liveness by scanning `/proc` because the
+  answer was not recoverable from state at all. The supervising process is recorded when a turn starts
+  and cleared on every terminal transition, and an active record whose supervisor is gone now projects as
+  `interrupted` — which also routes it to the attention list, where it belongs. Records written before
+  this keep their recorded status rather than being downgraded. Pid reuse can still fool the check, which
+  is exactly the previous behaviour, so this is a strict improvement rather than a guarantee.
 - **A handoff is no longer refused because a sibling test target filtered to nothing.** `cargo test -p
   <pkg> <filter>` runs the package's lib unittests *and* each of its integration-test binaries, so the
   filter matches in one target and reports `0 passed; 0 failed; N filtered out` for every other. The

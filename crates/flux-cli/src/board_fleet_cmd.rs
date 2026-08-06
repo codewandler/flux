@@ -3223,6 +3223,57 @@ fn fleet_status_is_active(status: &str) -> bool {
     matches!(status, "active" | "running" | "working")
 }
 
+/// Is the process that recorded an in-flight turn still there?
+///
+/// Signal 0 performs the existence check without delivering anything. Always the same user as the
+/// recorder, so a non-zero return means gone rather than forbidden. On a platform without signals the
+/// answer is unknown, and unknown must read as "still there": wrongly reporting a live worker as
+/// interrupted would let a wave be reaped underneath it, which is far worse than the status quo.
+#[cfg(unix)]
+fn supervisor_process_is_live(pid: i64) -> bool {
+    // Range-check BEFORE narrowing, and treat anything outside it as gone. This is not defensive
+    // padding: `pid_t` is `i32`, so a value that does not fit wraps, and `u32::MAX` wraps to `-1` — for
+    // which `kill` means *every process this user may signal* and duly reports success. A nonsense pid
+    // therefore read as alive, which a test caught; with any signal other than 0 the same cast would
+    // have been a far worse bug than a wrong status.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn supervisor_process_is_live(_pid: i64) -> bool {
+    true
+}
+
+/// The status an agent record actually justifies.
+///
+/// A turn is executed *synchronously* by the process that recorded `working`, so if that process dies —
+/// killed, crashed, its terminal closed — nothing ever writes a terminal status and the agent reads
+/// `working` forever. `wave-308-worker-1` read `working` for hours with no process behind it: it inflated
+/// `worker_counts.active`, kept its wave out of reaping, and made the driver reimplement liveness by
+/// scanning `/proc` because the answer was not recoverable from Fleet state at all.
+///
+/// Recording the supervisor's pid makes it recoverable. Pid reuse can still fool the check — a recycled
+/// pid reads as alive — but that is exactly today's behaviour, so this is a strict improvement rather
+/// than a guarantee. An agent with no recorded pid keeps its recorded status, so records written before
+/// this existed are unaffected.
+fn effective_worker_status(agent: &Value) -> &str {
+    let status = agent["status"].as_str().unwrap_or("unknown");
+    if fleet_status_is_active(status) {
+        if let Some(pid) = agent["supervisor_pid"].as_i64() {
+            if !supervisor_process_is_live(pid) {
+                return "interrupted";
+            }
+        }
+    }
+    status
+}
+
 fn fleet_status_needs_attention(status: &str) -> bool {
     matches!(
         status,
@@ -3231,7 +3282,7 @@ fn fleet_status_needs_attention(status: &str) -> bool {
 }
 
 fn fleet_worker_needs_attention(agent: &Value) -> bool {
-    let status = agent["status"].as_str().unwrap_or("unknown");
+    let status = effective_worker_status(agent);
     fleet_status_needs_attention(status)
         || (agent["last_error"].is_string()
             && !matches!(status, "cancelled" | "completed" | "done"))
@@ -3334,10 +3385,8 @@ fn fleet_status_wave_summary(id: &str, wave: &Value) -> Value {
 fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
     let mut workers = state.agents.iter().collect::<Vec<_>>();
     workers.sort_by(|(left_id, left), (right_id, right)| {
-        worker_status_order(left["status"].as_str().unwrap_or("unknown"))
-            .cmp(&worker_status_order(
-                right["status"].as_str().unwrap_or("unknown"),
-            ))
+        worker_status_order(effective_worker_status(left))
+            .cmp(&worker_status_order(effective_worker_status(right)))
             .then_with(|| left_id.cmp(right_id))
     });
     let worker_summaries = workers
@@ -3348,7 +3397,7 @@ fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
     let worker_active = state
         .agents
         .values()
-        .filter(|agent| fleet_status_is_active(agent["status"].as_str().unwrap_or("unknown")))
+        .filter(|agent| fleet_status_is_active(effective_worker_status(agent)))
         .count();
     let worker_attention = state
         .agents
@@ -3358,9 +3407,7 @@ fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
     let mut worker_statuses = BTreeMap::<&'static str, usize>::new();
     for agent in state.agents.values() {
         *worker_statuses
-            .entry(fleet_status_bucket(
-                agent["status"].as_str().unwrap_or("unknown"),
-            ))
+            .entry(fleet_status_bucket(effective_worker_status(agent)))
             .or_default() += 1;
     }
 
@@ -11263,6 +11310,9 @@ fn execute_and_record_agent_turn(
         state.main_agent.status = "working".into();
     } else if let Some(agent) = state.agents.get_mut(&spec.id) {
         agent["status"] = json!("working");
+        // Whose process owns this `working`? Executing the turn is synchronous, so if this process dies
+        // nothing writes a terminal status and the record claims work forever.
+        agent["supervisor_pid"] = json!(std::process::id());
     }
     if let Some(intake_id) = intake_id {
         if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -11312,6 +11362,7 @@ fn execute_and_record_agent_turn(
                 state.main_agent.last_error = None;
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
                 agent["status"] = json!("completed");
+                agent["supervisor_pid"] = Value::Null;
                 agent["runtime_session"] = json!(session.clone());
                 agent["session"] = json!(session);
                 agent["last_turn"] = receipt.clone();
@@ -11344,6 +11395,7 @@ fn execute_and_record_agent_turn(
                 state.main_agent.last_error = Some(message.clone());
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
                 agent["status"] = json!(if cancelled { "cancelled" } else { "failed" });
+                agent["supervisor_pid"] = Value::Null;
                 agent["last_error"] = json!(message);
                 record_failed_turn_evidence(agent, &error);
             }
@@ -13967,6 +14019,55 @@ mod tests {
         assert!(!ran_no_tests(
             &json!({"success": true, "stdout": "Starting 3 tests across 12 binaries\n    Summary [0.2s] 3 tests run: 3 passed, 0 skipped\n", "stderr": ""})
         ));
+    }
+
+    /// Failing first: an agent recorded `working` by a process that no longer exists must not read as
+    /// active.
+    ///
+    /// A turn runs synchronously in the process that wrote `working`, so that process dying is the one
+    /// case where no terminal status is ever written. `wave-308-worker-1` read `working` for hours with
+    /// nothing behind it, which inflated `worker_counts.active`, kept its wave out of reaping, and was
+    /// not answerable from Fleet state at all — the driver had to scan `/proc` to find out.
+    #[test]
+    fn an_agent_whose_supervisor_died_is_not_active() {
+        // A pid that is certainly dead: run a child to completion and reap it. Reusing that pid within
+        // the microseconds before the check is possible in principle and has no practical bearing here.
+        // Do NOT reach for a nonsense value instead — `u32::MAX` narrows to `-1`, which `kill` reads as
+        // "every process this user may signal", so it reports success and the assertion inverts.
+        let reaped = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let reaped_pid = reaped.id();
+        let mut reaped = reaped;
+        reaped.wait().expect("reap it");
+        let dead = json!({"status": "working", "supervisor_pid": reaped_pid});
+        assert_eq!(
+            effective_worker_status(&dead),
+            "interrupted",
+            "a `working` record with a dead supervisor is not work in flight"
+        );
+        assert!(!fleet_status_is_active(effective_worker_status(&dead)));
+        assert_eq!(
+            fleet_status_bucket(effective_worker_status(&dead)),
+            "interrupted"
+        );
+        assert!(
+            fleet_worker_needs_attention(&dead),
+            "an interrupted worker is exactly what an operator must be shown"
+        );
+
+        // This process is the supervisor of a turn it is running, and must stay active.
+        let live = json!({"status": "working", "supervisor_pid": std::process::id()});
+        assert_eq!(effective_worker_status(&live), "working");
+        assert!(fleet_status_is_active(effective_worker_status(&live)));
+
+        // A record written before the pid existed keeps its recorded status rather than being downgraded.
+        let legacy = json!({"status": "working"});
+        assert_eq!(effective_worker_status(&legacy), "working");
+
+        // A terminal status is never reinterpreted, whatever the pid says.
+        let done = json!({"status": "completed", "supervisor_pid": reaped_pid});
+        assert_eq!(effective_worker_status(&done), "completed");
     }
 
     /// Live activity must reach a surface DURING a wave. Failing first: a wave writes `state.json`
