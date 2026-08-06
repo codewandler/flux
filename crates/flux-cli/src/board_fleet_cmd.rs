@@ -772,6 +772,15 @@ pub(super) enum FleetAction {
     },
     Doctor,
     Refresh,
+    /// Reclaim a finished wave's build output, and its worktrees if they provably hold no work.
+    ///
+    /// Acceptance reclaims automatically; this is for the waves that ended some other way — parked,
+    /// failed, conflicted — which otherwise keep their target directories for as long as the checkout
+    /// exists. Disk is what caps fleet width, so those are not free.
+    Reclaim {
+        /// Wave to reclaim. Omit to reclaim every wave that is not in flight.
+        target: Option<String>,
+    },
     Validate,
     Start,
     Stop,
@@ -4823,6 +4832,9 @@ worktree_root = ".flux/fleet/worktrees"
                 state.revision,
             ))
         }
+        FleetAction::Reclaim { target } => {
+            reclaim_finished_waves(command, root, state, target.as_deref())
+        }
         FleetAction::Start => {
             state.running = true;
             state.main_agent.status = "running".into();
@@ -5835,6 +5847,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Resume { .. }
             | FleetAction::Apply { .. }
             | FleetAction::Note { .. }
+            | FleetAction::Reclaim { .. }
     ) || matches!(action, FleetAction::Call { operation } if !matches!(operation.as_str(), "status" | "schedule" | "schema"))
 }
 
@@ -5977,6 +5990,9 @@ fn fleet_operations() -> &'static [&'static str] {
         "init",
         "doctor",
         "refresh",
+        // Reclaim MUTATES (it deletes build output and journals what it freed), so it is deliberately
+        // absent from the read-only list below.
+        "reclaim",
         "validate",
         "start",
         "stop",
@@ -11686,6 +11702,82 @@ fn goal_key(scope: GoalScope, name: &str) -> Result<String> {
     Ok(format!("{}/{}", scope.as_str(), name))
 }
 
+/// Which wave statuses are safe to reclaim without asking?
+///
+/// Everything that cannot still be advanced. A wave awaiting handoffs or mid-integration owns live
+/// worktrees and a build in progress; anything else has finished, one way or another, and its build
+/// output is dead weight. `parked` is deliberately included — a parked wave is precisely the one that
+/// sits for hours holding gigabytes while a human decides, and reclaiming build output costs it nothing
+/// because its commits live on branches.
+fn wave_is_reclaimable(status: &str) -> bool {
+    matches!(
+        status,
+        "applied" | "cancelled" | "conflict" | "red" | "parked" | "agent-turn-failed" | "green"
+    )
+}
+
+fn reclaim_finished_waves(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    target: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let waves = match target {
+        Some(wave) => {
+            let record = state
+                .waves
+                .get(wave)
+                .with_context(|| format!("not-found: wave {wave}"))?;
+            let status = record["status"].as_str().unwrap_or("unknown");
+            if !wave_is_reclaimable(status) {
+                bail!(
+                    "conflict/precondition: wave {wave} is {status}; reclaiming a wave that can still \
+                     advance would delete a build it is about to use"
+                )
+            }
+            vec![wave.to_string()]
+        }
+        None => state
+            .waves
+            .iter()
+            .filter(|(_, record)| {
+                wave_is_reclaimable(record["status"].as_str().unwrap_or("unknown"))
+            })
+            .map(|(id, _)| id.clone())
+            .collect(),
+    };
+    let mut outcomes = Vec::new();
+    for wave in &waves {
+        let Some(record) = state.waves.get(wave) else {
+            continue;
+        };
+        if !record["topology"].is_object() {
+            continue;
+        }
+        let reclaimed = if command.dry_run {
+            json!({"preview": true})
+        } else {
+            reclaim_wave_storage(record)
+        };
+        outcomes.push(json!({"wave": wave, "reclaimed": reclaimed}));
+    }
+    // Record what was freed. Reclamation is the one maintenance action whose effect is invisible in the
+    // state it mutates, so an unjournalled run leaves no way to tell it from a no-op.
+    state.revision += 1;
+    let data = json!({"waves": outcomes, "dry_run": command.dry_run});
+    persist_fleet_mutation(command, root, &state, "wave.reclaimed", data.clone())?;
+    Ok((
+        format!("reclaimed {} wave(s)", outcomes_len(&data)),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
+fn outcomes_len(data: &Value) -> usize {
+    data["waves"].as_array().map_or(0, Vec::len)
+}
+
 fn fleet_control_mutation(
     command: &FleetCommand,
     root: &Path,
@@ -11711,8 +11803,26 @@ fn fleet_control_mutation(
         "cancelled" => bail!("not-found: fleet agent or wave {target}"),
         _ => {}
     }
+    // Reclaim a cancelled wave's build output here, not only on acceptance.
+    //
+    // Reclamation ran on accept alone, so every wave that ended any other way kept its target
+    // directories for as long as the checkout existed — 27 GB of it on one machine, cleared by hand.
+    // Disk is what caps how many workers can run, so unreclaimed dead waves directly cost width.
+    //
+    // Safe because `reclaim_wave_storage` already separates the two things: build output is regenerable
+    // and always goes, while the worktree itself is removed only when it provably holds no commit and no
+    // uncommitted change. Cancelling a wave therefore cannot cost work, only rebuild time.
+    let reclaimed = if verb == "cancelled" && !command.dry_run {
+        state
+            .waves
+            .get(target)
+            .filter(|wave| wave["topology"].is_object())
+            .map(reclaim_wave_storage)
+    } else {
+        None
+    };
     state.revision += 1;
-    let data = json!({"target":target,"state":verb,"ack":"completed"});
+    let data = json!({"target":target,"state":verb,"ack":"completed","reclaimed":reclaimed});
     persist_fleet_mutation(
         command,
         root,
@@ -14019,6 +14129,42 @@ mod tests {
         assert!(!ran_no_tests(
             &json!({"success": true, "stdout": "Starting 3 tests across 12 binaries\n    Summary [0.2s] 3 tests run: 3 passed, 0 skipped\n", "stderr": ""})
         ));
+    }
+
+    /// Reclamation must never be able to delete a build a wave is about to use.
+    ///
+    /// The dangerous direction is one-sided: refusing to reclaim a finished wave wastes disk, while
+    /// reclaiming a wave that can still advance destroys work in progress. So the in-flight statuses are
+    /// enumerated here and asserted unreclaimable, rather than trusting the allow-list to stay right by
+    /// inspection. `parked` is on the reclaimable side on purpose — it is exactly the state that sits for
+    /// hours holding gigabytes while a human decides, and its commits live on branches.
+    #[test]
+    fn a_wave_that_can_still_advance_is_never_reclaimable() {
+        for status in [
+            "accepted",
+            "awaiting-handoffs",
+            "handoffs-ready",
+            "integrating",
+            "working",
+            "running",
+            "unknown",
+        ] {
+            assert!(
+                !wave_is_reclaimable(status),
+                "{status} can still advance and owns a live build"
+            );
+        }
+        for status in [
+            "applied",
+            "cancelled",
+            "conflict",
+            "red",
+            "parked",
+            "agent-turn-failed",
+            "green",
+        ] {
+            assert!(wave_is_reclaimable(status), "{status} has finished");
+        }
     }
 
     /// Failing first: an agent recorded `working` by a process that no longer exists must not read as

@@ -53,6 +53,17 @@ All notable changes to this project are documented in this file. The format is b
   show story states, eligibility, isolated worktrees, review/rework and the separate publication
   boundary.
 
+### Added
+
+- **`flux fleet reclaim [wave]`** reclaims a finished wave's build output, and its worktrees when they
+  provably hold no commit and no uncommitted change. Reclamation previously ran on acceptance alone, so
+  every wave that ended any other way — cancelled, parked, conflicted, gate-red — kept its target
+  directories and checkouts for as long as the fleet root existed. Disk is what caps how many workers can
+  run, so those are not free: the first run on a real fleet removed 47 stale worktrees and retained the
+  two that held work. Cancelling a wave now reclaims it in the same step. A wave that can still advance is
+  refused rather than reclaimed, since deleting a build it is about to use would cost work rather than
+  space.
+
 ### Changed
 
 - **A Fleet agent no longer pays disk for incremental compilation it can never reuse.** Each story gets
