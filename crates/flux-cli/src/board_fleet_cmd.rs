@@ -12882,19 +12882,46 @@ fn path_hits_fence(path: &str, fence: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// Clip long captured output while KEEPING BOTH ENDS.
+///
+/// This used to keep the head alone, which threw away the only part that matters. A repository gate emits
+/// thousands of `Compiling …` and `test … ok` lines and then fails at the very end, so a failed gate's
+/// record filled its 16 KiB with progress and cut the error off: on one real wave both streams were
+/// exactly 16385 bytes and the reason for the failure was not recoverable from Fleet state at all.
+///
+/// The head is still worth keeping — it carries the command, the toolchain, and the first error in a
+/// compile — so the budget is split, with an explicit marker naming how much was dropped. Never claim
+/// completeness silently. The same reasoning already governs the agent event buffer, which retains the
+/// NEWEST lines for exactly this reason.
 fn clipped_redacted(bytes: &[u8]) -> String {
     const MAX: usize = 16 * 1024;
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= MAX {
         return redact(&text);
     }
-    let end = text
+    // Two thirds to the tail: a failure is far more likely to be explained by the end than the start.
+    let tail_budget = MAX / 3 * 2;
+    let head_budget = MAX - tail_budget;
+    let head_end = text
         .char_indices()
-        .take_while(|(index, _)| *index <= MAX)
+        .take_while(|(index, _)| *index <= head_budget)
         .map(|(index, character)| index + character.len_utf8())
         .last()
-        .unwrap_or(0);
-    redact(&text[..end.min(text.len())])
+        .unwrap_or(0)
+        .min(text.len());
+    let mut tail_start = text.len().saturating_sub(tail_budget);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let dropped = tail_start.saturating_sub(head_end);
+    if dropped == 0 {
+        return redact(&text[..head_end]);
+    }
+    redact(&format!(
+        "{}\n… [{dropped} bytes elided from the middle; the tail is kept because a failure explains itself there] …\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    ))
 }
 
 fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
@@ -14316,6 +14343,49 @@ mod tests {
         assert!(!ran_no_tests(
             &json!({"success": true, "stdout": "Starting 3 tests across 12 binaries\n    Summary [0.2s] 3 tests run: 3 passed, 0 skipped\n", "stderr": ""})
         ));
+    }
+
+    /// Failing first: clipped output must keep the END, because that is where a failure explains itself.
+    ///
+    /// Clipping kept the head alone. A repository gate emits thousands of `Compiling …` and `test … ok`
+    /// lines and then fails at the very end, so a failed gate's record filled its whole budget with
+    /// progress and cut the error off: on one real wave both captured streams were exactly 16385 bytes
+    /// and the reason for the failure was not recoverable from Fleet state at all.
+    #[test]
+    fn clipping_keeps_the_tail_where_a_failure_explains_itself() {
+        let mut long = String::new();
+        for index in 0..4000 {
+            long.push_str(&format!("   Compiling crate-number-{index} v0.1.0\n"));
+        }
+        long.push_str("error[E0425]: cannot find value `missing_thing` in this scope\n");
+        long.push_str("error: could not compile `exchange-host` (lib) due to 1 previous error\n");
+        let clipped = clipped_redacted(long.as_bytes());
+
+        assert!(
+            clipped.contains("could not compile"),
+            "the failure is at the end and must survive the clip"
+        );
+        assert!(
+            clipped.contains("cannot find value"),
+            "so must the diagnostic above it"
+        );
+        assert!(
+            clipped.contains("Compiling crate-number-0 "),
+            "the head is still worth keeping: it carries the command and the first error"
+        );
+        assert!(
+            clipped.contains("elided from the middle"),
+            "never claim completeness silently"
+        );
+        assert!(
+            clipped.len() <= 17 * 1024,
+            "still bounded: {}",
+            clipped.len()
+        );
+
+        // Output that fits is returned whole, with no marker.
+        let short = clipped_redacted(b"all good\n");
+        assert_eq!(short, "all good\n");
     }
 
     /// Reclamation must never be able to delete a build a wave is about to use.

@@ -86,6 +86,12 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Clipped output keeps the end, where a failure explains itself.** Captured gate output was clipped
+  from the head, and a repository gate emits thousands of `Compiling …` and `test … ok` lines before
+  failing at the very end — so a failed gate's record filled its 16 KiB budget with progress and cut the
+  error off. On one real wave both streams were exactly 16385 bytes and the reason for the failure was
+  not recoverable from Fleet state at all. The budget is now split, two thirds to the tail, with an
+  explicit marker naming how many bytes were elided; completeness is never claimed silently.
 - **Integration applies the worker's whole commit range, not just the commit its handoff cited.** A
   handoff names one commit and a story worker legitimately makes several — implementation, then its
   record, which is the shape the contract asks for. Cherry-picking the cited commit therefore applied
