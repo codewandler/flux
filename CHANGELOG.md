@@ -100,6 +100,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Accepting a candidate no longer requires the repository to have stood still.** Two refusals were left
+  over from when applying MERGED the candidate: a merge has to land on the base it was tested against and
+  it touches the working tree, so a moved canonical ref and a dirty checkout were both real hazards.
+  Acceptance now writes an annotated tag on the candidate and nothing else — it does not read the working
+  tree, moves no branch, and cannot be invalidated by unrelated commits arriving on the canonical ref.
+  Keeping the checks cost a green wave: one passed both repository gates and was then refused with "moved
+  from its pinned base" because ordinary work had continued during the hours the wave took, which means the
+  longer a wave is worth accepting the more certain it becomes that it cannot be. The invariant that does
+  matter is still enforced — the candidate branch must point at the commit that was gated — and the base it
+  was gated against is now recorded in the acceptance entry, because the later step that writes the
+  canonical branch has to re-gate against whatever that branch has become. Acceptance is not landing.
 - **A concurrent write no longer throws away an entire integration.** Integration is the longest operation
   the fleet performs — cherry-picks, candidate preparation and a full repository gate, tens of minutes from
   cold — and it writes state several times along the way. Any coordinator write inside that window lost the

@@ -14076,15 +14076,25 @@ fn apply_wave(
         let branch = repository["integration"]["branch"]
             .as_str()
             .context("validation/gate: candidate branch missing")?;
-        if git_output(&source, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty())
-        {
-            bail!("conflict/precondition: repository {repository_id} is dirty; apply refuses to modify it")
-        }
-        if git_output(&source, &["rev-parse", canonical_ref]).as_deref() != Some(base)
-            || git_output(&source, &["rev-parse", "HEAD"]).as_deref() != Some(base)
-        {
-            bail!("conflict/precondition: repository {repository_id} moved from its pinned base; rebase a new wave")
-        }
+        // Acceptance does not require the repository to have stood still.
+        //
+        // These two refusals are left over from when applying MERGED the candidate: a merge has to land on
+        // the base it was tested against, and it touches the working tree, so a moved ref or a dirty
+        // checkout were both real hazards. Acceptance now writes an annotated tag on the candidate and
+        // nothing else — it does not read the working tree, does not move any branch, and cannot be
+        // invalidated by unrelated commits arriving on the canonical ref.
+        //
+        // Keeping them cost a green wave. `wave-346` passed both repository gates and was then refused
+        // with "moved from its pinned base" because ordinary work had continued on `main` during the hours
+        // the wave took — so the longer a wave is worth accepting, the more certain it becomes that it
+        // cannot be. That is exactly backwards.
+        //
+        // The invariant that DOES matter is checked below: the candidate branch must still point at the
+        // commit that was gated. And the base it was gated against is recorded in the acceptance record,
+        // because the later step that writes `main` has to re-gate against whatever `main` has become —
+        // acceptance is not landing, and must not be read as landing.
+        let base_moved =
+            git_output(&source, &["rev-parse", canonical_ref]).as_deref() != Some(base);
         if git_output(&source, &["rev-parse", branch]).as_deref() != Some(candidate) {
             bail!("conflict/precondition: repository {repository_id} candidate branch moved after its green gate")
         }
@@ -14096,6 +14106,8 @@ fn apply_wave(
             repository_id.to_string(),
             source,
             branch.to_string(),
+            base.to_string(),
+            base_moved,
             candidate.to_string(),
         ));
     }
@@ -14111,13 +14123,15 @@ fn apply_wave(
     // annotated tag that outlives the wave, the integration branch, and any worktree reclamation, and
     // the tag name is reported so a human can always find accepted-but-unmerged work.
     let mut merged = Vec::new();
-    for (repository_id, source, branch, candidate) in &targets {
+    for (repository_id, source, branch, base, base_moved, candidate) in &targets {
         let tag = format!("fleet/accepted/{wave}/{repository_id}");
         if command.dry_run {
             merged.push(json!({
                 "repository": repository_id,
                 "candidate": candidate,
                 "accepted_tag": tag,
+                "gated_against_base": base,
+                "canonical_ref_moved_since": base_moved,
                 "preview": true,
             }));
             continue;
@@ -14148,6 +14162,8 @@ fn apply_wave(
             "candidate": candidate,
             "accepted_tag": tag,
             "branch": branch,
+            "gated_against_base": base,
+            "canonical_ref_moved_since": base_moved,
         }));
     }
     state.revision += 1;
