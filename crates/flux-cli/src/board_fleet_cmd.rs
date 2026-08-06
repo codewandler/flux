@@ -1268,6 +1268,19 @@ struct FleetRepository {
     board: String,
     #[serde(default)]
     gate: Vec<String>,
+    /// Regenerate this repository's derived artifacts on the assembled candidate, before the gate.
+    ///
+    /// Some checked-in artifacts are derived from many stories at once — a documentation mirror, a
+    /// generated index, a lockfile. They belong to the CANDIDATE, not to any one story: two stories
+    /// regenerating the same artifact collide, and regenerating it on either branch alone produces an
+    /// artifact missing the other story's contribution. Observed on `wave-346`, where the flux gate
+    /// refused a candidate with `embedded docs are stale` because two stories had edited
+    /// `website/docs/**` and neither could correctly rebuild the shared mirror by itself.
+    ///
+    /// Runs after every cherry-pick for the repository and before its gate, in the integration worktree.
+    /// Optional: an empty list means the candidate is exactly what the stories produced.
+    #[serde(default)]
+    prepare: Vec<String>,
     #[serde(default)]
     fences: Vec<String>,
     #[serde(default)]
@@ -12646,11 +12659,16 @@ fn prepare_wave_worktrees(
     }
     let mut repositories = Vec::new();
     for (repository_id, story_refs) in grouped {
-        let (repository_root, canonical_ref, gate) = if config.repositories.is_empty() {
+        let (repository_root, canonical_ref, gate, prepare) = if config.repositories.is_empty() {
             if repository_id != "default" {
                 bail!("not-found: fleet repository {repository_id}")
             }
-            (root.to_path_buf(), "HEAD".to_string(), Vec::new())
+            (
+                root.to_path_buf(),
+                "HEAD".to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
         } else {
             let repository = config
                 .repositories
@@ -12661,6 +12679,7 @@ fn prepare_wave_worktrees(
                 repository_root(root, repository)?,
                 repository.canonical_ref.clone(),
                 repository.gate.clone(),
+                repository.prepare.clone(),
             )
         };
         let dirty = git_output(&repository_root, &["status", "--porcelain"])
@@ -12719,6 +12738,7 @@ fn prepare_wave_worktrees(
             "integration": {"branch": integration_branch, "worktree": display_path(&integration_path)},
             "stories": stories,
             "final_gate": gate,
+            "candidate_prepare": prepare,
         }));
     }
     Ok(json!({
@@ -13676,11 +13696,57 @@ fn integrate_wave(
             conflicted = false;
             continue;
         }
+        // Prepare the candidate before gating it: regenerate whatever is derived from the wave as a
+        // whole. A failure here is the repository's failure, recorded like any other, and never silently
+        // skipped — a stale derived artifact that reaches the gate reads as the stories being wrong.
+        let prepare_argv = wave["topology"]["repositories"][repository_index]["candidate_prepare"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if !prepare_argv.is_empty() && !command.dry_run {
+            let prepared = run_typed_argv(&integration_worktree, &prepare_argv)?;
+            if prepared["success"].as_bool() != Some(true) {
+                wave["topology"]["repositories"][repository_index]["prepare"] = prepared.clone();
+                failures.push(json!({
+                    "repository": repository_id,
+                    "reason": "candidate preparation failed",
+                    "evidence": prepared,
+                }));
+                continue;
+            }
+            // Whatever preparation regenerated is part of the candidate, so it must be committed — an
+            // uncommitted change would fail the gate's own cleanliness checks and would not survive
+            // into the accepted tag.
+            let status = git_output(&integration_worktree, &["status", "--porcelain"]);
+            if status.is_some_and(|status| !status.is_empty()) {
+                let _ = guarded_git(&integration_worktree, &["add", "-A"]);
+                let committed = guarded_git(
+                    &integration_worktree,
+                    &[
+                        "commit",
+                        "-m",
+                        "chore(integration): regenerate derived artifacts for this candidate",
+                    ],
+                )?;
+                if committed.exit_code != 0 {
+                    failures.push(json!({
+                        "repository": repository_id,
+                        "reason": "could not commit prepared artifacts",
+                        "stderr": clipped_redacted(committed.stderr.as_bytes()),
+                    }));
+                    continue;
+                }
+            }
+            wave["topology"]["repositories"][repository_index]["prepare"] = prepared;
+        }
         let candidate = if command.dry_run {
             base.clone()
         } else {
             git_output(&integration_worktree, &["rev-parse", "HEAD"])
-                .context("validation/gate: integration candidate missing")?
+                .context("validation/gate: candidate commit missing after preparation")?
         };
         let gate_argv = wave["topology"]["repositories"][repository_index]["final_gate"]
             .as_array()

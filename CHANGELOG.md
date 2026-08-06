@@ -86,6 +86,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+### Added
+
+- **A repository may declare a `prepare` step that regenerates its candidate's derived artifacts before
+  the gate.** Some checked-in artifacts are derived from a whole wave rather than from one story — a
+  documentation mirror, a generated index — and they belong to the candidate, not to any story. Two
+  stories regenerating one artifact collide, and regenerating it on either branch alone produces an
+  artifact missing the other story's contribution. Observed on a real wave whose gate refused the
+  candidate with `embedded docs are stale` while both stories were correct in isolation. The step runs
+  once, after every cherry-pick for that repository and before its gate, and whatever it regenerates is
+  committed into the candidate so it survives into the accepted tag. A preparation failure is recorded as
+  that repository's failure rather than surfacing later as the stories being wrong.
+
+### Fixed
+
 - **A failed integration can be retried once its cause is fixed.** `conflict` and `red` were terminal, so
   a wave that failed kept a memory of failing and no later `fleet integrate` would touch it — which made
   fixing the cause pointless. Three delivered stories stayed unreachable after the defect that stranded

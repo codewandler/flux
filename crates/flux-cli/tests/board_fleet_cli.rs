@@ -2223,6 +2223,129 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::remove_dir_all(root).ok();
 }
 
+/// Failing first: a derived artifact is regenerated on the CANDIDATE, once, before the gate.
+///
+/// Some checked-in artifacts are derived from many stories at once — a documentation mirror, a generated
+/// index. They belong to the candidate, not to any one story: two stories regenerating the same artifact
+/// collide, and regenerating it on either branch alone yields an artifact missing the other's
+/// contribution. `wave-346`'s flux gate refused a candidate with `embedded docs are stale` for exactly
+/// that reason, with both stories correct in isolation.
+#[test]
+fn a_derived_artifact_is_regenerated_on_the_candidate_before_the_gate() {
+    let root = fixture("candidate-prepare");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: One\nstatus: ready\npriority: 1\n---\n\n# One\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    // `INDEX` is derived from every `part-*` file. The gate demands it be current; only a step that runs
+    // after all stories are cherry-picked can make that true.
+    fs::write(root.join("INDEX"), "").unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\nprepare = [\"sh\", \"-c\", \"ls part-* > INDEX\"]\ngate = [\"sh\", \"-c\", \"ls part-* | diff - INDEX\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(dispatched.status.success());
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let story = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    // The story adds its part and deliberately does NOT touch the derived index.
+    fs::write(story.join("part-a"), "a\n").unwrap();
+    assert!(git(&story, &["add", "part-a"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "add part-a"])
+        .status
+        .success());
+    let commit = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "part-a",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "part-a",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "one part",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "preparation must make the derived artifact current: stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let integration = PathBuf::from(
+        integrated["data"]["topology"]["repositories"][0]["integration"]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(integration.join("INDEX"))
+            .unwrap()
+            .trim(),
+        "part-a",
+        "the regenerated artifact is part of the candidate"
+    );
+    // And it is committed, not left dirty — an uncommitted change would not survive into the tag.
+    let dirt = String::from_utf8(git(&integration, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(dirt.trim().is_empty(), "candidate left dirty: {dirt:?}");
+    fs::remove_dir_all(root).ok();
+}
+
 /// Failing first: a story that made several commits integrates all of them.
 ///
 /// A handoff names one commit and a worker legitimately makes several — implementation then
