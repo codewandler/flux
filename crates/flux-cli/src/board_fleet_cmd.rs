@@ -10296,6 +10296,28 @@ const RECLAIMABLE_BUILD_DIRS: [&str; 2] = ["target", "node_modules"];
 /// unfinished work exists (wave-299 held a complete six-file implementation that its turn never
 /// committed). Failure to reclaim is reported, never fatal: a full disk must not also block the apply
 /// that frees it.
+/// Land a wave's record on CURRENT state, rebasing when another writer moved on.
+///
+/// Integration is the longest operation the fleet performs — cherry-picks, a candidate preparation step and
+/// a full repository gate, tens of minutes from cold — and it writes state several times along the way.
+/// Any coordinator write inside that window lost the compare-and-set and threw the entire run away: a real
+/// integration died on `stale fleet revision 428; current revision is 429` after both gates had run, with
+/// the wave left mid-flight and every minute of gate time wasted.
+///
+/// Rebasing is safe here for the same reason it is safe for dispatch: this function only ever replaces the
+/// record of ONE wave, and no other writer is touching that wave — the wave is owned by this integration
+/// for its duration, and ownership is recorded. Retrying the whole operation instead would be wrong,
+/// because it would re-run a gate that has already produced its verdict.
+fn commit_wave_record(state: &mut FleetState, root: &Path, wave_id: &str, wave: &Value) {
+    if let Ok(latest) = read_fleet_state(root) {
+        if latest.revision > state.revision {
+            *state = latest;
+        }
+    }
+    state.waves.insert(wave_id.to_string(), wave.clone());
+    state.revision += 1;
+}
+
 /// Is this wave finished for good, so that its worktrees are no longer structure it needs?
 fn wave_worktrees_are_removable(status: &str) -> bool {
     matches!(status, "applied" | "cancelled")
@@ -13538,6 +13560,21 @@ fn integrate_wave(
             Some((id, (candidate, status)))
         })
         .collect::<BTreeMap<_, _>>();
+    // A repository whose candidate is already ACCEPTED keeps its verdict and is skipped below.
+    //
+    // Acceptance is the end of that repository's road: its candidate is pinned by a tag and nothing later
+    // in the wave can improve it. Re-gating it on a retry spends the longest operation in the pipeline to
+    // re-derive a known answer, and — worse — a re-gate that came out red would make already-accepted work
+    // read as failed. Observed: retrying wave-346 for its flux half cleared and re-ran the exchange gate
+    // that had already produced the accepted candidate.
+    let accepted_repositories = wave["applied"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["accepted_tag"].is_string())
+        .filter_map(|entry| entry["repository"].as_str())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
     if retryable_failure || stalled_integration {
         wave["conflict"] = Value::Null;
         for repository in wave["topology"]["repositories"]
@@ -13545,8 +13582,17 @@ fn integrate_wave(
             .into_iter()
             .flatten()
         {
+            if repository["id"]
+                .as_str()
+                .is_some_and(|id| accepted_repositories.contains(id))
+            {
+                continue;
+            }
             repository["gate"] = Value::Null;
             repository["candidate"] = Value::Null;
+            // Stale preparation evidence from the previous attempt would otherwise be reported as this
+            // attempt's, which is how a retry comes to look like it did work it never did.
+            repository["prepare"] = Value::Null;
         }
     }
     let items = wave["items"]
@@ -13600,8 +13646,7 @@ fn integrate_wave(
     wave["status"] = json!("integrating");
     wave["integration_supervisor_pid"] = json!(std::process::id());
     wave["integration_order"] = json!(order);
-    state.waves.insert(wave_id.to_string(), wave.clone());
-    state.revision += 1;
+    commit_wave_record(&mut state, root, wave_id, &wave);
     persist_fleet_mutation(
         command,
         root,
@@ -13621,6 +13666,9 @@ fn integrate_wave(
             .as_str()
             .unwrap_or("default")
             .to_string();
+        if accepted_repositories.contains(&repository_id) {
+            continue;
+        }
         let integration_worktree = PathBuf::from(
             wave["topology"]["repositories"][repository_index]["integration"]["worktree"]
                 .as_str()
@@ -13709,8 +13757,7 @@ fn integrate_wave(
                     wave["apply_eligible"] = json!(false);
                     wave["conflict"] = json!({"story":item,"commit":commit,"files":conflicts,"stderr":clipped_redacted(output.stderr.as_bytes()),"candidate":candidate});
                     wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"conflict","runs":0,"reason":format!("integration conflict in {item}"),"candidate":candidate});
-                    state.waves.insert(wave_id.to_string(), wave.clone());
-                    state.revision += 1;
+                    commit_wave_record(&mut state, root, wave_id, &wave);
                     persist_fleet_mutation(
                         command,
                         root,
@@ -13830,8 +13877,7 @@ fn integrate_wave(
             wave["status"] = json!("red");
             wave["apply_eligible"] = json!(false);
             wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"red","runs":0,"reason":"missing final gate argv","candidate":candidate});
-            state.waves.insert(wave_id.to_string(), wave.clone());
-            state.revision += 1;
+            commit_wave_record(&mut state, root, wave_id, &wave);
             persist_fleet_mutation(
                 command,
                 root,
@@ -13865,8 +13911,7 @@ fn integrate_wave(
         if !green {
             wave["status"] = json!("red");
             wave["apply_eligible"] = json!(false);
-            state.waves.insert(wave_id.to_string(), wave.clone());
-            state.revision += 1;
+            commit_wave_record(&mut state, root, wave_id, &wave);
             persist_fleet_mutation(
                 command,
                 root,
@@ -13895,8 +13940,7 @@ fn integrate_wave(
         // Release ownership before reporting: the run is over either way, and a wave left owned by a dead
         // process is the trap this field exists to close.
         wave["integration_supervisor_pid"] = Value::Null;
-        state.waves.insert(wave_id.to_string(), wave.clone());
-        state.revision += 1;
+        commit_wave_record(&mut state, root, wave_id, &wave);
         persist_fleet_mutation(
             command,
             root,
@@ -13934,8 +13978,7 @@ fn integrate_wave(
     wave["status"] = json!("green");
     wave["integration_supervisor_pid"] = Value::Null;
     wave["apply_eligible"] = json!(true);
-    state.waves.insert(wave_id.to_string(), wave.clone());
-    state.revision += 1;
+    commit_wave_record(&mut state, root, wave_id, &wave);
     let data = json!({"wave":wave_id,"status":"green","apply_eligible":true,"topology":wave["topology"],"pushed":false});
     persist_fleet_mutation(command, root, &state, "wave.gate.green", data.clone())?;
     Ok((

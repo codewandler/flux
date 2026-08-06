@@ -100,6 +100,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A concurrent write no longer throws away an entire integration.** Integration is the longest operation
+  the fleet performs — cherry-picks, candidate preparation and a full repository gate, tens of minutes from
+  cold — and it writes state several times along the way. Any coordinator write inside that window lost the
+  compare-and-set and discarded the whole run: one real integration died on `stale fleet revision 428;
+  current revision is 429` after both gates had already produced their verdicts. Each of those writes now
+  rebases onto current state, which is safe for the same reason it is safe for dispatch: the call replaces
+  the record of exactly one wave, and that wave is owned by the integration for its duration, with the
+  ownership recorded.
+- **A retry no longer re-judges a repository whose candidate is already accepted.** Acceptance is the end of
+  that repository's road — its candidate is pinned by a tag and nothing later in the wave can improve it —
+  so re-gating it spends the pipeline's longest operation to re-derive a known answer, and a re-gate that
+  came out red would make accepted work read as failed. Stale preparation evidence is cleared too, so a
+  retry cannot report work it did not do.
 - **Reclamation no longer removes a worktree an unfinished wave still needs.** Build output is regenerable
   and always goes; a worktree is structure, and `worktree_holds_work` answers "does this contain work?"
   rather than "is this still needed?". Reclaiming a wave whose worker turn had failed therefore removed its
