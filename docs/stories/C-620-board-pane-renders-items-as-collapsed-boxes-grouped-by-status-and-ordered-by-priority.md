@@ -2,11 +2,11 @@
 id: C-620
 title: "Board pane renders items as collapsed boxes grouped by status and ordered by priority"
 pillar: "Core"
-status: ready
-priority: 20
+status: done
 epic: tui-board-surface
 areas: [flux-tui]
 design: docs/designs/the-tui-board-is-a-real-board-collapsed-expandable-clickable-items-rendering-markdown-detail.md
+done_override: "Acceptance boxes were written by the contracting session, not by the worker that delivered it; the auditable evidence is the accepted tag, the green repository gate and the merge commit named in the evidence entry."
 ---
 
 # Board pane renders items as collapsed boxes grouped by status and ordered by priority
@@ -43,3 +43,8 @@ The board has >1100 items today, so eager construction is a real cost rather tha
   flat table (`flux/C-42 before flux/C-43`, fixture order preserved) before the pane existed.
 - `cargo test -p flux-tui board_pane` — 3 passed (ordering, collapsed box + wave marker, and paging
   over a 1200-item board where a 24-row viewport builds exactly 24 rows).
+
+
+## Evidence
+
+- Delivered by a fleet worker in wave-385, gated green, accepted as fleet/accepted/wave-385/flux and merged into main as 824856ee. The Board pane renders items as collapsed boxes grouped by status and ordered by board-next priority, paging to the selection so rows built stay bounded by terminal height.

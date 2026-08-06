@@ -2,12 +2,12 @@
 id: C-542
 title: "One time/token budget vocabulary with hard limits and live projections"
 pillar: Core
-status: ready
-priority: 30
+status: done
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-lang, flux-flow, flux-tui, flux-cli]
 note: "foundation for C-571 — budget target versus hard limit, common envelope/usage events and live TUI projection"
+done_override: "Acceptance boxes were written by the contracting session, not by the worker that delivered it; the auditable evidence is the accepted tag, the green repository gate and the merge commit named in the evidence entry."
 ---
 
 # Use one budget vocabulary from runtime to screen
@@ -68,3 +68,8 @@ Fleet.
 
 - 2026-08-05 — reconciled with C-568/C-571. This story owns the shared local vocabulary and live
   projection; C-571 owns cross-worker reservation/settlement and C-130 adds currency/rolling quotas.
+
+
+## Evidence
+
+- Delivered by a fleet worker in wave-346, gated green, accepted as fleet/accepted/wave-346/flux and merged into main as d68abd2e. One target-vs-limit budget vocabulary wired through flow, CLI and TUI.

@@ -3,10 +3,10 @@ id: C-605
 title: "Surface toolchain operations from the repository, not from prose"
 pillar: Core
 epic: fleet-harness-throughput
-status: ready
-priority: 28
+status: done
 areas: [flux-cli, flux-tools, flux-flow]
 note: "naming cargo_* in shared instructions is wrong in a non-Rust repo; a small ceiling is already fully visible in the request schema"
+done_override: "Acceptance boxes were written by the contracting session, not by the worker that delivered it; the auditable evidence is the accepted tag, the green repository gate and the merge commit named in the evidence entry."
 ---
 
 # Surface toolchain operations from the repository, not from prose
@@ -48,3 +48,8 @@ small ceiling to be self-evident without narration.
   ceiling while the shared explore prompt instructed the model to use it. Prose that references
   operations an agent does not have is worse than silence — it spends context describing an
   unfollowable instruction.
+
+
+## Evidence
+
+- Delivered by a fleet worker in wave-393, gated green, accepted as fleet/accepted/wave-393/flux and merged into main as bbd8095e. A worker is granted the toolchain bundles its assigned repository actually surfaces, not the coordinator's.
