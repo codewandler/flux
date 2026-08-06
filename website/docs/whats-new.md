@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.57.0] - 2026-08-06
+
 ### New
 
 - **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain

@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-08-06
+
 ### Added
 
 - **A native workspace Board is now the complete cross-repository program authority** (C-588).
