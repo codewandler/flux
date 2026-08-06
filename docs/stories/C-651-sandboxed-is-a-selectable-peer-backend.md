@@ -13,7 +13,18 @@ note: "Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a s
 
 ## Goal
 
+Confinement becomes a selectable peer. Today the sandbox (bubblewrap/Seatbelt,
+`crates/flux-system/src/sandbox.rs`) is a modifier applied inside the native `System`'s single
+spawn choke point. A `sandboxed` backend kind resolves to an `ExecutionSystem` implementation that
+composes the native system with the sandbox, so host selection, posture floors and Decision 0018
+rule 8's confined default can name it like any other backend.
 
 ## Acceptance
 
-- [ ] Define acceptance.
+- [ ] `backend = "sandboxed"` resolves to a peer `ExecutionSystem` implementation that passes the
+      `flux-codegate` backend census through a reviewed ALLOW entry.
+- [ ] On a platform with no usable confinement backend the binding fails closed at resolution
+      (`Require` semantics), never degrading silently; a test proves the refusal face.
+- [ ] The existing `--sandbox`/`--no-sandbox` modifier path is byte-for-byte unchanged, and a
+      posture `SandboxFloor` may force selection of the sandboxed backend.
+- [ ] The peer backend's `SubstrateIdentity` reports its confinement truthfully.
