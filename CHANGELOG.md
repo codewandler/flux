@@ -75,6 +75,18 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A handoff is no longer refused because a sibling test target filtered to nothing.** `cargo test -p
+  <pkg> <filter>` runs the package's lib unittests *and* each of its integration-test binaries, so the
+  filter matches in one target and reports `0 passed; 0 failed; N filtered out` for every other. The
+  "did this run any tests" check was a substring search over the combined output, so it saw the
+  non-matching target and concluded no test had run — silently refusing a handoff whose cited test
+  genuinely ran and passed, and parking a wave that held delivered, committed work. Every summary is now
+  counted, in both libtest and nextest vocabulary, and the run counts as executed if any target ran a
+  test.
+- **A lost update no longer reports itself as a contradiction.** Fleet's compare-and-set printed `stale
+  fleet revision 392; current revision is 392` when a concurrent writer had already produced that
+  revision with different content. Same message for two unlike failures, and unactionable for the one it
+  described least. The two cases now say what happened and what to do.
 - **Two stories in one repository may now write the same file.** Integration refused any wave whose
   stories' write sets intersected — a proxy for "these commits will not combine", and within one
   repository wrong far more often than right. A wave of two delivered stories was parked because each

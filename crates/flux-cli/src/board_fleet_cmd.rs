@@ -96,15 +96,47 @@ fn guarded_git(root: &Path, args: &[&str]) -> Result<flux_system::ProcessOutput>
 /// reports `0 passed; 0 failed; N filtered out` and exits 0. Recognises the libtest summary shared by
 /// `cargo test`/`cargo nextest`; an unrecognised runner simply reports `false` and keeps the strict
 /// exit-code contract.
+///
+/// **Every summary is counted, not the presence of one string.** `cargo test -p <pkg> <filter>` runs the
+/// package's lib unittests *and* each of its integration-test binaries, so a filter that matches one
+/// target emits a real summary for that target and `0 passed; 0 failed; N filtered out` for every other.
+/// A substring search over the combined output therefore reported "no tests ran" for a run in which a
+/// test genuinely ran and passed — which silently refused a correct handoff and parked a wave holding
+/// delivered work. The question is whether ANY target executed a test, so the counts are summed.
 fn ran_no_tests(evidence: &Value) -> bool {
     let haystack = format!(
         "{}{}",
         evidence["stdout"].as_str().unwrap_or_default(),
         evidence["stderr"].as_str().unwrap_or_default()
     );
-    haystack.contains("0 passed; 0 failed")
-        || haystack.contains("0 tests run")
-        || haystack.contains("Starting 0 tests")
+    /// Read the integer immediately preceding `marker` (`"4 passed"` → `4`).
+    fn count_before(line: &str, marker: &str) -> Option<u64> {
+        let head = &line[..line.find(marker)?];
+        let digits = head
+            .trim_end()
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()?;
+        digits.parse().ok()
+    }
+    let mut recognised = false;
+    let mut executed = 0u64;
+    for line in haystack.lines() {
+        // libtest: `test result: ok. 1 passed; 0 failed; 293 filtered out; ...`
+        if line.contains("test result:") {
+            recognised = true;
+            executed += count_before(line, " passed").unwrap_or(0);
+            executed += count_before(line, " failed").unwrap_or(0);
+        }
+        // nextest: `Summary [ 0.1s] 4 tests run: 4 passed, 0 skipped` / `Starting 4 tests across ...`
+        else if line.contains(" tests run") {
+            recognised = true;
+            executed += count_before(line, " tests run").unwrap_or(0);
+        } else if line.contains("Starting ") && line.contains(" tests") {
+            recognised = true;
+            executed += count_before(line, " tests").unwrap_or(0);
+        }
+    }
+    recognised && executed == 0
 }
 
 /// Sidecar carrying live worker activity, relative to the Fleet root.
@@ -9677,12 +9709,23 @@ fn write_fleet_state(root: &Path, state: &FleetState) -> Result<()> {
                     .map_err(|error| flux_core::Error::Other(error.to_string()))?;
                 let mut current_core = current_state.clone();
                 current_core.idempotency.clear();
-                if current_state.revision > desired_revision
-                    || (current_state.revision == desired_revision && current_core != desired_core)
-                {
+                // Two different failures, and they used to print the same sentence. The equal-revision
+                // case rendered as `stale fleet revision 392; current revision is 392`, which reads as
+                // a contradiction and tells the reader nothing about what to do — it cost real time to
+                // work out that a concurrent writer had already produced that revision with different
+                // content, and that retrying from a fresh read is the whole remedy.
+                if current_state.revision > desired_revision {
                     return Err(flux_core::Error::Other(format!(
-                        "stale fleet revision {desired_revision}; current revision is {}",
+                        "stale fleet revision {desired_revision}; current revision is {} — re-read the \
+                         state and recompute this mutation",
                         current_state.revision
+                    )));
+                }
+                if current_state.revision == desired_revision && current_core != desired_core {
+                    return Err(flux_core::Error::Other(format!(
+                        "lost update at fleet revision {desired_revision}: another writer already \
+                         produced this revision with different content, so this mutation was computed \
+                         against a state that no longer exists — re-read and retry"
                     )));
                 }
             }
@@ -13892,6 +13935,38 @@ mod tests {
         // An unrecognised runner keeps the strict exit-code contract rather than being waved through.
         let opaque = json!({"success": true, "stdout": "done", "stderr": ""});
         assert!(!ran_no_tests(&opaque));
+
+        // Failing first: `cargo test -p <pkg> <filter>` runs the lib unittests AND every integration
+        // test binary, so the filter matches in one target and matches nothing in the others. A
+        // substring search over the combined output saw `0 passed; 0 failed` from the non-matching
+        // target and concluded no test ran — refusing a handoff whose test genuinely ran and passed,
+        // and parking a wave that held delivered work. Real captured output from `cargo test -p
+        // flux-tui board_pane_groups_by_status_and_orders_by_priority`.
+        let multi_target = json!({
+            "success": true,
+            "stdout": "     Running unittests src/lib.rs (target/debug/deps/flux_tui-669f2bfa)\n\nrunning 1 test\ntest operations::tests::board_pane_groups_by_status_and_orders_by_priority ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 293 filtered out; finished in 0.01s\n\n     Running tests/loop_mocks.rs (target/debug/deps/loop_mocks-62225ac6)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s\n",
+            "stderr": ""
+        });
+        assert!(
+            !ran_no_tests(&multi_target),
+            "one target running the test is enough; sibling targets filter to nothing by construction"
+        );
+
+        // The genuinely-absent case still holds when several targets all match nothing.
+        let absent_everywhere = json!({
+            "success": true,
+            "stdout": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 293 filtered out;\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 22 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(ran_no_tests(&absent_everywhere));
+
+        // nextest's own vocabulary, both directions.
+        assert!(ran_no_tests(
+            &json!({"success": true, "stdout": "Starting 0 tests across 12 binaries\n", "stderr": ""})
+        ));
+        assert!(!ran_no_tests(
+            &json!({"success": true, "stdout": "Starting 3 tests across 12 binaries\n    Summary [0.2s] 3 tests run: 3 passed, 0 skipped\n", "stderr": ""})
+        ));
     }
 
     /// Live activity must reach a surface DURING a wave. Failing first: a wave writes `state.json`
