@@ -2373,6 +2373,26 @@ impl FleetTuiSource {
         }
     }
 
+    /// Run one fleet action through the same path the CLI uses.
+    ///
+    /// Reimplementing an action's body here would fork it: `FleetAction::Start` is where configuration is
+    /// re-read, every loop binding re-validated and the coordinator's recorded capability set rebuilt, and a
+    /// second copy of that would drift from the first the moment either changed.
+    fn fleet_action(&self, action: FleetAction) -> Result<String> {
+        let command = FleetCommand {
+            root: self.root.clone(),
+            output: AgentOutput::Human,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            action,
+        };
+        let state = read_fleet_state(&self.root)?;
+        let (_, _, _, revision) = run_fleet_action(&command, &self.root, state, None)?;
+        Ok(revision.to_string())
+    }
+
     fn board_command(&self, action: BoardAction) -> Result<BoardCommand> {
         let scope = default_board_scope(&self.root)?;
         Ok(BoardCommand {
@@ -2907,6 +2927,46 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                 "attached".into(),
                 json!({"agent":"main","session":session,"status":state.main_agent.status}),
             ))
+        })
+    }
+
+    fn restart(&self) -> Result<flux_tui::operations::FleetAck> {
+        // Refuse while work is genuinely in flight. A stop-and-start beneath a live turn orphans it: the
+        // worker keeps running against a coordinator that has been reset under it, and its handoff will
+        // arrive for a wave whose record no longer expects it. `worker_activity` is the same derivation
+        // `fleet status` reports, so the refusal and the display can never disagree — and it accounts for a
+        // supervisor that has died, so a corpse recorded as `working` does not block a restart forever.
+        let live = read_fleet_state(&self.root)?
+            .agents
+            .values()
+            .filter(|agent| worker_activity(agent) == WorkerActivity::Active)
+            .count();
+        if live > 0 {
+            bail!(
+                "conflict/precondition: {live} worker(s) are still running; a restart beneath a live turn \
+                 orphans it — wait, or cancel the wave first"
+            )
+        }
+        self.mutate("fleet.restarted", |state| {
+            state.running = false;
+            state.revision += 1;
+            Ok((
+                "fleet".into(),
+                "restarted".into(),
+                json!({"phase": "stopped", "revision": state.revision}),
+            ))
+        })?;
+        // `fleet start` is what re-reads configuration, re-validates every loop binding and re-establishes
+        // the coordinator's recorded capability set, so the restart is that call rather than a flag flip.
+        let started = self.fleet_action(FleetAction::Start)?;
+        Ok(flux_tui::operations::FleetAck {
+            id: "fleet".into(),
+            level: "restarted".into(),
+            revision: started,
+            message:
+                "fleet restarted: configuration, loop bindings and the coordinator capability set \
+                      were re-read"
+                    .into(),
         })
     }
 

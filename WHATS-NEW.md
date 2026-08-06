@@ -21,6 +21,11 @@
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
 
+- **`/fleet:restart` applies fleet configuration changes without leaving the terminal UI.** Edit your fleet
+  settings, type `/fleet:restart`, and the fleet stops and starts so the new configuration, loops and limits
+  take effect. It waits rather than interrupting: if a worker is still running it tells you instead of
+  restarting underneath it. `/fleet:refresh` re-reads fleet state when you want the current picture now.
+
 ## [0.58.0] - 2026-08-07
 
 ### New

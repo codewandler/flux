@@ -966,8 +966,27 @@ impl flux_tui::ModelResolver for CliTuiModelResolver {
 /// Built-in TUI slash commands (D-186): a file command sharing one of these names is dropped at
 /// load (with a warning) rather than shadowing it — mirrors `flux-tui`'s `BUILTIN_COMMANDS` names.
 const TUI_BUILTIN_COMMANDS: &[&str] = &[
-    "help", "usage", "clear", "new", "model", "effort", "quit", "restart", "exit", "compact",
-    "shell", "tools", "evidence", "session", "sessions", "resume", "queue", "insights", "fleet",
+    "help",
+    "usage",
+    "clear",
+    "new",
+    "model",
+    "effort",
+    "quit",
+    "restart",
+    "fleet:restart",
+    "fleet:refresh",
+    "exit",
+    "compact",
+    "shell",
+    "tools",
+    "evidence",
+    "session",
+    "sessions",
+    "resume",
+    "queue",
+    "insights",
+    "fleet",
     "board",
 ];
 

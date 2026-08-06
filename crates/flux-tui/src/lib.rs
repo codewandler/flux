@@ -301,7 +301,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("sessions", "list recent sessions"),
     ("resume", "resume a session id"),
     ("queue", "manage queued follow-ups"),
-    ("fleet", "open Fleet operations"),
+    (
+        "fleet",
+        "operations pane · also /fleet:restart, /fleet:refresh",
+    ),
     ("board", "open Board work and decisions"),
     ("theme", "show or switch the color theme"),
 ];
@@ -5169,6 +5172,7 @@ where
                                 state,
                                 &mut cancel,
                                 model_resolver.as_ref(),
+                                operations_source.as_ref(),
                             )
                             .await?;
                             if wants_quit {
@@ -5262,6 +5266,7 @@ async fn handle_command(
     state: &mut ChatState,
     cancel: &mut CancellationToken,
     model_resolver: Option<&Arc<dyn ModelResolver>>,
+    operations_source: Option<&operations::SharedFleetBoardSource>,
 ) -> anyhow::Result<bool> {
     let command = text.trim().trim_start_matches('/');
     let (name, args) = command
@@ -5298,6 +5303,54 @@ async fn handle_command(
         }
         "usage" => state.usage_open = true,
         "quit" | "exit" => return Ok(true),
+        // The `fleet:` family. Routed on the prefix rather than one arm per verb, so the verbs still to be
+        // written — doctor, gate, park/unpark, land, attention, each already a story — are one arm each, and
+        // an unrecognised name gets the list rather than silence.
+        name if name.starts_with("fleet:") => {
+            let Some(source) = operations_source else {
+                state.push(Entry::Notice {
+                    text:
+                        "standalone chat has no attached fleet · relaunch with `flux tui --fleet`"
+                            .into(),
+                    sev: Sev::Info,
+                });
+                return Ok(false);
+            };
+            match name.trim_start_matches("fleet:") {
+                "restart" => match source.restart() {
+                    Ok(ack) => state.push(Entry::Notice {
+                        text: format!("{} · revision {}", ack.message, ack.revision),
+                        sev: Sev::Info,
+                    }),
+                    Err(error) => state.push(Entry::Notice {
+                        text: format!("fleet restart refused: {error}"),
+                        sev: Sev::Warn,
+                    }),
+                },
+                "refresh" => {
+                    source.invalidate_snapshot_cache();
+                    match source.snapshot() {
+                        Ok(snapshot) => state.push(Entry::Notice {
+                            text: format!(
+                                "fleet refreshed · revision {} · {} active worker(s) · {} board item(s)",
+                                snapshot.revision,
+                                snapshot.capacity.active,
+                                snapshot.items.len()
+                            ),
+                            sev: Sev::Info,
+                        }),
+                        Err(error) => state.push(Entry::Notice {
+                            text: format!("fleet refresh failed: {error}"),
+                            sev: Sev::Err,
+                        }),
+                    }
+                }
+                other => state.push(Entry::Notice {
+                    text: format!("unknown fleet command `{other}` · available: restart, refresh"),
+                    sev: Sev::Warn,
+                }),
+            }
+        }
         "restart" => {
             RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
             state.push(Entry::Notice {

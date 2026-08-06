@@ -210,8 +210,13 @@ pub struct FleetAck {
     pub message: String,
 }
 
-/// Typed in-process operations boundary. Mutations are deliberately limited to coordinator intake
-/// acknowledgements and an explicitly confirmed Board decision.
+/// Typed in-process operations boundary.
+///
+/// Mutations are deliberately narrow: coordinator intake acknowledgements, an explicitly confirmed Board
+/// decision, and a lifecycle restart. The line is publication and destruction — this boundary exists so a
+/// surface cannot push, release, deploy, apply a candidate or clean worktrees, and `restart` does none of
+/// those. It re-reads configuration, which is the opposite of a durable side effect: nothing new exists
+/// afterwards that did not exist in a file already.
 pub trait FleetBoardSource: Send + Sync {
     fn snapshot(&self) -> Result<FleetBoardSnapshot>;
     /// Cheap token for deciding whether the durable runtime projection changed.
@@ -234,6 +239,18 @@ pub trait FleetBoardSource: Send + Sync {
         error: Option<&str>,
     ) -> Result<FleetAck>;
     fn decide(&self, decision_ref: &str, outcome: &str) -> Result<FleetAck>;
+    /// Stop and start the fleet so current configuration takes effect.
+    ///
+    /// Distinct from restarting the process: that changes the executable, this re-reads the fleet — config,
+    /// every loop binding, and the coordinator's recorded capability set. Editing `.flux/fleet.toml` and
+    /// then wondering whether the attached coordinator has seen it is a question an operator should be able
+    /// to answer by asking rather than by reasoning.
+    ///
+    /// Implementations must refuse while a worker is genuinely active: a stop-and-start beneath a live turn
+    /// orphans it, leaving a process running against a coordinator that no longer knows about it.
+    fn restart(&self) -> Result<FleetAck> {
+        anyhow::bail!("this fleet attachment does not support restart")
+    }
 }
 
 pub type SharedFleetBoardSource = Arc<dyn FleetBoardSource>;

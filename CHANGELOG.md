@@ -31,6 +31,19 @@ All notable changes to this project are documented in this file. The format is b
   reused verbatim: a restart that quietly changed the model, the fleet root or the posture would be a
   different session wearing the same name.
 
+- **A `fleet:` command namespace in the terminal UI**, with `/fleet:restart` and `/fleet:refresh`.
+  `/restart` changes the executable; `/fleet:restart` re-reads the *fleet* — configuration, every loop
+  binding, and the coordinator's recorded capability set — by running the same `fleet start` path the CLI
+  uses rather than a second copy of it. It refuses while a worker is genuinely active, because a
+  stop-and-start beneath a live turn orphans it, and the refusal uses the same activity derivation
+  `fleet status` reports so the two can never disagree. `/fleet:refresh` drops the snapshot cache and
+  reports what it found. An unrecognised `fleet:` name lists the available ones.
+
+  The operations boundary is widened deliberately and only this far: the surface still cannot push,
+  release, deploy, apply a candidate or clean worktrees. Restart publishes nothing and destroys nothing —
+  it re-reads files that already exist. `/fleet:reclaim` was considered and **excluded** for exactly that
+  reason: reclamation deletes worktrees, which is on the far side of the line.
+
 ## [0.58.0] - 2026-08-07
 
 ### Added
