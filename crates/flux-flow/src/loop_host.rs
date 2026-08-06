@@ -418,6 +418,7 @@ impl EngineLoopHost {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .ok_or_else(|| Error::Other("ai_segment: non-empty 'goal' is required".into()))?;
         let tools = input
             .get("tools")
@@ -444,8 +445,57 @@ impl EngineLoopHost {
             .ok_or_else(|| {
                 Error::Other("ai_segment: 'max_rounds' must be greater than zero".into())
             })?;
+        let current_turn = input
+            .get("current_turn")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_tokens = input
+            .get("max_tokens")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        Error::Other("ai_segment: 'max_tokens' must be greater than zero".into())
+                    })
+            })
+            .transpose()?;
+        let max_history_bytes = input
+            .get("max_history_bytes")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        Error::Other(
+                            "ai_segment: 'max_history_bytes' must be greater than zero".into(),
+                        )
+                    })
+            })
+            .transpose()?;
 
         let (mut context, provider, model) = self.adaptive_context()?;
+        let effective_goal = if current_turn {
+            let request = context
+                .conversation
+                .iter()
+                .rev()
+                .find(|message| message.role == flux_core::Role::User)
+                .map(Message::text)
+                .map(|request| request.trim().to_string())
+                .filter(|request| !request.is_empty())
+                .ok_or_else(|| {
+                    Error::Other(
+                        "ai_segment: current_turn requested but the turn has no user message"
+                            .into(),
+                    )
+                })?;
+            format!("{goal}\n\nCurrent request:\n{request}")
+        } else {
+            goal
+        };
         let unavailable = tools
             .iter()
             .filter(|name| !context.advertised.contains(*name))
@@ -459,10 +509,19 @@ impl EngineLoopHost {
         }
         context.advertised = tools;
         context.authored_ceiling = Some(context.advertised.clone());
-        context.conversation = vec![Message::user_text(goal)];
+        // Authored segments never inherit retained conversation implicitly. `current_turn` above
+        // copies only the latest request into this fresh one-message segment.
+        context.conversation = vec![Message::user_text(&effective_goal)];
         context.adaptive_policy.max_model_calls = max_rounds;
         context.adaptive_policy.explore.max_calls = None;
-        let intent = crate::staged::scoped_segment_state(&context, goal)?;
+        // Like `max_rounds`, an authored ceiling wins outright: the author knows how much evidence
+        // this segment legitimately accumulates.
+        context.adaptive_policy.max_history_bytes = max_history_bytes;
+        if let Some(max_tokens) = max_tokens {
+            context.adaptive_policy.explore.max_tokens =
+                Some(max_tokens.min(context.opts.max_tokens.max(1)));
+        }
+        let intent = crate::staged::scoped_segment_state(&context, &effective_goal)?;
         let mut next = json!({ "state": intent["state"].clone() });
         let mut remaining = max_rounds;
 

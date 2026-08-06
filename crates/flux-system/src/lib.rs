@@ -259,10 +259,10 @@ impl Drop for ScratchWorkspace {
 impl Workspace {
     /// Create a workspace rooted at `root` (canonicalized; must exist).
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
         let root = root
-            .as_ref()
             .canonicalize()
-            .map_err(|e| Error::Config(format!("workspace root: {e}")))?;
+            .map_err(|e| Error::Config(format!("workspace root {}: {e}", root.display())))?;
         Ok(Self {
             root,
             named: HashMap::new(),
@@ -299,10 +299,10 @@ impl Workspace {
     /// This is the seam a context-local worktree transition uses — the plain constructors would
     /// drop the widened roots and so break `@named`-root operations inside the new root (C-97).
     pub fn with_root(&self, root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
         let root = root
-            .as_ref()
             .canonicalize()
-            .map_err(|e| Error::Config(format!("workspace root: {e}")))?;
+            .map_err(|e| Error::Config(format!("workspace root {}: {e}", root.display())))?;
         Ok(Self {
             root,
             named: self.named.clone(),

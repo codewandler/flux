@@ -86,9 +86,11 @@ pub use flux_agent::AgentExecutorConfig;
 /// The agent definition ([`ClientBuilder::from_spec`]) plus its permission rules. Re-exported so
 /// the full-control door needs no direct `flux-agent` dependency.
 pub use flux_agent::{
-    AdaptiveLoopPolicy, AgentLoopSpec, AgentProfile, AgentSpec, AgentStagePolicy, BuiltinAgentLoop,
-    Permissions, PromptCacheClass, PromptLayer, PromptLayerKind, PromptManifestEntry, PromptTrust,
+    AdaptiveLoopPolicy, AgentLoopBinding, AgentLoopSpec, AgentProfile, AgentSpec, AgentStagePolicy,
+    BuiltinAgentLoop, Permissions, PromptCacheClass, PromptLayer, PromptLayerKind,
+    PromptManifestEntry, PromptTrust,
 };
+pub use flux_core::{AgentLoopBindingMetadata, AgentLoopRunnerKind};
 
 /// The per-turn token accounting carried on [`TurnOutput`]. Re-exported from `flux-core`.
 pub use flux_core::Usage;
@@ -580,6 +582,13 @@ impl ClientBuilder {
     /// Select the Flux-Lang outer control program for conversational turns.
     pub fn agent_loop(mut self, agent_loop: AgentLoopSpec) -> Self {
         self.spec.agent_loop = agent_loop;
+        self.spec.agent_loop_binding = None;
+        self
+    }
+    /// Select an already-resolved, receipt-identifiable outer control program.
+    pub fn agent_loop_binding(mut self, binding: AgentLoopBinding) -> Self {
+        self.spec.agent_loop = binding.spec().clone();
+        self.spec.agent_loop_binding = Some(binding);
         self
     }
     /// Add a permission allow rule (e.g. `"write"`, `"Bash(git:*)"`).
@@ -2798,6 +2807,7 @@ mod tests {
                 max_tokens: Some(222),
                 max_calls: Some(1),
             },
+            max_history_bytes: None,
         };
 
         let client = Client::builder()

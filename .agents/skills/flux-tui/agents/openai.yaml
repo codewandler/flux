@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flux TUI"
+  short_description: "Drive and verify Flux TUI sessions in tmux"
+  default_prompt: "Use $flux-tui to run, restart, and inspect this Flux TUI workflow in tmux."

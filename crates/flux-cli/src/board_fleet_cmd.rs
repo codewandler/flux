@@ -919,6 +919,12 @@ struct FleetConfig {
     allow_ad_hoc_agents: bool,
     #[serde(default)]
     agent_templates: Vec<AgentTemplate>,
+    /// Operator-authored behavior profiles available to Fleet task policy.
+    #[serde(default)]
+    loop_profiles: BTreeMap<String, FleetLoopProfile>,
+    /// Task kind -> loop profile id. Fleet tasks have no implicit adaptive fallback.
+    #[serde(default)]
+    loop_policy: BTreeMap<String, String>,
     #[serde(default = "default_worktree_root")]
     worktree_root: PathBuf,
     #[serde(default)]
@@ -992,6 +998,12 @@ struct MainAgentConfig {
     instructions: Option<PathBuf>,
     #[serde(default)]
     model: Option<String>,
+    /// Explicit operator-authored outer loop for the main coordinator.
+    #[serde(default, rename = "loop")]
+    agent_loop: Option<PathBuf>,
+    /// Explicit operator-authored outer loop for bounded research children started with `task`.
+    #[serde(default)]
+    research_loop: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -999,6 +1011,8 @@ struct MainAgentConfig {
 struct AgentTemplate {
     id: String,
     role: String,
+    #[serde(default = "default_fleet_task_kind")]
+    task_kind: String,
     instructions: PathBuf,
     #[serde(default)]
     model: Option<String>,
@@ -1010,6 +1024,16 @@ struct AgentTemplate {
     fences: Vec<String>,
     #[serde(default = "default_template_instances")]
     max_instances: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetLoopProfile {
+    revision: String,
+    source: PathBuf,
+    entry: String,
+    #[serde(default)]
+    required_runtime_features: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1052,6 +1076,13 @@ const fn default_true() -> bool {
 const fn default_template_instances() -> usize {
     1
 }
+/// The task kind that grants a template the dedicated wave-integrator catalogue. Declaring it in
+/// `fleet.toml` is the operator's explicit act; nothing else confers assemble authority.
+const FLEET_INTEGRATION_TASK_KIND: &str = "integration";
+
+fn default_fleet_task_kind() -> String {
+    "implementation".into()
+}
 fn default_canonical_ref() -> String {
     "origin/main".into()
 }
@@ -1083,6 +1114,7 @@ pub(super) struct FleetTuiLaunch {
     pub(super) root: PathBuf,
     pub(super) store: PathBuf,
     pub(super) session: Option<String>,
+    pub(super) agent_loop: String,
     pub(super) initial_snapshot: flux_tui::operations::FleetBoardSnapshot,
     pub(super) source: flux_tui::operations::SharedFleetBoardSource,
 }
@@ -1090,6 +1122,721 @@ pub(super) struct FleetTuiLaunch {
 #[derive(Clone, Debug)]
 struct FleetTuiSource {
     root: PathBuf,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetAgentsInput {
+    /// Maximum worker records to return. The total always reports the untruncated count.
+    #[serde(default = "default_native_fleet_agent_limit")]
+    limit: usize,
+}
+
+fn default_native_fleet_agent_limit() -> usize {
+    100
+}
+
+/// Read-only native Fleet operations installed only for an explicitly attached main coordinator.
+///
+/// These are deliberately separate from `flux-orchestrate`'s A2A/process `fleet.*` pack. That pack
+/// owns transient workers started inside one agent process; this projection reads durable native
+/// Fleet admission state, which is also what `flux fleet agents` and the Operations TUI display.
+pub(super) fn native_fleet_integrator_tools(
+    root: PathBuf,
+) -> Result<Vec<Arc<dyn flux_runtime::Tool>>> {
+    let root = confined_root(&root)?;
+    if !root.join(".flux/fleet.toml").is_file() {
+        bail!(
+            "not-found: no Fleet configuration at {}",
+            root.join(".flux/fleet.toml").display()
+        )
+    }
+    Ok(native_fleet_integrator_tools_at(root))
+}
+
+pub(super) fn native_fleet_main_tools(root: PathBuf) -> Result<Vec<Arc<dyn flux_runtime::Tool>>> {
+    let root = confined_root(&root)?;
+    if !root.join(".flux/fleet.toml").is_file() {
+        bail!(
+            "not-found: no Fleet configuration at {}",
+            root.join(".flux/fleet.toml").display()
+        )
+    }
+    Ok(native_fleet_main_tools_at(root))
+}
+
+const NATIVE_COORDINATOR_OPERATIONS: [NativeCoordinatorOperation; 15] = [
+    NativeCoordinatorOperation::BoardShow,
+    NativeCoordinatorOperation::BoardGet,
+    NativeCoordinatorOperation::BoardNext,
+    NativeCoordinatorOperation::BoardCheck,
+    NativeCoordinatorOperation::BoardStart,
+    NativeCoordinatorOperation::BoardBlock,
+    NativeCoordinatorOperation::BoardUnblock,
+    NativeCoordinatorOperation::BoardComment,
+    NativeCoordinatorOperation::BoardEvidence,
+    NativeCoordinatorOperation::FleetStatus,
+    NativeCoordinatorOperation::FleetSchedule,
+    NativeCoordinatorOperation::FleetRun,
+    NativeCoordinatorOperation::FleetMessage,
+    NativeCoordinatorOperation::FleetCancel,
+    NativeCoordinatorOperation::FleetResume,
+];
+
+/// The dedicated wave-integrator's exact ceiling. Deliberately disjoint from the coordinator's: the
+/// integrator may assemble a wave and read Fleet lifecycle state, and nothing else. It gets no Board
+/// mutation, no dispatch, no cancel/resume, and no apply — a green gate is where its authority ends.
+///
+/// `fleet.integrate` is intentionally **absent** from [`NATIVE_COORDINATOR_OPERATIONS`]. The
+/// coordinator schedules work and delegates assembly; keeping the two catalogues disjoint is what
+/// makes "the writer never integrates itself, and the scheduler never assembles" structural rather
+/// than a matter of prompt discipline.
+const NATIVE_INTEGRATOR_OPERATIONS: [NativeCoordinatorOperation; 2] = [
+    NativeCoordinatorOperation::FleetIntegrate,
+    NativeCoordinatorOperation::FleetStatus,
+];
+
+fn native_fleet_integrator_tools_at(root: PathBuf) -> Vec<Arc<dyn flux_runtime::Tool>> {
+    NATIVE_INTEGRATOR_OPERATIONS
+        .into_iter()
+        .map(|operation| {
+            Arc::new(NativeCoordinatorTool {
+                root: root.clone(),
+                operation,
+            }) as Arc<dyn flux_runtime::Tool>
+        })
+        .collect()
+}
+
+/// Exact model-facing operation ceiling for the dedicated wave integrator.
+pub(super) fn native_fleet_integrator_operation_ceiling() -> Vec<String> {
+    let mut names = vec!["ai_segment".to_string()];
+    names.extend(
+        NATIVE_INTEGRATOR_OPERATIONS
+            .into_iter()
+            .map(|operation| operation.name().to_string()),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn native_fleet_main_tools_at(root: PathBuf) -> Vec<Arc<dyn flux_runtime::Tool>> {
+    let mut tools: Vec<Arc<dyn flux_runtime::Tool>> =
+        vec![Arc::new(NativeFleetAgentsTool { root: root.clone() })];
+    tools.extend(NATIVE_COORDINATOR_OPERATIONS.into_iter().map(|operation| {
+        Arc::new(NativeCoordinatorTool {
+            root: root.clone(),
+            operation,
+        }) as Arc<dyn flux_runtime::Tool>
+    }));
+    tools
+}
+
+/// Exact model-facing coordinator operation ceiling. Authored-loop machinery is added by the
+/// engine assembly and remains hidden; this list contains only deliberate native services plus
+/// bounded research delegation.
+pub(super) fn native_fleet_main_operation_ceiling() -> Vec<String> {
+    let mut names = vec![
+        "fleet.agents".to_string(),
+        "task".to_string(),
+        "ai_segment".to_string(),
+    ];
+    names.extend(
+        NATIVE_COORDINATOR_OPERATIONS
+            .into_iter()
+            .map(|operation| operation.name().to_string()),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub(super) fn native_fleet_main_read_operations() -> Vec<&'static str> {
+    let mut names = vec!["fleet.agents"];
+    names.extend(
+        NATIVE_COORDINATOR_OPERATIONS
+            .into_iter()
+            .filter(|operation| operation.is_read())
+            .map(NativeCoordinatorOperation::name),
+    );
+    names
+}
+
+/// Hard ceiling for `task` children started by the attached main. The child can inspect the
+/// workspace and git evidence, but cannot mutate files, run processes, manage Board/Fleet, or
+/// recursively delegate another task.
+pub(super) fn native_fleet_research_operation_ceiling() -> Vec<String> {
+    // `register_agent_ops` adds the child's hidden loop machinery after this base is narrowed.
+    // Datasource retrieval is intentionally omitted: the specialized spawner owns only the native
+    // read/git-inspection tools registered in `try_register_builtins`.
+    let mut names = [
+        "read",
+        "glob",
+        "grep",
+        "cwd",
+        "home_dir",
+        "sys_info",
+        "now",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_hunks",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Build the same native Fleet-main pack for the test-only production catalog census.
+///
+/// The census reads operation specifications and never executes them, so it needs no synthetic
+/// Fleet configuration or mutable state fixture.
+#[cfg(test)]
+pub(super) fn native_fleet_main_tools_for_catalog() -> Vec<Arc<dyn flux_runtime::Tool>> {
+    native_fleet_main_tools_at(PathBuf::from("."))
+}
+
+struct NativeFleetAgentsTool {
+    root: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum NativeCoordinatorOperation {
+    BoardShow,
+    BoardGet,
+    BoardNext,
+    BoardCheck,
+    BoardStart,
+    BoardBlock,
+    BoardUnblock,
+    BoardComment,
+    BoardEvidence,
+    FleetStatus,
+    FleetSchedule,
+    FleetRun,
+    FleetMessage,
+    FleetCancel,
+    FleetResume,
+    FleetIntegrate,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeEmptyInput {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardIdInput {
+    id: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardNextInput {
+    #[serde(default = "default_native_board_next_limit")]
+    limit: usize,
+}
+
+fn default_native_board_next_limit() -> usize {
+    10
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardBlockInput {
+    id: String,
+    reason: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardTextInput {
+    id: String,
+    text: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetRunInput {
+    items: Vec<String>,
+    #[serde(default)]
+    prepare_only: bool,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetIntegrateInput {
+    /// the exact wave to assemble, e.g. `wave-263`
+    wave: String,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum NativeWaitLevel {
+    Accepted,
+    Delivered,
+    Completed,
+}
+
+impl NativeWaitLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Delivered => "delivered",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetMessageInput {
+    target: String,
+    message: String,
+    #[serde(default = "default_native_wait_level")]
+    wait: NativeWaitLevel,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+fn default_native_wait_level() -> NativeWaitLevel {
+    NativeWaitLevel::Completed
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetTargetInput {
+    target: String,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+struct NativeCoordinatorTool {
+    root: PathBuf,
+    operation: NativeCoordinatorOperation,
+}
+
+impl NativeCoordinatorOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::BoardShow => "board.show",
+            Self::BoardGet => "board.get",
+            Self::BoardNext => "board.next",
+            Self::BoardCheck => "board.check",
+            Self::BoardStart => "board.start",
+            Self::BoardBlock => "board.block",
+            Self::BoardUnblock => "board.unblock",
+            Self::BoardComment => "board.comment",
+            Self::BoardEvidence => "board.evidence",
+            Self::FleetStatus => "fleet.status",
+            Self::FleetSchedule => "fleet.schedule",
+            Self::FleetRun => "fleet.run",
+            Self::FleetMessage => "fleet.message",
+            Self::FleetCancel => "fleet.cancel",
+            Self::FleetResume => "fleet.resume",
+            Self::FleetIntegrate => "fleet.integrate",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::BoardShow => "Show the authoritative workspace Board and planning documents.",
+            Self::BoardGet => {
+                "Read one exact namespaced item from the authoritative workspace Board."
+            }
+            Self::BoardNext => {
+                "List dependency-satisfied ready Board items in deterministic priority order."
+            }
+            Self::BoardCheck => {
+                "Validate the authoritative workspace Board configuration and story contracts."
+            }
+            Self::BoardStart => "Move one authoritative Board item to in-progress.",
+            Self::BoardBlock => "Block one authoritative Board item and record the reason.",
+            Self::BoardUnblock => "Return one blocked authoritative Board item to ready.",
+            Self::BoardComment => "Append a durable comment to one authoritative Board item.",
+            Self::BoardEvidence => "Append structured evidence to one authoritative Board item.",
+            Self::FleetStatus => {
+                "Read bounded durable native Fleet lifecycle state and source status."
+            }
+            Self::FleetSchedule => {
+                "Read the dependency-aware native Fleet schedule derived from the Board."
+            }
+            Self::FleetRun => {
+                "Prepare and launch a native Fleet wave for exact dependency-satisfied Board items."
+            }
+            Self::FleetMessage => {
+                "Deliver an acknowledged message to an admitted native Fleet agent."
+            }
+            Self::FleetCancel => "Cancel one exact native Fleet worker or wave.",
+            Self::FleetResume => {
+                "Resume one exact native Fleet target using its durable admitted state."
+            }
+            Self::FleetIntegrate => {
+                "Assemble one wave's accepted story commits in declared dependency order onto its \
+                 integration branch and run each repository's configured final gate exactly once. \
+                 Refuses unless every story is handoff-accepted and write sets are disjoint. Records \
+                 a green candidate as eligible for explicit operator apply; it never merges into a \
+                 main branch, pushes, releases or deploys."
+            }
+        }
+    }
+
+    fn is_read(self) -> bool {
+        matches!(
+            self,
+            Self::BoardShow
+                | Self::BoardGet
+                | Self::BoardNext
+                | Self::BoardCheck
+                | Self::FleetStatus
+                | Self::FleetSchedule
+        )
+    }
+
+    fn input_schema(self) -> Value {
+        match self {
+            Self::BoardShow | Self::BoardCheck | Self::FleetStatus | Self::FleetSchedule => {
+                flux_spec::tool_input_schema::<NativeEmptyInput>()
+            }
+            Self::BoardGet | Self::BoardStart | Self::BoardUnblock => {
+                flux_spec::tool_input_schema::<NativeBoardIdInput>()
+            }
+            Self::BoardNext => flux_spec::tool_input_schema::<NativeBoardNextInput>(),
+            Self::BoardBlock => flux_spec::tool_input_schema::<NativeBoardBlockInput>(),
+            Self::BoardComment | Self::BoardEvidence => {
+                flux_spec::tool_input_schema::<NativeBoardTextInput>()
+            }
+            Self::FleetRun => flux_spec::tool_input_schema::<NativeFleetRunInput>(),
+            Self::FleetMessage => flux_spec::tool_input_schema::<NativeFleetMessageInput>(),
+            Self::FleetCancel | Self::FleetResume => {
+                flux_spec::tool_input_schema::<NativeFleetTargetInput>()
+            }
+            Self::FleetIntegrate => flux_spec::tool_input_schema::<NativeFleetIntegrateInput>(),
+        }
+    }
+
+    fn cli_args(self, root: &Path, params: Value) -> Result<Vec<String>> {
+        fn board_prefix(root: &Path) -> Vec<String> {
+            vec![
+                "board".into(),
+                "--root".into(),
+                display_path(root),
+                "--scope".into(),
+                "workspace".into(),
+                "--output".into(),
+                "json".into(),
+            ]
+        }
+        fn fleet_prefix(root: &Path) -> Vec<String> {
+            vec![
+                "fleet".into(),
+                "--root".into(),
+                display_path(root),
+                "--output".into(),
+                "json".into(),
+            ]
+        }
+        fn add_board_guards(args: &mut Vec<String>, revision: Option<String>, key: Option<String>) {
+            if let Some(revision) = revision {
+                args.extend(["--if-revision".into(), revision]);
+            }
+            if let Some(key) = key {
+                args.extend(["--idempotency-key".into(), key]);
+            }
+        }
+        fn add_fleet_guards(args: &mut Vec<String>, revision: Option<u64>, key: Option<String>) {
+            if let Some(revision) = revision {
+                args.extend(["--if-revision".into(), revision.to_string()]);
+            }
+            if let Some(key) = key {
+                args.extend(["--idempotency-key".into(), key]);
+            }
+        }
+
+        let args = match self {
+            Self::BoardShow => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = board_prefix(root);
+                args.push("show".into());
+                args
+            }
+            Self::BoardCheck => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = board_prefix(root);
+                args.push("check".into());
+                args
+            }
+            Self::BoardGet => {
+                let input: NativeBoardIdInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                args.extend(["get".into(), input.id]);
+                args
+            }
+            Self::BoardNext => {
+                let input: NativeBoardNextInput = serde_json::from_value(params)?;
+                if !(1..=100).contains(&input.limit) {
+                    bail!("board.next: limit must be 1..=100")
+                }
+                let mut args = board_prefix(root);
+                args.extend(["next".into(), "--limit".into(), input.limit.to_string()]);
+                args
+            }
+            Self::BoardStart | Self::BoardUnblock => {
+                let input: NativeBoardIdInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                add_board_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    if matches!(self, Self::BoardStart) {
+                        "start"
+                    } else {
+                        "unblock"
+                    }
+                    .into(),
+                    input.id,
+                ]);
+                args
+            }
+            Self::BoardBlock => {
+                let input: NativeBoardBlockInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                add_board_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend(["block".into(), input.id, "--reason".into(), input.reason]);
+                args
+            }
+            Self::BoardComment | Self::BoardEvidence => {
+                let input: NativeBoardTextInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                add_board_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    if matches!(self, Self::BoardComment) {
+                        "comment"
+                    } else {
+                        "evidence"
+                    }
+                    .into(),
+                    input.id,
+                    input.text,
+                ]);
+                args
+            }
+            Self::FleetStatus => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = fleet_prefix(root);
+                args.extend([
+                    "inspect".into(),
+                    "snapshot".into(),
+                    "--limit".into(),
+                    "100".into(),
+                ]);
+                args
+            }
+            Self::FleetSchedule => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = fleet_prefix(root);
+                args.push("schedule".into());
+                args
+            }
+            Self::FleetRun => {
+                let input: NativeFleetRunInput = serde_json::from_value(params)?;
+                if input.items.is_empty() || input.items.len() > 10 {
+                    bail!("fleet.run: items must contain 1..=10 exact Board refs")
+                }
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.push("run".into());
+                args.extend(input.items);
+                if input.prepare_only {
+                    args.push("--prepare-only".into());
+                }
+                args
+            }
+            Self::FleetMessage => {
+                let input: NativeFleetMessageInput = serde_json::from_value(params)?;
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    "message".into(),
+                    input.target,
+                    input.message,
+                    "--wait".into(),
+                    input.wait.as_str().into(),
+                ]);
+                args
+            }
+            Self::FleetIntegrate => {
+                let input: NativeFleetIntegrateInput = serde_json::from_value(params)?;
+                if input.wave.trim().is_empty() {
+                    bail!("fleet.integrate: wave must be an exact wave id")
+                }
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend(["integrate".into(), input.wave]);
+                args
+            }
+            Self::FleetCancel | Self::FleetResume => {
+                let input: NativeFleetTargetInput = serde_json::from_value(params)?;
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    if matches!(self, Self::FleetCancel) {
+                        "cancel"
+                    } else {
+                        "resume"
+                    }
+                    .into(),
+                    input.target,
+                ]);
+                args
+            }
+        };
+        Ok(args)
+    }
+}
+
+#[async_trait]
+impl flux_runtime::Tool for NativeCoordinatorTool {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        let read = self.operation.is_read();
+        flux_spec::ToolSpec {
+            name: self.operation.name().into(),
+            description: self.operation.description().into(),
+            input_schema: self.operation.input_schema(),
+            output_schema: None,
+            effects: if read {
+                vec![flux_spec::Effect::Read]
+            } else {
+                vec![flux_spec::Effect::Write, flux_spec::Effect::Process]
+            },
+            risk: if read {
+                flux_spec::Risk::Low
+            } else {
+                flux_spec::Risk::Medium
+            },
+            idempotency: flux_spec::Idempotency::NonIdempotent,
+            access: if read {
+                vec![flux_spec::AccessKind::Filesystem]
+            } else {
+                vec![
+                    flux_spec::AccessKind::Filesystem,
+                    flux_spec::AccessKind::Process,
+                ]
+            },
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        let mut subjects = vec![display_path(&self.root)];
+        for key in ["id", "target"] {
+            if let Some(value) = params.get(key).and_then(Value::as_str) {
+                subjects.push(bounded_text(value, 200));
+            }
+        }
+        subjects
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &flux_runtime::ToolContext,
+        params: Value,
+    ) -> flux_core::Result<flux_runtime::ToolResult> {
+        let args = self
+            .operation
+            .cli_args(&self.root, params)
+            .map_err(|error| {
+                flux_core::Error::Other(format!("{}: {error}", self.operation.name()))
+            })?;
+        let root = self.root.clone();
+        let operation = self.operation.name().to_string();
+        let result = tokio::task::spawn_blocking(move || invoke_flux_cli(&root, &args))
+            .await
+            .map_err(|error| flux_core::Error::Other(format!("{operation}: {error}")))?
+            .map_err(|error| flux_core::Error::Other(format!("{operation}: {error}")))?;
+        Ok(flux_runtime::ToolResult::ok(
+            json!({
+                "schema": "flux.native-coordinator-operation/v1",
+                "operation": operation,
+                "revision": result.revision,
+                "warnings": result.warnings,
+                "data": result.data,
+            })
+            .to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl flux_runtime::Tool for NativeFleetAgentsTool {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec {
+            name: "fleet.agents".into(),
+            description:
+                "List bounded durable native Fleet worker admissions and current statuses. \
+                          Unlike fleet.worker_status, this needs no known worker id and does not \
+                          inspect transient A2A/process workers."
+                    .into(),
+            input_schema: flux_spec::tool_input_schema::<NativeFleetAgentsInput>(),
+            output_schema: None,
+            effects: vec![flux_spec::Effect::Read],
+            risk: flux_spec::Risk::Low,
+            // This is a live state read. Idempotent would allow the operation cache to replay a
+            // stale worker census instead of observing a just-completed/cancelled worker.
+            idempotency: flux_spec::Idempotency::NonIdempotent,
+            access: vec![flux_spec::AccessKind::Filesystem],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![display_path(&self.root.join(".flux/fleet/state.json"))]
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &flux_runtime::ToolContext,
+        params: Value,
+    ) -> flux_core::Result<flux_runtime::ToolResult> {
+        let input: NativeFleetAgentsInput = serde_json::from_value(params)
+            .map_err(|error| flux_core::Error::Other(format!("fleet.agents: {error}")))?;
+        if !(1..=100).contains(&input.limit) {
+            return Ok(flux_runtime::ToolResult::error(
+                "fleet.agents: limit must be 1..=100",
+            ));
+        }
+        let state = read_fleet_state(&self.root)
+            .map_err(|error| flux_core::Error::Other(format!("fleet.agents: {error}")))?;
+        Ok(flux_runtime::ToolResult::ok(
+            fleet_agents_projection(&state, input.limit).to_string(),
+        ))
+    }
 }
 
 /// Validate one Fleet root and resolve the reserved main agent's exact durable store/session.
@@ -1103,6 +1850,8 @@ pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
         )
     }
     let config = read_fleet_config(&root)?;
+    let agent_loop = configured_main_agent_loop(&root, &config)?;
+    configured_main_research_loop_with(&root, &config)?;
     let state = read_fleet_state(&root)?;
     let store = agent_store_path(&root, "main")?;
     let session = state.main_agent.session.clone();
@@ -1111,9 +1860,41 @@ pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
         root: root.clone(),
         store,
         session,
+        agent_loop,
         initial_snapshot,
         source: Arc::new(FleetTuiSource { root }),
     })
+}
+
+fn configured_main_agent_loop(root: &Path, config: &FleetConfig) -> Result<String> {
+    let configured_loop = config.main.agent_loop.as_deref().with_context(|| {
+        "validation/gate: Fleet main requires `[main] loop = \"path/to/coordinator.flux\"`"
+    })?;
+    let loop_path = confined_config_file(root, configured_loop, "main coordinator loop")?;
+    loop_path
+        .strip_prefix(root)
+        .context("permission: main coordinator loop escaped the Fleet root")?
+        .to_str()
+        .context("input/schema: main coordinator loop path is not UTF-8")
+        .map(str::to_string)
+}
+
+pub(super) fn configured_main_research_loop(root: &Path) -> Result<String> {
+    let config = read_fleet_config(root)?;
+    configured_main_research_loop_with(root, &config)
+}
+
+fn configured_main_research_loop_with(root: &Path, config: &FleetConfig) -> Result<String> {
+    let configured_loop = config.main.research_loop.as_deref().with_context(|| {
+        "validation/gate: Fleet main requires `[main] research_loop = \"path/to/research.flux\"`"
+    })?;
+    let loop_path = confined_config_file(root, configured_loop, "main research loop")?;
+    loop_path
+        .strip_prefix(root)
+        .context("permission: main research loop escaped the Fleet root")?
+        .to_str()
+        .context("input/schema: main research loop path is not UTF-8")
+        .map(str::to_string)
 }
 
 fn fleet_tui_initial_snapshot(
@@ -1440,11 +2221,10 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         })?;
         let stats = stats(&stats_command, &self.root, true, None)?;
 
-        let is_active = |status: &str| matches!(status, "active" | "running" | "working");
         let active = state
             .agents
             .values()
-            .filter(|agent| agent["status"].as_str().is_some_and(is_active))
+            .filter(|agent| agent["status"].as_str().is_some_and(fleet_status_is_active))
             .count();
         let mut workers = state
             .agents
@@ -1676,7 +2456,9 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         for (id, agent) in &state.agents {
             let status = agent["status"].as_str().unwrap_or("unknown");
             let error = agent["last_error"].as_str();
-            if matches!(status, "failed" | "parked") || error.is_some() {
+            if matches!(status, "failed" | "parked")
+                || (error.is_some() && !matches!(status, "cancelled" | "completed" | "done"))
+            {
                 failures.push(FleetFailureView {
                     subject: bounded_text(id, 200),
                     kind: "worker".into(),
@@ -1691,6 +2473,9 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         }
         for (id, wave) in &state.waves {
             let status = wave["status"].as_str().unwrap_or_default();
+            if matches!(status, "cancelled" | "completed" | "done") {
+                continue;
+            }
             let mut detailed = false;
             if let Some(conflict) = wave.get("conflict").filter(|value| !value.is_null()) {
                 detailed = true;
@@ -2162,6 +2947,423 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
     } else {
         head
     }
+}
+
+fn loop_binding_summary(value: &Value) -> Value {
+    if !value.is_object() {
+        return Value::Null;
+    }
+    let bounded_list = |key: &str| {
+        value[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(100)
+            .filter_map(Value::as_str)
+            .map(|entry| bounded_text(entry, 200))
+            .collect::<Vec<_>>()
+    };
+    json!({
+        "schema": bounded_text(value["schema"].as_str().unwrap_or(""), 100),
+        "profile": bounded_text(value["profile"].as_str().unwrap_or(""), 200),
+        "revision": bounded_text(value["revision"].as_str().unwrap_or(""), 100),
+        "runner": bounded_text(value["runner"].as_str().unwrap_or(""), 100),
+        "source_ref": bounded_text(value["source_ref"].as_str().unwrap_or(""), 500),
+        "source_sha256": bounded_text(value["source_sha256"].as_str().unwrap_or(""), 64),
+        "entry_point": bounded_text(value["entry_point"].as_str().unwrap_or(""), 100),
+        "required_operations": bounded_list("required_operations"),
+        "required_runtime_features": bounded_list("required_runtime_features"),
+    })
+}
+
+fn fleet_worker_summary(id: &str, agent: &Value) -> Value {
+    let assignment = &agent["assignment"];
+    json!({
+        "id": bounded_text(id, 200),
+        "role": bounded_text(agent["role"].as_str().unwrap_or("worker"), 100),
+        "task_kind": agent["task_kind"].as_str().map(|value| bounded_text(value, 100)),
+        "status": bounded_text(agent["status"].as_str().unwrap_or("unknown"), 100),
+        "board_ref": assignment["board_ref"].as_str()
+            .or_else(|| agent["board_ref"].as_str())
+            .map(|value| bounded_text(value, 200)),
+        "wave": assignment["wave"].as_str()
+            .or_else(|| agent["wave"].as_str())
+            .map(|value| bounded_text(value, 200)),
+        "session": agent["runtime_session"].as_str()
+            .or_else(|| agent["session"].as_str())
+            .map(|value| bounded_text(value, 200)),
+        "recommendation_must_be_challenged": agent["recommendation_must_be_challenged"].as_bool(),
+        "loop_binding": loop_binding_summary(&agent["loop_binding"]),
+    })
+}
+
+fn fleet_agents_projection(state: &FleetState, limit: usize) -> Value {
+    let workers_total = state.agents.len();
+    let workers = state
+        .agents
+        .iter()
+        .take(limit)
+        .map(|(id, agent)| fleet_worker_summary(id, agent))
+        .collect::<Vec<_>>();
+    json!({
+        "schema": "flux.fleet-agents/v1",
+        "revision": state.revision,
+        "running": state.running,
+        "main_agent": {
+            "id": bounded_text(&state.main_agent.id, 200),
+            "status": bounded_text(&state.main_agent.status, 100),
+            "session": state.main_agent.session.as_deref().map(|value| bounded_text(value, 200)),
+        },
+        "workers": workers,
+        "workers_total": workers_total,
+        "truncated": workers_total > limit,
+    })
+}
+
+fn fleet_agents_cli_projection(state: &FleetState) -> Value {
+    let mut projection = fleet_agents_projection(state, usize::MAX);
+    projection["workers"] = Value::Object(
+        state
+            .agents
+            .iter()
+            .map(|(id, agent)| (id.clone(), fleet_worker_summary(id, agent)))
+            .collect::<Map<_, _>>(),
+    );
+    projection
+}
+
+const MAX_FLEET_STATUS_WORKERS: usize = 50;
+const MAX_FLEET_STATUS_WAVES: usize = 20;
+const MAX_FLEET_STATUS_INTAKE: usize = 20;
+const MAX_FLEET_STATUS_SOURCES: usize = 50;
+const MAX_FLEET_STATUS_DECISIONS: usize = 20;
+const MAX_FLEET_STATUS_BYTES: usize = 256 * 1024;
+
+fn fleet_status_is_active(status: &str) -> bool {
+    matches!(status, "active" | "running" | "working")
+}
+
+fn fleet_status_needs_attention(status: &str) -> bool {
+    matches!(
+        status,
+        "blocked" | "failed" | "interrupted" | "parked" | "red" | "conflict"
+    )
+}
+
+fn fleet_worker_needs_attention(agent: &Value) -> bool {
+    let status = agent["status"].as_str().unwrap_or("unknown");
+    fleet_status_needs_attention(status)
+        || (agent["last_error"].is_string()
+            && !matches!(status, "cancelled" | "completed" | "done"))
+}
+
+fn fleet_status_bucket(status: &str) -> &'static str {
+    match status {
+        "accepted" => "accepted",
+        "active" | "running" | "working" => "active",
+        "blocked" => "blocked",
+        "cancelled" => "cancelled",
+        "completed" | "done" => "completed",
+        "failed" | "red" | "conflict" => "failed",
+        "interrupted" => "interrupted",
+        "parked" => "parked",
+        "waiting" | "yielded" | "yielding" => "waiting",
+        _ => "unknown",
+    }
+}
+
+fn bounded_redacted_text(value: &str, max_chars: usize) -> String {
+    bounded_text(&redact(value), max_chars)
+}
+
+fn fleet_turn_transition_summary(last_turn: Option<&Value>) -> Value {
+    let Some(last_turn) = last_turn.filter(|value| value.is_object()) else {
+        return Value::Null;
+    };
+    json!({
+        "type": "agent.turn.completed",
+        "ack": last_turn["ack"].as_str().map(|value| bounded_redacted_text(value, 100)),
+        "outcome": last_turn["outcome"].as_str().map(|value| bounded_redacted_text(value, 100)),
+        "session": last_turn["session"].as_str().map(|value| bounded_redacted_text(value, 200)),
+        "event_count": last_turn["events"].as_array().map(Vec::len),
+    })
+}
+
+fn fleet_status_worker_summary(id: &str, agent: &Value) -> Value {
+    let assignment = &agent["assignment"];
+    json!({
+        "id": bounded_redacted_text(id, 200),
+        "role": bounded_redacted_text(agent["role"].as_str().unwrap_or("worker"), 100),
+        "task_kind": agent["task_kind"].as_str().map(|value| bounded_redacted_text(value, 100)),
+        "status": bounded_redacted_text(agent["status"].as_str().unwrap_or("unknown"), 100),
+        "board_ref": assignment["board_ref"].as_str()
+            .or_else(|| agent["board_ref"].as_str())
+            .map(|value| bounded_redacted_text(value, 200)),
+        "wave": assignment["wave"].as_str()
+            .or_else(|| agent["wave"].as_str())
+            .map(|value| bounded_redacted_text(value, 200)),
+        "session": agent["runtime_session"].as_str()
+            .or_else(|| agent["session"].as_str())
+            .map(|value| bounded_redacted_text(value, 200)),
+        "last_transition": agent["last_activity"].as_str()
+            .map(|value| bounded_redacted_text(value, 200)),
+        "last_outcome": agent["last_turn"]["outcome"].as_str()
+            .map(|value| bounded_redacted_text(value, 100)),
+        "last_error": agent["last_error"].as_str()
+            .map(|value| bounded_redacted_text(value, 500)),
+    })
+}
+
+fn fleet_status_wave_summary(id: &str, wave: &Value) -> Value {
+    const MAX_WAVE_ITEMS: usize = 10;
+    const MAX_WAVE_REPOSITORIES: usize = 10;
+    let items_total = wave["items"].as_array().map_or(0, Vec::len);
+    let items = wave["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_WAVE_ITEMS)
+        .filter_map(Value::as_str)
+        .map(|value| bounded_redacted_text(value, 200))
+        .collect::<Vec<_>>();
+    let repositories = wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_WAVE_REPOSITORIES)
+        .map(|repository| {
+            json!({
+                "id": repository["id"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "candidate": repository["candidate"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "gate_status": repository["gate"]["status"].as_str().map(|value| bounded_redacted_text(value, 100)),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": bounded_redacted_text(id, 200),
+        "status": bounded_redacted_text(wave["status"].as_str().unwrap_or("unknown"), 100),
+        "items": items,
+        "items_total": items_total,
+        "items_truncated": items_total > MAX_WAVE_ITEMS,
+        "apply_eligible": wave["apply_eligible"].as_bool().unwrap_or(false),
+        "coordinator": wave["coordinator"].as_str().map(|value| bounded_redacted_text(value, 200)),
+        "repositories": repositories,
+    })
+}
+
+fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
+    let mut workers = state.agents.iter().collect::<Vec<_>>();
+    workers.sort_by(|(left_id, left), (right_id, right)| {
+        worker_status_order(left["status"].as_str().unwrap_or("unknown"))
+            .cmp(&worker_status_order(
+                right["status"].as_str().unwrap_or("unknown"),
+            ))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let worker_summaries = workers
+        .into_iter()
+        .take(MAX_FLEET_STATUS_WORKERS)
+        .map(|(id, agent)| fleet_status_worker_summary(id, agent))
+        .collect::<Vec<_>>();
+    let worker_active = state
+        .agents
+        .values()
+        .filter(|agent| fleet_status_is_active(agent["status"].as_str().unwrap_or("unknown")))
+        .count();
+    let worker_attention = state
+        .agents
+        .values()
+        .filter(|agent| fleet_worker_needs_attention(agent))
+        .count();
+    let mut worker_statuses = BTreeMap::<&'static str, usize>::new();
+    for agent in state.agents.values() {
+        *worker_statuses
+            .entry(fleet_status_bucket(
+                agent["status"].as_str().unwrap_or("unknown"),
+            ))
+            .or_default() += 1;
+    }
+
+    let mut waves = state.waves.iter().collect::<Vec<_>>();
+    waves.sort_by(|(left_id, left), (right_id, right)| {
+        let rank = |wave: &Value| {
+            let status = wave["status"].as_str().unwrap_or("unknown");
+            if fleet_status_is_active(status) {
+                0
+            } else if fleet_status_needs_attention(status) {
+                1
+            } else {
+                2
+            }
+        };
+        rank(left)
+            .cmp(&rank(right))
+            .then_with(|| left_id.cmp(right_id))
+    });
+    let wave_summaries = waves
+        .into_iter()
+        .take(MAX_FLEET_STATUS_WAVES)
+        .map(|(id, wave)| fleet_status_wave_summary(id, wave))
+        .collect::<Vec<_>>();
+    let wave_active = state
+        .waves
+        .values()
+        .filter(|wave| fleet_status_is_active(wave["status"].as_str().unwrap_or("unknown")))
+        .count();
+    let wave_attention = state
+        .waves
+        .values()
+        .filter(|wave| fleet_status_needs_attention(wave["status"].as_str().unwrap_or("unknown")))
+        .count();
+
+    let mut intake = state.intake.iter().collect::<Vec<_>>();
+    intake.sort_by_key(|(id, _)| {
+        id.strip_prefix("intake-")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    let intake_total = intake.len();
+    let intake = intake
+        .into_iter()
+        .rev()
+        .take(MAX_FLEET_STATUS_INTAKE)
+        .map(|(id, value)| {
+            json!({
+                "id": bounded_redacted_text(id, 200),
+                "ack": value["ack"].as_str().map(|value| bounded_redacted_text(value, 100)),
+                "source": value["source"].as_str().map(|value| bounded_redacted_text(value, 100)),
+                "session": value["session"].as_str().map(|value| bounded_redacted_text(value, 200)),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let sources = fleet_sources(root)?;
+    let source_repositories = sources["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_FLEET_STATUS_SOURCES)
+        .map(|repository| {
+            json!({
+                "id": repository["id"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "board": repository["board"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "canonical_ref": repository["canonical_ref"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "head": repository["head"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "canonical_commit": repository["canonical_commit"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "dirty": repository["dirty"],
+                "stale_or_diverged": repository["stale_or_diverged"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let source_total = sources["repositories"].as_array().map_or(0, Vec::len);
+
+    let schedule = fleet_schedule(root)?;
+    let schedule_waves_total = schedule["waves"].as_array().map_or(0, Vec::len);
+    let schedule_waves = schedule["waves"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|wave| {
+            wave["state"].as_str() == Some("active")
+                || !wave["eligible"].as_array().is_none_or(Vec::is_empty)
+        })
+        .take(MAX_FLEET_STATUS_WAVES)
+        .map(|wave| {
+            json!({
+                "id": wave["id"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "state": wave["state"].as_str().map(|value| bounded_redacted_text(value, 100)),
+                "repository": wave["repository"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "eligible": wave["eligible"].as_array().into_iter().flatten().take(10)
+                    .filter_map(Value::as_str).map(|value| bounded_redacted_text(value, 200)).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let decisions = open_decisions(root)?;
+    let decisions_total = decisions.as_array().map_or(0, Vec::len);
+    let decisions = decisions
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(MAX_FLEET_STATUS_DECISIONS)
+        .map(|decision| {
+            json!({
+                "ref": decision["ref"].as_str().map(|value| bounded_redacted_text(value, 200)),
+                "status": decision["status"].as_str().map(|value| bounded_redacted_text(value, 100)),
+                "title": decision["title"].as_str().map(|value| bounded_redacted_text(value, 300)),
+            })
+        })
+        .collect::<Vec<_>>();
+    let main_attention = state.main_agent.last_error.is_some()
+        || fleet_status_needs_attention(&state.main_agent.status);
+    let attention_required = main_attention
+        || worker_attention > 0
+        || wave_attention > 0
+        || decisions_total > 0
+        || schedule["attention_required"].as_bool() == Some(true);
+
+    let projection = redact_value(json!({
+        "schema": "flux.fleet-status/v1",
+        "attention_required": attention_required,
+        "state": {
+            "schema": state.schema,
+            "revision": state.revision,
+            "running": state.running,
+            "main_agent": {
+                "id": bounded_redacted_text(&state.main_agent.id, 200),
+                "role": bounded_redacted_text(&state.main_agent.role, 100),
+                "status": bounded_redacted_text(&state.main_agent.status, 100),
+                "session": state.main_agent.session.as_deref().map(|value| bounded_redacted_text(value, 200)),
+                "goals_revision": state.main_agent.goals_revision,
+                "last_transition": fleet_turn_transition_summary(state.main_agent.last_turn.as_ref()),
+                "last_error": state.main_agent.last_error.as_deref().map(|value| bounded_redacted_text(value, 500)),
+            },
+            "workers": worker_summaries,
+            "worker_counts": {
+                "total": state.agents.len(),
+                "active": worker_active,
+                "attention": worker_attention,
+                "by_status": worker_statuses,
+            },
+            "workers_truncated": state.agents.len() > MAX_FLEET_STATUS_WORKERS,
+            "waves": wave_summaries,
+            "wave_counts": {"total": state.waves.len(), "active": wave_active, "attention": wave_attention},
+            "waves_truncated": state.waves.len() > MAX_FLEET_STATUS_WAVES,
+            "intake": intake,
+            "intake_total": intake_total,
+            "intake_truncated": intake_total > MAX_FLEET_STATUS_INTAKE,
+            "goals": {"total": state.goals.len(), "revision": state.main_agent.goals_revision},
+        },
+        "sources": {
+            "root": sources["root"].as_str().map(|value| bounded_redacted_text(value, 500)),
+            "repositories": source_repositories,
+            "repositories_total": source_total,
+            "truncated": source_total > MAX_FLEET_STATUS_SOURCES,
+        },
+        "schedule": {
+            "active_milestone": schedule["active_milestone"],
+            "attention_required": schedule["attention_required"],
+            "program_items": schedule["program_items"].as_array().into_iter().flatten().take(20)
+                .filter_map(Value::as_str).map(|value| bounded_redacted_text(value, 200)).collect::<Vec<_>>(),
+            "waves": schedule_waves,
+            "waves_total": schedule_waves_total,
+        },
+        "human_decisions": decisions,
+        "human_decisions_total": decisions_total,
+        "human_decisions_truncated": decisions_total > MAX_FLEET_STATUS_DECISIONS,
+        "inspect": {
+            "snapshot": "flux fleet inspect snapshot --limit 100 --output json",
+            "activity": "flux fleet inspect activity --limit 100 --output json",
+            "worker": "flux fleet inspect worker WORKER --limit 100 --output json",
+            "wave": "flux fleet inspect wave WAVE --limit 100 --output json",
+        },
+    }));
+    debug_assert!(
+        serde_json::to_vec(&projection)
+            .is_ok_and(|encoded| encoded.len() <= MAX_FLEET_STATUS_BYTES),
+        "bounded Fleet status projection exceeded {MAX_FLEET_STATUS_BYTES} bytes"
+    );
+    Ok(projection)
 }
 
 fn worker_status_order(status: &str) -> u8 {
@@ -3268,7 +4470,50 @@ fn run_fleet_action(
             if !command.dry_run {
                 let system = guarded_system(root)?;
                 if system.read_optional_text(".flux/fleet.toml")?.is_none() {
-                    system.write_file_atomic(".flux/fleet.toml", &format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\nallow_ad_hoc_agents = true\nworktree_root = \".flux/fleet/worktrees\"\n\n# [main]\n# instructions = \".flux/fleet/main.md\"\n# model = \"codex/gpt-5.6-sol\"\n\n# [[agent_templates]]\n# id = \"story-worker\"\n# role = \"writer\"\n# instructions = \".flux/fleet/agents/story-worker.md\"\n# mode = \"write\"\n# capabilities = [\"read\", \"edit\", \"git\", \"shell\"]\n# fences = [\".git/**\", \".flux/fleet/**\"]\n# max_instances = {max_workers}\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
+                    system.write_file_atomic(
+                        ".flux/fleet.toml",
+                        &format!(
+                            r#"schema = "flux.fleet/v1"
+max_workers = {max_workers}
+max_wave = {max_wave}
+max_rework = {max_rework}
+decision_mode = "human" # or "auto" for an independent adversarial decision agent
+allow_ad_hoc_agents = true
+worktree_root = ".flux/fleet/worktrees"
+
+# [main]
+# instructions = ".flux/fleet/main.md"
+# model = "codex/gpt-5.6-sol"
+# loop = ".flux/fleet/loops/main-coordinator.flux" # required before a main turn or TUI attachment
+# research_loop = ".flux/fleet/loops/research.flux" # required read-only task-child loop
+
+# [loop_profiles.implementation]
+# revision = "1"
+# source = ".flux/fleet/loops/team-implementation.flux"
+# entry = "work"
+
+# [loop_policy]
+# implementation = "implementation"
+
+# [[agent_templates]]
+# id = "story-worker"
+# role = "writer"
+# task_kind = "implementation"
+# instructions = ".flux/fleet/agents/story-worker.md"
+# mode = "write"
+# capabilities = ["read", "edit", "git", "shell"]
+# fences = [".git/**", ".flux/fleet/**"]
+# max_instances = {max_workers}
+
+# [[repositories]]
+# id = "repo"
+# root = "."
+# board = "default"
+# canonical_ref = "origin/main"
+# gate = ["cargo", "test", "--workspace"]
+"#,
+                        ),
+                    )?;
                 }
                 let config = read_fleet_config(root)?;
                 write_fleet_state(root, &state)?;
@@ -3454,7 +4699,7 @@ fn run_fleet_action(
             },
         ),
         FleetAction::Status | FleetAction::Dashboard => {
-            let data = json!({"state": state, "sources": fleet_sources(root)?, "schedule": fleet_schedule(root)?, "human_decisions": open_decisions(root)?});
+            let data = fleet_status_projection(root, &state)?;
             Ok((fleet_status_human(&data), data, vec![], state.revision))
         }
         FleetAction::Schedule => {
@@ -3580,6 +4825,12 @@ fn run_fleet_action(
                 .agent_templates
                 .iter()
                 .find(|template| template.id == "story-worker");
+            let task_kind = template
+                .map(|template| template.task_kind.as_str())
+                .unwrap_or("implementation");
+            // Resolve and parse policy before worktree creation: a Fleet task never falls back to
+            // the general adaptive harness and an invalid profile cannot reach a model call.
+            let loop_binding = resolve_fleet_loop_binding(root, &config, task_kind)?;
             let instructions = match template {
                 Some(template) => read_configured_instructions(
                     root,
@@ -3604,13 +4855,24 @@ fn run_fleet_action(
                 });
             let (capabilities, operations) =
                 normalize_worker_capabilities(mode, &requested_capabilities)?;
+            validate_loop_capability_compatibility(&loop_binding, &operations)?;
             let template_fences = template
                 .map(|template| template.fences.clone())
                 .unwrap_or_default();
             let model = template.and_then(|template| template.model.clone());
             let wave = format!("wave-{}", state.revision + 1);
-            let topology = prepare_wave_worktrees(command, root, &wave, &selected)?;
+            let mut topology = prepare_wave_worktrees(command, root, &wave, &selected)?;
+            for repository in topology["repositories"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                for story in repository["stories"].as_array_mut().into_iter().flatten() {
+                    story["wave"] = json!(wave);
+                }
+            }
             state.revision += 1;
+            let mut admitted_workers = Vec::new();
             for (index, item) in selected.iter().enumerate() {
                 let worker = format!("{}-worker-{}", wave, index + 1);
                 let assignment = topology["repositories"]
@@ -3649,11 +4911,18 @@ fn run_fleet_action(
                     &read_roots,
                     &fences,
                 );
+                snapshot_fleet_loop_binding(
+                    &worktree,
+                    &loop_binding,
+                    FLEET_AGENT_LOOP_SOURCE,
+                    FLEET_AGENT_LOOP_BINDING,
+                )?;
                 state.agents.insert(
                     worker.clone(),
                     json!({
-                        "id": worker,
+                        "id": worker.clone(),
                         "role": role,
+                        "task_kind": task_kind,
                         "parent": "main",
                         "created_by": "main",
                         "board_ref": item,
@@ -3670,8 +4939,19 @@ fn run_fleet_action(
                         "writable_root": display_path(&worktree),
                         "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
                         "capability_set": capability_set,
+                        "loop_binding": loop_binding.metadata(),
+                        "loop_source": FLEET_AGENT_LOOP_SOURCE,
+                        "loop_binding_receipt": FLEET_AGENT_LOOP_BINDING,
                     }),
                 );
+                admitted_workers.push(json!({
+                    "id": worker,
+                    "board_ref": item,
+                    "role": role,
+                    "task_kind": task_kind,
+                    "session": format!("{wave}-session-{}", index + 1),
+                    "loop_binding": loop_binding.metadata(),
+                }));
             }
             state.waves.insert(wave.clone(), json!({"id": wave, "items": selected, "status": "accepted", "coordinator": "main", "goals_revision": state.main_agent.goals_revision, "topology": topology, "apply_eligible": false}));
             persist_fleet_mutation(
@@ -3777,6 +5057,7 @@ fn run_fleet_action(
                             if let Some(agent) = state.agents.get_mut(&id) {
                                 agent["status"] = json!("failed");
                                 agent["last_error"] = json!(message);
+                                record_failed_turn_evidence(agent, &error);
                             }
                             errors.push(json!({"agent":id,"error":message}));
                         }
@@ -3812,14 +5093,14 @@ fn run_fleet_action(
                 }
                 return Ok((
                     format!("{wave} agents completed; handoffs required"),
-                    json!({"wave": wave, "items": selected, "ack": "completed", "topology": topology, "receipts": receipts}),
+                    json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "completed", "topology": topology, "receipts": receipts}),
                     vec![],
                     state.revision,
                 ));
             }
             Ok((
                 format!("{wave} accepted: {} item(s)", selected.len()),
-                json!({"wave": wave, "items": selected, "ack": "accepted", "prepare_only": prepare_only, "topology": topology}),
+                json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "accepted", "prepare_only": prepare_only, "topology": topology}),
                 vec![],
                 state.revision,
             ))
@@ -4070,7 +5351,7 @@ fn run_fleet_action(
                 .chain(state.agents.keys().cloned())
                 .collect::<Vec<_>>()
                 .join("\n"),
-            json!({"main_agent": state.main_agent, "workers": state.agents}),
+            fleet_agents_cli_projection(&state),
             vec![],
             state.revision,
         )),
@@ -7518,6 +8799,51 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
     if let Some(instructions) = &config.main.instructions {
         confined_config_file(root, instructions, "main instructions")?;
     }
+    if let Some(agent_loop) = &config.main.agent_loop {
+        confined_config_file(root, agent_loop, "main coordinator loop")?;
+    }
+    if let Some(research_loop) = &config.main.research_loop {
+        confined_config_file(root, research_loop, "main research loop")?;
+    }
+    for (profile_id, profile) in &config.loop_profiles {
+        flux_datasource::board::BoardId::new(profile_id)
+            .map_err(|error| anyhow::anyhow!("input/schema: loop profile {error}"))?;
+        if profile.revision.trim().is_empty() || profile.entry.trim().is_empty() {
+            bail!(
+                "input/schema: Fleet loop profile {profile_id} requires non-empty revision and entry"
+            )
+        }
+        let source = read_configured_instructions(
+            root,
+            &profile.source,
+            &format!("Fleet loop profile {profile_id}"),
+        )?;
+        flux_agent::AgentLoopBinding::native_flux_with_features(
+            profile_id,
+            &profile.revision,
+            format!(
+                "fleet-profile:{profile_id}@{}:{}",
+                profile.revision,
+                display_path(&profile.source)
+            ),
+            &profile.entry,
+            source,
+            profile.required_runtime_features.clone(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("validation/gate: Fleet loop profile {profile_id}: {error}")
+        })?;
+    }
+    for (task_kind, profile_id) in &config.loop_policy {
+        if task_kind.trim().is_empty() || profile_id.trim().is_empty() {
+            bail!("input/schema: Fleet loop policy keys and profile ids cannot be empty")
+        }
+        if !config.loop_profiles.contains_key(profile_id) {
+            bail!(
+                "validation/gate: Fleet loop policy `{task_kind}` names missing profile `{profile_id}`"
+            )
+        }
+    }
     let mut template_ids = BTreeSet::new();
     for template in &config.agent_templates {
         flux_datasource::board::BoardId::new(&template.id)
@@ -7532,6 +8858,13 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
             bail!(
                 "input/schema: agent template {} has an empty role",
                 template.id
+            )
+        }
+        if !config.loop_policy.contains_key(template.task_kind.trim()) {
+            bail!(
+                "validation/gate: agent template {} task kind `{}` has no explicit loop policy binding",
+                template.id,
+                template.task_kind
             )
         }
         if !(1..=config.max_workers).contains(&template.max_instances) {
@@ -8082,14 +9415,22 @@ struct AgentTurnSpec {
     read_roots: Vec<PathBuf>,
     store: PathBuf,
     model: Option<String>,
+    agent_loop: Option<String>,
+    /// Internal receipt path paired with `agent_loop`; lets the child reconstruct the admitted
+    /// profile/revision/digest instead of re-identifying the snapshot as a fresh inline loop.
+    agent_loop_binding: Option<String>,
     instructions: String,
     request: String,
-    resume: bool,
+    resume_session: Option<String>,
     enforce_operation_ceiling: bool,
     admitted_operations: Vec<String>,
     capability_set: Value,
     shell_capability: bool,
     context_origin: Value,
+    /// Attach this turn as the dedicated wave integrator, selecting the closed two-operation
+    /// assemble/read catalogue. Mutually exclusive with the `main` coordinator attachment, which is
+    /// keyed on `id` — the child refuses if both are requested.
+    fleet_integrator: bool,
 }
 
 const DEFAULT_STORY_CAPABILITIES: [&str; 4] = ["read", "edit", "git", "shell"];
@@ -8207,6 +9548,31 @@ fn normalize_worker_capabilities(
     Ok((capabilities, operations))
 }
 
+fn validate_loop_capability_compatibility(
+    binding: &flux_agent::AgentLoopBinding,
+    admitted_operations: &[String],
+) -> Result<()> {
+    let admitted = admitted_operations
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let missing = binding
+        .metadata()
+        .required_operations
+        .iter()
+        .filter(|operation| !admitted.contains(operation.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "validation/gate: Fleet loop profile `{}` is incompatible with its capability ceiling; missing operations: {}",
+            binding.metadata().profile,
+            missing.join(", ")
+        )
+    }
+    Ok(())
+}
+
 fn normalize_fences(fences: impl IntoIterator<Item = String>) -> Vec<String> {
     let mut fences = [".git/**".to_string(), ".flux/fleet/**".to_string()]
         .into_iter()
@@ -8319,6 +9685,106 @@ fn read_configured_instructions(root: &Path, path: &Path, label: &str) -> Result
         .with_context(|| format!("not-found: {label} {}", absolute.display()))
 }
 
+fn resolve_fleet_loop_binding(
+    root: &Path,
+    config: &FleetConfig,
+    task_kind: &str,
+) -> Result<flux_agent::AgentLoopBinding> {
+    let task_kind = task_kind.trim();
+    if task_kind.is_empty() {
+        bail!("input/schema: Fleet task kind cannot be empty")
+    }
+    let profile_id = config.loop_policy.get(task_kind).with_context(|| {
+        format!(
+            "validation/gate: Fleet task kind `{task_kind}` has no explicit loop policy binding"
+        )
+    })?;
+    let profile = config.loop_profiles.get(profile_id).with_context(|| {
+        format!(
+            "validation/gate: Fleet loop policy `{task_kind}` names missing profile `{profile_id}`"
+        )
+    })?;
+    let source = read_configured_instructions(
+        root,
+        &profile.source,
+        &format!("Fleet loop profile {profile_id}"),
+    )?;
+    flux_agent::AgentLoopBinding::native_flux_with_features(
+        profile_id,
+        &profile.revision,
+        format!(
+            "fleet-profile:{profile_id}@{}:{}",
+            profile.revision,
+            display_path(&profile.source)
+        ),
+        &profile.entry,
+        source,
+        profile.required_runtime_features.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+const FLEET_AGENT_LOOP_SOURCE: &str = ".flux/fleet/agent-loop.flux";
+const FLEET_AGENT_LOOP_BINDING: &str = ".flux/fleet/agent-loop-binding.json";
+
+fn snapshot_fleet_loop_binding(
+    worktree: &Path,
+    binding: &flux_agent::AgentLoopBinding,
+    source_path: &str,
+    metadata_path: &str,
+) -> Result<()> {
+    let system = guarded_system(worktree)?;
+    system
+        .write_file_atomic(source_path, binding.source())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let metadata = serde_json::to_string_pretty(binding.metadata())?;
+    system
+        .write_file_atomic(metadata_path, &metadata)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(())
+}
+
+fn reconstruct_fleet_loop_binding(
+    worktree: &Path,
+    agent: &Value,
+    id: &str,
+) -> Result<flux_agent::AgentLoopBinding> {
+    let admitted: flux_core::AgentLoopBindingMetadata =
+        serde_json::from_value(agent["loop_binding"].clone()).with_context(|| {
+            format!("validation/gate: admitted agent {id} has no valid loop binding snapshot")
+        })?;
+    let source_path = agent["loop_source"].as_str().with_context(|| {
+        format!("validation/gate: admitted agent {id} has no loop source snapshot")
+    })?;
+    let metadata_path = agent["loop_binding_receipt"].as_str().with_context(|| {
+        format!("validation/gate: admitted agent {id} has no loop binding receipt snapshot")
+    })?;
+    let system = guarded_system(worktree)?;
+    let source = system
+        .read_optional_text(source_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .with_context(|| {
+            format!("validation/gate: admitted agent {id} loop source snapshot is missing")
+        })?;
+    let metadata_text = system
+        .read_optional_text(metadata_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .with_context(|| {
+            format!("validation/gate: admitted agent {id} loop binding receipt is missing")
+        })?;
+    let snapshotted: flux_core::AgentLoopBindingMetadata = serde_json::from_str(&metadata_text)
+        .with_context(|| {
+            format!("validation/gate: admitted agent {id} loop binding receipt is invalid")
+        })?;
+    if snapshotted != admitted {
+        bail!(
+            "validation/gate: admitted agent {id} loop binding receipt drifted; explicit re-admission is required"
+        )
+    }
+    flux_agent::AgentLoopBinding::from_metadata_and_source(admitted, source)
+        .map_err(|error| anyhow::anyhow!("validation/gate: admitted agent {id}: {error}"))
+}
+
 fn story_worker_request(item: &str, assignment: &Value, worktree: &Path) -> String {
     format!(
         "Work only on board item {item}. Your isolated worktree is {}. Your branch is {} at pinned base {}. Use `flux board skill`, then inspect the owning repository's AGENTS.md, the exact story contract and linked design. Implement that contract as a writer; do not select, observe or explore unrelated work. Finish with one exact commit and report its full SHA, observed write set, targeted test argv, failing-before/passing-after evidence, and summary for `flux fleet handoff`.",
@@ -8330,6 +9796,8 @@ fn story_worker_request(item: &str, assignment: &Value, worktree: &Path) -> Stri
 
 fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<AgentTurnSpec> {
     let config = read_fleet_config(root)?;
+    let agent_loop = configured_main_agent_loop(root, &config)?;
+    configured_main_research_loop_with(root, &config)?;
     let read_roots = config
         .repositories
         .iter()
@@ -8339,25 +9807,29 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
     };
-    let resume = state.main_agent.session.is_some();
+    let resume_session = state.main_agent.session.clone();
     let context_origin = agent_context_origin(
         "main",
         &instructions,
         None,
-        resume,
+        resume_session.is_some(),
         state.main_agent.goals_revision,
     );
     Ok(AgentTurnSpec {
+        // The coordinator is never the integrator; the two catalogues are disjoint by construction.
+        fleet_integrator: false,
         id: "main".into(),
         worktree: root.to_path_buf(),
         read_roots,
         store: agent_store_path(root, "main")?,
         model: config.main.model,
+        agent_loop: Some(agent_loop),
+        agent_loop_binding: None,
         instructions,
         request,
-        resume,
-        enforce_operation_ceiling: false,
-        admitted_operations: Vec::new(),
+        resume_session,
+        enforce_operation_ceiling: true,
+        admitted_operations: native_fleet_main_operation_ceiling(),
         capability_set: Value::Null,
         shell_capability: false,
         context_origin,
@@ -8430,23 +9902,38 @@ fn addressed_turn_spec(
             "validation/gate: admitted agent {target} capability-set digest drifted; explicit re-admission is required"
         )
     }
-    let resume = agent["runtime_session"].is_string();
+    let resume_session = agent["runtime_session"].as_str().map(str::to_string);
+    let _loop_binding = reconstruct_fleet_loop_binding(&worktree, agent, target)?;
+    let loop_source = agent["loop_source"]
+        .as_str()
+        .context("validation/gate: admitted agent has no loop source snapshot")?
+        .to_string();
+    let loop_binding_receipt = agent["loop_binding_receipt"]
+        .as_str()
+        .context("validation/gate: admitted agent has no loop binding receipt snapshot")?
+        .to_string();
     let context_origin = agent_context_origin(
         target,
         &instructions,
         agent.get("assignment"),
-        resume,
+        resume_session.is_some(),
         state.main_agent.goals_revision,
     );
     Ok(AgentTurnSpec {
+        // An admitted agent attaches as the wave integrator when its template declared that task
+        // kind. This is the only route to the assemble catalogue: it follows the admitted record, so
+        // a worker cannot request integration authority by prose or by resuming another agent.
+        fleet_integrator: agent["task_kind"].as_str() == Some(FLEET_INTEGRATION_TASK_KIND),
         id: target.to_string(),
         store: agent_store_path(&worktree, target)?,
         worktree,
         read_roots,
         model: agent["model"].as_str().map(str::to_string),
+        agent_loop: Some(loop_source),
+        agent_loop_binding: Some(loop_binding_receipt),
         instructions,
         request,
-        resume,
+        resume_session,
         enforce_operation_ceiling: true,
         shell_capability: capabilities.iter().any(|capability| capability == "shell"),
         admitted_operations,
@@ -8495,6 +9982,7 @@ struct OversizedFleetEventHeader {
     outcome: Option<String>,
     usage: Option<Value>,
     cost_usd: Option<Value>,
+    loop_binding: Option<Value>,
 }
 
 fn summarize_oversized_fleet_event(line: &str, actual_bytes: usize, limit_bytes: usize) -> Value {
@@ -8512,6 +10000,7 @@ fn summarize_oversized_fleet_event(line: &str, actual_bytes: usize, limit_bytes:
             "outcome": header.outcome,
             "usage": header.usage,
             "cost_usd": header.cost_usd,
+            "loop_binding": header.loop_binding,
             "answer": "",
             "error": "omitted: event_too_large",
             "payload_omitted": {
@@ -8586,6 +10075,50 @@ fn execute_agent_turn(fleet_root: &Path, spec: &AgentTurnSpec, goals: &str) -> R
     execute_agent_turn_with_runtime(fleet_root, spec, goals, None)
 }
 
+/// A worker turn that ran, produced a parseable event stream, and then reported a non-ok terminal.
+///
+/// The distinction matters because the side effects of a failed turn are real: a story worker can
+/// commit its complete deliverable and only afterwards exhaust a budget. Returning a bare message
+/// discarded the durable session id and the event stream that names that commit, so Fleet recorded a
+/// worker as `failed` with no way to find what it had already delivered, and `fleet rework` could not
+/// re-dispatch it (that path requires `runtime_session` to be a string, which only the success arm
+/// ever wrote). Carrying the parsed receipt alongside the message keeps the evidence addressable
+/// without pretending the turn succeeded.
+#[derive(Debug)]
+struct AgentTurnFailure {
+    message: String,
+    receipt: Value,
+}
+
+impl std::fmt::Display for AgentTurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentTurnFailure {}
+
+/// The partial receipt carried by a failed-but-observed turn, when there is one. A turn that never
+/// started, or whose stream could not be parsed, has no receipt and yields `None`.
+fn failed_turn_receipt(error: &anyhow::Error) -> Option<&Value> {
+    error
+        .downcast_ref::<AgentTurnFailure>()
+        .map(|failure| &failure.receipt)
+}
+
+/// Record what a failed turn still proved: its durable session and the parsed receipt. Mirrors the
+/// success arm's writes so a failed worker stays addressable by `fleet rework` and its committed SHA
+/// stays discoverable from state rather than only from the worktree.
+fn record_failed_turn_evidence(agent: &mut Value, error: &anyhow::Error) {
+    let Some(receipt) = failed_turn_receipt(error) else {
+        return;
+    };
+    if let Some(session) = receipt["session"].as_str() {
+        agent["runtime_session"] = json!(session);
+    }
+    agent["last_turn"] = receipt.clone();
+}
+
 fn render_agent_turn_prompt(spec: &AgentTurnSpec, goals: &str) -> String {
     if spec.id == "main" {
         format!(
@@ -8614,11 +10147,23 @@ fn agent_turn_argv(executable: &Path, spec: &AgentTurnSpec, prompt: String) -> V
         "--stream-json".into(),
         "--yes".into(),
     ];
-    if spec.resume {
-        argv.push("--continue".into());
+    if let Some(session) = spec.resume_session.as_deref() {
+        argv.extend(["--resume-session".into(), session.into()]);
     }
     if let Some(model) = spec.model.as_deref() {
         argv.extend(["--model".into(), model.into()]);
+    }
+    if let Some(agent_loop) = spec.agent_loop.as_deref() {
+        argv.extend(["--loop".into(), agent_loop.into()]);
+    }
+    if let Some(binding) = spec.agent_loop_binding.as_deref() {
+        argv.extend(["--resolved-loop-binding".into(), binding.into()]);
+    }
+    if spec.id == "main" {
+        argv.push("--native-fleet-main".into());
+    }
+    if spec.fleet_integrator {
+        argv.push("--native-fleet-integrator".into());
     }
     if spec.enforce_operation_ceiling {
         argv.push("--operation-ceiling".into());
@@ -8678,7 +10223,7 @@ fn execute_agent_turn_with_runtime(
             },
         )?;
     if output.exit_code != 0 || terminal["outcome"].as_str() != Some("ok") {
-        bail!(
+        let message = format!(
             "transient-worker: agent {} turn failed: {}{}",
             spec.id,
             terminal["error"].as_str().unwrap_or("non-zero exit"),
@@ -8687,7 +10232,28 @@ fn execute_agent_turn_with_runtime(
             } else {
                 format!("; {}", clipped_redacted(output.stderr.as_bytes()))
             }
-        )
+        );
+        // The stream parsed, so the session and events are known — including any commit the loop
+        // made before it failed. Carry them instead of dropping them on the floor.
+        return Err(anyhow::Error::new(AgentTurnFailure {
+            receipt: redact_value(json!({
+                "schema": "flux.fleet-agent-turn/v1",
+                "agent": spec.id,
+                "session": session,
+                "ack": "failed",
+                "error": message,
+                "answer": terminal["answer"],
+                "usage": terminal["usage"],
+                "loop_binding": terminal["loop_binding"],
+                "events": events,
+                "stream_budget": stream_budget,
+                "context_origin": spec.context_origin.clone(),
+                "capability_set": spec.capability_set.clone(),
+                "store": display_path(&store),
+                "exit_code": output.exit_code,
+            })),
+            message,
+        }));
     }
     Ok(redact_value(json!({
         "schema": "flux.fleet-agent-turn/v1",
@@ -8696,6 +10262,7 @@ fn execute_agent_turn_with_runtime(
         "ack": "completed",
         "answer": terminal["answer"],
         "usage": terminal["usage"],
+        "loop_binding": terminal["loop_binding"],
         "events": events,
         "stream_budget": stream_budget,
         "context_origin": spec.context_origin.clone(),
@@ -8809,6 +10376,7 @@ fn execute_and_record_agent_turn(
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
                 agent["status"] = json!(if cancelled { "cancelled" } else { "failed" });
                 agent["last_error"] = json!(message);
+                record_failed_turn_evidence(agent, &error);
             }
             if let Some(intake_id) = intake_id {
                 if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -8866,6 +10434,13 @@ fn fleet_spawn(
         .mode
         .or_else(|| template.map(|template| template.mode))
         .unwrap_or_default();
+    let task_kind = template
+        .map(|template| template.task_kind.as_str())
+        .unwrap_or(match mode {
+            FleetTaskMode::ReadOnly => "research",
+            FleetTaskMode::Write => "implementation",
+        });
+    let loop_binding = resolve_fleet_loop_binding(root, &config, task_kind)?;
     if mode == FleetTaskMode::Write && options.item.is_none() {
         bail!("input/schema: a write-capable worker requires --item BOARD/ITEM")
     }
@@ -8927,6 +10502,10 @@ fn fleet_spawn(
     if id == "main" || state.agents.contains_key(&id) {
         bail!("conflict/precondition: agent id {id:?} is reserved or already registered")
     }
+    let loop_dir = format!(".flux/fleet/agents/{}", safe_ref_segment(&id));
+    let loop_source = format!("{loop_dir}/agent-loop.flux");
+    let loop_binding_receipt = format!("{loop_dir}/agent-loop-binding.json");
+    snapshot_fleet_loop_binding(root, &loop_binding, &loop_source, &loop_binding_receipt)?;
     let mut capabilities = match template {
         Some(template) => template.capabilities.clone(),
         None if options.capabilities.is_empty() => match mode {
@@ -8940,6 +10519,7 @@ fn fleet_spawn(
     };
     capabilities.extend(options.capabilities.iter().cloned());
     let (capabilities, operations) = normalize_worker_capabilities(mode, &capabilities)?;
+    validate_loop_capability_compatibility(&loop_binding, &operations)?;
     let mut fences = template
         .map(|template| template.fences.clone())
         .unwrap_or_default();
@@ -8958,6 +10538,7 @@ fn fleet_spawn(
         "id": id,
         "parent": "main",
         "role": role,
+        "task_kind": task_kind,
         "template": template.map(|template| template.id.as_str()),
         "ephemeral": template.is_none(),
         "transport": "flux-local",
@@ -8971,6 +10552,9 @@ fn fleet_spawn(
         "writable_root": display_path(root),
         "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
         "capability_set": capability_set,
+        "loop_binding": loop_binding.metadata(),
+        "loop_source": loop_source,
+        "loop_binding_receipt": loop_binding_receipt,
         "status": "admitted",
         "lease": {"generation": state.revision, "holder": id, "status": "active"},
         "created_by": "main",
@@ -9130,6 +10714,213 @@ fn read_event_lines(root: &Path, limit: usize) -> Result<Vec<Value>> {
     Ok(lines)
 }
 
+const MAX_FLEET_INSPECT_BYTES: usize = 256 * 1024;
+const FLEET_INSPECT_DATA_BUDGET: usize = 192 * 1024;
+const MAX_FLEET_INSPECT_STRING_BYTES: usize = 16 * 1024;
+const MAX_FLEET_INSPECT_COLLECTION_ITEMS: usize = 100;
+const MAX_FLEET_INSPECT_OMISSIONS: usize = 100;
+
+struct FleetInspectBudget {
+    remaining: usize,
+    source: &'static str,
+    omissions: Vec<Value>,
+    omissions_total: usize,
+}
+
+impl FleetInspectBudget {
+    fn new(view: InspectView) -> Self {
+        Self {
+            remaining: FLEET_INSPECT_DATA_BUDGET,
+            source: if matches!(view, InspectView::Activity | InspectView::Search) {
+                ".flux/fleet/events.ndjson"
+            } else {
+                ".flux/fleet/state.json"
+            },
+            omissions: Vec::new(),
+            omissions_total: 0,
+        }
+    }
+
+    fn omit(&mut self, path: &str, reason: &str, detail: Value) -> Value {
+        let index = self.omissions_total;
+        self.omissions_total += 1;
+        if self.omissions.len() < MAX_FLEET_INSPECT_OMISSIONS {
+            self.omissions.push(json!({
+                "index": index,
+                "source": self.source,
+                "path": bounded_redacted_text(path, 500),
+                "reason": reason,
+                "detail": detail,
+            }));
+        }
+        json!({"$omitted": index})
+    }
+
+    fn take(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining {
+            false
+        } else {
+            self.remaining -= bytes;
+            true
+        }
+    }
+
+    fn value(&mut self, value: Value, path: &str) -> Value {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => {
+                let bytes = serde_json::to_vec(&value).map_or(16, |encoded| encoded.len());
+                if self.take(bytes) {
+                    value
+                } else {
+                    self.omit(path, "byte-budget", json!({"encoded_bytes": bytes}))
+                }
+            }
+            Value::String(value) => {
+                let encoded_bytes = serde_json::to_vec(&value).map_or(value.len() + 2, |v| v.len());
+                if encoded_bytes <= MAX_FLEET_INSPECT_STRING_BYTES && self.take(encoded_bytes) {
+                    Value::String(value)
+                } else {
+                    let reason = if encoded_bytes > MAX_FLEET_INSPECT_STRING_BYTES {
+                        "string-byte-limit"
+                    } else {
+                        "byte-budget"
+                    };
+                    let sha256 = flux_lang::runtime::sha256_hex(&value);
+                    self.omit(
+                        path,
+                        reason,
+                        json!({
+                            "encoded_bytes": encoded_bytes,
+                            "byte_limit": MAX_FLEET_INSPECT_STRING_BYTES,
+                            "sha256": sha256,
+                        }),
+                    )
+                }
+            }
+            Value::Array(values) => {
+                let total = values.len();
+                let mut bounded = Vec::new();
+                for (index, value) in values
+                    .into_iter()
+                    .take(MAX_FLEET_INSPECT_COLLECTION_ITEMS)
+                    .enumerate()
+                {
+                    bounded.push(self.value(value, &format!("{path}/{index}")));
+                }
+                if total > MAX_FLEET_INSPECT_COLLECTION_ITEMS {
+                    bounded.push(self.omit(
+                        path,
+                        "item-limit",
+                        json!({
+                            "items_total": total,
+                            "items_kept": MAX_FLEET_INSPECT_COLLECTION_ITEMS,
+                            "items_omitted": total - MAX_FLEET_INSPECT_COLLECTION_ITEMS,
+                        }),
+                    ));
+                }
+                Value::Array(bounded)
+            }
+            Value::Object(values) => {
+                let total = values.len();
+                let mut entries = values.into_iter().collect::<Vec<_>>();
+                let priority = |key: &str| match key {
+                    "schema" => 0,
+                    "id" | "type" => 1,
+                    "status" | "outcome" | "ack" => 2,
+                    "error" | "reason" => 3,
+                    "revision" | "session" | "board_ref" | "wave" => 4,
+                    _ => 10,
+                };
+                entries.sort_by(|(left, _), (right, _)| {
+                    priority(left)
+                        .cmp(&priority(right))
+                        .then_with(|| left.cmp(right))
+                });
+                let mut bounded = Map::new();
+                for (key, value) in entries.into_iter().take(MAX_FLEET_INSPECT_COLLECTION_ITEMS) {
+                    let key_bytes = key.len() + 3;
+                    if self.take(key_bytes) {
+                        bounded.insert(key.clone(), self.value(value, &format!("{path}/{key}")));
+                    } else {
+                        bounded.insert(
+                            key.clone(),
+                            self.omit(
+                                &format!("{path}/{key}"),
+                                "byte-budget",
+                                json!({"field": key}),
+                            ),
+                        );
+                    }
+                }
+                if total > MAX_FLEET_INSPECT_COLLECTION_ITEMS {
+                    bounded.insert(
+                        "$additional_fields".into(),
+                        self.omit(
+                            path,
+                            "field-limit",
+                            json!({
+                                "fields_total": total,
+                                "fields_kept": MAX_FLEET_INSPECT_COLLECTION_ITEMS,
+                                "fields_omitted": total - MAX_FLEET_INSPECT_COLLECTION_ITEMS,
+                            }),
+                        ),
+                    );
+                }
+                Value::Object(bounded)
+            }
+        }
+    }
+}
+
+fn bounded_fleet_inspect(
+    view: InspectView,
+    target: Option<&str>,
+    limit: usize,
+    payload: Value,
+) -> Value {
+    let payload = redact_value(payload);
+    let mut budget = FleetInspectBudget::new(view);
+    let data = budget.value(payload, "data");
+    let omissions = budget.omissions;
+    let omissions_total = budget.omissions_total;
+    let projection = json!({
+        "schema":"flux.fleet-inspect/v1",
+        "view":format!("{view:?}").to_ascii_lowercase(),
+        "target":target,
+        "bounded":true,
+        "limit":limit,
+        "byte_limit":MAX_FLEET_INSPECT_BYTES,
+        "truncated":omissions_total > 0,
+        "omissions_total":omissions_total,
+        "omissions_truncated":omissions_total > MAX_FLEET_INSPECT_OMISSIONS,
+        "omissions":omissions,
+        "data":data,
+    });
+    let encoded_bytes = serde_json::to_vec(&projection).map_or(usize::MAX, |value| value.len());
+    if encoded_bytes <= MAX_FLEET_INSPECT_BYTES {
+        return projection;
+    }
+    json!({
+        "schema":"flux.fleet-inspect/v1",
+        "view":format!("{view:?}").to_ascii_lowercase(),
+        "target":target,
+        "bounded":true,
+        "limit":limit,
+        "byte_limit":MAX_FLEET_INSPECT_BYTES,
+        "truncated":true,
+        "omissions_total":omissions_total + 1,
+        "omissions_truncated":true,
+        "omissions":[{
+            "index":0,
+            "source":if matches!(view, InspectView::Activity | InspectView::Search) { ".flux/fleet/events.ndjson" } else { ".flux/fleet/state.json" },
+            "path":"data",
+            "reason":"projection-byte-limit",
+            "detail":{"encoded_bytes":encoded_bytes,"byte_limit":MAX_FLEET_INSPECT_BYTES},
+        }],
+        "data":{"$omitted":0},
+    })
+}
+
 fn fleet_inspect(
     root: &Path,
     state: &FleetState,
@@ -9143,7 +10934,14 @@ fn fleet_inspect(
         InspectView::Snapshot => json!({
             "revision":state.revision,
             "running":state.running,
-            "main_agent":state.main_agent,
+            "main_agent": {
+                "id": state.main_agent.id,
+                "role": state.main_agent.role,
+                "status": state.main_agent.status,
+                "session": state.main_agent.session,
+                "intake_sequence": state.main_agent.intake_sequence,
+                "goals_revision": state.main_agent.goals_revision,
+            },
             "goals_revision":state.main_agent.goals_revision,
             "goals":state.goals.len(),
             "intake":state.intake.len(),
@@ -9266,14 +11064,7 @@ fn fleet_inspect(
             json!({"wave":target,"supported":false,"reason":"fleet never opens pull requests; inspect the local candidate and apply explicitly","status":wave["status"],"apply_eligible":wave["apply_eligible"]})
         }
     };
-    Ok(redact_value(json!({
-        "schema":"flux.fleet-inspect/v1",
-        "view":format!("{view:?}").to_ascii_lowercase(),
-        "target":target,
-        "bounded":true,
-        "limit":limit,
-        "data":payload,
-    })))
+    Ok(bounded_fleet_inspect(view, target, limit, payload))
 }
 
 fn fleet_sources(root: &Path) -> Result<Value> {
@@ -9303,11 +11094,16 @@ fn fleet_sources(root: &Path) -> Result<Value> {
         "root": display_path(root),
         "config": true,
         "limits": {"max_workers": config.max_workers, "max_wave": config.max_wave, "max_rework": config.max_rework},
-        "main": {"instructions": config.main.instructions, "model": config.main.model},
+        "main": {"instructions": config.main.instructions, "model": config.main.model, "loop": config.main.agent_loop, "research_loop": config.main.research_loop},
+        "loop_profiles": config.loop_profiles.iter().map(|(id, profile)| (id.clone(), json!({
+            "revision": profile.revision, "source": profile.source, "entry": profile.entry,
+            "required_runtime_features": profile.required_runtime_features
+        }))).collect::<Map<String, Value>>(),
+        "loop_policy": config.loop_policy,
         "allow_ad_hoc_agents": config.allow_ad_hoc_agents,
         "worktree_root": config.worktree_root,
         "agent_templates": config.agent_templates.iter().map(|template| json!({
-            "id": template.id, "role": template.role, "mode": template.mode,
+            "id": template.id, "role": template.role, "task_kind": template.task_kind, "mode": template.mode,
             "model": template.model, "max_instances": template.max_instances,
             "capabilities": template.capabilities, "fences": template.fences
         })).collect::<Vec<_>>(),
@@ -9519,16 +11315,34 @@ fn schedule_human(data: &Value) -> String {
         .join("\n")
 }
 fn fleet_status_human(data: &Value) -> String {
+    let worker_attention = data["state"]["worker_counts"]["attention"]
+        .as_u64()
+        .unwrap_or(0);
+    let wave_attention = data["state"]["wave_counts"]["attention"]
+        .as_u64()
+        .unwrap_or(0);
+    let attention = worker_attention
+        + wave_attention
+        + data["human_decisions_total"].as_u64().unwrap_or(0)
+        + u64::from(data["state"]["main_agent"]["last_error"].is_string());
     format!(
-        "fleet: {} · revision {} · {} agent(s) · {} wave(s)",
+        "fleet: {} · revision {} · {}/{} active worker(s) · {}/{} active wave(s) · {} attention\nnext: {}",
         if data["state"]["running"].as_bool().unwrap_or(false) {
             "running"
         } else {
             "stopped"
         },
         data["state"]["revision"],
-        data["state"]["agents"].as_object().map_or(0, Map::len),
-        data["state"]["waves"].as_object().map_or(0, Map::len)
+        data["state"]["worker_counts"]["active"],
+        data["state"]["worker_counts"]["total"],
+        data["state"]["wave_counts"]["active"],
+        data["state"]["wave_counts"]["total"],
+        attention,
+        if attention > 0 {
+            "flux fleet inspect activity --limit 100 --output json"
+        } else {
+            "flux fleet inspect snapshot --limit 100 --output json"
+        }
     )
 }
 fn validate_board_refs(items: &[String]) -> Result<()> {
@@ -10769,6 +12583,162 @@ mod tests {
     use super::*;
     use flux_tui::operations::FleetBoardSource as _;
 
+    /// C-596: the integrator's authority ends at a green gate. Apply, push, Board mutation and
+    /// dispatch must be absent from its catalogue structurally, not merely discouraged in prose —
+    /// a loop naming an operation outside its admitted ceiling is refused at admission.
+    #[test]
+    fn the_wave_integrator_ceiling_stops_at_assembling_and_reading() {
+        let ceiling = native_fleet_integrator_operation_ceiling();
+
+        assert!(ceiling.contains(&"fleet.integrate".to_string()));
+        assert!(ceiling.contains(&"fleet.status".to_string()));
+        for forbidden in [
+            "fleet.apply",
+            "fleet.run",
+            "fleet.cancel",
+            "fleet.resume",
+            "fleet.message",
+            "board.start",
+            "board.comment",
+            "git_push",
+            "bash",
+        ] {
+            assert!(
+                !ceiling.contains(&forbidden.to_string()),
+                "`{forbidden}` must not be reachable by the integrator; ceiling was {ceiling:?}"
+            );
+        }
+    }
+
+    /// C-596: assemble authority follows the admitted record into the child process. A story worker
+    /// must never carry the integrator attachment, and the integrator must never carry the
+    /// coordinator's.
+    #[test]
+    fn only_an_admitted_integrator_carries_the_assemble_attachment() {
+        let base = AgentTurnSpec {
+            id: "wave-1-integrator".into(),
+            worktree: PathBuf::from("/tmp/wave-1"),
+            read_roots: vec![],
+            store: PathBuf::from("/tmp/wave-1/store"),
+            model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
+            instructions: "assemble".into(),
+            request: "integrate wave-1".into(),
+            resume_session: None,
+            enforce_operation_ceiling: true,
+            admitted_operations: vec!["fleet.integrate".into()],
+            capability_set: Value::Null,
+            shell_capability: false,
+            context_origin: Value::Null,
+            fleet_integrator: true,
+        };
+        let argv = agent_turn_argv(Path::new("/bin/flux"), &base, "integrate".into());
+        assert!(argv.iter().any(|a| a == "--native-fleet-integrator"));
+        assert!(
+            !argv.iter().any(|a| a == "--native-fleet-main"),
+            "the integrator never carries the coordinator attachment"
+        );
+
+        let worker = AgentTurnSpec {
+            id: "wave-1-worker-1".into(),
+            fleet_integrator: false,
+            ..base
+        };
+        let argv = agent_turn_argv(Path::new("/bin/flux"), &worker, "implement".into());
+        assert!(
+            !argv.iter().any(|a| a == "--native-fleet-integrator"),
+            "a story worker cannot attach as the integrator"
+        );
+    }
+
+    /// C-596: the coordinator delegates assembly rather than performing it. Keeping `fleet.integrate`
+    /// out of its catalogue is what stops the scheduler from also being the assembler.
+    #[test]
+    fn the_coordinator_cannot_integrate_a_wave_itself() {
+        let coordinator = native_fleet_main_operation_ceiling();
+
+        assert!(
+            !coordinator.contains(&"fleet.integrate".to_string()),
+            "the coordinator delegates integration; ceiling was {coordinator:?}"
+        );
+        assert!(
+            coordinator.contains(&"fleet.run".to_string()),
+            "the coordinator still dispatches work"
+        );
+    }
+
+    /// The operation maps to the deterministic host verb — it does not reimplement cherry-picking or
+    /// gating, and it carries the optimistic-concurrency guards every mutating Fleet call accepts.
+    #[test]
+    fn fleet_integrate_delegates_to_the_deterministic_host_verb() {
+        let args = NativeCoordinatorOperation::FleetIntegrate
+            .cli_args(
+                Path::new("/tmp/fleet-root"),
+                json!({"wave": "wave-263", "if_revision": 264}),
+            )
+            .expect("a valid integrate request builds argv");
+
+        assert!(args.iter().any(|arg| arg == "integrate"));
+        assert!(args.iter().any(|arg| arg == "wave-263"));
+        assert!(args.iter().any(|arg| arg == "--if-revision"));
+
+        let rejected = NativeCoordinatorOperation::FleetIntegrate
+            .cli_args(Path::new("/tmp/fleet-root"), json!({"wave": "   "}));
+        assert!(rejected.is_err(), "an empty wave id is refused client-side");
+    }
+
+    /// C-595 (failing first): a worker that commits and *then* exhausts a budget must stay
+    /// addressable. Fleet wave-257 lost `flux/C-562` this way — the loop committed 04e31775, the
+    /// next round crossed the 512 KiB history ceiling, and the turn was recorded as `failed` with
+    /// only a message: no `runtime_session`, no receipt, and therefore no `fleet rework`
+    /// re-dispatch (that path requires `runtime_session` to be a string).
+    #[test]
+    fn a_failed_turn_records_the_session_and_receipt_it_already_proved() {
+        let receipt = json!({
+            "schema": "flux.fleet-agent-turn/v1",
+            "agent": "wave-257-worker-2",
+            "session": "s_live_42",
+            "ack": "failed",
+            "events": [{"kind": "adaptive.call", "data": {"op": "git_commit"}}],
+        });
+        let error = anyhow::Error::new(AgentTurnFailure {
+            message: "transient-worker: agent wave-257-worker-2 turn failed: \
+                      authored segment history budget exceeded"
+                .to_string(),
+            receipt: receipt.clone(),
+        });
+
+        let mut agent = json!({"id": "wave-257-worker-2", "status": "working"});
+        record_failed_turn_evidence(&mut agent, &error);
+
+        assert_eq!(
+            agent["runtime_session"], "s_live_42",
+            "fleet rework gates on runtime_session being a string"
+        );
+        assert_eq!(
+            agent["last_turn"], receipt,
+            "the parsed receipt names what the failed turn already delivered"
+        );
+    }
+
+    /// The evidence path must not invent a receipt. A turn that never started (or whose stream could
+    /// not be parsed) has nothing to record, and must leave the agent record untouched rather than
+    /// writing a null session that later reads as "observed".
+    #[test]
+    fn a_turn_that_never_produced_a_receipt_records_no_evidence() {
+        let error = anyhow::anyhow!("transient-worker: agent wave-9-worker-1 could not start");
+
+        let mut agent = json!({"id": "wave-9-worker-1", "status": "working"});
+        record_failed_turn_evidence(&mut agent, &error);
+
+        assert!(
+            agent.get("runtime_session").is_none(),
+            "no session was proved"
+        );
+        assert!(agent.get("last_turn").is_none(), "no receipt was produced");
+    }
+
     fn fleet_tui_fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "flux-fleet-tui-{tag}-{}-{}",
@@ -10779,12 +12749,23 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join(".flux/fleet")).unwrap();
+        fs::create_dir_all(root.join(".flux/fleet/loops")).unwrap();
         fs::create_dir_all(root.join("docs/stories")).unwrap();
         fs::create_dir_all(root.join("docs/decisions")).unwrap();
         fs::create_dir_all(root.join("docs/designs")).unwrap();
         fs::write(
             root.join(".flux/fleet.toml"),
-            "schema = \"flux.fleet/v1\"\nmax_workers = 5\nmax_wave = 10\nmax_rework = 2\n",
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\nmax_wave = 10\nmax_rework = 2\n\n[main]\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".flux/fleet/loops/main.flux"),
+            "flow fleet-main -> string\n  return \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".flux/fleet/loops/research.flux"),
+            "flow fleet-research -> string\n  return \"fixture research\"\n",
         )
         .unwrap();
         fs::write(
@@ -10897,7 +12878,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fleet_tui_snapshot_is_typed_bounded_and_exact_about_unavailable_capacity() {
         let root = fleet_tui_fixture("snapshot");
-        write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
+        let mut populated = populated_fleet_tui_state();
+        populated.waves.insert(
+            "wave-cancelled-red".into(),
+            json!({
+                "status":"cancelled",
+                "topology":{"repositories":[{
+                    "id":"flux",
+                    "gate":{"status":"red","evidence":{"stderr":"historical failure"}}
+                }]}
+            }),
+        );
+        write_fleet_state(&root, &populated).unwrap();
         let source = FleetTuiSource {
             root: root.canonicalize().unwrap(),
         };
@@ -10964,6 +12956,472 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn attached_fleet_main_can_list_durable_workers_without_known_ids() {
+        let root = fleet_tui_fixture("native-agent-operation");
+        write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
+        let tools = native_fleet_main_tools(root.canonicalize().unwrap()).unwrap();
+        let agents = tools
+            .iter()
+            .find(|tool| tool.spec().name == "fleet.agents")
+            .expect("attached Fleet main must receive native worker enumeration");
+        let system = Arc::new(guarded_system(&root).unwrap());
+
+        let result = agents
+            .execute(&flux_runtime::ToolContext::new(system), json!({"limit": 2}))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&result.content).unwrap();
+
+        assert_eq!(payload["schema"], "flux.fleet-agents/v1");
+        assert_eq!(payload["workers_total"], 106);
+        assert_eq!(payload["workers"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["main_agent"]["id"], "main");
+        assert!(payload["workers"][0]["id"].is_string());
+        assert!(payload["workers"][0].get("instructions").is_none());
+        assert!(payload["workers"][0].get("last_turn").is_none());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_agents_cli_projection_lists_all_workers_without_turn_receipts() {
+        let mut state = populated_fleet_tui_state();
+        state.main_agent.last_turn = Some(json!({
+            "answer": "x".repeat(1_000_000),
+            "events": [{"payload": "y".repeat(1_000_000)}],
+        }));
+
+        let projection = fleet_agents_cli_projection(&state);
+        let encoded = serde_json::to_vec(&projection).unwrap();
+
+        assert_eq!(projection["schema"], "flux.fleet-agents/v1");
+        assert_eq!(projection["workers_total"], 106);
+        assert_eq!(projection["workers"].as_object().unwrap().len(), 106);
+        assert_eq!(projection["truncated"], false);
+        assert!(projection["main_agent"].get("last_turn").is_none());
+        assert!(projection["workers"]["worker-000"]
+            .get("last_turn")
+            .is_none());
+        assert!(projection["workers"]["worker-000"]
+            .get("instructions")
+            .is_none());
+        assert!(
+            encoded.len() < 100_000,
+            "census grew to {} bytes",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn fleet_status_projection_is_bounded_and_counts_current_state_not_old_receipts() {
+        let root = fleet_tui_fixture("bounded-fleet-status");
+        let mut state = populated_fleet_tui_state();
+        state.main_agent.last_turn = Some(json!({
+            "answer": "main-answer-marker".repeat(100_000),
+            "events": [{"payload": "main-event-marker".repeat(100_000)}],
+            "outcome": "ok",
+            "session": "s-main",
+        }));
+        state.main_agent.last_error = Some("api_key=sk-live".into());
+        state.intake.insert(
+            "intake-999".into(),
+            json!({
+                "ack":"completed",
+                "source":"user",
+                "text":"intake-body-marker".repeat(100_000),
+                "receipt":{"events":[{"payload":"receipt-marker".repeat(100_000)}]},
+            }),
+        );
+        state.agents.insert(
+            "worker-stale-active-receipt".into(),
+            json!({
+                "role":"writer",
+                "status":"failed",
+                "last_error":"failed after its process exited",
+                "last_turn":{"status":"working","events":[{"payload":"worker-event-marker".repeat(100_000)}]},
+                "assignment":{"board_ref":"repo/C-9","wave":"wave-7"},
+            }),
+        );
+
+        let unbounded = serde_json::to_vec(&state).unwrap();
+        assert!(
+            unbounded.len() > 2_000_000,
+            "fixture is only {} bytes",
+            unbounded.len()
+        );
+
+        let projection = fleet_status_projection(&root, &state).unwrap();
+        let encoded = serde_json::to_vec(&projection).unwrap();
+        let rendered = String::from_utf8(encoded.clone()).unwrap();
+
+        assert_eq!(projection["schema"], "flux.fleet-status/v1");
+        assert_eq!(projection["state"]["worker_counts"]["active"], 1);
+        assert_eq!(projection["state"]["worker_counts"]["attention"], 2);
+        assert_eq!(projection["state"]["worker_counts"]["total"], 107);
+        assert_eq!(projection["state"]["workers"].as_array().unwrap().len(), 50);
+        assert_eq!(projection["state"]["workers_truncated"], true);
+        assert_eq!(projection["attention_required"], true);
+        assert_eq!(
+            projection["state"]["main_agent"]["last_transition"]["event_count"],
+            1
+        );
+        for forbidden in [
+            "main-answer-marker",
+            "main-event-marker",
+            "intake-body-marker",
+            "receipt-marker",
+            "worker-event-marker",
+            "last_turn",
+            "sk-live",
+        ] {
+            assert!(!rendered.contains(forbidden), "status retained {forbidden}");
+        }
+        assert!(
+            encoded.len() <= MAX_FLEET_STATUS_BYTES,
+            "status grew to {} bytes",
+            encoded.len()
+        );
+        assert!(fleet_status_human(&projection).contains("flux fleet inspect activity"));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_status_fixture_matrix_is_stable_bounded_and_operationally_truthful() {
+        let root = fleet_tui_fixture("fleet-status-matrix");
+        let empty = FleetState {
+            revision: 1,
+            ..FleetState::default()
+        };
+
+        let mut one_active = FleetState {
+            revision: 2,
+            running: true,
+            ..FleetState::default()
+        };
+        one_active.agents.insert(
+            "worker-1".into(),
+            json!({"status":"working","role":"writer","runtime_session":"s-1","assignment":{"board_ref":"repo/C-1","wave":"wave-1"}}),
+        );
+
+        let mut five_active = FleetState {
+            revision: 3,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 0..5 {
+            five_active.agents.insert(
+                format!("worker-{index}"),
+                json!({"status":"working","role":"writer","runtime_session":format!("s-{index}"),"assignment":{"board_ref":format!("repo/C-{index}"),"wave":"wave-3"}}),
+            );
+        }
+
+        let mut repeated_failures = FleetState {
+            revision: 4,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 0..20 {
+            repeated_failures.agents.insert(
+                format!("failed-{index:02}"),
+                json!({
+                    "status":"failed",
+                    "role":"writer",
+                    "last_error":"same bounded failure",
+                    "last_turn":{"outcome":"error","events":[{"content":"failure-history".repeat(2_000)}]},
+                    "assignment":{"board_ref":format!("repo/C-{index}"),"wave":"wave-4"},
+                }),
+            );
+        }
+
+        let mut long_lived = FleetState {
+            revision: 50_000,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 0..500 {
+            long_lived.agents.insert(
+                format!("retired-{index:04}"),
+                json!({
+                    "status":"cancelled",
+                    "last_error":"historical failure",
+                    "last_turn":{"events":[{"content":"retained-history".repeat(500)}]},
+                    "assignment":{"board_ref":format!("repo/C-{index}"),"wave":format!("wave-{index}")},
+                }),
+            );
+            long_lived.intake.insert(
+                format!("intake-{index}"),
+                json!({"ack":"completed","text":"old-intake".repeat(500),"receipt":{"events":["old-receipt".repeat(500)]}}),
+            );
+            long_lived.waves.insert(
+                format!("wave-{index}"),
+                json!({"status":"cancelled","items":[format!("repo/C-{index}")],"evidence":"old-wave-evidence".repeat(500)}),
+            );
+        }
+
+        for (name, state, expected_active, expected_attention) in [
+            ("empty", empty, 0, 0),
+            ("one-active", one_active, 1, 0),
+            ("five-active", five_active, 5, 0),
+            ("repeated-failures", repeated_failures, 0, 20),
+            ("long-lived", long_lived, 0, 0),
+        ] {
+            let first = fleet_status_projection(&root, &state).unwrap();
+            let second = fleet_status_projection(&root, &state).unwrap();
+            assert_eq!(first, second, "{name} projection changed between reads");
+            assert_eq!(
+                first["state"]["worker_counts"]["active"], expected_active,
+                "{name} active count"
+            );
+            assert_eq!(
+                first["state"]["worker_counts"]["attention"], expected_attention,
+                "{name} attention count"
+            );
+            let encoded = serde_json::to_vec(&first).unwrap();
+            assert!(
+                encoded.len() <= MAX_FLEET_STATUS_BYTES,
+                "{name} status grew to {} bytes",
+                encoded.len()
+            );
+            assert!(fleet_status_human(&first).contains("flux fleet inspect"));
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn attached_fleet_main_status_uses_the_bounded_native_snapshot() {
+        let root = Path::new("/workspace");
+        let args = NativeCoordinatorOperation::FleetStatus
+            .cli_args(root, json!({}))
+            .unwrap();
+
+        assert_eq!(
+            args,
+            [
+                "fleet",
+                "--root",
+                "/workspace",
+                "--output",
+                "json",
+                "inspect",
+                "snapshot",
+                "--limit",
+                "100",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "status"));
+    }
+
+    #[test]
+    fn fleet_inspect_snapshot_excludes_main_turn_payloads() {
+        let root = fleet_tui_fixture("bounded-inspect-snapshot");
+        let mut state = populated_fleet_tui_state();
+        state.main_agent.last_turn = Some(json!({
+            "answer": "x".repeat(1_000_000),
+            "events": [{"payload": "y".repeat(1_000_000)}],
+        }));
+
+        let snapshot = fleet_inspect(&root, &state, InspectView::Snapshot, None, 100).unwrap();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+
+        assert_eq!(snapshot["data"]["main_agent"]["id"], "main");
+        assert_eq!(snapshot["data"]["main_agent"]["status"], "running");
+        assert!(snapshot["data"]["main_agent"].get("last_turn").is_none());
+        assert!(snapshot["data"]["main_agent"].get("last_error").is_none());
+        assert!(
+            encoded.len() < 4_096,
+            "snapshot grew to {} bytes",
+            encoded.len()
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn targeted_fleet_inspect_keeps_terminal_facts_and_bounds_retained_evidence() {
+        let root = fleet_tui_fixture("bounded-targeted-inspect");
+        let mut state = populated_fleet_tui_state();
+        state.agents.get_mut("worker-000").unwrap()["last_turn"] = json!({
+            "schema":"flux.fleet-agent-turn/v1",
+            "outcome":"ok",
+            "session":"s-0",
+            "answer":"worker-answer-marker".repeat(100_000),
+            "events":[{
+                "type":"tool_result",
+                "outcome":"ok",
+                "content":"worker-event-marker".repeat(100_000),
+                "api_key":"sk-live",
+            }],
+        });
+        state.waves.get_mut("wave-7").unwrap()["evidence"] = json!({
+            "status":"recorded",
+            "stdout":"wave-evidence-marker".repeat(100_000),
+        });
+        state.waves.insert(
+            "wave-result".into(),
+            json!({
+                "status":"completed",
+                "topology":{"repositories":[{"stories":[{
+                    "board_ref":"repo/C-9",
+                    "status":"completed",
+                    "handoff":{"outcome":"accepted","content":"result-handoff-marker".repeat(100_000)},
+                    "reviews":[{"outcome":"pass","content":"result-review-marker".repeat(100_000)}],
+                }]}]},
+            }),
+        );
+
+        let worker =
+            fleet_inspect(&root, &state, InspectView::Worker, Some("worker-000"), 7).unwrap();
+        let wave = fleet_inspect(&root, &state, InspectView::Wave, Some("wave-7"), 7).unwrap();
+        let activity = bounded_fleet_inspect(
+            InspectView::Activity,
+            None,
+            150,
+            json!({"events":(0..150).map(|index| json!({
+                "type":"tool_result",
+                "outcome":"ok",
+                "index":index,
+                "content":"activity-event-marker".repeat(2_000),
+            })).collect::<Vec<_>>() }),
+        );
+        let result =
+            fleet_inspect(&root, &state, InspectView::Result, Some("repo/C-9"), 7).unwrap();
+
+        assert_eq!(worker["data"]["last_turn"]["outcome"], "ok");
+        assert_eq!(worker["data"]["last_turn"]["session"], "s-0");
+        assert!(worker["data"]["last_turn"]["answer"]["$omitted"].is_u64());
+        assert_eq!(worker["truncated"], true);
+        assert_eq!(wave["truncated"], true);
+        assert_eq!(activity["truncated"], true);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["data"]["results"][0]["status"], "completed");
+        assert_eq!(
+            result["data"]["results"][0]["handoff"]["outcome"],
+            "accepted"
+        );
+        assert!(activity["omissions_total"].as_u64().unwrap() > 100);
+        assert_eq!(activity["omissions_truncated"], true);
+        assert_eq!(
+            activity["omissions"][0]["source"],
+            ".flux/fleet/events.ndjson"
+        );
+
+        for projection in [&worker, &wave, &activity, &result] {
+            let encoded = serde_json::to_vec(projection).unwrap();
+            let rendered = String::from_utf8(encoded.clone()).unwrap();
+            assert!(encoded.len() <= MAX_FLEET_INSPECT_BYTES);
+            for forbidden in [
+                "worker-answer-marker",
+                "worker-event-marker",
+                "wave-evidence-marker",
+                "activity-event-marker",
+                "result-handoff-marker",
+                "result-review-marker",
+                "sk-live",
+            ] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "inspect retained {forbidden}"
+                );
+            }
+            assert!(projection["byte_limit"].is_u64());
+            assert!(projection["omissions"].is_array());
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn attached_fleet_main_and_research_child_catalogs_are_closed() {
+        let tool_names = native_fleet_main_tools_for_catalog()
+            .into_iter()
+            .map(|tool| tool.spec().name)
+            .collect::<BTreeSet<_>>();
+        let ceiling = native_fleet_main_operation_ceiling()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert!(ceiling.contains("task"));
+        assert!(ceiling.contains("ai_segment"));
+        assert!(tool_names.contains("board.next"));
+        assert!(tool_names.contains("fleet.schedule"));
+        assert!(tool_names.contains("fleet.agents"));
+        assert!(tool_names.contains("fleet.run"));
+        for forbidden in [
+            "bash",
+            "read",
+            "edit",
+            "git_commit",
+            "web.fetch",
+            "pane.open",
+            "fleet.start",
+            "fleet.worker_status",
+            "fleet.dispatch",
+        ] {
+            assert!(!ceiling.contains(forbidden), "main exposed {forbidden}");
+        }
+
+        let research = native_fleet_research_operation_ceiling()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for required in ["read", "grep", "git_status"] {
+            assert!(research.contains(required), "research omitted {required}");
+        }
+        for forbidden in [
+            "task",
+            "bash",
+            "write",
+            "edit",
+            "git_commit",
+            "board.next",
+            "fleet.status",
+        ] {
+            assert!(
+                !research.contains(forbidden),
+                "research exposed {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_fleet_main_refuses_without_an_operator_authored_loop() {
+        let root = fleet_tui_fixture("missing-main-loop");
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\n",
+        )
+        .unwrap();
+
+        let error = match prepare_fleet_tui(&root) {
+            Ok(_) => panic!("Fleet TUI attached without an authored main loop"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("[main] loop"), "{error}");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn attached_fleet_main_refuses_without_an_operator_authored_research_loop() {
+        let root = fleet_tui_fixture("missing-research-loop");
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\n\n[main]\nloop = \".flux/fleet/loops/main.flux\"\n",
+        )
+        .unwrap();
+
+        let error = match prepare_fleet_tui(&root) {
+            Ok(_) => panic!("Fleet TUI attached without an authored research loop"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("[main] research_loop"), "{error}");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn fleet_tui_intake_and_decision_actions_use_durable_native_state() {
         let root = fleet_tui_fixture("mutations");
         write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
@@ -11009,14 +13467,17 @@ mod tests {
     #[test]
     fn first_story_worker_prompt_does_not_inherit_fleet_wide_goals() {
         let spec = AgentTurnSpec {
+            fleet_integrator: false,
             id: "wave-1-worker-1".into(),
             worktree: PathBuf::from("/tmp/story-C-566"),
             read_roots: vec![],
             store: PathBuf::from("/tmp/story-C-566/store"),
             model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
             instructions: "Implement only the assigned story as a writer.".into(),
             request: "Work only on flux/C-566 at pinned base abc123.".into(),
-            resume: false,
+            resume_session: None,
             enforce_operation_ceiling: true,
             admitted_operations: vec!["read".into(), "edit".into()],
             capability_set: json!({"digest_sha256":"worker-one"}),
@@ -11040,14 +13501,17 @@ mod tests {
     #[test]
     fn parallel_story_worker_launches_use_fresh_distinct_stores() {
         let worker = |id: &str, item: &str, store: &str| AgentTurnSpec {
+            fleet_integrator: false,
             id: id.into(),
             worktree: PathBuf::from(format!("/tmp/{item}")),
             read_roots: vec![],
             store: PathBuf::from(store),
             model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
             instructions: "Implement only the assigned story as a writer.".into(),
             request: format!("Work only on {item}."),
-            resume: false,
+            resume_session: None,
             enforce_operation_ceiling: true,
             admitted_operations: vec!["read".into(), "edit".into()],
             capability_set: json!({"digest_sha256":id}),
@@ -11067,8 +13531,12 @@ mod tests {
             render_agent_turn_prompt(&second, "private main goal"),
         );
 
-        assert!(!first_argv.iter().any(|argument| argument == "--continue"));
-        assert!(!second_argv.iter().any(|argument| argument == "--continue"));
+        assert!(!first_argv
+            .iter()
+            .any(|argument| argument == "--resume-session"));
+        assert!(!second_argv
+            .iter()
+            .any(|argument| argument == "--resume-session"));
         assert!(first_argv
             .iter()
             .any(|argument| argument == "/stores/worker-1"));
@@ -11080,7 +13548,7 @@ mod tests {
         assert!(!second_argv.last().unwrap().contains("flux/C-566"));
 
         let mut continued_first = first.clone();
-        continued_first.resume = true;
+        continued_first.resume_session = Some("s-worker-1".into());
         continued_first.context_origin["session_mode"] = json!("continue");
         let continued_argv = agent_turn_argv(
             Path::new("/bin/flux"),
@@ -11088,8 +13556,8 @@ mod tests {
             render_agent_turn_prompt(&continued_first, "changed main goal"),
         );
         assert!(continued_argv
-            .iter()
-            .any(|argument| argument == "--continue"));
+            .windows(2)
+            .any(|pair| pair == ["--resume-session", "s-worker-1"]));
         assert!(continued_argv
             .iter()
             .any(|argument| argument == "/stores/worker-1"));
@@ -11109,14 +13577,17 @@ mod tests {
     #[test]
     fn story_worker_launch_argv_enforces_an_operation_ceiling() {
         let spec = AgentTurnSpec {
+            fleet_integrator: false,
             id: "wave-1-worker-1".into(),
             worktree: PathBuf::from("/tmp/story-C-565"),
             read_roots: vec![],
             store: PathBuf::from("/tmp/story-C-565/store"),
             model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
             instructions: "Implement only the admitted story.".into(),
             request: "Work only on flux/C-565.".into(),
-            resume: false,
+            resume_session: None,
             enforce_operation_ceiling: true,
             admitted_operations: vec!["read".into(), "edit".into()],
             capability_set: json!({"digest_sha256":"worker-one"}),
@@ -11297,14 +13768,42 @@ mod tests {
         std::fs::create_dir_all(fleet.join(".flux")).unwrap();
         std::fs::write(
             fleet.join(".flux/fleet.toml"),
-            "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"flux\"\nroot = \"../flux\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"connectors\"\nroot = \"../connectors\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"exchange\"\nroot = \"../exchange\"\ngate = [\"true\"]\n",
+            "schema = \"flux.fleet/v1\"\n\n[main]\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n\n[[repositories]]\nid = \"flux\"\nroot = \"../flux\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"connectors\"\nroot = \"../connectors\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"exchange\"\nroot = \"../exchange\"\ngate = [\"true\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(fleet.join(".flux/fleet/loops")).unwrap();
+        fs::write(
+            fleet.join(".flux/fleet/loops/main.flux"),
+            "flow fleet-main -> string\n  return \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            fleet.join(".flux/fleet/loops/research.flux"),
+            "flow fleet-research -> string\n  return \"fixture research\"\n",
         )
         .unwrap();
 
         let mut state = FleetState::default();
         state.main_agent.session = Some("continued-session".into());
         let spec = main_turn_spec(&fleet, &state, "inspect".into()).unwrap();
-        assert!(spec.resume);
+        assert_eq!(spec.resume_session.as_deref(), Some("continued-session"));
+        assert_eq!(
+            spec.agent_loop.as_deref(),
+            Some(".flux/fleet/loops/main.flux")
+        );
+        assert!(spec.enforce_operation_ceiling);
+        assert_eq!(
+            spec.admitted_operations,
+            native_fleet_main_operation_ceiling()
+        );
+        let argv = agent_turn_argv(Path::new("/bin/flux"), &spec, "inspect".into());
+        assert!(argv
+            .iter()
+            .any(|argument| argument == "--native-fleet-main"));
+        assert!(argv
+            .windows(2)
+            .any(|pair| { pair == ["--loop", ".flux/fleet/loops/main.flux"] }));
+        assert!(!argv.iter().any(|argument| argument == "bash"));
         assert_eq!(
             spec.read_roots,
             vec![
@@ -11355,6 +13854,21 @@ mod tests {
             &[],
             &fences,
         );
+        let loop_binding = flux_agent::AgentLoopBinding::native_flux(
+            "implementation",
+            "1",
+            "fleet-profile:implementation@1:test",
+            "work",
+            "flow work -> string\n  return \"done\"\n",
+        )
+        .unwrap();
+        snapshot_fleet_loop_binding(
+            &worktree,
+            &loop_binding,
+            FLEET_AGENT_LOOP_SOURCE,
+            FLEET_AGENT_LOOP_BINDING,
+        )
+        .unwrap();
         state.agents.insert(
             "wave-1-worker-1".into(),
             json!({
@@ -11368,6 +13882,9 @@ mod tests {
                 "writable_root": display_path(&worktree),
                 "read_roots": [],
                 "capability_set": capability_set,
+                "loop_binding": loop_binding.metadata(),
+                "loop_source": FLEET_AGENT_LOOP_SOURCE,
+                "loop_binding_receipt": FLEET_AGENT_LOOP_BINDING,
                 "runtime_session": "s_1",
                 "assignment": {
                     "board_ref": "flux/C-566",
@@ -11386,7 +13903,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(spec.resume);
+        assert_eq!(spec.resume_session.as_deref(), Some("s_1"));
         assert!(spec.read_roots.is_empty());
         assert_eq!(spec.worktree, worktree);
         assert_eq!(spec.context_origin["board_ref"], "flux/C-566");
@@ -11403,6 +13920,24 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("not available for delivery"));
         }
+        std::fs::write(
+            worktree.join(FLEET_AGENT_LOOP_SOURCE),
+            "flow changed -> string\n  return \"drifted\"\n",
+        )
+        .unwrap();
+        let drift = addressed_turn_spec(
+            &fleet,
+            &state,
+            "wave-1-worker-1",
+            "This must preserve the admitted behavior.".into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(drift.contains("source_sha256"), "{drift}");
+        assert!(
+            drift.contains("explicit re-admission") || drift.contains("mismatch"),
+            "{drift}"
+        );
         std::fs::remove_dir_all(base).ok();
     }
 

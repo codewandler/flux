@@ -27,7 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::{register_agent_ops, AdaptiveLoopPolicy};
+use flux_agent::{register_agent_ops, AdaptiveLoopPolicy, AgentLoopBinding, AgentLoopSpec};
 use flux_core::{DispatchId, Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::AgentSink;
@@ -133,6 +133,8 @@ pub struct LocalSpawner {
     default_model: String,
     default_thinking: bool,
     default_effort: Option<Effort>,
+    /// Host-owned outer loop forced onto every child. `None` preserves each role's configured loop.
+    agent_loop: Option<AgentLoopBinding>,
     /// Complete native intent/explore policy assigned to every role-derived child spec. Kept
     /// separate from `SpawnLimits`: those bound the whole child/outer loop, while this bounds the
     /// adaptive model stages inside one logical run.
@@ -176,6 +178,7 @@ impl LocalSpawner {
             default_model: default_model.into(),
             default_thinking: false,
             default_effort: None,
+            agent_loop: None,
             adaptive_policy: AdaptiveLoopPolicy::default(),
             limits: SpawnLimits::new(max_tokens),
             approver: None,
@@ -245,6 +248,24 @@ impl LocalSpawner {
         self
     }
 
+    /// Force one host-authored outer loop onto every child, overriding role frontmatter.
+    ///
+    /// This is for implementors that own a specialized delegation contract (for example a
+    /// read-only Fleet research child) and must not fall back to the generic adaptive role loop.
+    /// Tool authority remains independently bounded by the child registry and role/scope
+    /// intersection; selecting a loop never widens it.
+    pub fn with_agent_loop(mut self, agent_loop: AgentLoopSpec) -> Self {
+        self.agent_loop = Some(AgentLoopBinding::from_spec(agent_loop));
+        self
+    }
+
+    /// Force one already-resolved host binding onto every child without losing its admitted
+    /// profile/revision/source identity.
+    pub fn with_agent_loop_binding(mut self, binding: AgentLoopBinding) -> Self {
+        self.agent_loop = Some(binding);
+        self
+    }
+
     /// Set the complete adaptive intent/explore cognition policy inherited by every spawned role.
     /// This is independent of [`SpawnLimits`]: it selects stage models/effort and bounds native
     /// model calls, while spawn limits bound the child's outer iterations, fallback output tokens,
@@ -297,6 +318,7 @@ impl LocalSpawner {
             default_model: self.default_model.clone(),
             default_thinking: self.default_thinking,
             default_effort: self.default_effort,
+            agent_loop: self.agent_loop.clone(),
             adaptive_policy: self.adaptive_policy.clone(),
             limits: self.limits.clone(),
             approver: self.approver.clone(),
@@ -518,6 +540,10 @@ impl Spawner for LocalSpawner {
         }
         spec.thinking = role.thinking.unwrap_or(self.default_thinking);
         spec.effort = role.effort.or(self.default_effort);
+        if let Some(agent_loop) = &self.agent_loop {
+            spec.agent_loop = agent_loop.spec().clone();
+            spec.agent_loop_binding = Some(agent_loop.clone());
+        }
         spec.adaptive_policy = self.adaptive_policy.clone();
         // A-41: a role's `model:` override speaks the same provider-prefixed spec form `-m` accepts
         // (e.g. `openrouter/deepseek/deepseek-v4-flash`), but sub-agents always run on the PARENT's
@@ -671,6 +697,8 @@ pub struct SubAgents {
     pub default_model: String,
     pub default_thinking: bool,
     pub default_effort: Option<Effort>,
+    /// Optional host-owned outer loop forced onto every child.
+    pub agent_loop: Option<AgentLoopSpec>,
     pub limits: SpawnLimits,
     pub approver: Option<Arc<dyn Approver>>,
     pub auth: Option<(AuthorizationPolicy, IdentityCell)>,
@@ -702,6 +730,7 @@ impl SubAgents {
             default_model: default_model.into(),
             default_thinking: false,
             default_effort: None,
+            agent_loop: None,
             limits: SpawnLimits::new(max_tokens),
             approver: None,
             auth: None,
@@ -754,6 +783,13 @@ impl SubAgents {
         self
     }
 
+    /// Force one host-authored outer loop onto every child. See
+    /// [`LocalSpawner::with_agent_loop`].
+    pub fn with_agent_loop(mut self, agent_loop: AgentLoopSpec) -> Self {
+        self.agent_loop = Some(agent_loop);
+        self
+    }
+
     /// Inject the approver a sub-agent's tool calls dispatch through.
     pub fn with_approver(mut self, approver: Arc<dyn Approver>) -> Self {
         self.approver = Some(approver);
@@ -803,6 +839,9 @@ impl SubAgents {
         // C-299: carry the parent's ceilings down. Unset is `ResourceLimits::new()` (unbounded),
         // so a host that configured nothing sees no behaviour change.
         .with_resource_limits(self.resource_limits);
+        if let Some(agent_loop) = self.agent_loop {
+            spawner = spawner.with_agent_loop(agent_loop);
+        }
         if let Some(approver) = self.approver {
             spawner = spawner.with_approver(approver);
         }
@@ -1657,6 +1696,7 @@ mod tests {
                 max_tokens: Some(222),
                 max_calls: Some(1),
             },
+            max_history_bytes: None,
         };
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider_requests = requests.clone();
@@ -3089,6 +3129,38 @@ mod tests {
             system.read_file("PINGED.marker").await.is_ok(),
             "the native op executed through the loop"
         );
+    }
+
+    #[tokio::test]
+    async fn host_authored_child_loop_overrides_the_generic_role_loop() {
+        let mut roles = RoleRegistry::default();
+        let mut role = parse_role("---\n---\nYou are a scout.", "scout");
+        role.agent_loop =
+            Some("flow role_loop -> string\n  return \"wrong role loop\"".to_string());
+        roles.insert(role);
+        let forced = flux_agent::AgentLoopSpec::parse(
+            "flow fleet_research -> string\n  return \"forced research loop\"",
+        )
+        .unwrap();
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1_024,
+        )
+        .with_agent_loop(forced);
+
+        let outcome = spawner
+            .spawn(
+                SpawnRequest::new("scout", "inspect only"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "forced research loop");
     }
 
     // ---- sub-agent capability-scope intersection (L-11 acceptance #4) ----

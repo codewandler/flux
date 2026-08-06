@@ -1,6 +1,9 @@
 use super::*;
 use flux_agent::resolve_compact_threshold_env;
 
+/// Audit label for operations available only to an explicitly attached native Fleet main.
+pub(super) const NATIVE_FLEET_MAIN_SOURCE: &str = "flux-cli attached native Fleet main";
+
 // Codex/Anthropic model resolution is backend knowledge owned by each provider crate
 // (`flux_providers::codex::resolve_model`, `flux_providers::anthropic::resolve_model`) so every
 // surface — CLI, SDK, server, TUI, the L3 sub-agent spawner — shares one owner instead of each
@@ -1193,13 +1196,23 @@ pub(super) type LiveAgentBuild = (
 pub(super) struct AgentBuildLocation {
     pub(super) workspace_root: std::path::PathBuf,
     pub(super) store_dir: std::path::PathBuf,
+    /// Explicit specialized-surface marker. A location alone never grants coordinator authority.
+    pub(super) fleet_main: bool,
 }
 
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    let (agent, session, spec, spawner, _) =
-        build_agent_with(flags, true, None, None, None, None, None).await?;
+    let (agent, session, spec, spawner, _) = build_agent_with(
+        flags,
+        true,
+        flags.resume_session.clone(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
     Ok((agent, session, spec, spawner))
 }
 
@@ -1346,6 +1359,229 @@ pub(super) async fn resolve_agent_loop(
         .await
         .with_context(|| format!("read explicit agent loop `{selection}`"))?;
     AgentLoopSpec::parse(&source).map_err(|error| anyhow::anyhow!("{error}"))
+}
+
+/// Resolve the executable selector together with an optional host-snapshotted binding receipt.
+/// The latter is used by Fleet continuation paths so a mutable config/role file cannot silently
+/// change a live worker's behavior.
+async fn resolve_agent_loop_binding(
+    selection: Option<&str>,
+    binding_receipt: Option<&str>,
+    system: &System,
+) -> Result<flux_agent::AgentLoopBinding> {
+    if let Some(binding_receipt) = binding_receipt {
+        let selection = selection
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("--resolved-loop-binding requires an explicit --loop source snapshot")?;
+        let metadata_text = system
+            .read_file(binding_receipt)
+            .await
+            .with_context(|| format!("read resolved agent loop binding `{binding_receipt}`"))?;
+        let metadata: flux_core::AgentLoopBindingMetadata = serde_json::from_str(&metadata_text)
+            .with_context(|| format!("parse resolved agent loop binding `{binding_receipt}`"))?;
+        let source = system
+            .read_file(selection)
+            .await
+            .with_context(|| format!("read explicit agent loop `{selection}`"))?;
+        return flux_agent::AgentLoopBinding::from_metadata_and_source(metadata, source)
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+    resolve_agent_loop(selection, system)
+        .await
+        .map(flux_agent::AgentLoopBinding::from_spec)
+}
+
+fn agent_loop_cache_root(store_dir: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    Ok(store_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(flux_store_dir()?)
+        .join("agent-loops"))
+}
+
+fn agent_loop_cache_path(
+    store_dir: Option<&std::path::Path>,
+    digest: &str,
+) -> Result<std::path::PathBuf> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid admitted agent loop source digest `{digest}`");
+    }
+    Ok(agent_loop_cache_root(store_dir)?.join(format!("{digest}.flux")))
+}
+
+fn persist_agent_loop_source(
+    store_dir: Option<&std::path::Path>,
+    binding: &flux_agent::AgentLoopBinding,
+) -> Result<()> {
+    let path = agent_loop_cache_path(store_dir, &binding.metadata().source_sha256)?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if flux_lang::runtime::sha256_hex(&existing) != binding.metadata().source_sha256 {
+            bail!(
+                "cached agent loop source digest mismatch at {}; remove the corrupt cache before retrying",
+                path.display()
+            )
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().expect("agent loop cache path has a parent"))?;
+    let temp = path.with_extension(format!("flux.tmp-{}", std::process::id()));
+    std::fs::write(&temp, binding.source())?;
+    match std::fs::rename(&temp, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.is_file() => {
+            let _ = std::fs::remove_file(&temp);
+            let existing = std::fs::read_to_string(&path)?;
+            if flux_lang::runtime::sha256_hex(&existing) == binding.metadata().source_sha256 {
+                Ok(())
+            } else {
+                Err(error).with_context(|| format!("persist agent loop cache {}", path.display()))
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error).with_context(|| format!("persist agent loop cache {}", path.display()))
+        }
+    }
+}
+
+async fn resolve_session_agent_loop_binding(
+    selection: Option<&str>,
+    explicit_selection: bool,
+    binding_receipt: Option<&str>,
+    system: &System,
+    events: &EventStore,
+    session_id: &str,
+    store_dir: Option<&std::path::Path>,
+) -> Result<flux_agent::AgentLoopBinding> {
+    let selected = resolve_agent_loop_binding(selection, binding_receipt, system).await?;
+    let admitted = events
+        .turns(session_id)
+        .ok()
+        .and_then(|turns| turns.last().and_then(|turn| turn.loop_binding.clone()));
+    let binding = if let Some(admitted) = admitted {
+        if explicit_selection && !selected.metadata().equivalent_to(&admitted) {
+            bail!(
+                "agent loop binding change from `{}`@{} to `{}`@{} requires a new session",
+                admitted.profile,
+                admitted.revision,
+                selected.metadata().profile,
+                selected.metadata().revision
+            )
+        }
+        let path = agent_loop_cache_path(store_dir, &admitted.source_sha256)?;
+        let source = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "admitted agent loop source snapshot is missing at {}; resume requires the original binding",
+                path.display()
+            )
+        })?;
+        flux_agent::AgentLoopBinding::from_metadata_and_source(admitted, source)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+    } else {
+        selected
+    };
+    persist_agent_loop_source(store_dir, &binding)?;
+    Ok(binding)
+}
+
+#[cfg(test)]
+mod loop_binding_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resume_reconstructs_admitted_source_while_explicit_switch_requires_new_session() {
+        let root = std::env::temp_dir().join(format!(
+            "flux-loop-resume-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = root.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("first.flux"),
+            "flow first -> string\n  return \"first\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("second.flux"),
+            "flow second -> string\n  return \"second\"\n",
+        )
+        .unwrap();
+        let system = System::new(Workspace::new(&root).unwrap());
+        let events = EventStore::in_memory().unwrap();
+        let session = events.create_session("mock").unwrap();
+
+        let first = resolve_session_agent_loop_binding(
+            Some("first.flux"),
+            false,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let mut legacy_metadata = first.metadata().clone();
+        legacy_metadata.required_operations.reverse();
+        legacy_metadata.required_runtime_features.reverse();
+        let turn = events
+            .begin_turn_with_loop_binding(&session, "start", "mock", Some(legacy_metadata.clone()))
+            .unwrap();
+        events
+            .end_turn_with_loop_binding(
+                &session,
+                turn,
+                "ok",
+                1,
+                "done",
+                None,
+                Some(legacy_metadata),
+            )
+            .unwrap();
+
+        let explicitly_same = resolve_session_agent_loop_binding(
+            Some("first.flux"),
+            true,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        assert!(explicitly_same.metadata().equivalent_to(first.metadata()));
+
+        let resumed = resolve_session_agent_loop_binding(
+            Some("second.flux"),
+            false,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.metadata().equivalent_to(first.metadata()));
+        assert_eq!(resumed.source(), first.source());
+
+        let error = resolve_session_agent_loop_binding(
+            Some("second.flux"),
+            true,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires a new session"), "{error}");
+        std::fs::remove_dir_all(root).ok();
+    }
 }
 
 /// Register the model-facing operation packs onto the top-level registry, in the order that lets the
@@ -1621,6 +1857,77 @@ fn resolve_permissions(
     }
 }
 
+/// Pre-authorize the native Fleet main's own bounded durable census.
+///
+/// The operation is registered only after the explicit Fleet root has been validated and captures
+/// that root in its host-owned tool instance, so model input cannot widen this grant to another
+/// file or workspace. Operator-authored deny rules still win in [`PermissionManager::check`].
+fn preauthorize_attached_native_fleet_main(perms: &mut PermissionManager) {
+    for operation in super::board_fleet_cmd::native_fleet_main_read_operations() {
+        perms.add_allow(operation);
+    }
+    // `task` is safe to run without a prompt only on this specialized surface because the child
+    // registry below is independently reduced to read-only research operations before the spawner
+    // exists. An operator-authored deny remains authoritative.
+    perms.add_allow("task");
+}
+
+pub(super) fn install_native_fleet_main_tools(
+    registry: &mut ToolRegistry,
+    tools: Vec<Arc<dyn flux_runtime::Tool>>,
+) -> Result<()> {
+    for tool in tools {
+        let name = tool.spec().name;
+        if registry.get(&name).is_some() {
+            registry.replace_from_with_placement(
+                NATIVE_FLEET_MAIN_SOURCE,
+                tool,
+                flux_runtime::OperationPlacement::LocalControlPlane,
+            )?;
+        } else {
+            registry.try_register_from_with_placement(
+                NATIVE_FLEET_MAIN_SOURCE,
+                tool,
+                flux_runtime::OperationPlacement::LocalControlPlane,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod attached_native_fleet_permissions_tests {
+    use super::*;
+    use flux_runtime::PermDecision;
+
+    #[test]
+    fn attached_safe_reads_and_research_never_prompt_but_an_operator_deny_still_wins() {
+        let state = "/workspace/.flux/fleet/state.json".to_string();
+        let mut allowed = PermissionManager::new();
+        preauthorize_attached_native_fleet_main(&mut allowed);
+        assert_eq!(
+            allowed.check("fleet.agents", std::slice::from_ref(&state)),
+            PermDecision::Allow
+        );
+        assert_eq!(
+            allowed.check("board.next", &["/workspace".to_string()]),
+            PermDecision::Allow
+        );
+        assert_eq!(
+            allowed.check("fleet.schedule", &["/workspace".to_string()]),
+            PermDecision::Allow
+        );
+        assert_eq!(
+            allowed.check("task", &["scout".to_string()]),
+            PermDecision::Allow
+        );
+
+        let mut denied = PermissionManager::from_rules(&[], &["fleet.agents".to_string()]);
+        preauthorize_attached_native_fleet_main(&mut denied);
+        assert_eq!(denied.check("fleet.agents", &[state]), PermDecision::Deny);
+    }
+}
+
 /// The engine-assembly inputs produced by the middle of [`build_agent_with`]: the provider +
 /// executor + event store, plus the resolved model, prompt, evidence-gated groups, ambient signals,
 /// config-authored model stages, and the validated iteration cap.
@@ -1696,6 +2003,7 @@ async fn assemble_engine(
     flags: &AgentFlags,
     system: &System,
     store_dir: Option<&std::path::Path>,
+    session_id: &str,
 ) -> Result<FlowEngine> {
     let EngineParts {
         provider,
@@ -1714,6 +2022,19 @@ async fn assemble_engine(
         catalog_refresher,
     } = parts;
     let flow = open_flow_store_in(events.clone(), store_dir)?;
+    let agent_loop_binding = resolve_session_agent_loop_binding(
+        flags
+            .agent_loop
+            .as_deref()
+            .or(cfg.agent.loop_spec.as_deref()),
+        flags.agent_loop.is_some() || flags.resolved_loop_binding.is_some(),
+        flags.resolved_loop_binding.as_deref(),
+        system,
+        events.as_ref(),
+        session_id,
+        store_dir,
+    )
+    .await?;
     let spec = AgentSpec {
         model,
         profile: flux_agent::AgentProfile::Coding,
@@ -1725,14 +2046,8 @@ async fn assemble_engine(
         max_iterations,
         thinking: flags.think,
         effort: flags.effort.map(Into::into),
-        agent_loop: resolve_agent_loop(
-            flags
-                .agent_loop
-                .as_deref()
-                .or(cfg.agent.loop_spec.as_deref()),
-            system,
-        )
-        .await?,
+        agent_loop: agent_loop_binding.spec().clone(),
+        agent_loop_binding: Some(agent_loop_binding),
         groups,
         adaptive_policy: adaptive_loop_policy(flags, &cfg.agent)?,
         ambient_signals,
@@ -1789,6 +2104,17 @@ pub(super) async fn build_agent_with(
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
     location: Option<AgentBuildLocation>,
 ) -> Result<LiveAgentBuild> {
+    let attached_native_fleet_main = flags.native_fleet_main
+        || location
+            .as_ref()
+            .is_some_and(|location| location.fleet_main);
+    let attached_native_fleet_integrator = flags.native_fleet_integrator;
+    if attached_native_fleet_main && attached_native_fleet_integrator {
+        anyhow::bail!(
+            "validation/gate: an agent cannot attach as both the Fleet coordinator and the wave \
+             integrator; those catalogues are deliberately disjoint"
+        );
+    }
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = match location.as_ref() {
         Some(location) => location.workspace_root.clone(),
@@ -1845,6 +2171,12 @@ pub(super) async fn build_agent_with(
     let system = Arc::new(
         System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
     );
+    let fleet_research_loop = if attached_native_fleet_main {
+        let selection = super::board_fleet_cmd::configured_main_research_loop(&cwd)?;
+        Some(resolve_agent_loop(Some(&selection), system.as_ref()).await?)
+    } else {
+        None
+    };
     let selected_execution_system = resolve_selected_execution_system(flags, &system).await?;
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
@@ -1888,6 +2220,21 @@ pub(super) async fn build_agent_with(
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
     let mut child_base = ToolRegistry::new();
     flux_tools::try_register_builtins(&mut child_base)?;
+    if attached_native_fleet_main {
+        let ceiling = super::board_fleet_cmd::native_fleet_research_operation_ceiling();
+        let missing = ceiling
+            .iter()
+            .filter(|name| child_base.get(name).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "validation/gate: attached Fleet research ceiling names unavailable operations: {}",
+                missing.join(", ")
+            )
+        }
+        child_base = child_base.subset(Some(&ceiling));
+    }
     let factory: ProviderFactory = {
         let spec = model_spec.clone();
         Arc::new(move || provider_for(&spec).map_err(|e| flux_core::Error::Other(e.to_string())))
@@ -1896,7 +2243,7 @@ pub(super) async fn build_agent_with(
     // `SubAgents::into_spawner` builds the spawner; we register `TaskTool` into the top-level registry
     // below. Sub-agents inherit the same authorization floor as the top-level agent, and audit into
     // the shared event store by default (A-08) — each child gets its own correlated session stream.
-    let spawner: Arc<dyn flux_runtime::Spawner> =
+    let mut sub_agents =
         SubAgents::new(roles, child_base, factory, model.clone(), flags.max_tokens)
             .with_reasoning(flags.think, flags.effort.map(Into::into))
             .with_authorization_cell(policy.clone(), identity.clone())
@@ -1905,8 +2252,11 @@ pub(super) async fn build_agent_with(
             // before this, a sub-agent ran on an unbounded executor. Each child gets an independent
             // copy of these ceilings (same numbers, own concurrency budget); sharing one budget
             // across the delegation boundary deadlocks, see `ResourceLimits::independent_copy`.
-            .with_resource_limits(resource_limits.clone())
-            .into_spawner(system.clone());
+            .with_resource_limits(resource_limits.clone());
+    if let Some(agent_loop) = fleet_research_loop {
+        sub_agents = sub_agents.with_agent_loop(agent_loop);
+    }
+    let spawner: Arc<dyn flux_runtime::Spawner> = sub_agents.into_spawner(system.clone());
 
     // Tools + permissions: from config (deny/allow rules); if no allow rules are configured,
     // reads are pre-allowed by default so the common case needs no config. Mutating tools prompt
@@ -1958,6 +2308,26 @@ pub(super) async fn build_agent_with(
         &canonical_spec,
         &events,
     )?;
+    // An explicit Fleet-main attachment receives the native durable Fleet projection. Keep this
+    // out of ordinary CLI/TUI agents and out of story workers: `fleet.agents` reads admission state
+    // owned by the attached Fleet root, whereas the always-registered `fleet.worker_status` reads
+    // transient process workers owned by this one agent runtime.
+    if attached_native_fleet_main {
+        install_native_fleet_main_tools(
+            &mut registry,
+            super::board_fleet_cmd::native_fleet_main_tools(cwd.clone())?,
+        )?;
+    }
+
+    // The dedicated wave integrator carries a closed two-operation catalogue that is disjoint from
+    // the coordinator's. It is mutually exclusive with the coordinator attachment: one subprocess
+    // assembles a wave, another schedules work, and neither inherits the other's authority.
+    if attached_native_fleet_integrator {
+        install_native_fleet_main_tools(
+            &mut registry,
+            super::board_fleet_cmd::native_fleet_integrator_tools(cwd.clone())?,
+        )?;
+    }
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
@@ -2045,7 +2415,7 @@ pub(super) async fn build_agent_with(
     // unavailable binding leaves core Flux intact and advertises no Exchange operation; the
     // turn-boundary refresher retries and publishes only complete effective generations through
     // C-318's live catalogue.
-    let catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
+    let mut catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
         std::env::var("FLUX_EXCHANGE_URL").ok(),
         std::env::var("FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN").ok(),
     ) {
@@ -2149,11 +2519,54 @@ pub(super) async fn build_agent_with(
         );
     }
 
+    if attached_native_fleet_integrator {
+        let ceiling = super::board_fleet_cmd::native_fleet_integrator_operation_ceiling();
+        let missing = ceiling
+            .iter()
+            .filter(|name| registry.get(name).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "validation/gate: attached wave integrator ceiling names unavailable operations: {}",
+                missing.join(", ")
+            )
+        }
+        registry = registry.subset(Some(&ceiling));
+        model_stages.clear();
+        // Same reasoning as the coordinator below: a turn-boundary Exchange/plugin refresh must not
+        // widen a deliberately closed catalogue after assembly.
+        catalog_refresher = None;
+    }
+
+    if attached_native_fleet_main {
+        let ceiling = super::board_fleet_cmd::native_fleet_main_operation_ceiling();
+        let missing = ceiling
+            .iter()
+            .filter(|name| registry.get(name).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "validation/gate: attached Fleet main ceiling names unavailable operations: {}",
+                missing.join(", ")
+            )
+        }
+        registry = registry.subset(Some(&ceiling));
+        model_stages.clear();
+        // A turn-boundary Exchange/plugin refresh must not widen the deliberately closed
+        // coordinator catalog after assembly.
+        catalog_refresher = None;
+    }
+
     let ResolvedPermissions {
-        perms,
+        mut perms,
         approver,
         hooks,
     } = resolve_permissions(&cwd, &cfg, posture, approver_override);
+    if attached_native_fleet_main {
+        preauthorize_attached_native_fleet_main(&mut perms);
+    }
 
     let mut environment = assemble_cli_execution_environment(
         system.clone(),
@@ -2267,6 +2680,7 @@ pub(super) async fn build_agent_with(
         location
             .as_ref()
             .map(|location| location.store_dir.as_path()),
+        &session_id,
     )
     .await?;
     Ok((agent, session_id, canonical_spec, spawner, live_plugins))

@@ -64,13 +64,32 @@ decision_mode = "human" # or "auto"
 allow_ad_hoc_agents = true
 worktree_root = ".flux/fleet/worktrees"
 
+[loop_profiles.implementation]
+revision = "1"
+source = ".flux/fleet/loops/story-implementation.flux"
+entry = "work"
+
+[loop_profiles.research]
+revision = "1"
+source = ".flux/fleet/loops/research.flux"
+entry = "research"
+
+[loop_policy]
+implementation = "implementation"
+documentation = "implementation"
+maintenance = "implementation"
+research = "research"
+
 [main]
 instructions = ".flux/fleet/main.md"
 model = "codex/gpt-5.6-sol"
+loop = ".flux/fleet/loops/main-coordinator.flux"
+research_loop = ".flux/fleet/loops/research.flux"
 
 [[agent_templates]]
 id = "story-worker"
 role = "writer"
+task_kind = "implementation"
 instructions = ".flux/fleet/agents/story-worker.md"
 model = "codex/gpt-5.6-sol"
 mode = "write"
@@ -95,9 +114,17 @@ gate = ["npm", "test"]
 
 Instruction paths are confined under the fleet root. Validation rejects duplicate/reserved ids,
 another coordinator role, invalid instance limits, overlapping roots, missing boards, invalid refs,
-and unsupported fields. Board validation separately rejects program dependency cycles,
+missing task-kind loop policy, unsupported loop runtime features, loop operations outside the
+template's capability ceiling, and unsupported fields. Board validation separately rejects program dependency cycles,
 cross-repository configured waves, or a wave over ten. Refresh and other read commands report
 dirty, stale, or diverged checkouts without fetching or modifying them.
+
+Fleet workers do not use the coordinator's loop and do not fall back to the general adaptive loop.
+Each template declares a `task_kind`; `[loop_policy]` maps that kind to an operator-authored
+`[loop_profiles.*]` binding. Admission validates the exact source and snapshots it with bounded
+profile/revision/digest metadata in the worker's fenced runtime directory. Message, restart, resume
+and rework reconstruct that snapshot, so later config or file edits affect new workers only. A new
+admission/session is required to change a live worker's loop.
 
 ### Configuration is not state
 
@@ -148,6 +175,21 @@ views; wide terminals also show an attention rail. Typed requirements are journa
 accepted, delivered, and completed/failed acknowledgement states. A stopped Fleet is observable but
 cannot accept input. See the [TUI guide](../agent/tui.md#board-and-fleet-operations) for navigation,
 decision confirmation, restart behavior, and the deliberately narrow mutation boundary.
+
+The attached main agent has a closed coordinator catalog: typed `board.*` operations for showing,
+checking, selecting and updating authoritative work; typed `fleet.*` operations for bounded status,
+schedule, complete worker enumeration, run, message, cancel and resume; and `task` for bounded
+read-only research. It does not receive shell, editing, git mutation, web/plugin, eval, pane, or the
+legacy transient-process Fleet operations. `fleet.agents` reads the same durable admissions shown by
+the Workers view and `flux fleet agents`, so the coordinator can discover ids before acting. Safe
+Board/Fleet reads are pre-authorized unless an operator-authored deny rule wins. A `task` child has
+its own read-only catalog and cannot inherit coordinator mutations or delegate again.
+
+`[main].loop` and `[main].research_loop` are required. Each free-form coordinator turn runs the
+first operator-authored Flux-Lang loop with only the current request and the closed coordinator
+catalog. Every `task` child runs the second operator-authored loop over its independent read-only
+catalog. Neither path falls back to the general adaptive intent/explore, `create_plan`, or
+retained-history budget path. Missing or invalid loop configuration refuses before a model call.
 
 The main agent plans against revisioned context rather than an untracked system prompt:
 
@@ -423,13 +465,34 @@ flux fleet note "Candidate preserved while CI is unavailable" --output json
 flux fleet dashboard --output json
 ```
 
+`flux fleet agents` lists every durable worker as a bounded summary: id, role, task kind, status,
+Board ref, wave, session and resolved loop identity. It never returns worker instructions or full
+historical turn receipts; use a targeted inspect view when deeper evidence is needed.
+
+`flux fleet status` and `dashboard` use the same bounded operational projection. They report current
+coordinator, worker, wave, Board-ref, session, repository and attention state without copying
+answers, tool events or intake bodies from durable receipts. The response names the targeted
+`inspect worker|wave|activity|snapshot` command for deeper evidence; terminal workers are not made
+active or attention-worthy merely because an older receipt or error said otherwise.
+
+Targeted inspection has a fixed structural byte ceiling in addition to its `--limit` item bound.
+Small terminal identity, status, outcome and session fields are retained first. Oversized strings,
+event collections, handoffs or reviews become indexed omission records that report the source path
+and reason; string omissions also report encoded size and digest, while collection omissions report
+kept and omitted counts. Structured JSON is never sliced into an invalid fragment.
+
 Events are redacted before persistence, not merely at display time. The corpus covers credentials,
 `.env`, key files, model commentary, commands, diffs, and JSON fields. Follow mode emits NDJSON so
 an agent does not parse terminal decoration.
 
 Fleet also bounds evidence before the supervisor retains it. Adaptive tool results larger than
 64 KiB become payload-free omission records; accumulated adaptive message history refuses above
-512 KiB and a complete provider request refuses above 1 MiB. Child NDJSON lines are limited to
+512 KiB and a complete provider request refuses above 1 MiB. An operator-authored `ai_segment` is
+bounded differently, because a long implementation loop accumulates many in-budget results and may
+already have committed by the time it reaches the ceiling: crossing its history budget sheds the
+oldest tool-result payloads into digest receipts and continues, and if elision cannot free enough the
+segment returns its evidence ledger as a result rather than failing the turn. Author
+`max_history_bytes` on the segment to raise that ceiling. Child NDJSON lines are limited to
 240 KiB (including the newline), below the 256 KiB parser boundary. An oversized nonterminal event
 becomes `event_omitted`; an oversized `turn_end` keeps its session, outcome, usage and cost while its
 answer/error payload becomes `payload_omitted`. `turn.budget`, `model.call` and the Fleet receipt's

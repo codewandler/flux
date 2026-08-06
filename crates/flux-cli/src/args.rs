@@ -136,6 +136,16 @@ pub(super) struct AgentFlags {
     #[arg(long = "loop", value_name = "ADAPTIVE|FILE")]
     pub(super) agent_loop: Option<String>,
 
+    /// Internal source-free receipt for a snapshotted `--loop`. Fleet uses this to reconstruct the
+    /// exact admitted binding on message/resume/rework; ordinary callers should select `--loop`.
+    #[arg(
+        long = "resolved-loop-binding",
+        value_name = "FILE",
+        hide = true,
+        requires = "agent_loop"
+    )]
+    pub(super) resolved_loop_binding: Option<String>,
+
     /// Maximum tokens per model-stage call. A truncated intent, exploration, repair, or presentation
     /// stage fails loudly rather than silently stopping. Zero would fail at the provider, so it is
     /// rejected at parse time.
@@ -237,6 +247,18 @@ pub(super) struct AgentFlags {
     #[arg(long)]
     pub(super) resume: bool,
 
+    /// Host-owned exact session continuation. Fleet uses this instead of "latest" because the
+    /// coordinator's correlated research children intentionally share its audit store and may be
+    /// newer sessions than the coordinator itself.
+    #[arg(
+        long = "resume-session",
+        value_name = "SESSION",
+        hide = true,
+        conflicts_with_all = ["continue_", "resume"],
+        requires = "operation_ceiling"
+    )]
+    pub(super) resume_session: Option<String>,
+
     /// Host-owned marker for an exact operation ceiling. Fleet supplies this only to admitted
     /// worker subprocesses; ordinary CLI users should declare capabilities in authored programs.
     #[arg(long = "operation-ceiling", hide = true)]
@@ -251,6 +273,17 @@ pub(super) struct AgentFlags {
         requires = "operation_ceiling"
     )]
     pub(super) admitted_operations: Vec<String>,
+
+    /// Host-owned marker for the durable native Fleet main coordinator subprocess. This selects a
+    /// closed native Board/Fleet catalog; it is not a general user capability flag.
+    #[arg(long = "native-fleet-main", hide = true)]
+    pub(super) native_fleet_main: bool,
+
+    /// Host-owned marker for the dedicated wave-integrator subprocess. This selects a closed
+    /// two-operation catalog (assemble a wave, read Fleet status) that is disjoint from the
+    /// coordinator's; it is not a general user capability flag.
+    #[arg(long = "native-fleet-integrator", hide = true)]
+    pub(super) native_fleet_integrator: bool,
 
     /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
     #[arg(long)]
@@ -1542,6 +1575,9 @@ pub(super) fn adaptive_loop_policy(
             .unwrap_or(flux_flow::DEFAULT_ADAPTIVE_MODEL_CALLS),
         intent: adaptive_stage_policy("intent", &config.adaptive.intent)?,
         explore: adaptive_stage_policy("explore", &config.adaptive.explore)?,
+        // Only an authored `ai_segment` may raise the retained-history ceiling; an ordinary adaptive
+        // turn keeps the fixed default.
+        max_history_bytes: None,
     })
 }
 

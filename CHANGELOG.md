@@ -28,6 +28,23 @@ All notable changes to this project are documented in this file. The format is b
   Fleet-apply, cleanup, and capacity changes remain outside the TUI. Desired/draining capacity is
   shown as unavailable until canonical Fleet state carries it.
 
+- **The attached Fleet main now has a closed coordinator runtime instead of an ordinary coding
+  agent catalog** (C-556). Fleet config binds an explicit operator-authored Flux-Lang loop; each
+  turn supplies only the current request and a bounded native Board/Fleet catalog, bypassing the
+  generic intent/explore and retained-history budget path. The parent can manage Board and Fleet
+  state or start one `task`; that child uses a separately configured host-authored loop and an
+  independently closed read-only research catalog with no generic `create_plan`, shell, edit,
+  git-write, Board/Fleet mutation or nested delegation authority. Missing or invalid main/research
+  loop config refuses at startup instead of silently widening behavior.
+
+- **Every runnable agent now has a resolved, versioned loop binding** (C-569). General omission
+  resolves to the explicit `adaptive@1` preset; CLI/SDK, role, nested-task, app and served starts all
+  cross the same validation boundary. Start, status, stream and terminal receipts carry bounded
+  profile/revision/source-digest/runner metadata, while resume reconstructs digest-addressed source
+  and refuses a live-session switch. Fleet task kinds resolve through operator-authored loop policy,
+  validate against the admitted capability ceiling, and snapshot exact source for message, restart,
+  resume and rework. `fleet.run` receipts now also return admitted worker ids and wave linkage.
+
 ### Changed
 
 - **Board and Fleet public docs now define the complete domain model.** Concepts appears before
@@ -38,6 +55,61 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **An authored segment that reaches its history ceiling no longer destroys the turn** (C-595).
+  A Fleet story worker committed its complete deliverable and then had the whole turn discarded by a
+  retained-history budget it crossed by 0.43%, so Fleet reported the one story that actually
+  delivered as the wave's only failure. Crossing the ceiling in an authored `ai_segment` now sheds
+  the oldest tool-result payloads into `tool_result_omitted` digest receipts — the same shape an
+  oversized single result already used — and keeps running with the most recent exchange verbatim.
+  When elision cannot free enough, the segment returns its evidence ledger as a result instead of an
+  error. `ai_segment` accepts `max_history_bytes` to raise the ceiling for a long implementation
+  loop. Ordinary adaptive turns are unchanged.
+- **A failed worker turn now records the session and receipt it already proved** (C-595). The turn's
+  parsed session id and event stream — including any commit the loop made before it failed — were
+  read successfully and then discarded, leaving a `failed` worker with no discoverable deliverable
+  and no `fleet rework` re-dispatch (that path requires a recorded runtime session). Both are now
+  persisted on the failure path alongside the error.
+- **An operator-authored `ai_segment` now runs with the exact tool ceiling it declares** (C-593).
+  The adaptive intent router's four-family cap bounds what the *model* may select; it was also
+  applied to the deterministic family union an authored `tools:` ceiling expands to, so any authored
+  loop spanning five or more families failed before its first tool call with `adaptive capability
+  declaration selected N distinct families; the maximum is 4`. A Fleet story-implementation loop
+  naming read, write, git, shell, datasource and system operations could never start a worker. The
+  cap now applies only to a model-declared selection; the independent operation-count and
+  schema-character budgets still bound both paths, and an adaptive state serialized by an older
+  runtime still resumes capped.
+- Workspace-root errors now name the offending path. `Workspace::new` and `Workspace::with_root`
+  reported a bare `workspace root: No such file or directory` while `Workspace::new_optional`
+  already named its path, leaving failures reached through `System::rerooted` with nothing to go on.
+- `flux fleet status` and `dashboard` now return the bounded `flux.fleet-status/v1` operational
+  projection instead of embedding durable `last_turn` receipts, tool events, answers and intake
+  bodies. Current lifecycle state—not stale receipt text—drives active and attention counts, and
+  terminal cancelled/completed workers no longer keep old errors in the attention rail. The compact
+  response keeps exact worker, wave, Board ref, session and repository identity plus targeted
+  inspect commands for deeper evidence. Targeted Fleet inspection is bounded too: a 256 KiB
+  structural response ceiling preserves terminal facts and replaces oversized evidence with
+  indexed omission metadata referencing Fleet state or the event journal, including digests for
+  omitted strings.
+- Structured JSON tool results are now redacted as JSON values before reserialization. A
+  credential-shaped substring inside an escaped model-stage state can no longer consume an escape,
+  invalidate the object, and make an authored loop see its typed result as opaque text; results that
+  need no redaction remain byte-for-byte unchanged.
+- An agent attached through `flux tui --fleet` can now enumerate durable native Fleet workers with
+  the bounded `fleet.agents` operation instead of asking the operator to supply guessed worker ids.
+  The attachment-only read uses the same state as `flux fleet agents` and the Workers view and stays
+  distinct from the pointwise transient-process `fleet.worker_status` operation. Both census paths
+  return role, task kind and resolved loop identity without embedding instructions or historical
+  turn receipts. The validated attachment pre-authorizes this bounded census, while an
+  operator-authored deny still wins.
+- Fleet-main Board/Fleet reads now use bounded native projections and require no approval. In
+  particular, `fleet.status` reads the compact inspect snapshot rather than serializing historical
+  worker turns and waves into the model context. Typed mutations retain revision, idempotency and
+  acknowledgement guards, and the installed catalog cannot refresh back into general coding,
+  plugin, pane, eval or transient-process operations between turns.
+- Durable loop bindings now canonicalize the set-valued required-operation and runtime-feature
+  fields at every reconstruction and live-session comparison. Sessions admitted by an older build
+  resume when only insertion order differs, while source, digest, profile, revision, runner and
+  entry-point drift still require an explicit new session.
 - Fleet-attached TUI startup and refresh now build Board/Fleet projections away from the terminal
   event loop. A cheap durable-state token avoids redundant rebuilds, explicit loading/unavailable
   states replace a frozen screen, and a failed later refresh keeps the last-good view marked stale.
