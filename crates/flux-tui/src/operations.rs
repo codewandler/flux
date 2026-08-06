@@ -5,6 +5,9 @@
 //! `flux board` and `flux fleet`; this crate never parses repository Markdown, shells out, reads
 //! tmux, or captures ANSI output.
 
+use std::cmp::Ordering;
+use std::iter::Peekable;
+use std::str::Chars;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,6 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use crate::{truncate, ChatState, Theme};
 
@@ -394,6 +398,303 @@ impl OperationsState {
     }
 }
 
+/// Terminal rows one collapsed Board box occupies: top border, one content row, bottom border.
+pub(crate) const BOARD_BOX_ROWS: usize = 3;
+
+/// One status group of the Board pane, as a span over [`BoardPane`]'s ordering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoardGroup {
+    pub status: String,
+    pub start: usize,
+    pub len: usize,
+}
+
+/// A grouped, priority-ordered *index* over the snapshot's Board items.
+///
+/// Only indices are materialized — one `usize` per item, never a box — and boxes are formatted for
+/// the visible window alone. The board carries >1000 items, so eager construction of a box per item
+/// would be paid on every frame.
+pub(crate) struct BoardPane<'a> {
+    items: &'a [BoardItemView],
+    order: Vec<usize>,
+    groups: Vec<BoardGroup>,
+}
+
+impl<'a> BoardPane<'a> {
+    pub(crate) fn new(items: &'a [BoardItemView]) -> Self {
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        order.sort_by(|left, right| {
+            let left = &items[*left];
+            let right = &items[*right];
+            story_status_order(&left.status)
+                .cmp(&story_status_order(&right.status))
+                // Statuses the Board CLI does not rank still group together rather than interleave.
+                .then_with(|| left.status.cmp(&right.status))
+                // `board next` order inside a group: ascending priority, unprioritized work last,
+                // then natural id order so `C-99` precedes `C-100`.
+                .then_with(|| {
+                    left.priority
+                        .unwrap_or(i64::MAX)
+                        .cmp(&right.priority.unwrap_or(i64::MAX))
+                })
+                .then_with(|| natural_ref_cmp(&left.board_ref, &right.board_ref))
+        });
+        let mut groups: Vec<BoardGroup> = Vec::new();
+        for (position, index) in order.iter().enumerate() {
+            let status = items[*index].status.as_str();
+            match groups.last_mut() {
+                Some(group) if group.status == status => group.len += 1,
+                _ => groups.push(BoardGroup {
+                    status: status.to_string(),
+                    start: position,
+                    len: 1,
+                }),
+            }
+        }
+        Self {
+            items,
+            order,
+            groups,
+        }
+    }
+
+    /// The item at `position` in board order, not in snapshot order.
+    pub(crate) fn item(&self, position: usize) -> Option<&'a BoardItemView> {
+        self.order.get(position).map(|index| &self.items[*index])
+    }
+
+    /// First terminal row of the box at `position`, counting the group headings above it.
+    fn row_of(&self, position: usize) -> usize {
+        let headings = self
+            .groups
+            .iter()
+            .take_while(|group| group.start <= position)
+            .count();
+        headings + position * BOARD_BOX_ROWS
+    }
+
+    /// Scroll so the selected box is fully visible; selection is the only paging state the pane
+    /// needs, so a refresh cannot leave the viewport somewhere the operator never scrolled to.
+    fn first_visible_row(&self, selected: usize, height: usize) -> usize {
+        if selected >= self.order.len() {
+            return 0;
+        }
+        let bottom = self.row_of(selected) + BOARD_BOX_ROWS;
+        bottom.saturating_sub(height)
+    }
+
+    /// Render at most `height` rows: group headings plus the collapsed boxes that intersect the
+    /// viewport. Items above or below it cost index arithmetic only.
+    pub(crate) fn window_lines(
+        &self,
+        selected: usize,
+        snapshot: &FleetBoardSnapshot,
+        theme: &Theme,
+        width: usize,
+        height: usize,
+    ) -> Vec<Line<'static>> {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if width == 0 || height == 0 {
+            return lines;
+        }
+        let first = self.first_visible_row(selected, height);
+        let mut row = 0usize;
+        'groups: for group in &self.groups {
+            if row >= first {
+                if lines.len() >= height {
+                    break 'groups;
+                }
+                lines.push(group_heading(&group.status, group.len, theme, width));
+            }
+            row += 1;
+            let skipped = if first > row {
+                ((first - row) / BOARD_BOX_ROWS).min(group.len)
+            } else {
+                0
+            };
+            row += skipped * BOARD_BOX_ROWS;
+            for position in (group.start + skipped)..(group.start + group.len) {
+                if lines.len() >= height {
+                    break 'groups;
+                }
+                let top = row;
+                row += BOARD_BOX_ROWS;
+                let item = &self.items[self.order[position]];
+                let wave = fleet_wave_in_flight(snapshot, &item.board_ref);
+                let collapsed =
+                    collapsed_box(item, wave.as_deref(), position == selected, theme, width);
+                for (offset, line) in collapsed.into_iter().enumerate() {
+                    if top + offset < first {
+                        continue;
+                    }
+                    if lines.len() >= height {
+                        break 'groups;
+                    }
+                    lines.push(line);
+                }
+            }
+        }
+        lines
+    }
+}
+
+/// Status group order, mirroring the Board projection's own ranking.
+fn story_status_order(status: &str) -> u8 {
+    match status {
+        "in-progress" => 0,
+        "ready" => 1,
+        "blocked" => 2,
+        "backlog" => 3,
+        "done" => 4,
+        _ => 5,
+    }
+}
+
+/// Compare digit runs numerically so `flux/C-99` sorts ahead of `flux/C-100`, matching the natural
+/// id tiebreak `board next` applies after priority.
+fn natural_ref_cmp(left: &str, right: &str) -> Ordering {
+    fn digits(chars: &mut Peekable<Chars<'_>>) -> u128 {
+        let mut value: u128 = 0;
+        while let Some(digit) = chars.peek().and_then(|c| c.to_digit(10)) {
+            value = value.saturating_mul(10).saturating_add(u128::from(digit));
+            chars.next();
+        }
+        value
+    }
+    let mut left = left.chars().peekable();
+    let mut right = right.chars().peekable();
+    loop {
+        match (left.peek().copied(), right.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(a), Some(b)) if a.is_ascii_digit() && b.is_ascii_digit() => {
+                match digits(&mut left).cmp(&digits(&mut right)) {
+                    Ordering::Equal => {}
+                    other => return other,
+                }
+            }
+            (Some(a), Some(b)) => match a.cmp(&b) {
+                Ordering::Equal => {
+                    left.next();
+                    right.next();
+                }
+                other => return other,
+            },
+        }
+    }
+}
+
+/// Whether the Fleet currently has this Board item in flight, and under which wave.
+///
+/// Only Fleet state answers this: a live worker's assignment, or membership of the active wave
+/// (which the projection already filters to in-flight statuses). A Board status of `in-progress` is
+/// not evidence that anything is running right now.
+fn fleet_wave_in_flight(snapshot: &FleetBoardSnapshot, board_ref: &str) -> Option<String> {
+    let working = snapshot.workers.iter().find(|worker| {
+        worker.board_ref.as_deref() == Some(board_ref)
+            && matches!(worker.status.as_str(), "working" | "running" | "active")
+    });
+    if let Some(worker) = working {
+        return Some(
+            worker
+                .wave
+                .clone()
+                .unwrap_or_else(|| "in flight".to_string()),
+        );
+    }
+    let wave = snapshot.active_wave.as_ref()?;
+    wave.items
+        .iter()
+        .any(|item| item == board_ref)
+        .then(|| wave.id.clone())
+}
+
+fn group_heading(status: &str, count: usize, theme: &Theme, width: usize) -> Line<'static> {
+    Line::styled(
+        truncate(&format!("{status} · {count} item(s)"), width),
+        theme.accent_style().add_modifier(Modifier::BOLD),
+    )
+}
+
+/// One collapsed item: a bordered box carrying id, status, priority, title, and — when Fleet state
+/// says so — the in-flight wave. Nothing else, so the count of items on screen stays the point.
+fn collapsed_box(
+    item: &BoardItemView,
+    wave: Option<&str>,
+    selected: bool,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(2);
+    let selected_style = Style::default()
+        .fg(theme.accent)
+        .bg(theme.sel_bg)
+        .add_modifier(Modifier::BOLD);
+    let border = if selected {
+        selected_style
+    } else {
+        theme.muted_style()
+    };
+    let head = if selected {
+        selected_style
+    } else {
+        theme.accent_style()
+    };
+    let body = if selected {
+        selected_style
+    } else {
+        theme.panel_style()
+    };
+    let flight = if selected {
+        selected_style
+    } else {
+        theme.warn_style()
+    };
+
+    let label = truncate(
+        &format!(
+            " {} · {} · {} ",
+            item.board_ref,
+            item.status,
+            item.priority
+                .map_or_else(|| "p—".to_string(), |value| format!("p{value}"))
+        ),
+        inner,
+    );
+    let marker = wave
+        .map(|wave| truncate(&format!("◆ {wave} "), inner.saturating_sub(label.width())))
+        .filter(|marker| !marker.is_empty());
+    let fill = inner
+        .saturating_sub(label.width())
+        .saturating_sub(marker.as_deref().map_or(0, UnicodeWidthStr::width));
+
+    let mut top = vec![Span::styled("┌", border), Span::styled(label, head)];
+    if fill > 0 {
+        top.push(Span::styled("─".repeat(fill), border));
+    }
+    if let Some(marker) = marker {
+        top.push(Span::styled(marker, flight));
+    }
+    top.push(Span::styled("┐", border));
+
+    let title = truncate(&item.title, inner.saturating_sub(2));
+    let pad = inner.saturating_sub(title.width() + 1);
+    vec![
+        Line::from(top),
+        Line::from(vec![
+            Span::styled("│", border),
+            Span::styled(format!(" {title}{}", " ".repeat(pad)), body),
+            Span::styled("│", border),
+        ]),
+        Line::from(vec![
+            Span::styled("└", border),
+            Span::styled("─".repeat(inner), border),
+            Span::styled("┘", border),
+        ]),
+    ]
+}
+
 pub(crate) fn split_chat_area(area: Rect, state: &ChatState) -> (Rect, Option<Rect>) {
     if state.operations.is_none() || area.width < ATTENTION_RAIL_MIN_FRAME {
         return (area, None);
@@ -625,14 +926,24 @@ pub(crate) fn render_overlay(frame: &mut Frame, state: &ChatState) {
         ]),
         chunks[0],
     );
-    let lines = overlay_lines(ops, &state.theme, chunks[1].width as usize);
+    let lines = overlay_lines(
+        ops,
+        &state.theme,
+        chunks[1].width as usize,
+        chunks[1].height as usize,
+    );
     frame.render_widget(
         Paragraph::new(lines).style(state.theme.panel_style()),
         chunks[1],
     );
 }
 
-fn overlay_lines(ops: &OperationsState, theme: &Theme, width: usize) -> Vec<Line<'static>> {
+fn overlay_lines(
+    ops: &OperationsState,
+    theme: &Theme,
+    width: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     if matches!(
         ops.projection_status,
         ProjectionStatus::Loading | ProjectionStatus::Error
@@ -664,31 +975,18 @@ fn overlay_lines(ops: &OperationsState, theme: &Theme, width: usize) -> Vec<Line
         .fg(theme.accent)
         .bg(theme.sel_bg)
         .add_modifier(Modifier::BOLD);
+    // Rows the ack/stale trailer claims below the list, so the Board pane pages within what is left.
+    let trailer =
+        usize::from(ops.last_ack.is_some()) * 2 + usize::from(ops.refresh_error.is_some());
     let mut rows = match ops.tab {
         OperationsTab::Overview => overview_lines(ops, theme, width),
-        OperationsTab::Board => ops
-            .snapshot
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let text = format!(
-                    " {} {:<11} {:<22} {}",
-                    if index == ops.selected { "▸" } else { " " },
-                    item.status,
-                    item.board_ref,
-                    item.title
-                );
-                Line::styled(
-                    truncate(&text, width),
-                    if index == ops.selected {
-                        selected_style
-                    } else {
-                        theme.panel_style()
-                    },
-                )
-            })
-            .collect(),
+        OperationsTab::Board => BoardPane::new(&ops.snapshot.items).window_lines(
+            ops.selected,
+            &ops.snapshot,
+            theme,
+            width,
+            height.saturating_sub(trailer),
+        ),
         OperationsTab::Workers => ops
             .snapshot
             .workers
@@ -951,7 +1249,10 @@ fn detail_lines(ops: &OperationsState, theme: &Theme, width: usize) -> Vec<Line<
     match ops.tab {
         OperationsTab::Overview => return overview_lines(ops, theme, width),
         OperationsTab::Board => {
-            let Some(item) = ops.snapshot.items.get(ops.selected) else {
+            // Detail resolves through the same board order the pane paints, so Enter opens the
+            // box the operator selected rather than a snapshot-order neighbour.
+            let pane = BoardPane::new(&ops.snapshot.items);
+            let Some(item) = pane.item(ops.selected) else {
                 return lines;
             };
             lines.extend([
@@ -1435,5 +1736,159 @@ mod tests {
         assert!(overlay.contains("workspace/D-7"), "{overlay}");
         assert!(overlay.contains("Which review posture"), "{overlay}");
         assert!(overlay.contains("open"), "{overlay}");
+    }
+
+    /// A fixture board whose input order deliberately contradicts the board order the pane owes:
+    /// status groups first, then ascending priority, then natural id order inside a group.
+    fn grouped_board_snapshot() -> FleetBoardSnapshot {
+        fn item(board_ref: &str, status: &str, priority: Option<i64>) -> BoardItemView {
+            BoardItemView {
+                board_ref: board_ref.into(),
+                title: format!("collapsed box for {board_ref}"),
+                status: status.into(),
+                priority,
+                dependencies: Vec::new(),
+                design: None,
+                epic: None,
+            }
+        }
+        let mut value = snapshot();
+        value.items = vec![
+            item("flux/C-31", "done", Some(3)),
+            item("flux/C-100", "ready", Some(20)),
+            item("flux/C-7", "ready", None),
+            item("flux/C-43", "in-progress", Some(6)),
+            item("flux/C-620", "blocked", Some(1)),
+            item("flux/C-99", "ready", Some(20)),
+            item("flux/C-8", "backlog", Some(2)),
+            item("flux/C-42", "in-progress", Some(5)),
+            item("flux/C-11", "ready", Some(10)),
+        ];
+        value.items_total = value.items.len();
+        // Fleet state, not the Board, says what is in flight: only C-42 is a member of the wave.
+        value.active_wave = Some(FleetWaveView {
+            id: "wave-7".into(),
+            status: "working".into(),
+            items: vec!["flux/C-42".into()],
+        });
+        value
+    }
+
+    fn board_pane_screen(snapshot: FleetBoardSnapshot, width: u16, height: u16) -> String {
+        let mut state = ChatState::new("mock".into());
+        let mut ops = OperationsState::new(snapshot);
+        ops.open = true;
+        ops.tab = OperationsTab::Board;
+        state.operations = Some(ops);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::render(frame, &state)).unwrap();
+        screen(&terminal)
+    }
+
+    #[test]
+    fn board_pane_groups_by_status_and_orders_by_priority() {
+        let content = board_pane_screen(grouped_board_snapshot(), 96, 44);
+        let at = |needle: &str| {
+            content
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing from\n{content}"))
+        };
+
+        // Collapsed items are bordered boxes, not table rows.
+        assert!(content.contains('┌'), "{content}");
+        assert!(content.contains('└'), "{content}");
+
+        // Group order first: in-progress, ready, blocked, backlog, done. Blocked C-620 carries the
+        // lowest priority on the board and still sorts behind every ready item.
+        // Inside the ready group the order is `board next` order: priority ascending, then natural
+        // id order, so C-99 precedes C-100 and the unprioritized C-7 sorts last.
+        for (earlier, later) in [
+            ("flux/C-42", "flux/C-43"),
+            ("flux/C-43", "flux/C-11"),
+            ("flux/C-11", "flux/C-99"),
+            ("flux/C-99", "flux/C-100"),
+            ("flux/C-100", "flux/C-7"),
+            ("flux/C-7", "flux/C-620"),
+            ("flux/C-620", "flux/C-8"),
+            ("flux/C-8", "flux/C-31"),
+        ] {
+            assert!(
+                at(earlier) < at(later),
+                "{earlier} before {later}\n{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn board_pane_collapsed_box_shows_id_title_status_priority_and_fleet_wave_marker() {
+        let content = board_pane_screen(grouped_board_snapshot(), 96, 44);
+
+        assert!(content.contains("flux/C-11 · ready · p10"), "{content}");
+        assert!(content.contains("collapsed box for flux/C-11"), "{content}");
+        // No priority renders as an explicit gap rather than a guess.
+        assert!(content.contains("flux/C-7 · ready · p—"), "{content}");
+
+        // The in-flight marker is Fleet-sourced: C-42 is a wave member, C-43 shares its
+        // `in-progress` Board status and is not marked.
+        assert_eq!(content.matches("◆ wave-7").count(), 1, "{content}");
+        let marker = content
+            .lines()
+            .find(|line| line.contains("◆ wave-7"))
+            .unwrap_or_else(|| panic!("no marked box in\n{content}"));
+        assert!(marker.contains("flux/C-42"), "{content}");
+    }
+
+    fn pane_text(lines: &[Line<'_>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn board_pane_pages_a_board_far_larger_than_the_viewport() {
+        let mut value = snapshot();
+        value.items = (0..1_200)
+            .map(|index| BoardItemView {
+                board_ref: format!("flux/C-{index}"),
+                title: format!("item {index:04}"),
+                status: if index % 2 == 0 { "ready" } else { "backlog" }.into(),
+                priority: Some(index),
+                dependencies: Vec::new(),
+                design: None,
+                epic: None,
+            })
+            .collect();
+        value.items_total = value.items.len();
+        let state = ChatState::new("mock".into());
+        let pane = BoardPane::new(&value.items);
+        assert_eq!(pane.order.len(), 1_200);
+        assert_eq!(
+            pane.groups
+                .iter()
+                .map(|group| (group.status.as_str(), group.len))
+                .collect::<Vec<_>>(),
+            vec![("ready", 600), ("backlog", 600)]
+        );
+
+        // A 24-row viewport builds 24 rows, not 1200 boxes.
+        let head = pane.window_lines(0, &value, &state.theme, 80, 24);
+        assert_eq!(head.len(), 24, "the viewport bounds the rows built");
+        let head_text = pane_text(&head);
+        assert!(head_text.contains("item 0000"), "{head_text}");
+        assert!(!head_text.contains("item 0100"), "{head_text}");
+
+        // Selecting deep into the board pages to it rather than materializing everything above.
+        let deep = pane.window_lines(400, &value, &state.theme, 80, 24);
+        assert_eq!(deep.len(), 24);
+        let deep_text = pane_text(&deep);
+        assert!(deep_text.contains("item 0800"), "{deep_text}");
+        assert!(!deep_text.contains("item 0000"), "{deep_text}");
     }
 }

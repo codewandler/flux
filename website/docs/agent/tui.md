@@ -56,10 +56,16 @@ assignment, session, worktree, handoff, review, rework, activity, and error evid
 say `unavailable`. Capacity distinguishes configured, desired, active, draining, and registered;
 desired/draining likewise remain unavailable until the Fleet's durable state records them.
 
-The Board view includes ready, active, blocked, and completed stories, dependencies, linked planning
-documents, decision lifecycles, and the exact `flux.board-stats/v1` ratios/history used by
-`flux board stats`. Lists and text are bounded before rendering; a refresh error keeps the last good
-snapshot and marks it stale instead of inventing an empty Fleet.
+The Board view renders each item as a collapsed bordered box carrying only its id, title, status,
+and priority, grouped by status and ordered by ascending priority inside a group — the same order
+`flux board next` returns for ready work. A box whose item the Fleet has in flight is additionally
+marked `◆ <wave>`; that marker comes from Fleet state (a live worker's assignment or active-wave
+membership), never from the Board's own status. Only the boxes the viewport shows are built, so a
+board of a thousand-plus items pages to the selection instead of rendering every box. The view also
+includes ready, active, blocked, and completed stories, dependencies, linked planning documents,
+decision lifecycles, and the exact `flux.board-stats/v1` ratios/history used by `flux board stats`.
+Lists and text are bounded before rendering; a refresh error keeps the last good snapshot and marks
+it stale instead of inventing an empty Fleet.
 
 Conversation input is durably acknowledged as `accepted`, `delivered`, then `completed` or `failed`.
 Those recent acknowledgements reconstruct after restart together with the main transcript. Viewing
