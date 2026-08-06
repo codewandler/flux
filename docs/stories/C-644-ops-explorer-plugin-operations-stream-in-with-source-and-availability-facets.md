@@ -2,11 +2,12 @@
 id: C-644
 title: "Ops explorer: plugin operations stream in, with source and availability facets"
 pillar: "Core"
-status: backlog
+status: ready
 epic: ops-explorer
 areas: [flux-tui, flux-cli]
 design: docs/designs/operations-explorer-epic.md
 note: "depends on C-643 landing; do not dispatch in the same wave as C-643"
+priority: 36
 ---
 
 # Ops explorer: plugin operations stream in, with source and availability facets

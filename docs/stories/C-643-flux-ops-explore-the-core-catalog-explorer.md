@@ -2,11 +2,12 @@
 id: C-643
 title: "flux ops --explore: the core catalog explorer"
 pillar: "Core"
-status: backlog
+status: ready
 epic: ops-explorer
 areas: [flux-tui, flux-cli]
 design: docs/designs/operations-explorer-epic.md
 note: "iteration 1: Google-like start screen, node-constellation pictogram, fuzzy search, category filter, docs links"
+priority: 8
 ---
 
 # flux ops --explore: the core catalog explorer
