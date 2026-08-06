@@ -6,8 +6,6 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
-## [0.57.0] - 2026-08-06
-
 ### Added
 
 - **Time and token spend now has one target-versus-limit vocabulary from the runtime to the screen**
@@ -23,6 +21,34 @@ All notable changes to this project are documented in this file. The format is b
   prints the crossings: a crossed target warns once and execution continues, a crossed hard limit
   stops with a typed scope, dimension, spent and limit. No surface recalculates totals, which is the
   same contract C-571's durable Fleet reservation/settlement ledger consumes.
+
+- **`flux fleet status` and `flux fleet dashboard` are now bounded projections** (C-562). The
+  default `flux.fleet-status/v1` view reports main state, active/attention/settled worker counts,
+  wave and item state, exact `BoardRef`s, repositories, current sessions, last transition/error
+  summaries and the current revision inside a reviewed fixed byte budget, instead of copying
+  retained `last_turn` receipts, intake receipts and historical event arrays into the default
+  output — the shape that reached 2,694,752 bytes on the 2026-08-05 roadmap dogfood run. Redaction
+  runs before budgeting, oversized values and trimmed arrays become payload-free
+  `flux.fleet-status-omitted/v1` records, and detail stays behind the explicitly bounded
+  `flux fleet inspect` route. Status and the TUI dashboard now share one worker-liveness
+  derivation, so a completed, failed, cancelled or interrupted process is never counted as active
+  because a stale receipt said `working`, while a delivered continuation is not settled by the
+  receipt of its previous turn.
+
+### Fixed
+
+- **A worker is granted the toolchain bundles its assigned repository actually surfaces**, not the ones
+  the coordinator's own root happens to reveal, so a wave dispatched against one repository no longer
+  offers its writer a toolchain that is not there (C-605).
+- **Operator permission denials and disabled tools now reach every sub-agent**, descending through nested
+  delegation for the same reason a resource ceiling does (C-612).
+- **The Board pane renders items as collapsed boxes** grouped by status and ordered as `board next` orders
+  them, paging to the selection so the rows built stay bounded by terminal height rather than by board
+  size (C-620).
+
+## [0.57.0] - 2026-08-06
+
+### Added
 
 - **A native workspace Board is now the complete cross-repository program authority** (C-588).
   A default `.flux/board.toml` binds member repositories and canonical refs, active milestone,
@@ -99,18 +125,6 @@ All notable changes to this project are documented in this file. The format is b
   in unrelated dirt, it goes to the current branch rather than a side branch (a side branch would
   reproduce the same invisibility), it does nothing outside a git repository, and it refuses rather than
   committing into an in-progress merge or rebase. The reported envelope carries the commit sha.
-- **`flux fleet status` and `flux fleet dashboard` are now bounded projections** (C-562). The
-  default `flux.fleet-status/v1` view reports main state, active/attention/settled worker counts,
-  wave and item state, exact `BoardRef`s, repositories, current sessions, last transition/error
-  summaries and the current revision inside a reviewed fixed byte budget, instead of copying
-  retained `last_turn` receipts, intake receipts and historical event arrays into the default
-  output — the shape that reached 2,694,752 bytes on the 2026-08-05 roadmap dogfood run. Redaction
-  runs before budgeting, oversized values and trimmed arrays become payload-free
-  `flux.fleet-status-omitted/v1` records, and detail stays behind the explicitly bounded
-  `flux fleet inspect` route. Status and the TUI dashboard now share one worker-liveness
-  derivation, so a completed, failed, cancelled or interrupted process is never counted as active
-  because a stale receipt said `working`, while a delivered continuation is not settled by the
-  receipt of its previous turn.
 
 ### Fixed
 

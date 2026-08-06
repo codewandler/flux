@@ -12,17 +12,35 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
-## [0.57.0] - 2026-08-06
-
 ### New
 
 - **A run's time and token budget is now visible while the run happens.** When a budget is set, the
-  terminal UI header shows how much of it has been spent against what was declared and keeps updating
-  as spend accrues; plain `flux run` says when a line is crossed. The two kinds of line stay distinct:
-  a target is a warning and the run continues, while a hard ceiling stops the run at the next safe
-  boundary and names exactly which figure was exceeded — wall time, model calls, or tokens. Work
-  already in flight is never reported as stopped, and a budget nobody declared shows nothing rather
-  than a reassuring zero.
+  terminal UI header shows how much of it has been spent against what was declared and keeps updating as
+  spend accrues; plain `flux run` says when a line is crossed. The two kinds of line stay distinct: a
+  target is guidance you can pass, a limit stops the run.
+- **The board view groups work the way you read it.** Items appear as collapsed boxes grouped by status
+  and ordered exactly as "what should I do next" orders them, so the top of the list is the answer. Wide
+  boards stay responsive because only the rows on screen are built.
+
+### Improved
+
+- **`flux fleet status` stays small and says what to do next.** It used to grow without bound by copying
+  whole turn receipts and event histories into itself — megabytes for one command. It now reports the
+  shape of things within a fixed size, names the single most useful next command for the state it found,
+  and says plainly when it left something out. Full detail is still one `flux fleet inspect` away.
+- **A fleet worker is offered the toolchain its own repository has.** Previously the tools a worker could
+  use were derived from wherever the coordinator was started, so a worker could be handed a toolchain that
+  did not exist where it was working.
+
+### Fixed
+
+- **Turning off a tool or denying a permission now applies to helper agents too.** A `deny` rule or a
+  disabled tool used to stop at the first agent and not reach the agents it delegated to, including
+  nested ones. It now travels the whole way down.
+
+## [0.57.0] - 2026-08-06
+
+### New
 
 - **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain
   `flux board` selects the configured workspace, validates every repository story and dependency,
@@ -75,13 +93,6 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   entries, map each supported task kind under `[loop_policy]`, and set `task_kind` on each agent
   template. Flux refuses an unbound or capability-incompatible worker before creating its worktree
   or making a model request.
-- **Fleet status stays small and readable however long the fleet has been running.** The default
-  status and dashboard report what is happening now — running state, live and attention-needing
-  workers, waves, work items, repositories, sessions and the last failure summary — inside a fixed
-  size, and end by naming the next useful inspection or recovery command. Retained turn history,
-  answers and tool output are no longer pasted into that view; ask for them with
-  `flux fleet inspect`, which keeps its own explicit limits and reports what it left out. A worker
-  that finished, failed, was cancelled or was interrupted is no longer counted as active.
 
 ## [0.56.0] - 2026-08-05
 
