@@ -100,6 +100,13 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Reclamation no longer removes a worktree an unfinished wave still needs.** Build output is regenerable
+  and always goes; a worktree is structure, and `worktree_holds_work` answers "does this contain work?"
+  rather than "is this still needed?". Reclaiming a wave whose worker turn had failed therefore removed its
+  integration worktree — legitimately empty and at its pinned base — while a story worktree in the same
+  wave held 940 uncommitted lines, leaving the wave with deliverable work, nowhere to assemble a candidate,
+  and no operation able to rebuild the missing structure. Worktrees are now removed only for a wave that is
+  applied or cancelled.
 - **A failed integration can be retried once its cause is fixed.** `conflict` and `red` were terminal, so
   a wave that failed kept a memory of failing and no later `fleet integrate` would touch it — which made
   fixing the cause pointless. Three delivered stories stayed unreachable after the defect that stranded

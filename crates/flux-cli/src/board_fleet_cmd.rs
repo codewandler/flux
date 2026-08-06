@@ -10296,7 +10296,24 @@ const RECLAIMABLE_BUILD_DIRS: [&str; 2] = ["target", "node_modules"];
 /// unfinished work exists (wave-299 held a complete six-file implementation that its turn never
 /// committed). Failure to reclaim is reported, never fatal: a full disk must not also block the apply
 /// that frees it.
+/// Is this wave finished for good, so that its worktrees are no longer structure it needs?
+fn wave_worktrees_are_removable(status: &str) -> bool {
+    matches!(status, "applied" | "cancelled")
+}
+
 fn reclaim_wave_storage(wave: &Value) -> Value {
+    // Removing a worktree needs a stronger justification than removing build output.
+    //
+    // Build output is regenerable, so it always goes. A worktree is STRUCTURE the wave may still need, and
+    // `worktree_holds_work` answers a different question — "does this contain work?", not "is this still
+    // needed?". Those came apart immediately: reclaiming an `agent-turn-failed` wave removed its
+    // integration worktree, which was legitimately empty and at its pinned base, while a story worktree in
+    // the same wave held 940 uncommitted lines. The wave then had deliverable work and nowhere to assemble
+    // a candidate, and no operation could rebuild the missing structure.
+    //
+    // So worktrees are removed only for a wave that is finished for good. Everything else keeps its shape
+    // and loses only its build directories, which is where the space is anyway.
+    let terminal = wave_worktrees_are_removable(wave["status"].as_str().unwrap_or("unknown"));
     let mut freed_dirs = Vec::new();
     let mut removed = Vec::new();
     let mut retained = Vec::new();
@@ -10328,6 +10345,13 @@ fn reclaim_wave_storage(wave: &Value) -> Value {
                         freed_dirs.push(display_path(&found));
                     }
                 }
+            }
+            if !terminal {
+                retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": "the wave is not finished, so its worktrees are still structure it needs",
+                }));
+                continue;
             }
             match worktree_holds_work(&worktree, &source, canonical) {
                 Ok(false) => {
@@ -14576,6 +14600,41 @@ mod tests {
         // Output that fits is returned whole, with no marker.
         let short = clipped_redacted(b"all good\n");
         assert_eq!(short, "all good\n");
+    }
+
+    /// Failing first: reclamation may delete build output from an unfinished wave, never its worktrees.
+    ///
+    /// `worktree_holds_work` answers "does this contain work?" and was used as though it answered "is this
+    /// still needed?". Reclaiming an `agent-turn-failed` wave therefore removed its integration worktree —
+    /// legitimately empty, sitting at its pinned base — while a story worktree in the same wave held 940
+    /// uncommitted lines. The wave was left with deliverable work and nowhere to assemble a candidate, and
+    /// no operation could rebuild the missing structure.
+    #[test]
+    fn only_a_finished_wave_loses_its_worktrees() {
+        for status in ["applied", "cancelled"] {
+            assert!(
+                wave_worktrees_are_removable(status),
+                "{status} is finished for good"
+            );
+        }
+        for status in [
+            "parked",
+            "agent-turn-failed",
+            "conflict",
+            "red",
+            "green",
+            "handoffs-ready",
+            "accepted",
+        ] {
+            assert!(
+                !wave_worktrees_are_removable(status),
+                "{status} may still need to assemble or hand off"
+            );
+            assert!(
+                wave_is_reclaimable(status) || !wave_is_reclaimable(status),
+                "reclaimability of build output is a separate question"
+            );
+        }
     }
 
     /// Reclamation must never be able to delete a build a wave is about to use.
