@@ -53,6 +53,17 @@ All notable changes to this project are documented in this file. The format is b
   show story states, eligibility, isolated worktrees, review/rework and the separate publication
   boundary.
 
+### Changed
+
+- **`flux board create` commits the document it creates**, path-scoped, with `--no-commit` to opt out.
+  Items are resolved at a git ref wherever a board is federated — a workspace member's stories are read
+  with `ls-tree`/`show` at its `canonical_ref` — so an uncommitted document is invisible to every read
+  that matters. Twenty-seven stories were filed, reported as created, and could not be scheduled: the
+  command had succeeded and nothing had happened. The commit names exactly the new path and never sweeps
+  in unrelated dirt, it goes to the current branch rather than a side branch (a side branch would
+  reproduce the same invisibility), it does nothing outside a git repository, and it refuses rather than
+  committing into an in-progress merge or rebase. The reported envelope carries the commit sha.
+
 ### Fixed
 
 - **Two stories in one repository may now write the same file.** Integration refused any wave whose

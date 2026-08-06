@@ -457,6 +457,104 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     fs::remove_dir_all(fleet_root).ok();
 }
 
+/// Failing first: creating a planning item commits it, path-scoped, and `--no-commit` opts out.
+///
+/// Items are resolved at a git ref wherever a board is federated — a workspace member's stories are read
+/// with `ls-tree`/`show` at its `canonical_ref` — so an uncommitted document is invisible to every read
+/// that matters. Twenty-seven stories were filed, reported as created, and could not be scheduled: the
+/// command had succeeded and nothing had happened. Committing is therefore the default, and it must
+/// never sweep in unrelated dirt from the checkout it happens to run in.
+#[test]
+fn creating_a_planning_item_commits_exactly_that_document() {
+    let root = fixture("create-commits");
+    // git records no empty directory, so the fixture needs one tracked file to have a first commit.
+    fs::write(root.join("docs/stories/README.md"), "# Board\n").unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "board@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Board Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+
+    // Unrelated uncommitted work that must survive untouched.
+    fs::write(root.join("UNRELATED.md"), "someone else's work\n").unwrap();
+
+    let created = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Committed on creation",
+            "--status",
+            "ready",
+            "--priority",
+            "7",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let sha = created["data"]["commit"]
+        .as_str()
+        .expect("creation must report the commit it made")
+        .to_string();
+    let file = created["data"]["file"].as_str().unwrap().to_string();
+
+    // The commit exists, and contains exactly the new document.
+    let named =
+        String::from_utf8(git(&root, &["show", "--name-only", "--pretty=format:", &sha]).stdout)
+            .unwrap();
+    let touched = named
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(touched.len(), 1, "path-scoped commit, got {touched:?}");
+    assert!(file.ends_with(touched[0]), "{file} vs {}", touched[0]);
+
+    // The unrelated file was neither committed nor staged.
+    let status = String::from_utf8(git(&root, &["status", "--porcelain"]).stdout).unwrap();
+    assert_eq!(status.trim(), "?? UNRELATED.md", "status was {status:?}");
+
+    // `--no-commit` writes the document and leaves it untracked, which is the invisible state.
+    let uncommitted = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Left uncommitted",
+            "--no-commit",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(uncommitted.status.success());
+    let uncommitted: serde_json::Value = serde_json::from_slice(&uncommitted.stdout).unwrap();
+    assert!(
+        uncommitted["data"]["commit"].is_null(),
+        "--no-commit must report no commit"
+    );
+    let status = String::from_utf8(git(&root, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(
+        status.contains("docs/stories/"),
+        "the opted-out document stays untracked: {status:?}"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn machine_schema_uses_the_versioned_envelope_and_clean_stdout() {
     let root = fixture("schema");

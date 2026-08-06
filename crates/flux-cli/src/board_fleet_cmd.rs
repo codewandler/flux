@@ -490,6 +490,10 @@ pub(super) enum BoardAction {
         design: Option<String>,
         #[arg(long)]
         note: Option<String>,
+        /// Leave the new document uncommitted. It will not be visible to any board read that resolves
+        /// items at a git ref, which is the default for a workspace member.
+        #[arg(long)]
+        no_commit: bool,
     },
     /// Update common planning metadata.
     Update {
@@ -4385,6 +4389,7 @@ fn run_board_action(
             areas,
             design,
             note,
+            no_commit,
         } => create_item(
             command,
             root,
@@ -4399,6 +4404,7 @@ fn run_board_action(
                 areas,
                 design: design.as_deref(),
                 note: note.as_deref(),
+                commit: !no_commit,
             },
         ),
         BoardAction::Update {
@@ -7341,6 +7347,7 @@ struct CreateItemInput<'a> {
     areas: &'a [String],
     design: Option<&'a str>,
     note: Option<&'a str>,
+    commit: bool,
 }
 
 fn create_item(
@@ -7359,6 +7366,7 @@ fn create_item(
         areas,
         design,
         note,
+        commit,
     } = input;
     let status = normalize_status(status);
     if !matches!(status.as_str(), "backlog" | "ready") {
@@ -7420,15 +7428,90 @@ fn create_item(
             .with_context(|| format!("conflict/precondition: {} already exists", file.display()))?;
         output.write_all(body.as_bytes())?;
     }
+    let recorded = if command.dry_run || !commit {
+        None
+    } else {
+        commit_new_planning_document(root, &file, &id, title)?
+    };
     Ok((
         format!(
-            "created {id}{}",
-            if command.dry_run { " (dry run)" } else { "" }
+            "created {id}{}{}",
+            if command.dry_run { " (dry run)" } else { "" },
+            recorded
+                .as_deref()
+                .map(|sha| format!(" and committed as {}", &sha[..sha.len().min(8)]))
+                .unwrap_or_default()
         ),
-        json!({"id": id, "slug": slug, "kind": format!("{kind:?}").to_ascii_lowercase(), "file": display_path(&file), "status": status, "pillar": pillar, "areas": areas, "dry_run": command.dry_run, "content": if command.dry_run { Some(body) } else { None }}),
+        json!({"id": id, "slug": slug, "kind": format!("{kind:?}").to_ascii_lowercase(), "file": display_path(&file), "status": status, "pillar": pillar, "areas": areas, "commit": recorded, "dry_run": command.dry_run, "content": if command.dry_run { Some(body) } else { None }}),
         vec![],
         changed_revision(root, command.dry_run)?,
     ))
+}
+
+/// Commit exactly the document just created, and nothing else.
+///
+/// Creating a planning item without committing it is a silent no-op wherever items are resolved at a
+/// git ref, which is the normal case: a workspace member's items are read with `ls-tree`/`show` at its
+/// `canonical_ref`, so an uncommitted story does not exist as far as the Board is concerned. Twenty-seven
+/// stories were filed, reported as created, and could not be scheduled — the command had succeeded and
+/// nothing had happened. Committing is what makes creation take effect, so it is the default.
+///
+/// Deliberately narrow:
+/// - The commit is path-scoped. It never sweeps in whatever else happens to be dirty in the checkout,
+///   which is the whole reason `git commit -a` is not used anywhere near this.
+/// - It commits to the current branch rather than a side branch. A side branch would reproduce exactly
+///   the invisibility being fixed. Item creation is also the one planning mutation that cannot conflict:
+///   it only ever adds a path that did not exist.
+/// - Outside a git repository it does nothing and reports nothing, because there is no ref for a read
+///   to resolve against.
+/// - Mid-merge or mid-rebase it refuses rather than committing into someone else's in-progress
+///   operation. The document is already on disk, so the path is named in the error and no work is lost.
+fn commit_new_planning_document(
+    root: &Path,
+    file: &Path,
+    id: &str,
+    title: &str,
+) -> Result<Option<String>> {
+    let Some(git_dir) = git_output(root, &["rev-parse", "--absolute-git-dir"]) else {
+        return Ok(None);
+    };
+    let git_dir = PathBuf::from(git_dir);
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        if git_dir.join(marker).exists() {
+            bail!(
+                "conflict/precondition: {} is mid-{marker}; {} was written but not committed",
+                root.display(),
+                file.display()
+            )
+        }
+    }
+    let relative = file
+        .strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let staged = guarded_git(root, &["add", "--", &relative])?;
+    if staged.exit_code != 0 {
+        bail!(
+            "validation/gate: staging {relative} failed; the document was written but not committed: {}",
+            clipped_redacted(staged.stderr.as_bytes())
+        )
+    }
+    let message = format!("board: add {id} {title}");
+    // The pathspec makes this `--only`: exactly this document, whatever else is staged.
+    let committed = guarded_git(root, &["commit", "-m", &message, "--", &relative])?;
+    if committed.exit_code != 0 {
+        bail!(
+            "validation/gate: committing {relative} failed; the document was written but not committed: {}",
+            clipped_redacted(committed.stderr.as_bytes())
+        )
+    }
+    Ok(git_output(root, &["rev-parse", "HEAD"]))
 }
 
 fn allocate_id(root: &Path, prefix: &str) -> String {
