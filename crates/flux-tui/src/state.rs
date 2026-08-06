@@ -49,6 +49,11 @@ pub struct ChatState {
     pub(super) turn_rounds: Vec<RoundUsage>,
     pub(super) cost_usd: Option<f64>,
     pub(super) cost_model: Option<(String, flux_core::PricingTable)>,
+    /// C-542: the engine's last published budget projection — spent versus declared for the enforced
+    /// envelope, straight from the ledger that enforces it. The surface renders this and re-derives
+    /// nothing, so the header can never disagree with the breach that stops the run. `None` means no
+    /// envelope has published yet: no budget to show, which is not the same as zero spent.
+    pub(super) budget: Option<flux_core::BudgetProjection>,
     pub(super) cost_unpriced: bool,
     pub(super) steps: usize,
     pub(super) last_elapsed: Option<Duration>,

@@ -28,6 +28,13 @@ In remote mode the header continuously shows the endpoint and canonical remote w
 a startup notice that scrolls away. The directory where the TUI started remains the local control
 plane; flux does not synchronize it with the remote tree.
 
+When a budget is declared, the header also carries a live budget segment — `budget Σ1.6k/4.0k tok`,
+`budget 3/10 calls`, `budget 12.0s/1.0m` — showing spend against the declared figure and updating as
+spend accrues. It shows the dimension closest to its ceiling, marks a crossed target `over target`
+and a crossed hard ceiling `limit`, and shows nothing at all when no budget is declared. The figures
+come from the enforcing ledger, not from a second tally kept by the UI — see
+[time and token budgets](./cli.md#time-and-token-budgets).
+
 ## Board and Fleet operations
 
 Ordinary `flux tui` remains a standalone chat and says so in the header. Fleet attachment is always

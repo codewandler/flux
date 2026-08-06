@@ -72,6 +72,21 @@ pub(super) enum UiEvent {
         model: String,
         usage: Usage,
     },
+    /// C-542: the live budget projection published by the enforcing ledger — spent versus declared,
+    /// plus whichever line this event crossed.
+    ///
+    /// Boxed because the projection carries five dimensions of spend, both declared sides, the
+    /// warnings so far and its attribution; inlining it would set this enum's size for every event
+    /// the surface sends.
+    Budget {
+        projection: Box<flux_core::BudgetProjection>,
+        /// A crossed soft target. The ledger reports it once per dimension, so the surface warns
+        /// once instead of once per model call.
+        warning: Option<flux_core::BudgetBreach>,
+        /// A crossed hard limit. The effect that produced it has already finished; execution stops at
+        /// the next safe boundary.
+        exhausted: Option<flux_core::BudgetBreach>,
+    },
     /// A provider connect retry reported *while the wait is still ahead of us* (C-181) — a backed-off
     /// 429/5xx, a forced OAuth refresh, or a transport→HTTP fallback.
     Retry {
@@ -316,6 +331,24 @@ impl AgentSink for ChannelSink {
             // child's reporting path, which must not block and must hold no lock across an await
             // (`docs/designs/live-sub-agent-activity.md`).
             self.send(UiEvent::SpawnActivity(Box::new(activity)));
+        } else if observation.kind == flux_evidence::KIND_BUDGET_PROJECTION {
+            // C-542: the enforcing ledger is the only accountant. The surface decodes its published
+            // projection as-is and never re-derives a total; `warning`/`exhausted` ride the event
+            // that crossed the line, so the one-warning-per-dimension rule stays in the ledger.
+            let breach = |key: &str| {
+                observation.data.get(key).and_then(|value| {
+                    serde_json::from_value::<flux_core::BudgetBreach>(value.clone()).ok()
+                })
+            };
+            if let Some(projection) = observation.data.get("projection").and_then(|value| {
+                serde_json::from_value::<flux_core::BudgetProjection>(value.clone()).ok()
+            }) {
+                self.send(UiEvent::Budget {
+                    projection: Box::new(projection),
+                    warning: breach("warning"),
+                    exhausted: breach("exhausted"),
+                });
+            }
         } else if observation.kind == "model.retry" {
             // C-181: reported before the backoff sleep, so the footer can name the wait while the
             // user is still in it rather than explaining it afterwards.

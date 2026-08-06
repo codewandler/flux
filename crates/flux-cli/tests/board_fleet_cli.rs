@@ -3006,6 +3006,35 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
         continued["data"]["receipt"]["context_origin"]["worker_contract_sha256"],
         first_worker_contract
     );
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    // C-562: the default projection is bounded operational truth. It names the worker, its exact
+    // BoardRef and its session, and never copies the raw agent record, its instruction body or its
+    // admitted operation catalogue out of durable state.
+    assert_eq!(status["data"]["schema"], "flux.fleet-status/v1");
+    assert_eq!(status["data"]["bounded"], true);
+    assert!(
+        status["data"]["state"].is_null(),
+        "default status embedded raw Fleet state: {status}"
+    );
+    let listed = status["data"]["workers"]["listed"].as_array().unwrap();
+    let row = listed
+        .iter()
+        .find(|worker| worker["id"] == first_agent)
+        .unwrap_or_else(|| panic!("{first_agent} missing from {listed:?}"));
+    assert_eq!(row["board_ref"], receipts[0]["context_origin"]["board_ref"]);
+    let projected = status.to_string();
+    assert!(
+        !projected.contains("Work only in the assigned story worktree"),
+        "default status embedded the worker instruction body: {projected}"
+    );
+    assert!(
+        !projected.contains("read_roots"),
+        "default status embedded the admitted operation scope: {projected}"
+    );
+
+    // Detail remains reachable through the explicitly bounded inspect route.
     let inspected = flux(
         &root,
         &[
@@ -3014,13 +3043,19 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
             "worker",
             first_agent,
             "--limit",
-            "100",
+            "50",
             "--output",
             "json",
         ],
     );
-    assert!(inspected.status.success());
+    assert!(
+        inspected.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&inspected.stdout),
+        String::from_utf8_lossy(&inspected.stderr)
+    );
     let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["data"]["bounded"], true);
     let admitted = &inspected["data"]["data"];
     assert_eq!(
         admitted["capabilities"],

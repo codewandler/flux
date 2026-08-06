@@ -106,6 +106,12 @@ pub const KIND_SIGNAL: &str = "project.signal";
 /// its group relevant for the turn without treating every installed operation as core.
 pub const KIND_TURN_INTENT: &str = "turn.intent";
 
+/// C-542: the observation kind carrying the live budget projection — spent versus declared for the
+/// enforced envelope, plus any crossed target or hard limit. The enforcing ledger publishes it and
+/// every surface renders that exact payload, so the kind is shared here rather than spelled out
+/// independently at each end.
+pub const KIND_BUDGET_PROJECTION: &str = "budget.projection";
+
 /// A built-in reaction: a [`KIND_DESTRUCTIVE`] observation escalates the operation to human
 /// approval. The runtime consults this to force an approval prompt even under a permissive
 /// allow-rule.

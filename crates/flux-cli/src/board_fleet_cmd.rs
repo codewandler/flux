@@ -2437,7 +2437,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         let active = state
             .agents
             .values()
-            .filter(|agent| agent["status"].as_str().is_some_and(fleet_status_is_active))
+            .filter(|agent| worker_activity(agent) == WorkerActivity::Active)
             .count();
         let live_activity = read_worker_activity(&self.root);
         let mut workers = state
@@ -2831,6 +2831,10 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             .count();
         let attention_required = failures_total > 0
             || blocked_items > 0
+            || state
+                .agents
+                .values()
+                .any(|agent| worker_activity(agent) == WorkerActivity::Attention)
             || decision_views
                 .iter()
                 .any(|decision| decision.status == "open");
@@ -3242,17 +3246,6 @@ fn fleet_agents_cli_projection(state: &FleetState) -> Value {
     projection
 }
 
-const MAX_FLEET_STATUS_WORKERS: usize = 50;
-const MAX_FLEET_STATUS_WAVES: usize = 20;
-const MAX_FLEET_STATUS_INTAKE: usize = 20;
-const MAX_FLEET_STATUS_SOURCES: usize = 50;
-const MAX_FLEET_STATUS_DECISIONS: usize = 20;
-const MAX_FLEET_STATUS_BYTES: usize = 256 * 1024;
-
-fn fleet_status_is_active(status: &str) -> bool {
-    matches!(status, "active" | "running" | "working")
-}
-
 /// Is the process that recorded an in-flight turn still there?
 ///
 /// Signal 0 performs the existence check without delivering anything. Always the same user as the
@@ -3278,349 +3271,6 @@ fn supervisor_process_is_live(pid: i64) -> bool {
 #[cfg(not(unix))]
 fn supervisor_process_is_live(_pid: i64) -> bool {
     true
-}
-
-/// The status an agent record actually justifies.
-///
-/// A turn is executed *synchronously* by the process that recorded `working`, so if that process dies —
-/// killed, crashed, its terminal closed — nothing ever writes a terminal status and the agent reads
-/// `working` forever. `wave-308-worker-1` read `working` for hours with no process behind it: it inflated
-/// `worker_counts.active`, kept its wave out of reaping, and made the driver reimplement liveness by
-/// scanning `/proc` because the answer was not recoverable from Fleet state at all.
-///
-/// Recording the supervisor's pid makes it recoverable. Pid reuse can still fool the check — a recycled
-/// pid reads as alive — but that is exactly today's behaviour, so this is a strict improvement rather
-/// than a guarantee. An agent with no recorded pid keeps its recorded status, so records written before
-/// this existed are unaffected.
-fn effective_worker_status(agent: &Value) -> &str {
-    let status = agent["status"].as_str().unwrap_or("unknown");
-    if fleet_status_is_active(status) {
-        if let Some(pid) = agent["supervisor_pid"].as_i64() {
-            if !supervisor_process_is_live(pid) {
-                return "interrupted";
-            }
-        }
-    }
-    status
-}
-
-fn fleet_status_needs_attention(status: &str) -> bool {
-    matches!(
-        status,
-        "blocked" | "failed" | "interrupted" | "parked" | "red" | "conflict"
-    )
-}
-
-fn fleet_worker_needs_attention(agent: &Value) -> bool {
-    let status = effective_worker_status(agent);
-    fleet_status_needs_attention(status)
-        || (agent["last_error"].is_string()
-            && !matches!(status, "cancelled" | "completed" | "done"))
-}
-
-fn fleet_status_bucket(status: &str) -> &'static str {
-    match status {
-        "accepted" => "accepted",
-        "active" | "running" | "working" => "active",
-        "blocked" => "blocked",
-        "cancelled" => "cancelled",
-        "completed" | "done" => "completed",
-        "failed" | "red" | "conflict" => "failed",
-        "interrupted" => "interrupted",
-        "parked" => "parked",
-        "waiting" | "yielded" | "yielding" => "waiting",
-        _ => "unknown",
-    }
-}
-
-fn bounded_redacted_text(value: &str, max_chars: usize) -> String {
-    bounded_text(&redact(value), max_chars)
-}
-
-fn fleet_turn_transition_summary(last_turn: Option<&Value>) -> Value {
-    let Some(last_turn) = last_turn.filter(|value| value.is_object()) else {
-        return Value::Null;
-    };
-    json!({
-        "type": "agent.turn.completed",
-        "ack": last_turn["ack"].as_str().map(|value| bounded_redacted_text(value, 100)),
-        "outcome": last_turn["outcome"].as_str().map(|value| bounded_redacted_text(value, 100)),
-        "session": last_turn["session"].as_str().map(|value| bounded_redacted_text(value, 200)),
-        "event_count": last_turn["events"].as_array().map(Vec::len),
-    })
-}
-
-fn fleet_status_worker_summary(id: &str, agent: &Value) -> Value {
-    let assignment = &agent["assignment"];
-    json!({
-        "id": bounded_redacted_text(id, 200),
-        "role": bounded_redacted_text(agent["role"].as_str().unwrap_or("worker"), 100),
-        "task_kind": agent["task_kind"].as_str().map(|value| bounded_redacted_text(value, 100)),
-        "status": bounded_redacted_text(agent["status"].as_str().unwrap_or("unknown"), 100),
-        "board_ref": assignment["board_ref"].as_str()
-            .or_else(|| agent["board_ref"].as_str())
-            .map(|value| bounded_redacted_text(value, 200)),
-        "wave": assignment["wave"].as_str()
-            .or_else(|| agent["wave"].as_str())
-            .map(|value| bounded_redacted_text(value, 200)),
-        "session": agent["runtime_session"].as_str()
-            .or_else(|| agent["session"].as_str())
-            .map(|value| bounded_redacted_text(value, 200)),
-        "last_transition": agent["last_activity"].as_str()
-            .map(|value| bounded_redacted_text(value, 200)),
-        "last_outcome": agent["last_turn"]["outcome"].as_str()
-            .map(|value| bounded_redacted_text(value, 100)),
-        "last_error": agent["last_error"].as_str()
-            .map(|value| bounded_redacted_text(value, 500)),
-    })
-}
-
-fn fleet_status_wave_summary(id: &str, wave: &Value) -> Value {
-    const MAX_WAVE_ITEMS: usize = 10;
-    const MAX_WAVE_REPOSITORIES: usize = 10;
-    let items_total = wave["items"].as_array().map_or(0, Vec::len);
-    let items = wave["items"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(MAX_WAVE_ITEMS)
-        .filter_map(Value::as_str)
-        .map(|value| bounded_redacted_text(value, 200))
-        .collect::<Vec<_>>();
-    let repositories = wave["topology"]["repositories"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(MAX_WAVE_REPOSITORIES)
-        .map(|repository| {
-            json!({
-                "id": repository["id"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "candidate": repository["candidate"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "gate_status": repository["gate"]["status"].as_str().map(|value| bounded_redacted_text(value, 100)),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "id": bounded_redacted_text(id, 200),
-        "status": bounded_redacted_text(wave["status"].as_str().unwrap_or("unknown"), 100),
-        "items": items,
-        "items_total": items_total,
-        "items_truncated": items_total > MAX_WAVE_ITEMS,
-        "apply_eligible": wave["apply_eligible"].as_bool().unwrap_or(false),
-        "coordinator": wave["coordinator"].as_str().map(|value| bounded_redacted_text(value, 200)),
-        "repositories": repositories,
-    })
-}
-
-fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
-    let mut workers = state.agents.iter().collect::<Vec<_>>();
-    workers.sort_by(|(left_id, left), (right_id, right)| {
-        worker_status_order(effective_worker_status(left))
-            .cmp(&worker_status_order(effective_worker_status(right)))
-            .then_with(|| left_id.cmp(right_id))
-    });
-    let worker_summaries = workers
-        .into_iter()
-        .take(MAX_FLEET_STATUS_WORKERS)
-        .map(|(id, agent)| fleet_status_worker_summary(id, agent))
-        .collect::<Vec<_>>();
-    let worker_active = state
-        .agents
-        .values()
-        .filter(|agent| fleet_status_is_active(effective_worker_status(agent)))
-        .count();
-    let worker_attention = state
-        .agents
-        .values()
-        .filter(|agent| fleet_worker_needs_attention(agent))
-        .count();
-    let mut worker_statuses = BTreeMap::<&'static str, usize>::new();
-    for agent in state.agents.values() {
-        *worker_statuses
-            .entry(fleet_status_bucket(effective_worker_status(agent)))
-            .or_default() += 1;
-    }
-
-    let mut waves = state.waves.iter().collect::<Vec<_>>();
-    waves.sort_by(|(left_id, left), (right_id, right)| {
-        let rank = |wave: &Value| {
-            let status = wave["status"].as_str().unwrap_or("unknown");
-            if fleet_status_is_active(status) {
-                0
-            } else if fleet_status_needs_attention(status) {
-                1
-            } else {
-                2
-            }
-        };
-        rank(left)
-            .cmp(&rank(right))
-            .then_with(|| left_id.cmp(right_id))
-    });
-    let wave_summaries = waves
-        .into_iter()
-        .take(MAX_FLEET_STATUS_WAVES)
-        .map(|(id, wave)| fleet_status_wave_summary(id, wave))
-        .collect::<Vec<_>>();
-    let wave_active = state
-        .waves
-        .values()
-        .filter(|wave| fleet_status_is_active(wave["status"].as_str().unwrap_or("unknown")))
-        .count();
-    let wave_attention = state
-        .waves
-        .values()
-        .filter(|wave| fleet_status_needs_attention(wave["status"].as_str().unwrap_or("unknown")))
-        .count();
-
-    let mut intake = state.intake.iter().collect::<Vec<_>>();
-    intake.sort_by_key(|(id, _)| {
-        id.strip_prefix("intake-")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0)
-    });
-    let intake_total = intake.len();
-    let intake = intake
-        .into_iter()
-        .rev()
-        .take(MAX_FLEET_STATUS_INTAKE)
-        .map(|(id, value)| {
-            json!({
-                "id": bounded_redacted_text(id, 200),
-                "ack": value["ack"].as_str().map(|value| bounded_redacted_text(value, 100)),
-                "source": value["source"].as_str().map(|value| bounded_redacted_text(value, 100)),
-                "session": value["session"].as_str().map(|value| bounded_redacted_text(value, 200)),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let sources = fleet_sources(root)?;
-    let source_repositories = sources["repositories"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(MAX_FLEET_STATUS_SOURCES)
-        .map(|repository| {
-            json!({
-                "id": repository["id"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "board": repository["board"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "canonical_ref": repository["canonical_ref"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "head": repository["head"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "canonical_commit": repository["canonical_commit"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "dirty": repository["dirty"],
-                "stale_or_diverged": repository["stale_or_diverged"],
-            })
-        })
-        .collect::<Vec<_>>();
-    let source_total = sources["repositories"].as_array().map_or(0, Vec::len);
-
-    let schedule = fleet_schedule(root)?;
-    let schedule_waves_total = schedule["waves"].as_array().map_or(0, Vec::len);
-    let schedule_waves = schedule["waves"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|wave| {
-            wave["state"].as_str() == Some("active")
-                || !wave["eligible"].as_array().is_none_or(Vec::is_empty)
-        })
-        .take(MAX_FLEET_STATUS_WAVES)
-        .map(|wave| {
-            json!({
-                "id": wave["id"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "state": wave["state"].as_str().map(|value| bounded_redacted_text(value, 100)),
-                "repository": wave["repository"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "eligible": wave["eligible"].as_array().into_iter().flatten().take(10)
-                    .filter_map(Value::as_str).map(|value| bounded_redacted_text(value, 200)).collect::<Vec<_>>(),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let decisions = open_decisions(root)?;
-    let decisions_total = decisions.as_array().map_or(0, Vec::len);
-    let decisions = decisions
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(MAX_FLEET_STATUS_DECISIONS)
-        .map(|decision| {
-            json!({
-                "ref": decision["ref"].as_str().map(|value| bounded_redacted_text(value, 200)),
-                "status": decision["status"].as_str().map(|value| bounded_redacted_text(value, 100)),
-                "title": decision["title"].as_str().map(|value| bounded_redacted_text(value, 300)),
-            })
-        })
-        .collect::<Vec<_>>();
-    let main_attention = state.main_agent.last_error.is_some()
-        || fleet_status_needs_attention(&state.main_agent.status);
-    let attention_required = main_attention
-        || worker_attention > 0
-        || wave_attention > 0
-        || decisions_total > 0
-        || schedule["attention_required"].as_bool() == Some(true);
-
-    let projection = redact_value(json!({
-        "schema": "flux.fleet-status/v1",
-        "attention_required": attention_required,
-        "state": {
-            "schema": state.schema,
-            "revision": state.revision,
-            "running": state.running,
-            "main_agent": {
-                "id": bounded_redacted_text(&state.main_agent.id, 200),
-                "role": bounded_redacted_text(&state.main_agent.role, 100),
-                "status": bounded_redacted_text(&state.main_agent.status, 100),
-                "session": state.main_agent.session.as_deref().map(|value| bounded_redacted_text(value, 200)),
-                "goals_revision": state.main_agent.goals_revision,
-                "last_transition": fleet_turn_transition_summary(state.main_agent.last_turn.as_ref()),
-                "last_error": state.main_agent.last_error.as_deref().map(|value| bounded_redacted_text(value, 500)),
-            },
-            "workers": worker_summaries,
-            "worker_counts": {
-                "total": state.agents.len(),
-                "active": worker_active,
-                "attention": worker_attention,
-                "by_status": worker_statuses,
-            },
-            "workers_truncated": state.agents.len() > MAX_FLEET_STATUS_WORKERS,
-            "waves": wave_summaries,
-            "wave_counts": {"total": state.waves.len(), "active": wave_active, "attention": wave_attention},
-            "waves_truncated": state.waves.len() > MAX_FLEET_STATUS_WAVES,
-            "intake": intake,
-            "intake_total": intake_total,
-            "intake_truncated": intake_total > MAX_FLEET_STATUS_INTAKE,
-            "goals": {"total": state.goals.len(), "revision": state.main_agent.goals_revision},
-        },
-        "sources": {
-            "root": sources["root"].as_str().map(|value| bounded_redacted_text(value, 500)),
-            "repositories": source_repositories,
-            "repositories_total": source_total,
-            "truncated": source_total > MAX_FLEET_STATUS_SOURCES,
-        },
-        "schedule": {
-            "active_milestone": schedule["active_milestone"],
-            "attention_required": schedule["attention_required"],
-            "program_items": schedule["program_items"].as_array().into_iter().flatten().take(20)
-                .filter_map(Value::as_str).map(|value| bounded_redacted_text(value, 200)).collect::<Vec<_>>(),
-            "waves": schedule_waves,
-            "waves_total": schedule_waves_total,
-        },
-        "human_decisions": decisions,
-        "human_decisions_total": decisions_total,
-        "human_decisions_truncated": decisions_total > MAX_FLEET_STATUS_DECISIONS,
-        "inspect": {
-            "snapshot": "flux fleet inspect snapshot --limit 100 --output json",
-            "activity": "flux fleet inspect activity --limit 100 --output json",
-            "worker": "flux fleet inspect worker WORKER --limit 100 --output json",
-            "wave": "flux fleet inspect wave WAVE --limit 100 --output json",
-        },
-    }));
-    debug_assert!(
-        serde_json::to_vec(&projection)
-            .is_ok_and(|encoded| encoded.len() <= MAX_FLEET_STATUS_BYTES),
-        "bounded Fleet status projection exceeded {MAX_FLEET_STATUS_BYTES} bytes"
-    );
-    Ok(projection)
 }
 
 /// Sortable recency for a worker's wave, from the `wave-<n>` numeric suffix. An unattached worker
@@ -11965,213 +11615,6 @@ fn read_event_lines(root: &Path, limit: usize) -> Result<Vec<Value>> {
     Ok(lines)
 }
 
-const MAX_FLEET_INSPECT_BYTES: usize = 256 * 1024;
-const FLEET_INSPECT_DATA_BUDGET: usize = 192 * 1024;
-const MAX_FLEET_INSPECT_STRING_BYTES: usize = 16 * 1024;
-const MAX_FLEET_INSPECT_COLLECTION_ITEMS: usize = 100;
-const MAX_FLEET_INSPECT_OMISSIONS: usize = 100;
-
-struct FleetInspectBudget {
-    remaining: usize,
-    source: &'static str,
-    omissions: Vec<Value>,
-    omissions_total: usize,
-}
-
-impl FleetInspectBudget {
-    fn new(view: InspectView) -> Self {
-        Self {
-            remaining: FLEET_INSPECT_DATA_BUDGET,
-            source: if matches!(view, InspectView::Activity | InspectView::Search) {
-                ".flux/fleet/events.ndjson"
-            } else {
-                ".flux/fleet/state.json"
-            },
-            omissions: Vec::new(),
-            omissions_total: 0,
-        }
-    }
-
-    fn omit(&mut self, path: &str, reason: &str, detail: Value) -> Value {
-        let index = self.omissions_total;
-        self.omissions_total += 1;
-        if self.omissions.len() < MAX_FLEET_INSPECT_OMISSIONS {
-            self.omissions.push(json!({
-                "index": index,
-                "source": self.source,
-                "path": bounded_redacted_text(path, 500),
-                "reason": reason,
-                "detail": detail,
-            }));
-        }
-        json!({"$omitted": index})
-    }
-
-    fn take(&mut self, bytes: usize) -> bool {
-        if bytes > self.remaining {
-            false
-        } else {
-            self.remaining -= bytes;
-            true
-        }
-    }
-
-    fn value(&mut self, value: Value, path: &str) -> Value {
-        match value {
-            Value::Null | Value::Bool(_) | Value::Number(_) => {
-                let bytes = serde_json::to_vec(&value).map_or(16, |encoded| encoded.len());
-                if self.take(bytes) {
-                    value
-                } else {
-                    self.omit(path, "byte-budget", json!({"encoded_bytes": bytes}))
-                }
-            }
-            Value::String(value) => {
-                let encoded_bytes = serde_json::to_vec(&value).map_or(value.len() + 2, |v| v.len());
-                if encoded_bytes <= MAX_FLEET_INSPECT_STRING_BYTES && self.take(encoded_bytes) {
-                    Value::String(value)
-                } else {
-                    let reason = if encoded_bytes > MAX_FLEET_INSPECT_STRING_BYTES {
-                        "string-byte-limit"
-                    } else {
-                        "byte-budget"
-                    };
-                    let sha256 = flux_lang::runtime::sha256_hex(&value);
-                    self.omit(
-                        path,
-                        reason,
-                        json!({
-                            "encoded_bytes": encoded_bytes,
-                            "byte_limit": MAX_FLEET_INSPECT_STRING_BYTES,
-                            "sha256": sha256,
-                        }),
-                    )
-                }
-            }
-            Value::Array(values) => {
-                let total = values.len();
-                let mut bounded = Vec::new();
-                for (index, value) in values
-                    .into_iter()
-                    .take(MAX_FLEET_INSPECT_COLLECTION_ITEMS)
-                    .enumerate()
-                {
-                    bounded.push(self.value(value, &format!("{path}/{index}")));
-                }
-                if total > MAX_FLEET_INSPECT_COLLECTION_ITEMS {
-                    bounded.push(self.omit(
-                        path,
-                        "item-limit",
-                        json!({
-                            "items_total": total,
-                            "items_kept": MAX_FLEET_INSPECT_COLLECTION_ITEMS,
-                            "items_omitted": total - MAX_FLEET_INSPECT_COLLECTION_ITEMS,
-                        }),
-                    ));
-                }
-                Value::Array(bounded)
-            }
-            Value::Object(values) => {
-                let total = values.len();
-                let mut entries = values.into_iter().collect::<Vec<_>>();
-                let priority = |key: &str| match key {
-                    "schema" => 0,
-                    "id" | "type" => 1,
-                    "status" | "outcome" | "ack" => 2,
-                    "error" | "reason" => 3,
-                    "revision" | "session" | "board_ref" | "wave" => 4,
-                    _ => 10,
-                };
-                entries.sort_by(|(left, _), (right, _)| {
-                    priority(left)
-                        .cmp(&priority(right))
-                        .then_with(|| left.cmp(right))
-                });
-                let mut bounded = Map::new();
-                for (key, value) in entries.into_iter().take(MAX_FLEET_INSPECT_COLLECTION_ITEMS) {
-                    let key_bytes = key.len() + 3;
-                    if self.take(key_bytes) {
-                        bounded.insert(key.clone(), self.value(value, &format!("{path}/{key}")));
-                    } else {
-                        bounded.insert(
-                            key.clone(),
-                            self.omit(
-                                &format!("{path}/{key}"),
-                                "byte-budget",
-                                json!({"field": key}),
-                            ),
-                        );
-                    }
-                }
-                if total > MAX_FLEET_INSPECT_COLLECTION_ITEMS {
-                    bounded.insert(
-                        "$additional_fields".into(),
-                        self.omit(
-                            path,
-                            "field-limit",
-                            json!({
-                                "fields_total": total,
-                                "fields_kept": MAX_FLEET_INSPECT_COLLECTION_ITEMS,
-                                "fields_omitted": total - MAX_FLEET_INSPECT_COLLECTION_ITEMS,
-                            }),
-                        ),
-                    );
-                }
-                Value::Object(bounded)
-            }
-        }
-    }
-}
-
-fn bounded_fleet_inspect(
-    view: InspectView,
-    target: Option<&str>,
-    limit: usize,
-    payload: Value,
-) -> Value {
-    let payload = redact_value(payload);
-    let mut budget = FleetInspectBudget::new(view);
-    let data = budget.value(payload, "data");
-    let omissions = budget.omissions;
-    let omissions_total = budget.omissions_total;
-    let projection = json!({
-        "schema":"flux.fleet-inspect/v1",
-        "view":format!("{view:?}").to_ascii_lowercase(),
-        "target":target,
-        "bounded":true,
-        "limit":limit,
-        "byte_limit":MAX_FLEET_INSPECT_BYTES,
-        "truncated":omissions_total > 0,
-        "omissions_total":omissions_total,
-        "omissions_truncated":omissions_total > MAX_FLEET_INSPECT_OMISSIONS,
-        "omissions":omissions,
-        "data":data,
-    });
-    let encoded_bytes = serde_json::to_vec(&projection).map_or(usize::MAX, |value| value.len());
-    if encoded_bytes <= MAX_FLEET_INSPECT_BYTES {
-        return projection;
-    }
-    json!({
-        "schema":"flux.fleet-inspect/v1",
-        "view":format!("{view:?}").to_ascii_lowercase(),
-        "target":target,
-        "bounded":true,
-        "limit":limit,
-        "byte_limit":MAX_FLEET_INSPECT_BYTES,
-        "truncated":true,
-        "omissions_total":omissions_total + 1,
-        "omissions_truncated":true,
-        "omissions":[{
-            "index":0,
-            "source":if matches!(view, InspectView::Activity | InspectView::Search) { ".flux/fleet/events.ndjson" } else { ".flux/fleet/state.json" },
-            "path":"data",
-            "reason":"projection-byte-limit",
-            "detail":{"encoded_bytes":encoded_bytes,"byte_limit":MAX_FLEET_INSPECT_BYTES},
-        }],
-        "data":{"$omitted":0},
-    })
-}
-
 fn fleet_inspect(
     root: &Path,
     state: &FleetState,
@@ -12315,7 +11758,22 @@ fn fleet_inspect(
             json!({"wave":target,"supported":false,"reason":"fleet never opens pull requests; inspect the local candidate and apply explicitly","status":wave["status"],"apply_eligible":wave["apply_eligible"]})
         }
     };
-    Ok(bounded_fleet_inspect(view, target, limit, payload))
+    let mut payload = redact_value(payload);
+    let omitted = enforce_projection_budget(
+        &mut payload,
+        FLEET_INSPECT_BUDGET_BYTES.saturating_sub(FLEET_STATUS_BUDGET_MARGIN_BYTES),
+        FLEET_INSPECT_OMITTED_SCHEMA,
+    );
+    Ok(json!({
+        "schema":"flux.fleet-inspect/v1",
+        "view":format!("{view:?}").to_ascii_lowercase(),
+        "target":target.map(redact),
+        "bounded":true,
+        "limit":limit,
+        "budget_bytes":FLEET_INSPECT_BUDGET_BYTES,
+        "omitted":omitted,
+        "data":payload,
+    }))
 }
 
 fn fleet_sources(root: &Path) -> Result<Value> {
@@ -12565,36 +12023,594 @@ fn schedule_human(data: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-fn fleet_status_human(data: &Value) -> String {
-    let worker_attention = data["state"]["worker_counts"]["attention"]
-        .as_u64()
-        .unwrap_or(0);
-    let wave_attention = data["state"]["wave_counts"]["attention"]
-        .as_u64()
-        .unwrap_or(0);
-    let attention = worker_attention
-        + wave_attention
-        + data["human_decisions_total"].as_u64().unwrap_or(0)
-        + u64::from(data["state"]["main_agent"]["last_error"].is_string());
-    format!(
-        "fleet: {} · revision {} · {}/{} active worker(s) · {}/{} active wave(s) · {} attention\nnext: {}",
-        if data["state"]["running"].as_bool().unwrap_or(false) {
-            "running"
-        } else {
-            "stopped"
-        },
-        data["state"]["revision"],
-        data["state"]["worker_counts"]["active"],
-        data["state"]["worker_counts"]["total"],
-        data["state"]["wave_counts"]["active"],
-        data["state"]["wave_counts"]["total"],
-        attention,
-        if attention > 0 {
-            "flux fleet inspect activity --limit 100 --output json"
-        } else {
-            "flux fleet inspect snapshot --limit 100 --output json"
+/// C-562: the reviewed fixed byte budget for the default `fleet status`/`dashboard` projection. The
+/// 2026-08-05 roadmap dogfood run reached 2,694,752 bytes by copying `last_turn` receipts, intake
+/// receipts and historical event arrays into it; detailed evidence stays behind `fleet inspect`.
+const FLEET_STATUS_BUDGET_BYTES: usize = 64 * 1024;
+/// Head room reserved for the budget and next-command metadata attached after trimming.
+const FLEET_STATUS_BUDGET_MARGIN_BYTES: usize = 8 * 1024;
+/// The matching fixed budget for the human projection of the same data.
+const FLEET_STATUS_HUMAN_BUDGET_BYTES: usize = 4 * 1024;
+/// The fixed byte budget of one bounded `fleet inspect` view, applied after redaction.
+const FLEET_INSPECT_BUDGET_BYTES: usize = 256 * 1024;
+const FLEET_STATUS_MAX_WORKER_ROWS: usize = 25;
+const FLEET_STATUS_MAX_WAVE_ROWS: usize = 10;
+const FLEET_STATUS_MAX_REF_ROWS: usize = 25;
+const FLEET_PROJECTION_OMISSION_RECORDS: usize = 12;
+const FLEET_STATUS_OMITTED_SCHEMA: &str = "flux.fleet-status-omitted/v1";
+const FLEET_INSPECT_OMITTED_SCHEMA: &str = "flux.fleet-inspect-omitted/v1";
+
+/// C-562: one shared derivation of worker liveness for `fleet status` and the TUI dashboard. A
+/// recorded terminal receipt, error or transition outranks a stale `working` status, so a completed,
+/// failed, cancelled or interrupted process is never counted as active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerActivity {
+    Active,
+    Attention,
+    Settled,
+}
+
+impl WorkerActivity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Attention => "attention",
+            Self::Settled => "settled",
         }
-    )
+    }
+
+    fn order(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Attention => 1,
+            Self::Settled => 2,
+        }
+    }
+}
+
+fn worker_turn_ended(agent: &Value) -> bool {
+    match agent["last_activity"].as_str() {
+        // The recorded transition outranks the retained receipt in both directions: a terminal
+        // transition settles a stale `working` status, and a fresh delivery proves the host handed
+        // the process another turn after the receipt of an earlier continued turn.
+        Some("agent.turn.completed" | "agent.turn.failed" | "agent.turn.cancelled") => return true,
+        Some("agent.turn.delivered") => return false,
+        _ => {}
+    }
+    let turn = &agent["last_turn"];
+    turn["exit_code"].is_number()
+        || turn["ack"]
+            .as_str()
+            .is_some_and(|ack| matches!(ack, "completed" | "failed" | "cancelled"))
+}
+
+fn worker_activity(agent: &Value) -> WorkerActivity {
+    let status = agent["status"].as_str().unwrap_or("unknown");
+    let errored = agent["last_error"]
+        .as_str()
+        .is_some_and(|error| !error.trim().is_empty());
+    if matches!(status, "failed" | "parked" | "interrupted") || errored {
+        return WorkerActivity::Attention;
+    }
+    if matches!(status, "working" | "running" | "active") {
+        // Two independent ways an active status can be a lie, and both are needed.
+        //
+        // A terminal receipt or transition proves the turn ENDED — the status field is merely stale, and
+        // that is what `worker_turn_ended` reads. But the turn is executed synchronously by the process
+        // that recorded `working`, so if that process is killed no receipt is ever written at all: there
+        // is nothing stale to notice, only silence. `wave-308-worker-1` read `working` for hours that way,
+        // inflating the active count, keeping its wave out of reaping, and pushing the driver into
+        // scanning `/proc` because state could not answer.
+        //
+        // So a recorded supervisor that is gone settles the record too. Pid reuse can fool this — a
+        // recycled pid reads as alive — which is exactly the previous behaviour, making it a strict
+        // improvement rather than a guarantee. An agent with no recorded pid is judged on its receipts
+        // alone, so records written before the pid existed are unaffected.
+        let supervisor_gone = agent["supervisor_pid"]
+            .as_i64()
+            .is_some_and(|pid| !supervisor_process_is_live(pid));
+        return if worker_turn_ended(agent) || supervisor_gone {
+            WorkerActivity::Attention
+        } else {
+            WorkerActivity::Active
+        };
+    }
+    WorkerActivity::Settled
+}
+
+fn projection_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |encoded| encoded.len())
+}
+
+/// C-562: shrink one already-redacted projection to a fixed byte budget without ever byte-slicing a
+/// structured value. An oversized scalar is replaced atomically with post-redaction omission
+/// metadata; an oversized array loses its tail and records how many entries were omitted.
+fn enforce_projection_budget(value: &mut Value, budget: usize, schema: &str) -> Vec<Value> {
+    let scalar_limit = (budget / 8).max(1_024);
+    let mut omitted = Vec::new();
+    replace_oversized_scalars(value, scalar_limit, schema, &mut omitted);
+    let mut trimmed: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for _ in 0..1_024 {
+        if projection_bytes(value) <= budget {
+            break;
+        }
+        let Some((path, len)) = largest_projection_array(value) else {
+            break;
+        };
+        let retained = len / 2;
+        let Some(items) = value_at_mut(value, &path).and_then(Value::as_array_mut) else {
+            break;
+        };
+        items.truncate(retained);
+        let entry = trimmed.entry(path.join(".")).or_insert((0, retained));
+        entry.0 += len - retained;
+        entry.1 = retained;
+    }
+    omitted.extend(trimmed.into_iter().map(|(path, (dropped, retained))| {
+        json!({
+            "schema": schema,
+            "reason": "records_omitted",
+            "path": path,
+            "omitted": dropped,
+            "retained": retained,
+        })
+    }));
+    omitted.truncate(FLEET_PROJECTION_OMISSION_RECORDS);
+    if projection_bytes(value) > budget {
+        let record = json!({
+            "schema": schema,
+            "reason": "projection_too_large",
+            "limit_bytes": budget,
+        });
+        omitted.push(record.clone());
+        *value = record;
+    }
+    omitted
+}
+
+fn replace_oversized_scalars(
+    value: &mut Value,
+    limit: usize,
+    schema: &str,
+    omitted: &mut Vec<Value>,
+) {
+    match value {
+        Value::String(text) if text.len() > limit => {
+            let record = json!({
+                "schema": schema,
+                "reason": "value_too_large",
+                "bytes": text.len(),
+                "limit_bytes": limit,
+                "sha256": flux_lang::runtime::sha256_hex(text),
+            });
+            omitted.push(record.clone());
+            *value = record;
+        }
+        Value::Array(items) => {
+            for item in items {
+                replace_oversized_scalars(item, limit, schema, omitted);
+            }
+        }
+        Value::Object(fields) => {
+            for (_, item) in fields.iter_mut() {
+                replace_oversized_scalars(item, limit, schema, omitted);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn largest_projection_array(value: &Value) -> Option<(Vec<String>, usize)> {
+    fn walk(value: &Value, path: &mut Vec<String>, best: &mut Option<(Vec<String>, usize, usize)>) {
+        match value {
+            Value::Array(items) => {
+                if !items.is_empty() {
+                    let bytes = projection_bytes(value);
+                    if best.as_ref().is_none_or(|(_, _, largest)| bytes > *largest) {
+                        *best = Some((path.clone(), items.len(), bytes));
+                    }
+                }
+                for (index, item) in items.iter().enumerate() {
+                    path.push(index.to_string());
+                    walk(item, path, best);
+                    path.pop();
+                }
+            }
+            Value::Object(fields) => {
+                for (key, item) in fields {
+                    path.push(key.clone());
+                    walk(item, path, best);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(value, &mut Vec::new(), &mut best);
+    best.map(|(path, len, _)| (path, len))
+}
+
+fn value_at_mut<'a>(value: &'a mut Value, path: &[String]) -> Option<&'a mut Value> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = match cursor {
+            Value::Object(fields) => fields.get_mut(segment)?,
+            Value::Array(items) => items.get_mut(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cursor)
+}
+
+fn bounded_status_text(value: &str, max_chars: usize) -> String {
+    bounded_text(&redact(value), max_chars)
+}
+
+fn bounded_status_ref(value: Option<&str>) -> Option<String> {
+    value.map(|value| bounded_status_text(value, 200))
+}
+
+/// A payload-free summary of one retained turn receipt: acknowledgement, session and event count.
+fn turn_summary(turn: Option<&Value>) -> Option<String> {
+    let turn = turn.filter(|turn| !turn.is_null())?;
+    let ack = turn["ack"].as_str().unwrap_or("recorded");
+    let session = turn["session"].as_str().unwrap_or("none");
+    let events = turn["events"].as_array().map_or(0, Vec::len);
+    let exit = turn["exit_code"]
+        .as_i64()
+        .map(|code| format!(" · exit {code}"))
+        .unwrap_or_default();
+    Some(bounded_status_text(
+        &format!("ack={ack} · session={session} · {events} event(s){exit}"),
+        300,
+    ))
+}
+
+fn wave_gate_summary(wave: &Value) -> Option<String> {
+    let red = wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|repository| repository["gate"]["status"].as_str() == Some("red"))
+        .map(|repository| {
+            bounded_status_text(repository["id"].as_str().unwrap_or("repository"), 100)
+        })
+        .collect::<Vec<_>>();
+    (!red.is_empty()).then(|| bounded_text(&format!("red gate: {}", red.join(", ")), 200))
+}
+
+/// C-562: the bounded default projection behind `fleet status` and `fleet dashboard`. It reports
+/// operational truth — main state, active/attention worker counts, wave/item state, exact BoardRefs,
+/// repositories, current sessions, last transition/error summaries and the current revision — and
+/// never copies answers, tool events, diffs or repository contents out of durable state.
+fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
+    let sources = fleet_sources(root)?;
+    let schedule = fleet_schedule(root)?;
+
+    let mut active = 0usize;
+    let mut attention = 0usize;
+    let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rows = Vec::new();
+    for (id, agent) in &state.agents {
+        let activity = worker_activity(agent);
+        match activity {
+            WorkerActivity::Active => active += 1,
+            WorkerActivity::Attention => attention += 1,
+            WorkerActivity::Settled => {}
+        }
+        *by_status
+            .entry(bounded_status_text(
+                agent["status"].as_str().unwrap_or("unknown"),
+                40,
+            ))
+            .or_default() += 1;
+        let assignment = &agent["assignment"];
+        let id = bounded_status_text(id, 200);
+        rows.push((
+            activity.order(),
+            id.clone(),
+            json!({
+                "id": id,
+                "role": bounded_status_text(agent["role"].as_str().unwrap_or("worker"), 100),
+                "status": bounded_status_text(agent["status"].as_str().unwrap_or("unknown"), 40),
+                "activity": activity.as_str(),
+                "board_ref": bounded_status_ref(assignment["board_ref"].as_str().or_else(|| agent["board_ref"].as_str())),
+                "wave": bounded_status_ref(assignment["wave"].as_str().or_else(|| agent["wave"].as_str())),
+                "session": bounded_status_ref(agent["runtime_session"].as_str().or_else(|| agent["session"].as_str())),
+                "last_transition": bounded_status_ref(agent["last_activity"].as_str()),
+                "last_turn": turn_summary(agent.get("last_turn")),
+                "last_error": agent["last_error"].as_str().map(|error| bounded_status_text(error, 300)),
+                "rework_round": agent["rework_round"].as_u64().or_else(|| assignment["rework_round"].as_u64()),
+            }),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let workers_total = rows.len();
+    let worker_rows = rows
+        .into_iter()
+        .take(FLEET_STATUS_MAX_WORKER_ROWS)
+        .map(|(_, _, row)| row)
+        .collect::<Vec<_>>();
+
+    let waves_total = state.waves.len();
+    let mut wave_rows = state
+        .waves
+        .iter()
+        .rev()
+        .take(FLEET_STATUS_MAX_WAVE_ROWS)
+        .map(|(id, wave)| {
+            json!({
+                "id": bounded_status_text(id, 200),
+                "status": bounded_status_text(wave["status"].as_str().unwrap_or("unknown"), 40),
+                "apply_eligible": wave["apply_eligible"].as_bool(),
+                "item_count": wave["items"].as_array().map_or(0, Vec::len),
+                "items": value_strings(&wave["items"]).iter().take(FLEET_STATUS_MAX_REF_ROWS)
+                    .map(|item| bounded_status_text(item, 200)).collect::<Vec<_>>(),
+                "gate": wave_gate_summary(wave),
+            })
+        })
+        .collect::<Vec<_>>();
+    wave_rows.reverse();
+
+    let ready_refs = value_strings(&schedule["program_items"]);
+    let configured_waves = schedule["waves"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(FLEET_STATUS_MAX_WAVE_ROWS)
+        .map(|wave| {
+            json!({
+                "id": bounded_status_ref(wave["id"].as_str()),
+                "state": bounded_status_ref(wave["state"].as_str()),
+                "item_count": wave["items"].as_array().map_or(0, Vec::len),
+                "eligible_count": wave["eligible"].as_array().map_or(0, Vec::len),
+                "dependencies_done": wave["dependencies_done"].as_bool(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let schedule_view = json!({
+        "active_milestone": bounded_status_ref(schedule["active_milestone"].as_str()),
+        "max_wave": schedule["max_wave"],
+        "attention_required": schedule["attention_required"].as_bool().unwrap_or(false),
+        "ready_total": ready_refs.len(),
+        "ready_items": ready_refs.iter().take(FLEET_STATUS_MAX_REF_ROWS)
+            .map(|item| bounded_status_text(item, 200)).collect::<Vec<_>>(),
+        "configured_waves_total": schedule["waves"].as_array().map_or(0, Vec::len),
+        "configured_waves": configured_waves,
+    });
+
+    let repositories_total = sources["repositories"].as_array().map_or(0, Vec::len);
+    let repositories = sources["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(FLEET_STATUS_MAX_REF_ROWS)
+        .map(|repository| {
+            json!({
+                "id": bounded_status_ref(repository["id"].as_str()),
+                "board": bounded_status_ref(repository["board"].as_str()),
+                "root": bounded_status_ref(repository["root"].as_str()),
+                "canonical_ref": bounded_status_ref(repository["canonical_ref"].as_str()),
+                "head": bounded_status_ref(repository["head"].as_str()),
+                "canonical_commit": bounded_status_ref(repository["canonical_commit"].as_str()),
+                "dirty": repository["dirty"].as_bool(),
+                "stale_or_diverged": repository["stale_or_diverged"].as_bool(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let decisions_total = schedule["human_decisions"].as_array().map_or(0, Vec::len);
+    let decision_rows = schedule["human_decisions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(FLEET_STATUS_MAX_REF_ROWS)
+        .map(|decision| {
+            json!({
+                "ref": bounded_status_ref(decision["ref"].as_str()),
+                "title": bounded_status_ref(decision["title"].as_str()),
+                "blocks": decision["blocks"].as_array().map_or(0, Vec::len),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut intake_by_ack: BTreeMap<String, usize> = BTreeMap::new();
+    for intake in state.intake.values() {
+        *intake_by_ack
+            .entry(bounded_status_text(
+                intake["ack"].as_str().unwrap_or("unknown"),
+                40,
+            ))
+            .or_default() += 1;
+    }
+    let intake = json!({
+        "total": state.intake.len(),
+        "by_ack": intake_by_ack,
+        "latest": state.intake
+            .get(&format!("intake-{}", state.main_agent.intake_sequence))
+            .map(|intake| json!({
+                "id": bounded_status_ref(intake["id"].as_str()),
+                "ack": bounded_status_ref(intake["ack"].as_str()),
+                "source": bounded_status_ref(intake["source"].as_str()),
+            })),
+    });
+
+    let main = json!({
+        "id": bounded_status_text(&state.main_agent.id, 100),
+        "role": bounded_status_text(&state.main_agent.role, 100),
+        "status": bounded_status_text(&state.main_agent.status, 40),
+        "session": state.main_agent.session.as_deref().map(|session| bounded_status_text(session, 200)),
+        "goals_revision": state.main_agent.goals_revision,
+        "goals": state.goals.len(),
+        "intake_sequence": state.main_agent.intake_sequence,
+        "last_turn": turn_summary(state.main_agent.last_turn.as_ref()),
+        "last_error": state.main_agent.last_error.as_deref().map(|error| bounded_status_text(error, 300)),
+    });
+
+    let attention_required = attention > 0
+        || decisions_total > 0
+        || state.main_agent.last_error.is_some()
+        || wave_rows.iter().any(|wave| wave["gate"].is_string());
+    let listed_workers = worker_rows.len();
+    let listed_waves = wave_rows.len();
+    let listed_repositories = repositories.len();
+    let listed_decisions = decision_rows.len();
+    let mut data = json!({
+        "schema": "flux.fleet-status/v1",
+        "bounded": true,
+        "root": bounded_status_text(&display_path(root), 500),
+        "revision": state.revision,
+        "running": state.running,
+        "config": sources["config"],
+        "limits": sources["limits"],
+        "main": main,
+        "intake": intake,
+        "workers": {
+            "total": workers_total,
+            "active": active,
+            "attention": attention,
+            "settled": workers_total.saturating_sub(active + attention),
+            "by_status": by_status,
+            "listed": worker_rows,
+            "omitted": workers_total.saturating_sub(listed_workers),
+        },
+        "waves": {
+            "total": waves_total,
+            "listed": wave_rows,
+            "omitted": waves_total.saturating_sub(listed_waves),
+        },
+        "schedule": schedule_view,
+        "repositories": {
+            "total": repositories_total,
+            "listed": repositories,
+            "omitted": repositories_total.saturating_sub(listed_repositories),
+        },
+        "open_decisions": {
+            "total": decisions_total,
+            "listed": decision_rows,
+            "omitted": decisions_total.saturating_sub(listed_decisions),
+        },
+        "attention_required": attention_required,
+    });
+    let omitted = enforce_projection_budget(
+        &mut data,
+        FLEET_STATUS_BUDGET_BYTES.saturating_sub(FLEET_STATUS_BUDGET_MARGIN_BYTES),
+        FLEET_STATUS_OMITTED_SCHEMA,
+    );
+    let payload_bytes = projection_bytes(&data);
+    data["next_command"] = json!(fleet_status_next_command(&data));
+    data["budget"] = json!({
+        "schema": "flux.fleet-status-budget/v1",
+        "limit_bytes": FLEET_STATUS_BUDGET_BYTES,
+        "payload_bytes": payload_bytes,
+        "omitted": omitted,
+    });
+    Ok(data)
+}
+
+/// The next useful bounded inspection or recovery command for the observed state.
+fn fleet_status_next_command(data: &Value) -> String {
+    let workers = data["workers"]["listed"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(worker) = workers
+        .iter()
+        .find(|worker| worker["activity"] == "attention")
+    {
+        let id = worker["id"].as_str().unwrap_or("WORKER");
+        if matches!(
+            worker["status"].as_str(),
+            Some("working" | "running" | "active")
+        ) {
+            return format!("flux fleet resume {id} --output json");
+        }
+        return format!("flux fleet inspect worker {id} --limit 50 --output json");
+    }
+    if data["main"]["last_error"].is_string() {
+        return "flux fleet inspect worker main --limit 50 --output json".into();
+    }
+    if let Some(wave) = data["waves"]["listed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|wave| wave["gate"].is_string())
+    {
+        return format!(
+            "flux fleet inspect integration {} --limit 50 --output json",
+            wave["id"].as_str().unwrap_or("WAVE")
+        );
+    }
+    if workers.iter().any(|worker| worker["activity"] == "active") {
+        return "flux fleet inspect activity --limit 50 --output json".into();
+    }
+    if data["open_decisions"]["total"].as_u64().unwrap_or(0) > 0 {
+        return "flux fleet decisions --output json".into();
+    }
+    if data["schedule"]["ready_total"].as_u64().unwrap_or(0) > 0 {
+        return "flux fleet schedule --output json".into();
+    }
+    "flux fleet inspect snapshot --limit 50 --output json".into()
+}
+
+fn fleet_status_human(data: &Value) -> String {
+    let workers = &data["workers"];
+    let waves = data["waves"]["listed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|wave| {
+            format!(
+                "{}={} ({} item(s))",
+                wave["id"].as_str().unwrap_or("?"),
+                wave["status"].as_str().unwrap_or("unknown"),
+                wave["item_count"]
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let lines = [
+        format!(
+            "fleet: {} · revision {} · main {}{}",
+            if data["running"].as_bool().unwrap_or(false) {
+                "running"
+            } else {
+                "stopped"
+            },
+            data["revision"],
+            data["main"]["status"].as_str().unwrap_or("unknown"),
+            data["main"]["session"]
+                .as_str()
+                .map(|session| format!(" · session {session}"))
+                .unwrap_or_default(),
+        ),
+        format!(
+            "workers: {} active · {} attention · {} registered",
+            workers["active"], workers["attention"], workers["total"]
+        ),
+        format!("waves: {} · {waves}", data["waves"]["total"]),
+        format!(
+            "items: {} ready · milestone {}",
+            data["schedule"]["ready_total"],
+            data["schedule"]["active_milestone"]
+                .as_str()
+                .unwrap_or("none")
+        ),
+        format!(
+            "repositories: {} · open decisions: {}",
+            data["repositories"]["total"], data["open_decisions"]["total"]
+        ),
+        format!(
+            "next: {}",
+            data["next_command"]
+                .as_str()
+                .unwrap_or("flux fleet inspect snapshot --limit 50 --output json")
+        ),
+    ];
+    // One char encodes to at most four UTF-8 bytes, so this char bound provably keeps the human
+    // projection inside the reviewed human byte budget.
+    bounded_text(&lines.join("\n"), FLEET_STATUS_HUMAN_BUDGET_BYTES / 4)
 }
 fn validate_board_refs(items: &[String]) -> Result<()> {
     for item in items {
@@ -13573,9 +13589,13 @@ fn integrate_wave(
         .flatten()
         .filter_map(|repository| {
             let id = repository["id"].as_str()?.to_string();
-            let candidate = repository["gate"]["candidate"].as_str()?.to_string();
+            // The tree, resolved through the repository's own checkout, because that is the identity a
+            // retry can actually reproduce.
+            let source = PathBuf::from(repository["source_root"].as_str()?);
+            let candidate = repository["gate"]["candidate"].as_str()?;
+            let tree = git_output(&source, &["rev-parse", &format!("{candidate}^{{tree}}")])?;
             let status = repository["gate"]["status"].as_str()?.to_string();
-            Some((id, (candidate, status)))
+            Some((id, (tree, status)))
         })
         .collect::<BTreeMap<_, _>>();
     // A repository whose candidate is already ACCEPTED keeps its verdict and is skipped below.
@@ -13906,12 +13926,19 @@ fn integrate_wave(
             failures.push(json!({"repository": repository_id, "reason": "no runnable final gate"}));
             continue;
         }
-        // One gate run per CANDIDATE. A retry that recomputes the identical candidate has identical
-        // inputs, so re-running the gate would only spend minutes to reach the same verdict; a retry that
-        // produces a different candidate has genuinely different inputs and must be gated afresh. Keying
-        // this to the candidate is what lets a wave be retried at all without weakening the guard.
-        if let Some((gated_candidate, gated_status)) = previously_gated.get(&repository_id) {
-            if gated_candidate == &candidate && gated_status == "red" {
+        // One gate run per candidate TREE, not per candidate commit.
+        //
+        // A retry that reproduces identical content has identical inputs, so re-running the gate would
+        // spend minutes to reach the same verdict. But it cannot be detected by comparing commit ids: a
+        // cherry-pick mints a new commit every time it runs — same content, different committer
+        // timestamp, different sha — so a sha comparison never matches and the guard never fires. The tree
+        // is what "the same inputs" actually means.
+        let candidate_tree = git_output(
+            &integration_worktree,
+            &["rev-parse", &format!("{candidate}^{{tree}}")],
+        );
+        if let Some((gated_tree, gated_status)) = previously_gated.get(&repository_id) {
+            if candidate_tree.as_deref() == Some(gated_tree.as_str()) && gated_status == "red" {
                 wave["topology"]["repositories"][repository_index]["candidate"] = json!(candidate);
                 wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"red","runs":1,"reason":"candidate unchanged since its red gate; nothing to re-run","candidate":candidate});
                 failures.push(json!({"repository": repository_id, "candidate": candidate, "reason": "candidate unchanged since its red gate"}));
@@ -14202,7 +14229,7 @@ fn fleet_call(
 ) -> Result<(String, Value, Vec<String>, u64)> {
     match operation {
         "status" if request.is_none() => {
-            let data = json!({"state":state,"sources":fleet_sources(root)?});
+            let data = fleet_status_projection(root, &state)?;
             Ok((fleet_status_human(&data), data, vec![], state.revision))
         }
         "schedule" if request.is_none() => {
@@ -14753,10 +14780,12 @@ mod tests {
     /// Failing first: an agent recorded `working` by a process that no longer exists must not read as
     /// active.
     ///
-    /// A turn runs synchronously in the process that wrote `working`, so that process dying is the one
-    /// case where no terminal status is ever written. `wave-308-worker-1` read `working` for hours with
-    /// nothing behind it, which inflated `worker_counts.active`, kept its wave out of reaping, and was
-    /// not answerable from Fleet state at all — the driver had to scan `/proc` to find out.
+    /// Two independent lies are possible about an active status, and `worker_activity` must catch both. A
+    /// terminal receipt proves the turn ENDED and the status is merely stale. But the turn runs
+    /// synchronously in the process that wrote `working`, so if that process is killed no receipt is ever
+    /// written: there is nothing stale to notice, only silence. `wave-308-worker-1` read `working` for
+    /// hours that way — inflating the active count, keeping its wave out of reaping, and pushing the
+    /// driver into scanning `/proc` because state could not answer.
     #[test]
     fn an_agent_whose_supervisor_died_is_not_active() {
         // A pid that is certainly dead: run a child to completion and reap it. Reusing that pid within
@@ -14769,34 +14798,40 @@ mod tests {
         let reaped_pid = reaped.id();
         let mut reaped = reaped;
         reaped.wait().expect("reap it");
+
+        // Silence: `working`, no receipt of any kind, and a supervisor that is gone.
         let dead = json!({"status": "working", "supervisor_pid": reaped_pid});
         assert_eq!(
-            effective_worker_status(&dead),
-            "interrupted",
+            worker_activity(&dead),
+            WorkerActivity::Attention,
             "a `working` record with a dead supervisor is not work in flight"
         );
-        assert!(!fleet_status_is_active(effective_worker_status(&dead)));
-        assert_eq!(
-            fleet_status_bucket(effective_worker_status(&dead)),
-            "interrupted"
-        );
-        assert!(
-            fleet_worker_needs_attention(&dead),
-            "an interrupted worker is exactly what an operator must be shown"
+        assert_ne!(
+            worker_activity(&dead),
+            WorkerActivity::Settled,
+            "an interrupted worker needs attention, not silence"
         );
 
-        // This process is the supervisor of a turn it is running, and must stay active.
+        // This process supervises a turn it is running, and must stay active.
         let live = json!({"status": "working", "supervisor_pid": std::process::id()});
-        assert_eq!(effective_worker_status(&live), "working");
-        assert!(fleet_status_is_active(effective_worker_status(&live)));
+        assert_eq!(worker_activity(&live), WorkerActivity::Active);
 
-        // A record written before the pid existed keeps its recorded status rather than being downgraded.
+        // A record written before the pid existed is judged on its receipts alone, not downgraded.
         let legacy = json!({"status": "working"});
-        assert_eq!(effective_worker_status(&legacy), "working");
+        assert_eq!(worker_activity(&legacy), WorkerActivity::Active);
 
-        // A terminal status is never reinterpreted, whatever the pid says.
+        // The other half of the derivation still holds: a receipt settles a stale `working` even while
+        // the supervisor is alive, which is the case a pid check alone cannot see.
+        let receipted = json!({
+            "status": "working",
+            "supervisor_pid": std::process::id(),
+            "last_activity": "agent.turn.completed",
+        });
+        assert_eq!(worker_activity(&receipted), WorkerActivity::Attention);
+
+        // A settled status is never reinterpreted, whatever the pid says.
         let done = json!({"status": "completed", "supervisor_pid": reaped_pid});
-        assert_eq!(effective_worker_status(&done), "completed");
+        assert_eq!(worker_activity(&done), WorkerActivity::Settled);
     }
 
     /// Live activity must reach a surface DURING a wave. Failing first: a wave writes `state.json`
@@ -15185,7 +15220,7 @@ mod tests {
                         "worktree":format!("/worktrees/{index}"),
                         "handoff":{"summary":"bounded handoff","events":["x".repeat(10_000)]}
                     },
-                    "last_activity":"agent.turn.completed",
+                    "last_activity": if index == 0 { "agent.turn.delivered" } else { "agent.turn.completed" },
                     "last_turn":{"events":[{"type":"tool_result","name":"read","outcome":"ok"}]}
                 }),
             );
@@ -15361,183 +15396,6 @@ mod tests {
     }
 
     #[test]
-    fn fleet_status_projection_is_bounded_and_counts_current_state_not_old_receipts() {
-        let root = fleet_tui_fixture("bounded-fleet-status");
-        let mut state = populated_fleet_tui_state();
-        state.main_agent.last_turn = Some(json!({
-            "answer": "main-answer-marker".repeat(100_000),
-            "events": [{"payload": "main-event-marker".repeat(100_000)}],
-            "outcome": "ok",
-            "session": "s-main",
-        }));
-        state.main_agent.last_error = Some("api_key=sk-live".into());
-        state.intake.insert(
-            "intake-999".into(),
-            json!({
-                "ack":"completed",
-                "source":"user",
-                "text":"intake-body-marker".repeat(100_000),
-                "receipt":{"events":[{"payload":"receipt-marker".repeat(100_000)}]},
-            }),
-        );
-        state.agents.insert(
-            "worker-stale-active-receipt".into(),
-            json!({
-                "role":"writer",
-                "status":"failed",
-                "last_error":"failed after its process exited",
-                "last_turn":{"status":"working","events":[{"payload":"worker-event-marker".repeat(100_000)}]},
-                "assignment":{"board_ref":"repo/C-9","wave":"wave-7"},
-            }),
-        );
-
-        let unbounded = serde_json::to_vec(&state).unwrap();
-        assert!(
-            unbounded.len() > 2_000_000,
-            "fixture is only {} bytes",
-            unbounded.len()
-        );
-
-        let projection = fleet_status_projection(&root, &state).unwrap();
-        let encoded = serde_json::to_vec(&projection).unwrap();
-        let rendered = String::from_utf8(encoded.clone()).unwrap();
-
-        assert_eq!(projection["schema"], "flux.fleet-status/v1");
-        assert_eq!(projection["state"]["worker_counts"]["active"], 1);
-        assert_eq!(projection["state"]["worker_counts"]["attention"], 2);
-        assert_eq!(projection["state"]["worker_counts"]["total"], 107);
-        assert_eq!(projection["state"]["workers"].as_array().unwrap().len(), 50);
-        assert_eq!(projection["state"]["workers_truncated"], true);
-        assert_eq!(projection["attention_required"], true);
-        assert_eq!(
-            projection["state"]["main_agent"]["last_transition"]["event_count"],
-            1
-        );
-        for forbidden in [
-            "main-answer-marker",
-            "main-event-marker",
-            "intake-body-marker",
-            "receipt-marker",
-            "worker-event-marker",
-            "last_turn",
-            "sk-live",
-        ] {
-            assert!(!rendered.contains(forbidden), "status retained {forbidden}");
-        }
-        assert!(
-            encoded.len() <= MAX_FLEET_STATUS_BYTES,
-            "status grew to {} bytes",
-            encoded.len()
-        );
-        assert!(fleet_status_human(&projection).contains("flux fleet inspect activity"));
-
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn fleet_status_fixture_matrix_is_stable_bounded_and_operationally_truthful() {
-        let root = fleet_tui_fixture("fleet-status-matrix");
-        let empty = FleetState {
-            revision: 1,
-            ..FleetState::default()
-        };
-
-        let mut one_active = FleetState {
-            revision: 2,
-            running: true,
-            ..FleetState::default()
-        };
-        one_active.agents.insert(
-            "worker-1".into(),
-            json!({"status":"working","role":"writer","runtime_session":"s-1","assignment":{"board_ref":"repo/C-1","wave":"wave-1"}}),
-        );
-
-        let mut five_active = FleetState {
-            revision: 3,
-            running: true,
-            ..FleetState::default()
-        };
-        for index in 0..5 {
-            five_active.agents.insert(
-                format!("worker-{index}"),
-                json!({"status":"working","role":"writer","runtime_session":format!("s-{index}"),"assignment":{"board_ref":format!("repo/C-{index}"),"wave":"wave-3"}}),
-            );
-        }
-
-        let mut repeated_failures = FleetState {
-            revision: 4,
-            running: true,
-            ..FleetState::default()
-        };
-        for index in 0..20 {
-            repeated_failures.agents.insert(
-                format!("failed-{index:02}"),
-                json!({
-                    "status":"failed",
-                    "role":"writer",
-                    "last_error":"same bounded failure",
-                    "last_turn":{"outcome":"error","events":[{"content":"failure-history".repeat(2_000)}]},
-                    "assignment":{"board_ref":format!("repo/C-{index}"),"wave":"wave-4"},
-                }),
-            );
-        }
-
-        let mut long_lived = FleetState {
-            revision: 50_000,
-            running: true,
-            ..FleetState::default()
-        };
-        for index in 0..500 {
-            long_lived.agents.insert(
-                format!("retired-{index:04}"),
-                json!({
-                    "status":"cancelled",
-                    "last_error":"historical failure",
-                    "last_turn":{"events":[{"content":"retained-history".repeat(500)}]},
-                    "assignment":{"board_ref":format!("repo/C-{index}"),"wave":format!("wave-{index}")},
-                }),
-            );
-            long_lived.intake.insert(
-                format!("intake-{index}"),
-                json!({"ack":"completed","text":"old-intake".repeat(500),"receipt":{"events":["old-receipt".repeat(500)]}}),
-            );
-            long_lived.waves.insert(
-                format!("wave-{index}"),
-                json!({"status":"cancelled","items":[format!("repo/C-{index}")],"evidence":"old-wave-evidence".repeat(500)}),
-            );
-        }
-
-        for (name, state, expected_active, expected_attention) in [
-            ("empty", empty, 0, 0),
-            ("one-active", one_active, 1, 0),
-            ("five-active", five_active, 5, 0),
-            ("repeated-failures", repeated_failures, 0, 20),
-            ("long-lived", long_lived, 0, 0),
-        ] {
-            let first = fleet_status_projection(&root, &state).unwrap();
-            let second = fleet_status_projection(&root, &state).unwrap();
-            assert_eq!(first, second, "{name} projection changed between reads");
-            assert_eq!(
-                first["state"]["worker_counts"]["active"], expected_active,
-                "{name} active count"
-            );
-            assert_eq!(
-                first["state"]["worker_counts"]["attention"], expected_attention,
-                "{name} attention count"
-            );
-            let encoded = serde_json::to_vec(&first).unwrap();
-            assert!(
-                encoded.len() <= MAX_FLEET_STATUS_BYTES,
-                "{name} status grew to {} bytes",
-                encoded.len()
-            );
-            assert!(fleet_status_human(&first).contains("flux fleet inspect"));
-        }
-
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
     fn attached_fleet_main_status_uses_the_bounded_native_snapshot() {
         let root = Path::new("/workspace");
         let args = NativeCoordinatorOperation::FleetStatus
@@ -15582,100 +15440,6 @@ mod tests {
             "snapshot grew to {} bytes",
             encoded.len()
         );
-
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn targeted_fleet_inspect_keeps_terminal_facts_and_bounds_retained_evidence() {
-        let root = fleet_tui_fixture("bounded-targeted-inspect");
-        let mut state = populated_fleet_tui_state();
-        state.agents.get_mut("worker-000").unwrap()["last_turn"] = json!({
-            "schema":"flux.fleet-agent-turn/v1",
-            "outcome":"ok",
-            "session":"s-0",
-            "answer":"worker-answer-marker".repeat(100_000),
-            "events":[{
-                "type":"tool_result",
-                "outcome":"ok",
-                "content":"worker-event-marker".repeat(100_000),
-                "api_key":"sk-live",
-            }],
-        });
-        state.waves.get_mut("wave-7").unwrap()["evidence"] = json!({
-            "status":"recorded",
-            "stdout":"wave-evidence-marker".repeat(100_000),
-        });
-        state.waves.insert(
-            "wave-result".into(),
-            json!({
-                "status":"completed",
-                "topology":{"repositories":[{"stories":[{
-                    "board_ref":"repo/C-9",
-                    "status":"completed",
-                    "handoff":{"outcome":"accepted","content":"result-handoff-marker".repeat(100_000)},
-                    "reviews":[{"outcome":"pass","content":"result-review-marker".repeat(100_000)}],
-                }]}]},
-            }),
-        );
-
-        let worker =
-            fleet_inspect(&root, &state, InspectView::Worker, Some("worker-000"), 7).unwrap();
-        let wave = fleet_inspect(&root, &state, InspectView::Wave, Some("wave-7"), 7).unwrap();
-        let activity = bounded_fleet_inspect(
-            InspectView::Activity,
-            None,
-            150,
-            json!({"events":(0..150).map(|index| json!({
-                "type":"tool_result",
-                "outcome":"ok",
-                "index":index,
-                "content":"activity-event-marker".repeat(2_000),
-            })).collect::<Vec<_>>() }),
-        );
-        let result =
-            fleet_inspect(&root, &state, InspectView::Result, Some("repo/C-9"), 7).unwrap();
-
-        assert_eq!(worker["data"]["last_turn"]["outcome"], "ok");
-        assert_eq!(worker["data"]["last_turn"]["session"], "s-0");
-        assert!(worker["data"]["last_turn"]["answer"]["$omitted"].is_u64());
-        assert_eq!(worker["truncated"], true);
-        assert_eq!(wave["truncated"], true);
-        assert_eq!(activity["truncated"], true);
-        assert_eq!(result["truncated"], true);
-        assert_eq!(result["data"]["results"][0]["status"], "completed");
-        assert_eq!(
-            result["data"]["results"][0]["handoff"]["outcome"],
-            "accepted"
-        );
-        assert!(activity["omissions_total"].as_u64().unwrap() > 100);
-        assert_eq!(activity["omissions_truncated"], true);
-        assert_eq!(
-            activity["omissions"][0]["source"],
-            ".flux/fleet/events.ndjson"
-        );
-
-        for projection in [&worker, &wave, &activity, &result] {
-            let encoded = serde_json::to_vec(projection).unwrap();
-            let rendered = String::from_utf8(encoded.clone()).unwrap();
-            assert!(encoded.len() <= MAX_FLEET_INSPECT_BYTES);
-            for forbidden in [
-                "worker-answer-marker",
-                "worker-event-marker",
-                "wave-evidence-marker",
-                "activity-event-marker",
-                "result-handoff-marker",
-                "result-review-marker",
-                "sk-live",
-            ] {
-                assert!(
-                    !rendered.contains(forbidden),
-                    "inspect retained {forbidden}"
-                );
-            }
-            assert!(projection["byte_limit"].is_u64());
-            assert!(projection["omissions"].is_array());
-        }
 
         fs::remove_dir_all(root).ok();
     }
@@ -16383,6 +16147,428 @@ mod tests {
         assert_eq!(terminal["payload_omitted"]["actual_bytes"], oversized.len());
         assert_eq!(stream_budget["omitted_event_count"], 1);
         assert!(!terminal.to_string().contains(&"x".repeat(event_limit)));
+    }
+
+    fn retained_turn_receipt(agent: &str, events: usize) -> Value {
+        json!({
+            "schema": "flux.fleet-agent-turn/v1",
+            "agent": agent,
+            "ack": "completed",
+            "session": "s_1",
+            "answer": "y".repeat(20_000),
+            "events": (0..events)
+                .map(|index| json!({
+                    "type": "tool_result",
+                    "name": "read",
+                    "outcome": "ok",
+                    "content": format!("{index}{}", "x".repeat(10_000)),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The 2026-08-05 roadmap dogfood shape: repeated failed/continued turns whose receipts, intake
+    /// bodies and historical event arrays are all retained in durable Fleet state.
+    fn dogfood_shaped_fleet_state() -> FleetState {
+        let mut state = FleetState {
+            revision: 150,
+            running: true,
+            ..FleetState::default()
+        };
+        state.main_agent.status = "working".into();
+        state.main_agent.session = Some("s_9".into());
+        state.main_agent.goals_revision = 4;
+        state.main_agent.last_turn = Some(retained_turn_receipt("main", 40));
+        for index in 0..7 {
+            state.agents.insert(
+                format!("wave-346-worker-{index}"),
+                json!({
+                    "role": "writer",
+                    "status": if index == 0 { "working" } else { "failed" },
+                    "runtime_session": format!("s_{index}"),
+                    "last_activity": if index == 0 { "agent.turn.delivered" } else { "agent.turn.failed" },
+                    "last_error": if index == 0 { Value::Null } else { json!("transient-worker: targeted gate failed") },
+                    "assignment": {
+                        "board_ref": format!("flux/C-{}", 560 + index),
+                        "wave": "wave-346",
+                        "worktree": format!("/worktrees/{index}"),
+                    },
+                    "last_turn": retained_turn_receipt(&format!("wave-346-worker-{index}"), 40),
+                }),
+            );
+        }
+        for index in 1..=12 {
+            state.intake.insert(
+                format!("intake-{index}"),
+                json!({
+                    "id": format!("intake-{index}"),
+                    "ack": "completed",
+                    "source": "user",
+                    "text": "Continue the roadmap wave",
+                    "receipt": retained_turn_receipt("main", 20),
+                }),
+            );
+        }
+        for index in 340..=346 {
+            state.waves.insert(
+                format!("wave-{index}"),
+                json!({
+                    "status": if index == 346 { "working" } else { "red" },
+                    "items": ["flux/C-560", "flux/C-561", "flux/C-562"],
+                    "apply_eligible": false,
+                    "topology": {"repositories": [{
+                        "id": "flux",
+                        "gate": {"status": "red", "evidence": {
+                            "argv": ["cargo", "test"],
+                            "exit_code": 101,
+                            "stdout": "z".repeat(60_000),
+                        }},
+                    }]},
+                }),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn default_fleet_status_stays_inside_its_reviewed_byte_budget() {
+        let root = fleet_tui_fixture("status-budget");
+        let state = dogfood_shaped_fleet_state();
+        let retained = serde_json::to_vec(&state).unwrap().len();
+        assert!(
+            retained > 2_500_000,
+            "fixture retained only {retained} bytes; it no longer reproduces the dogfood shape"
+        );
+
+        let data = fleet_status_projection(&root, &state).unwrap();
+        let encoded = serde_json::to_vec(&data).unwrap();
+        let human = fleet_status_human(&data);
+
+        assert!(
+            encoded.len() <= FLEET_STATUS_BUDGET_BYTES,
+            "default status projection was {} bytes for {retained} retained bytes",
+            encoded.len()
+        );
+        assert!(
+            human.len() <= FLEET_STATUS_HUMAN_BUDGET_BYTES,
+            "human status projection was {} bytes",
+            human.len()
+        );
+        let text = String::from_utf8(encoded).unwrap();
+        for payload in ["x".repeat(1_000), "y".repeat(1_000), "z".repeat(1_000)] {
+            assert!(
+                !text.contains(&payload),
+                "default status embedded retained turn payload"
+            );
+        }
+        assert!(
+            !text.contains("tool_result"),
+            "default status embedded historical tool events"
+        );
+        assert_eq!(data["schema"], "flux.fleet-status/v1");
+        assert_eq!(data["revision"], 150);
+        assert_eq!(data["running"], true);
+        assert_eq!(data["main"]["session"], "s_9");
+        assert_eq!(data["main"]["goals_revision"], 4);
+        assert_eq!(data["workers"]["total"], 7);
+        assert_eq!(data["workers"]["active"], 1);
+        assert_eq!(data["workers"]["attention"], 6);
+        assert_eq!(data["waves"]["total"], 7);
+        assert_eq!(data["intake"]["total"], 12);
+        assert_eq!(
+            data["workers"]["listed"][0]["board_ref"], "flux/C-560",
+            "status lost the exact BoardRef"
+        );
+        assert!(
+            human.contains("flux fleet inspect worker"),
+            "human status named no next inspect command: {human}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&fleet_status_projection(&root, &state).unwrap()).unwrap(),
+            serde_json::to_vec(&data).unwrap(),
+            "status projection changed between reads"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_status_fixtures_cover_empty_active_concurrent_and_failing_states() {
+        let root = fleet_tui_fixture("status-fixtures");
+        let working = |item: &str, wave: &str, session: &str| {
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": session,
+                "last_activity": "agent.turn.delivered",
+                "assignment": {"board_ref": item, "wave": wave},
+            })
+        };
+        let mut one = FleetState {
+            revision: 3,
+            running: true,
+            ..FleetState::default()
+        };
+        one.agents.insert(
+            "wave-1-worker-1".into(),
+            working("flux/C-562", "wave-1", "s_1"),
+        );
+        let mut five = FleetState {
+            revision: 9,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 1..=5 {
+            five.agents.insert(
+                format!("wave-2-worker-{index}"),
+                working(
+                    &format!("flux/C-56{index}"),
+                    "wave-2",
+                    &format!("s_{index}"),
+                ),
+            );
+        }
+        let mut failures = FleetState {
+            revision: 21,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 1..=3 {
+            failures.agents.insert(
+                format!("wave-3-worker-{index}"),
+                json!({
+                    "role": "writer",
+                    "status": "failed",
+                    "last_activity": "agent.turn.failed",
+                    "last_error": "transient-worker: agent turn failed",
+                    "assignment": {"board_ref": format!("flux/C-56{index}"), "wave": "wave-3"},
+                    "last_turn": retained_turn_receipt(&format!("wave-3-worker-{index}"), 20),
+                }),
+            );
+        }
+
+        for (label, state, total, active, attention) in [
+            ("empty", FleetState::default(), 0, 0, 0),
+            ("one-active", one, 1, 1, 0),
+            ("five-concurrent", five, 5, 5, 0),
+            ("repeated-failures", failures, 3, 0, 3),
+            ("long-lived", dogfood_shaped_fleet_state(), 7, 1, 6),
+        ] {
+            let data = fleet_status_projection(&root, &state).unwrap();
+            let encoded = serde_json::to_vec(&data).unwrap();
+            let human = fleet_status_human(&data);
+            assert_eq!(data["workers"]["total"], total, "{label}");
+            assert_eq!(data["workers"]["active"], active, "{label}");
+            assert_eq!(data["workers"]["attention"], attention, "{label}");
+            assert!(
+                encoded.len() <= FLEET_STATUS_BUDGET_BYTES,
+                "{label} status projection was {} bytes",
+                encoded.len()
+            );
+            assert!(
+                human.contains("next: flux fleet "),
+                "{label} named no next command: {human}"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_status_redacts_before_budgeting_and_omits_one_huge_event() {
+        let root = fleet_tui_fixture("status-redaction");
+        let mut state = FleetState {
+            revision: 5,
+            running: true,
+            ..FleetState::default()
+        };
+        state.main_agent.last_error = Some("provider refused: api_key sk-live-adversarial".into());
+        state.agents.insert(
+            "wave-1-worker-1".into(),
+            json!({
+                "role": "writer",
+                "status": "failed",
+                "last_activity": "agent.turn.failed",
+                "last_error": "authorization: Bearer sk-live-adversarial recorded in the gate log",
+                "assignment": {"board_ref": "flux/C-562", "wave": "wave-1"},
+                "last_turn": {"ack": "failed", "events": [{
+                    "type": "tool_result",
+                    "content": "q".repeat(900_000),
+                }]},
+            }),
+        );
+
+        let data = fleet_status_projection(&root, &state).unwrap();
+        let text = serde_json::to_string(&data).unwrap();
+
+        assert!(text.len() <= FLEET_STATUS_BUDGET_BYTES);
+        assert!(
+            !text.contains("sk-live-adversarial"),
+            "adversarial secret survived the default projection: {text}"
+        );
+        assert!(
+            !text.contains(&"q".repeat(1_000)),
+            "one huge event survived the default projection"
+        );
+        assert_eq!(data["main"]["last_error"], "[redacted]");
+        assert_eq!(data["workers"]["listed"][0]["last_error"], "[redacted]");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fleet_status_and_dashboard_agree_on_active_workers() {
+        let root = fleet_tui_fixture("active-agreement");
+        let mut state = FleetState {
+            revision: 11,
+            running: true,
+            ..FleetState::default()
+        };
+        state.main_agent.status = "running".into();
+        state.main_agent.session = Some("s-main".into());
+        state.agents.insert(
+            "live".into(),
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": "s_1",
+                "last_activity": "agent.turn.delivered",
+                "assignment": {"board_ref": "flux/C-562", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "interrupted".into(),
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": "s_2",
+                "last_activity": "agent.turn.completed",
+                "last_turn": {"ack": "completed", "session": "s_2"},
+                "assignment": {"board_ref": "flux/C-561", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "continued".into(),
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": "s_3",
+                "last_activity": "agent.turn.delivered",
+                "last_turn": {"ack": "completed", "session": "s_3", "events": []},
+                "assignment": {"board_ref": "flux/C-557", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "broken".into(),
+            json!({
+                "role": "writer",
+                "status": "failed",
+                "last_activity": "agent.turn.failed",
+                "last_error": "validation/gate: targeted test failed",
+                "assignment": {"board_ref": "flux/C-560", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "stopped".into(),
+            json!({
+                "role": "writer",
+                "status": "cancelled",
+                "assignment": {"board_ref": "flux/C-559", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "finished".into(),
+            json!({
+                "role": "writer",
+                "status": "completed",
+                "last_activity": "agent.turn.completed",
+                "assignment": {"board_ref": "flux/C-558", "wave": "wave-1"},
+            }),
+        );
+        write_fleet_state(&root, &state).unwrap();
+
+        let data = fleet_status_projection(&root, &state).unwrap();
+        let snapshot = FleetTuiSource {
+            root: root.canonicalize().unwrap(),
+        }
+        .snapshot()
+        .unwrap();
+
+        assert_eq!(data["workers"]["total"], 6);
+        assert_eq!(snapshot.capacity.registered, 6);
+        assert_eq!(
+            data["workers"]["active"], 2,
+            "status miscounted live and finished processes"
+        );
+        assert_eq!(
+            snapshot.capacity.active, 2,
+            "dashboard miscounted live and finished processes"
+        );
+        assert_eq!(data["workers"]["attention"], 2);
+        let listed = data["workers"]["listed"].as_array().unwrap();
+        let activity = |id: &str| {
+            listed
+                .iter()
+                .find(|worker| worker["id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing from {listed:?}"))["activity"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(activity("live"), "active");
+        assert_eq!(
+            activity("continued"),
+            "active",
+            "a continued worker was settled by the receipt of its previous turn"
+        );
+        assert_eq!(activity("interrupted"), "attention");
+        assert_eq!(activity("broken"), "attention");
+        assert_eq!(activity("stopped"), "settled");
+        assert_eq!(activity("finished"), "settled");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_inspect_bounds_retained_evidence_with_omission_metadata() {
+        let root = fleet_tui_fixture("inspect-budget");
+        let state = dogfood_shaped_fleet_state();
+
+        let data = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Worker,
+            Some("wave-346-worker-1"),
+            100,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&data).unwrap();
+
+        assert!(
+            encoded.len() <= FLEET_INSPECT_BUDGET_BYTES,
+            "inspect worker returned {} bytes",
+            encoded.len()
+        );
+        assert_eq!(data["bounded"], true);
+        assert_eq!(data["limit"], 100);
+        assert_eq!(data["budget_bytes"], FLEET_INSPECT_BUDGET_BYTES);
+        assert_eq!(data["data"]["assignment"]["board_ref"], "flux/C-561");
+        let omitted = data["omitted"].as_array().unwrap();
+        assert!(
+            !omitted.is_empty(),
+            "bounded inspect returned no omission metadata"
+        );
+        for record in omitted {
+            assert_eq!(record["schema"], "flux.fleet-inspect-omitted/v1");
+            let encoded = record.to_string();
+            assert!(encoded.len() < 512, "omission record grew to {encoded}");
+            assert!(
+                !encoded.contains(&"x".repeat(100)),
+                "omission metadata carried the omitted payload"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

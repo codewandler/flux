@@ -7,6 +7,7 @@
 
 mod agent_loop;
 mod audio;
+pub mod budget;
 mod content;
 mod context;
 mod dispatch;
@@ -23,6 +24,10 @@ mod urlencode;
 
 pub use agent_loop::{AgentLoopBindingMetadata, AgentLoopRunnerKind};
 pub use audio::{AudioEncoding, AudioFormat};
+pub use budget::{
+    BudgetAttribution, BudgetBreach, BudgetCharge, BudgetDimension, BudgetEnvelope, BudgetLedger,
+    BudgetLimits, BudgetOutcome, BudgetProjection, BudgetScope, BudgetSpend, BudgetUsageEvent,
+};
 pub use content::{
     ContentBlock, ImageSource, Role, ToolResultContent, ARGS_PARSE_ERROR_KEY, ARGS_RAW_PREFIX_KEY,
 };

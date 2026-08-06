@@ -490,6 +490,16 @@ flux fleet stop --output json
 
 Status has an independent read lane, so a busy or stuck worker cannot make fleet inspection hang.
 
+`status` and `dashboard` are bounded projections, not a dump of durable state. They report main
+state, active and attention worker counts, wave and item state, exact board references,
+repositories, current sessions, the last transition or error summary and the current revision, and
+they stay inside a fixed byte budget however much turn history the fleet has retained. Answers, tool
+events, diffs, instruction bodies and repository contents are never copied into them; anything the
+budget drops is reported as payload-free omission metadata, and the human form names the next useful
+inspection or recovery command. A worker counts as active only while its recorded transition says a
+turn is in flight, so a completed, failed, cancelled or interrupted process is never active merely
+because an old receipt still says `working`.
+
 ## Bounded inspection replaces helper scripts
 
 Every inspect command has a stable JSON form and an explicit bound:

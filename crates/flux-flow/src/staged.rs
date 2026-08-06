@@ -142,8 +142,12 @@ pub(crate) struct StagedContext {
     pub authored_ceiling: Option<HashSet<String>>,
     pub groups: Vec<ToolGroup>,
     pub opts: StageOptions,
-    /// Remaining billed-token budget when this stage call began.
-    pub remaining_token_budget: Option<u64>,
+    /// C-542: what the enclosing run/turn budget envelope had already spent, and what it declares,
+    /// when this stage began. [`ensure_stage_budget`] charges this segment's finished rounds on top
+    /// of it, so a stop names the enclosing scope's real spent/limit rather than a stage-local
+    /// remainder. An empty envelope (the default) means no budget is declared and nothing is
+    /// enforced.
+    pub budget: flux_core::BudgetProjection,
     /// Logical-run and per-stage cognition policy. Counts live in [`AdaptiveState`] so an `await`
     /// and process restart cannot reset them.
     pub adaptive_policy: AdaptiveLoopPolicy,
@@ -3097,17 +3101,51 @@ fn ensure_model_call_budget(
     Ok(())
 }
 
+/// C-542: the segment-scope budget check, run at the stage's **safe boundary** — after the round
+/// that just finished has been measured and reported, and before the next model call is dispatched.
+/// An effect in flight is therefore never reported stopped while it is still finishing: its usage
+/// arrives in `usages` and is charged first, and only then can the ledger refuse the next round.
+///
+/// The ledger is the single accounting path: the enclosing scope's spend enters as one event and
+/// this stage's rounds as segment events, so the typed [`flux_core::BudgetBreach`] names the real
+/// scope, dimension, spent and limit. A declared *target* never stops a stage — only a hard limit
+/// does.
 fn ensure_stage_budget(ctx: &StagedContext, usages: &[Usage]) -> Result<()> {
-    let Some(remaining) = ctx.remaining_token_budget else {
-        return Ok(());
+    let envelope = flux_core::BudgetEnvelope {
+        scope: ctx.budget.scope,
+        target: ctx.budget.target,
+        limit: ctx.budget.limit,
     };
-    let used = usages.iter().map(Usage::total).sum::<u64>();
-    if used < remaining {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "turn token budget exhausted before the next model round ({used} stage tokens used; {remaining} remained)"
-        )))
+    if envelope.limit.is_empty() {
+        return Ok(());
+    }
+    let attribution = flux_core::BudgetAttribution {
+        run_id: ctx.session_id.clone(),
+        session_id: Some(ctx.session_id.clone()),
+        turn_id: ctx.audit.as_ref().map(|(_, turn_id)| *turn_id),
+        segment: None,
+    };
+    let mut ledger = flux_core::BudgetLedger::new(envelope);
+    ledger.record(&flux_core::BudgetUsageEvent {
+        event_id: "enclosing-spend".into(),
+        scope: envelope.scope,
+        attribution: attribution.clone(),
+        spend: ctx.budget.spent,
+        rollup: false,
+    });
+    for (round, usage) in usages.iter().enumerate() {
+        ledger.record(&flux_core::BudgetUsageEvent::for_call(
+            format!("segment-round-{round}"),
+            flux_core::BudgetScope::Segment,
+            attribution.clone(),
+            usage,
+        ));
+    }
+    match ledger.exhausted() {
+        None => Ok(()),
+        Some(breach) => Err(Error::Other(format!(
+            "budget exhausted before the next model round: {breach} (hard limit, stopped at the stage boundary)"
+        ))),
     }
 }
 
@@ -4206,7 +4244,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
@@ -4303,7 +4341,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
@@ -4424,7 +4462,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
@@ -5804,6 +5842,102 @@ mod tests {
         );
     }
 
+    /// C-542: an enclosing hard limit stops the stage at its safe boundary and the refusal names
+    /// scope, dimension, spent and limit. The round that just finished is charged *before* the
+    /// ledger is consulted, so a call still in flight is never reported as stopped.
+    #[test]
+    fn a_hard_token_limit_stops_at_the_stage_boundary_with_a_typed_breach() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.budget = flux_core::BudgetProjection {
+            scope: flux_core::BudgetScope::Run,
+            spent: flux_core::BudgetSpend {
+                total_tokens: 100,
+                ..Default::default()
+            },
+            target: flux_core::BudgetLimits::default(),
+            limit: flux_core::BudgetLimits::with_total_tokens(300),
+            warnings: Vec::new(),
+            exhausted: None,
+            attribution: None,
+        };
+
+        ensure_stage_budget(&context, &[]).expect("under the limit the stage may continue");
+
+        let finished = Usage {
+            input_tokens: 150,
+            output_tokens: 60,
+            ..Default::default()
+        };
+        let error = ensure_stage_budget(&context, &[finished])
+            .expect_err("the hard limit must stop the next round")
+            .to_string();
+        assert!(error.contains("run budget total_tokens"), "{error}");
+        assert!(error.contains("310"), "{error}");
+        assert!(error.contains("300"), "{error}");
+    }
+
+    /// C-542: a target with no hard limit is a warning line, not a stop line — the stage keeps
+    /// running however far past it the run has spent.
+    #[test]
+    fn a_target_without_a_hard_limit_never_stops_a_stage() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.budget = flux_core::BudgetProjection {
+            scope: flux_core::BudgetScope::Run,
+            spent: flux_core::BudgetSpend {
+                total_tokens: 9_000,
+                ..Default::default()
+            },
+            target: flux_core::BudgetLimits::with_total_tokens(100),
+            limit: flux_core::BudgetLimits::default(),
+            warnings: Vec::new(),
+            exhausted: None,
+            attribution: None,
+        };
+        let usage = Usage {
+            input_tokens: 5_000,
+            ..Default::default()
+        };
+        ensure_stage_budget(&context, &[usage]).expect("a target must not stop execution");
+    }
+
+    /// C-542: an already-exhausted envelope refuses at the boundary *before* any provider call, so
+    /// the stop never interrupts an effect and never charges usage it did not measure.
+    #[tokio::test]
+    async fn an_exhausted_budget_stops_a_stage_before_any_provider_call() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![prose("this response must never be requested")]);
+        context.budget = flux_core::BudgetProjection {
+            scope: flux_core::BudgetScope::Turn,
+            spent: flux_core::BudgetSpend {
+                total_tokens: 400,
+                ..Default::default()
+            },
+            target: flux_core::BudgetLimits::default(),
+            limit: flux_core::BudgetLimits::with_total_tokens(300),
+            warnings: Vec::new(),
+            exhausted: None,
+            attribution: None,
+        };
+
+        let run = detect_intent_stage(context).await;
+        let error = run.result.expect_err("the turn limit is hard").to_string();
+        assert!(error.contains("budget exhausted"), "{error}");
+        assert!(error.contains("turn budget total_tokens"), "{error}");
+        assert!(
+            run.usages.is_empty(),
+            "no call was in flight, so nothing was charged: {:?}",
+            run.usages
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            0,
+            "the stop happens at the boundary, never by interrupting a dispatched call"
+        );
+    }
+
     #[tokio::test]
     async fn built_in_stage_policy_overrides_model_effort_and_tokens_independently() {
         let TestHarness {
@@ -7026,7 +7160,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
