@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.58.0] - 2026-08-07
+
 ### New
 
 - **A run's time and token budget is now visible while the run happens.** When a budget is set, the

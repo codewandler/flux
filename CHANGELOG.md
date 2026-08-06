@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.58.0] - 2026-08-07
+
 ### Added
 
 - **Time and token spend now has one target-versus-limit vocabulary from the runtime to the screen**
