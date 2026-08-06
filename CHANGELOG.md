@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`flux board next --independent` returns the largest wave-safe set instead of the
+  highest-priority prefix.** Dependency satisfaction says only that nothing an item *waits on* is
+  outstanding; it says nothing about whether two ready items can be built at the same time.
+  Integration refuses a wave in which two stories wrote the same path, and priority clusters by
+  subject — so the highest-priority `--limit` items are frequently the worst possible wave. On the
+  flux board the eight highest-priority ready stories all declared `flux-cli`, meaning
+  `board next --limit 8` returned eight workers' worth of guaranteed integration refusal.
+  `--independent` solves for mutual independence instead: different members never conflict, a
+  declared dependency or a shared `areas`/`design` entry does, and an item with no declared areas
+  fails closed because an unknown write set costs every worker in the wave when the guess is wrong.
+  The objective is deliberately lexicographic — more items beats better priority, since an idle
+  worker delivers nothing — and the result carries a `held_back` list naming, for every excluded
+  item, the batch member it collided with and why. That list is the point as much as the batch is:
+  a width that cannot be filled is a fact about the shape of the backlog.
+
 ### Fixed
 
 - **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every

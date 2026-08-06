@@ -499,6 +499,15 @@ pub(super) enum BoardAction {
         limit: usize,
         #[arg(long)]
         area: Option<String>,
+        /// Return the largest wave-safe set instead of the highest-priority prefix.
+        ///
+        /// Dependency satisfaction says only that nothing an item *waits on* is outstanding. It
+        /// says nothing about whether two ready items can be built at the same time, and
+        /// integration refuses a wave in which two stories wrote the same path. Priority clusters
+        /// by subject, and subject is what predicts collisions, so the highest-priority `--limit`
+        /// items are often the worst possible wave.
+        #[arg(long)]
+        independent: bool,
     },
     /// Create a story, epic or design without clobbering an existing file.
     Create {
@@ -3788,7 +3797,18 @@ fn run_session_board_action(
                 current,
             ))
         }
-        BoardAction::Next { limit, area } => {
+        BoardAction::Next {
+            limit,
+            area,
+            independent,
+        } => {
+            if *independent {
+                // Session items carry no areas, so there is nothing to derive a write set from.
+                // Refusing beats returning a prefix that claims to be wave-safe.
+                anyhow::bail!(
+                    "--independent needs declared areas to reason about; session-scope items have none"
+                );
+            }
             let mut items = snapshot
                 .items
                 .values()
@@ -4164,13 +4184,20 @@ fn run_board_action(
             area.as_deref(),
             text.as_deref(),
         ),
-        BoardAction::Next { limit, area } => {
+        BoardAction::Next {
+            limit,
+            area,
+            independent,
+        } => {
             if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
                 let mut stories = active_program_projection(root)?;
                 stories.retain(|story| {
                     area.as_deref()
                         .is_none_or(|area| story.areas.iter().any(|value| value == area))
                 });
+                if *independent {
+                    return independent_batch_result(stories, *limit);
+                }
                 stories.truncate(*limit);
                 return item_result_preserving_order(stories);
             }
@@ -4194,6 +4221,9 @@ fn run_board_action(
                 })
                 .collect();
             sort_ready(&mut stories);
+            if *independent {
+                return independent_batch_result(stories, *limit);
+            }
             stories.truncate(*limit);
             item_result(stories)
         }
@@ -6216,6 +6246,225 @@ fn sort_ready(stories: &mut [Story]) {
 fn item_result(mut stories: Vec<Story>) -> Result<(String, Value, Vec<String>, Option<String>)> {
     stories.sort_by(|a, b| natural_cmp(&a.id, &b.id));
     item_result_preserving_order(stories)
+}
+
+/// The member a workspace item belongs to, or `None` for a repository-scoped id.
+fn story_member(id: &str) -> Option<&str> {
+    id.split_once('/').map(|(member, _)| member)
+}
+
+/// Why `a` and `b` cannot be built in the same wave, or `None` if they are independent.
+///
+/// Independence here means "will not write the same path", because a shared path is what
+/// integration refuses. It is decided from what the stories declare about themselves, and it fails
+/// closed: a story that declares no `areas` has an unknown write set, and a wave that dies at
+/// integration costs every worker in it, not just the two that collided.
+fn wave_conflict(a: &Story, b: &Story) -> Option<String> {
+    // Different members never conflict. Integration assembles one candidate per repository, so
+    // their commits cannot land in the same tree however much they overlap in subject.
+    if let (Some(left), Some(right)) = (story_member(&a.id), story_member(&b.id)) {
+        if left != right {
+            return None;
+        }
+    }
+    if a.dependencies.contains(&b.id) || b.dependencies.contains(&a.id) {
+        return Some("declared dependency".to_string());
+    }
+    if let Some(area) = a.areas.iter().find(|area| b.areas.contains(area)) {
+        return Some(format!("shared area {area}"));
+    }
+    if a.areas.is_empty() || b.areas.is_empty() {
+        return Some("undeclared write set".to_string());
+    }
+    match (a.design.as_deref(), b.design.as_deref()) {
+        // Both stories update the design as they land, so the document itself is the collision.
+        (Some(left), Some(right)) if left == right => Some(format!("shared design {left}")),
+        _ => None,
+    }
+}
+
+/// Search ceiling for [`select_independent_batch`]. A ready pool is tens of items and the width is
+/// single digits, so the exact search finishes far inside this; the budget exists so a pathological
+/// pool degrades to the best set found instead of running unbounded.
+const INDEPENDENT_BATCH_NODE_BUDGET: usize = 200_000;
+
+/// The largest set of mutually independent stories, preferring higher priority among equal sizes.
+///
+/// The objective is deliberately lexicographic — **more items always beats better priority** —
+/// because an idle worker delivers nothing, while a lower-priority story still delivers a story.
+///
+/// Takes `stories` already in priority order and returns indices into it, the stories held back
+/// with the batch member each one collides with, and whether the search was exhaustive.
+fn select_independent_batch(stories: &[Story], limit: usize) -> (Vec<usize>, Vec<Value>, bool) {
+    let count = stories.len();
+    if count == 0 || limit == 0 {
+        return (Vec::new(), Vec::new(), true);
+    }
+
+    let mut reasons: BTreeMap<(usize, usize), String> = BTreeMap::new();
+    let mut conflicts = vec![vec![false; count]; count];
+    for left in 0..count {
+        for right in (left + 1)..count {
+            if let Some(reason) = wave_conflict(&stories[left], &stories[right]) {
+                conflicts[left][right] = true;
+                conflicts[right][left] = true;
+                reasons.insert((left, right), reason);
+            }
+        }
+    }
+
+    // Rank is the index, because `stories` arrives in priority order. A smaller rank sum is a
+    // higher-priority batch, so the key maximises size first and negated rank sum second.
+    fn key(chosen: &[usize]) -> (usize, i64) {
+        (chosen.len(), -(chosen.iter().sum::<usize>() as i64))
+    }
+
+    let mut best: Vec<usize> = Vec::new();
+    let mut best_key = (0usize, 0i64);
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut nodes = 0usize;
+    let mut exhaustive = true;
+
+    // Iterative depth-first search over "take or skip" at each candidate, so a deep pool cannot
+    // overflow the stack the way recursion would.
+    struct Frame {
+        position: usize,
+        taken: bool,
+    }
+    let mut stack: Vec<Frame> = vec![Frame {
+        position: 0,
+        taken: false,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if frame.taken {
+            chosen.pop();
+            continue;
+        }
+        nodes += 1;
+        if nodes > INDEPENDENT_BATCH_NODE_BUDGET {
+            exhaustive = false;
+            break;
+        }
+        if key(&chosen) > best_key {
+            best_key = key(&chosen);
+            best = chosen.clone();
+        }
+        if chosen.len() == limit || frame.position == count {
+            continue;
+        }
+        // Nothing left to reach can beat the incumbent on size, and size dominates the key.
+        let reachable = chosen.len() + (count - frame.position).min(limit - chosen.len());
+        if reachable < best_key.0 {
+            continue;
+        }
+        let index = frame.position;
+        // Skip branch is pushed first so the take branch is explored first: taking the
+        // highest-priority admissible item early raises the incumbent and prunes harder.
+        stack.push(Frame {
+            position: index + 1,
+            taken: false,
+        });
+        if !chosen.iter().any(|other| conflicts[*other][index]) {
+            chosen.push(index);
+            stack.push(Frame {
+                position: index,
+                taken: true,
+            });
+            stack.push(Frame {
+                position: index + 1,
+                taken: false,
+            });
+        }
+    }
+
+    best.sort_unstable();
+    let held_back = (0..count)
+        .filter(|index| !best.contains(index))
+        .map(|index| {
+            let blocker = best.iter().find(|other| conflicts[**other][index]).copied();
+            match blocker {
+                Some(other) => {
+                    let pair = (index.min(other), index.max(other));
+                    json!({
+                        "id": stories[index].id,
+                        "blocked_by": stories[other].id,
+                        "reason": reasons.get(&pair).cloned().unwrap_or_default(),
+                    })
+                }
+                // Independent of the batch but the width ran out before it was reached.
+                None => json!({"id": stories[index].id, "reason": "width reached"}),
+            }
+        })
+        .collect();
+
+    (best, held_back, exhaustive)
+}
+
+/// `board next --independent`: the batch, plus why every other ready item was held back.
+///
+/// The held-back list is the point as much as the batch is. A width that cannot be filled is a fact
+/// about the shape of the backlog, and naming the item each exclusion collided with is what turns
+/// "the fleet only ran three workers" into "one crate serialises eleven stories".
+fn independent_batch_result(
+    stories: Vec<Story>,
+    limit: usize,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let (indices, held_back, exhaustive) = select_independent_batch(&stories, limit);
+    let pool = stories.len();
+    let batch: Vec<Story> = indices
+        .iter()
+        .map(|index| stories[*index].clone())
+        .collect();
+
+    let mut human = batch
+        .iter()
+        .map(|story| format!("{}\t{}\t{}", story.id, story.status, story.title))
+        .collect::<Vec<_>>();
+    human.push(format!(
+        "\n{} of {} requested, from a ready pool of {pool}{}",
+        batch.len(),
+        limit,
+        if exhaustive {
+            ""
+        } else {
+            " (search truncated)"
+        }
+    ));
+    if batch.len() < limit {
+        human.push(format!(
+            "held back: {}",
+            held_back
+                .iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?;
+                    let reason = entry.get("reason")?.as_str()?;
+                    Some(format!("{id} ({reason})"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    if !exhaustive {
+        warnings.push(
+            "independent-batch search hit its node budget; the batch is the best found, not proven \
+             largest"
+                .to_string(),
+        );
+    }
+    Ok((
+        human.join("\n"),
+        json!({
+            "items": batch,
+            "held_back": held_back,
+            "pool": pool,
+            "proved_largest": exhaustive,
+        }),
+        warnings,
+        None,
+    ))
 }
 
 fn item_result_preserving_order(
@@ -14655,6 +14904,148 @@ fn redact_value(value: Value) -> Value {
 mod tests {
     use super::*;
     use flux_tui::operations::FleetBoardSource as _;
+
+    fn ready_story(id: &str, priority: i64, areas: &[&str]) -> Story {
+        Story {
+            id: id.to_string(),
+            title: format!("story {id}"),
+            status: "ready".to_string(),
+            file: format!("docs/stories/{id}.md"),
+            pillar: None,
+            epic: None,
+            design: None,
+            areas: areas.iter().map(|area| area.to_string()).collect(),
+            note: None,
+            priority: Some(priority),
+            dependencies: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    /// The shape that motivated `--independent`, taken from the flux board on 2026-08-07: the eight
+    /// highest-priority ready stories every one declared `flux-cli`, because every fleet verb lands
+    /// in the same file. `board next --limit 8` returns exactly those eight, so dispatching its
+    /// answer as a wave buys eight workers and one guaranteed integration refusal.
+    #[test]
+    fn the_highest_priority_prefix_can_be_the_worst_possible_wave() {
+        let stories: Vec<Story> = [
+            "C-618", "C-637", "C-635", "C-636", "C-641", "C-639", "C-638", "C-642",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| ready_story(&format!("flux/{id}"), rank as i64, &["flux-cli"]))
+        .collect();
+
+        let (batch, held_back, exhaustive) = select_independent_batch(&stories, 8);
+
+        assert!(
+            exhaustive,
+            "a pool this small must be searched exhaustively"
+        );
+        assert_eq!(
+            batch,
+            vec![0],
+            "eight stories writing one crate cannot share a wave"
+        );
+        assert_eq!(held_back.len(), 7);
+        assert_eq!(held_back[0]["blocked_by"], "flux/C-618");
+        assert_eq!(held_back[0]["reason"], "shared area flux-cli");
+    }
+
+    /// Integration assembles one candidate per repository, so two members cannot write the same
+    /// tree however much their declared areas overlap.
+    #[test]
+    fn stories_in_different_members_are_always_independent() {
+        let stories = vec![
+            ready_story("flux/C-1", 0, &["shared-name"]),
+            ready_story("exchange/X-1", 1, &["shared-name"]),
+        ];
+
+        let (batch, held_back, _) = select_independent_batch(&stories, 8);
+
+        assert_eq!(batch, vec![0, 1]);
+        assert!(held_back.is_empty());
+    }
+
+    /// A story that declares no areas has an unknown write set. Guessing costs every worker in the
+    /// wave when the guess is wrong, so the selector fails closed and says why.
+    #[test]
+    fn an_undeclared_write_set_conflicts_with_everything_in_its_member() {
+        let stories = vec![
+            ready_story("flux/C-1", 0, &["flux-cli"]),
+            ready_story("flux/C-2", 1, &[]),
+        ];
+
+        let (batch, held_back, _) = select_independent_batch(&stories, 8);
+
+        assert_eq!(batch, vec![0]);
+        assert_eq!(held_back[0]["reason"], "undeclared write set");
+    }
+
+    /// More items beats better priority: an idle worker delivers nothing, while a lower-priority
+    /// story still delivers a story. Here the top-priority item conflicts with all three others, so
+    /// dropping it triples the wave.
+    #[test]
+    fn a_larger_batch_wins_over_a_higher_priority_one() {
+        let stories = vec![
+            ready_story("flux/C-0", 0, &["one", "two", "three"]),
+            ready_story("flux/C-1", 1, &["one"]),
+            ready_story("flux/C-2", 2, &["two"]),
+            ready_story("flux/C-3", 3, &["three"]),
+        ];
+
+        let (batch, _, exhaustive) = select_independent_batch(&stories, 8);
+
+        assert!(exhaustive);
+        assert_eq!(batch, vec![1, 2, 3]);
+    }
+
+    /// Among equally large batches the higher-priority one wins, so the tie-break is priority and
+    /// only the tie-break is.
+    #[test]
+    fn equal_sized_batches_are_broken_by_priority() {
+        let stories = vec![
+            ready_story("flux/C-0", 0, &["one"]),
+            ready_story("flux/C-1", 1, &["one"]),
+            ready_story("flux/C-2", 2, &["two"]),
+        ];
+
+        let (batch, _, _) = select_independent_batch(&stories, 2);
+
+        assert_eq!(batch, vec![0, 2], "C-0 outranks C-1 and both exclude it");
+    }
+
+    /// A declared dependency between two ready items is an ordering, not a parallelism. It should
+    /// not survive `board next`'s own filter, but a pool is a snapshot and this is cheap to hold.
+    #[test]
+    fn a_declared_dependency_between_candidates_conflicts() {
+        let mut blocked = ready_story("flux/C-2", 1, &["other"]);
+        blocked.dependencies = vec!["flux/C-1".to_string()];
+        let stories = vec![ready_story("flux/C-1", 0, &["one"]), blocked];
+
+        let (batch, held_back, _) = select_independent_batch(&stories, 8);
+
+        assert_eq!(batch, vec![0]);
+        assert_eq!(held_back[0]["reason"], "declared dependency");
+    }
+
+    /// The width is a ceiling, not a target.
+    #[test]
+    fn the_batch_never_exceeds_the_requested_width() {
+        let stories: Vec<Story> = (0..10)
+            .map(|index| {
+                ready_story(
+                    &format!("flux/C-{index}"),
+                    index,
+                    &[&format!("area{index}")],
+                )
+            })
+            .collect();
+
+        let (batch, _, _) = select_independent_batch(&stories, 3);
+
+        assert_eq!(batch, vec![0, 1, 2]);
+    }
 
     /// C-596: the integrator's authority ends at a green gate. Apply, push, Board mutation and
     /// dispatch must be absent from its catalogue structurally, not merely discouraged in prose —
