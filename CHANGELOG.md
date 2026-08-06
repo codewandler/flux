@@ -86,6 +86,17 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A failed integration can be retried once its cause is fixed.** `conflict` and `red` were terminal, so
+  a wave that failed kept a memory of failing and no later `fleet integrate` would touch it — which made
+  fixing the cause pointless. Three delivered stories stayed unreachable after the defect that stranded
+  them was found, fixed and installed, refused with "not ready for integration". Retrying loses nothing:
+  the handoffs are still accepted and each integration worktree is reset to its pinned base first, which
+  the retry path must do or it refuses itself for a *different* reason than the original failure. The
+  guard worth keeping — never spend a second gate run on unchanged inputs — belongs to the candidate, not
+  the wave, and is now enforced by comparing the recomputed candidate with the one already gated. The
+  wave's verdict is also decided once, from the collected failures, rather than in each branch on its way
+  out: deciding it per branch is exactly how a path slipped through without setting one, leaving a wave
+  `integrating` with its owner released and permanently wedged.
 - **Clipped output keeps the end, where a failure explains itself.** Captured gate output was clipped
   from the head, and a repository gate emits thousands of `Compiling …` and `test … ok` lines before
   failing at the very end — so a failed gate's record filled its 16 KiB budget with progress and cut the

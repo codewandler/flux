@@ -2132,6 +2132,45 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
         "a red wave cannot spend a second gate run"
     );
 
+    // Failing first: a wave that failed integration can be RETRIED once the cause is fixed, but a retry
+    // that recomputes the identical candidate must not spend a second gate run.
+    //
+    // `conflict` and `red` used to be terminal, so a wave that failed kept a memory of failing and no
+    // later `fleet integrate` would touch it. That made fixing the cause pointless: three delivered
+    // stories stayed unreachable after the defect that stranded them was fixed and installed, refused
+    // with "not ready for integration". The guard worth keeping belongs to the candidate, not the wave.
+    let reretry = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        !reretry.status.success(),
+        "an unchanged candidate must not be re-gated"
+    );
+    let reretry: serde_json::Value = serde_json::from_slice(&reretry.stdout).unwrap();
+    assert_eq!(reretry["error"]["class"], "validation/gate");
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "integration",
+            "wave-2",
+            "--output",
+            "json",
+        ],
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let gate = &inspected["data"]["data"]["repositories"][0]["gate"];
+    assert_eq!(
+        gate["runs"], 1,
+        "still exactly one gate run for this candidate: {gate}"
+    );
+    assert!(
+        gate["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unchanged"),
+        "and the refusal says why rather than repeating the old verdict: {gate}"
+    );
+
     // Failing first: a NAMED apply is judged per repository, not by the wave rollup.
     //
     // Integration assembles and gates one candidate per repository, so a wave can hold a green candidate

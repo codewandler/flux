@@ -13435,13 +13435,52 @@ fn integrate_wave(
         && wave["integration_supervisor_pid"]
             .as_i64()
             .is_some_and(|pid| !supervisor_process_is_live(pid));
+    // A failed integration is RETRYABLE, because the reason it failed is usually outside the wave.
+    //
+    // `conflict` and `red` were terminal: once a wave reached either, no `fleet integrate` would ever
+    // touch it again. That made fixing the cause pointless — wave-346 conflicted because integration
+    // applied one commit per story instead of the worker's whole range, and after that defect was fixed
+    // and installed the retry was still refused with "not ready for integration". Three delivered
+    // stories were unreachable not because anything was wrong with them but because the wave had a
+    // memory of having failed.
+    //
+    // Nothing is lost by retrying: the handoffs are still accepted, and each repository's integration
+    // worktree is reset to its pinned base below. What must NOT be lost is the guard against spending a
+    // second gate run on an unchanged candidate — that guard belongs to the CANDIDATE, not the wave, and
+    // is enforced per repository further down by comparing the recomputed candidate with the one already
+    // gated.
+    let retryable_failure = matches!(wave["status"].as_str(), Some("conflict" | "red"));
     if !stalled_integration
+        && !retryable_failure
         && !matches!(
             wave["status"].as_str(),
             Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
         )
     {
         bail!("conflict/precondition: wave {wave_id} is not ready for integration")
+    }
+    // Carry the previous attempt's verdicts aside, then clear them: this attempt records its own.
+    let previously_gated = wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|repository| {
+            let id = repository["id"].as_str()?.to_string();
+            let candidate = repository["gate"]["candidate"].as_str()?.to_string();
+            let status = repository["gate"]["status"].as_str()?.to_string();
+            Some((id, (candidate, status)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    if retryable_failure || stalled_integration {
+        wave["conflict"] = Value::Null;
+        for repository in wave["topology"]["repositories"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            repository["gate"] = Value::Null;
+            repository["candidate"] = Value::Null;
+        }
     }
     let items = wave["items"]
         .as_array()
@@ -13524,6 +13563,19 @@ fn integrate_wave(
             .as_str()
             .context("validation/gate: integration base missing")?
             .to_string();
+        // A retry must start from the pinned base, so put the worktree back there first.
+        //
+        // Without this the retry path is unusable: a previous attempt leaves the integration worktree
+        // holding its cherry-picks (that is what a candidate IS), so the clean-at-base check below refuses
+        // the retry — and refuses it with a *different* reason than the original failure, which is how a
+        // wave ends up looking broken in two ways at once. Resetting is safe because a candidate is
+        // reconstructed from the accepted handoffs on every attempt and is not the record of anything;
+        // the record lives in state.
+        if retryable_failure || stalled_integration {
+            let _ = guarded_git(&integration_worktree, &["cherry-pick", "--abort"]);
+            let _ = guarded_git(&integration_worktree, &["reset", "--hard", &base]);
+            let _ = guarded_git(&integration_worktree, &["clean", "-fd"]);
+        }
         if git_output(&integration_worktree, &["rev-parse", "HEAD"]).as_deref()
             != Some(base.as_str())
             || git_output(&integration_worktree, &["status", "--porcelain"])
@@ -13653,6 +13705,18 @@ fn integrate_wave(
             failures.push(json!({"repository": repository_id, "reason": "no runnable final gate"}));
             continue;
         }
+        // One gate run per CANDIDATE. A retry that recomputes the identical candidate has identical
+        // inputs, so re-running the gate would only spend minutes to reach the same verdict; a retry that
+        // produces a different candidate has genuinely different inputs and must be gated afresh. Keying
+        // this to the candidate is what lets a wave be retried at all without weakening the guard.
+        if let Some((gated_candidate, gated_status)) = previously_gated.get(&repository_id) {
+            if gated_candidate == &candidate && gated_status == "red" {
+                wave["topology"]["repositories"][repository_index]["candidate"] = json!(candidate);
+                wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"red","runs":1,"reason":"candidate unchanged since its red gate; nothing to re-run","candidate":candidate});
+                failures.push(json!({"repository": repository_id, "candidate": candidate, "reason": "candidate unchanged since its red gate"}));
+                continue;
+            }
+        }
         let gate = if command.dry_run {
             json!({"argv":gate_argv,"success":true,"exit_code":Value::Null,"stdout":"","stderr":"","preview":true})
         } else {
@@ -13678,6 +13742,19 @@ fn integrate_wave(
         }
     }
     if !failures.is_empty() {
+        // Set the wave's verdict HERE, from the collected failures, rather than in each branch on its way
+        // out. Deciding it per branch is what let a path slip through without setting one at all: the
+        // unchanged-candidate refusal left the wave `integrating` with its owner released, which is
+        // neither retryable nor ready — permanently wedged by a refusal that was supposed to be cheap.
+        wave["status"] = json!(if failures.iter().any(|failure| failure["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("conflict")))
+        {
+            "conflict"
+        } else {
+            "red"
+        });
+        wave["apply_eligible"] = json!(false);
         // Release ownership before reporting: the run is over either way, and a wave left owned by a dead
         // process is the trap this field exists to close.
         wave["integration_supervisor_pid"] = Value::Null;
