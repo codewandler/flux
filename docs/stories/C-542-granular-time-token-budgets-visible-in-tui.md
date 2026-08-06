@@ -54,6 +54,13 @@ Fleet.
   `over target` / `limit` states plus transcript notes, and `CliSink`
   (`crates/flux-cli/src/rendering.rs`) projects the same published payload as a yellow target warning
   or a red hard-limit stop line. Both read the ledger's own figures; neither re-derives a total.
+- 2026-08-05 — enforcement and surfaces are committed, not just written: `loop_host.rs`,
+  `staged.rs`, `crates/flux-evidence/src/lib.rs` (`KIND_BUDGET_PROJECTION`) and the TUI
+  `controller.rs`/`lib.rs`/`state.rs` budget path, with `BudgetProjection: Default` as the honest
+  empty snapshot. Targeted evidence: `cargo test -p codewandler-flux-core` (51 + 5 + 5),
+  `-p codewandler-flux-flow` (272 + 7), `-p flux-tui` (286 + 22), `cargo clippy --all-targets -- -D
+  warnings` for all three, and `cargo fmt --all -- --check` — which failed first on the TUI budget
+  test and is now clean.
 - Residual: the full repository gate (and the untouched `plugins/` workspace) runs at the wave
   integration boundary, not from this story worktree — the last acceptance box is the integrator's.
 
