@@ -6,6 +6,7 @@
 //! and the surfaces all build on these types.
 
 mod audio;
+pub mod budget;
 mod content;
 mod context;
 mod dispatch;
@@ -21,6 +22,10 @@ mod timing;
 mod urlencode;
 
 pub use audio::{AudioEncoding, AudioFormat};
+pub use budget::{
+    BudgetAttribution, BudgetBreach, BudgetCharge, BudgetDimension, BudgetEnvelope, BudgetLedger,
+    BudgetLimits, BudgetOutcome, BudgetProjection, BudgetScope, BudgetSpend, BudgetUsageEvent,
+};
 pub use content::{
     ContentBlock, ImageSource, Role, ToolResultContent, ARGS_PARSE_ERROR_KEY, ARGS_RAW_PREFIX_KEY,
 };
