@@ -86,12 +86,21 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **A dispatch is no longer discarded by a concurrent write.** Creating a wave already happened on disk
+  — a worktree and a branch per story — before the state write. If the coordinator or an operator wrote
+  Fleet state in that window, the compare-and-set lost and the whole dispatch was thrown away with its
+  worktrees already created and nothing recording them; observed as a dispatch failing the moment the
+  coordinator accepted an intake. The write now rebases onto current state, which is safe here precisely
+  because the call only ever adds keys nothing else could have written: a fresh wave id and its fresh
+  worker ids. Re-running the action instead would be wrong, since worktree creation refuses an existing
+  wave root and integration would spend a second gate.
 - **Fleet state can now tell a live worker from a dead one.** A turn runs synchronously in the process
   that recorded `working`, so that process dying is the one case where no terminal status is ever
   written: a worker read `working` for hours with nothing behind it, inflating the active count, keeping
   its wave out of reaping, and forcing the driver to reimplement liveness by scanning `/proc` because the
   answer was not recoverable from state at all. The supervising process is recorded when a turn starts
-  and cleared on every terminal transition, and an active record whose supervisor is gone now projects as
+  and cleared on every terminal transition — on the wave path as well as the single-turn path, the wave
+  path being the one that produced the stuck record — and an active record whose supervisor is gone projects as
   `interrupted` — which also routes it to the attention list, where it belongs. Records written before
   this keep their recorded status rather than being downgraded. Pid reuse can still fool the check, which
   is exactly the previous behaviour, so this is a strict improvement rather than a guarantee.

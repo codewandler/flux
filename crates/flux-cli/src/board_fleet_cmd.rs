@@ -5293,6 +5293,31 @@ worktree_root = ".flux/fleet/worktrees"
                     "loop_binding": loop_binding.metadata(),
                 }));
             }
+            // Rebase this dispatch onto current state before writing it.
+            //
+            // Everything above already happened on disk: `prepare_wave_worktrees` created a worktree and
+            // a branch per story. If the coordinator or an operator wrote Fleet state during that window
+            // — a `fleet message`, an ack, a decision — the compare-and-set here loses and the whole
+            // dispatch is discarded with its worktrees already on disk and nothing recording them.
+            // Observed exactly once as `dispatch FAILED for: flux/C-605` immediately after the
+            // coordinator accepted an intake; the next tick re-dispatched, so the cost was a leaked
+            // wave root and a minute.
+            //
+            // Safe to rebase, unlike a blanket retry: this call only ever ADDS keys that nothing else
+            // could have written — a fresh wave id and its fresh worker ids. Re-running the action
+            // instead would be wrong, because `prepare_wave_worktrees` refuses an existing wave root and
+            // `integrate` would spend a second gate. The same idiom guards the wave-completion write
+            // below.
+            if let Ok(latest) = read_fleet_state(root) {
+                if latest.revision > state.revision {
+                    let mut rebased = latest;
+                    rebased.revision += 1;
+                    for (id, record) in &state.agents {
+                        rebased.agents.entry(id.clone()).or_insert(record.clone());
+                    }
+                    state = rebased;
+                }
+            }
             state.waves.insert(wave.clone(), json!({"id": wave, "items": selected, "status": "accepted", "coordinator": "main", "goals_revision": state.main_agent.goals_revision, "topology": topology, "apply_eligible": false}));
             persist_fleet_mutation(
                 command,
@@ -5329,6 +5354,10 @@ worktree_root = ".flux/fleet/worktrees"
                 for spec in &specs {
                     if let Some(agent) = state.agents.get_mut(&spec.id) {
                         agent["status"] = json!("working");
+                        // The wave path records `working` too, and this is the path that produced the
+                        // worker stuck at `working` with no process behind it. Recording the supervisor
+                        // only in the single-turn path would have left the motivating case unfixed.
+                        agent["supervisor_pid"] = json!(std::process::id());
                     }
                 }
                 persist_fleet_mutation(
@@ -5399,6 +5428,7 @@ worktree_root = ".flux/fleet/worktrees"
                         Ok(receipt) => {
                             if let Some(agent) = state.agents.get_mut(&id) {
                                 agent["status"] = json!("completed");
+                                agent["supervisor_pid"] = Value::Null;
                                 agent["runtime_session"] = receipt["session"].clone();
                                 agent["session"] = receipt["session"].clone();
                                 agent["last_turn"] = receipt.clone();
@@ -5410,6 +5440,7 @@ worktree_root = ".flux/fleet/worktrees"
                             let message = redact(&error.to_string());
                             if let Some(agent) = state.agents.get_mut(&id) {
                                 agent["status"] = json!("failed");
+                                agent["supervisor_pid"] = Value::Null;
                                 agent["last_error"] = json!(message);
                                 record_failed_turn_evidence(agent, &error);
                             }
