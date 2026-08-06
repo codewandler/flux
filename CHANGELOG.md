@@ -86,6 +86,25 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Fixed
 
+- **Integration applies the worker's whole commit range, not just the commit its handoff cited.** A
+  handoff names one commit and a story worker legitimately makes several — implementation, then its
+  record, which is the shape the contract asks for. Cherry-picking the cited commit therefore applied
+  only the LAST one and silently dropped everything before it: measured on one real wave, a two-commit
+  story contributed only its documentation commit and a five-commit story likewise. It surfaced as a
+  conflict, which was luck — a clean apply would have produced a candidate documenting code that was not
+  in it, and a gate that never compiles the missing part could even have passed it. The evidence already
+  assumed the range, since handoff verification computes the write set with `diff <base> <commit>`, so
+  the record described a range the integration never applied. A handoff citing its own base is now
+  refused outright rather than producing an unchanged candidate.
+- **A conflicted integration leaves its worktree reusable.** The half-applied cherry-pick was kept on
+  disk, which bought nothing (the conflict evidence is recorded in state) and cost the retry: a wedged
+  worktree fails the next attempt's "clean at its pinned base" check, so the wave reported a *different*
+  reason the second time and could never recover on its own.
+- **An interrupted integration can be retried.** `integrating` is transient and recorded no owner, so a
+  process dying mid-gate — the longest operation the fleet runs — left the wave `integrating` forever
+  with every retry refused as "not ready for integration" and no escape but hand-editing state, which the
+  operating rules forbid. Integration now records its supervisor and releases it on every exit, and a
+  wave held by a process that is gone may be retried.
 - **One repository's integration failure no longer discards another's candidate** (C-630). Integration
   assembles and gates one candidate per repository, but the first repository to conflict, gate red, miss
   a gate argv, or hold a dirty integration worktree aborted the run for all of them — so a

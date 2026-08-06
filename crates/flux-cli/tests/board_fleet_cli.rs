@@ -2184,6 +2184,92 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::remove_dir_all(root).ok();
 }
 
+/// Failing first: a story that made several commits integrates all of them.
+///
+/// A handoff names one commit and a worker legitimately makes several — implementation then
+/// documentation is the shape the contract asks for. Integration cherry-picked the single cited commit,
+/// so it applied only the LAST one and silently dropped the rest: on one real wave a two-commit story
+/// contributed only its docs commit, and a five-commit story likewise. That surfaced as a conflict,
+/// which was luck; a clean apply would have produced a candidate documenting code that was not in it.
+///
+/// The evidence already assumed the range — handoff verification computes the write set with
+/// `diff <base> <commit>` — so the record described a range the integration never applied.
+#[test]
+fn a_story_that_made_several_commits_integrates_all_of_them() {
+    let (root, story) = one_story_wave("multi-commit-story");
+    // Two commits, exactly as a worker is asked to produce: the change, then its record. Only the
+    // second is cited by the handoff.
+    fs::write(story.join("result.txt"), "implemented\n").unwrap();
+    assert!(git(&story, &["add", "result.txt"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "implement the thing"])
+        .status
+        .success());
+    fs::write(story.join("EVIDENCE.md"), "why it is right\n").unwrap();
+    assert!(git(&story, &["add", "EVIDENCE.md"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "record the evidence"])
+        .status
+        .success());
+    let cited = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &cited,
+            "--write-set",
+            "result.txt",
+            "--write-set",
+            "EVIDENCE.md",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "two commits, one handoff",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let integration = PathBuf::from(
+        integrated["data"]["topology"]["repositories"][0]["integration"]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    // The IMPLEMENTATION must be there, not only the commit that was named.
+    assert!(
+        integration.join("result.txt").is_file(),
+        "the cited commit's ancestor carried the implementation and must have been applied too"
+    );
+    assert!(integration.join("EVIDENCE.md").is_file());
+    fs::remove_dir_all(root).ok();
+}
+
 /// Failing first: two stories in ONE repository that both write the SAME file integrate, as long as
 /// their commits actually combine.
 ///

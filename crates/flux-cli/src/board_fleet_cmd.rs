@@ -13392,10 +13392,28 @@ fn integrate_wave(
         .get(wave_id)
         .cloned()
         .with_context(|| format!("not-found: wave {wave_id}"))?;
-    if !matches!(
-        wave["status"].as_str(),
-        Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
-    ) {
+    // `integrating` is a TRANSIENT state, and a transient state with no recorded owner is a trap.
+    //
+    // Integration cherry-picks and then runs a full repository gate, which is the longest-running thing
+    // the fleet does — minutes to tens of minutes from a cold build. If the process doing it dies in that
+    // window (killed, timed out, terminal closed), the wave keeps `integrating` forever: every retry is
+    // refused as "not ready for integration", and the only way out is hand-editing Fleet state, which the
+    // operating rules forbid. Exactly the shape of the worker that read `working` with no process behind
+    // it — same defect, different field.
+    //
+    // So integration records its own supervisor, and a wave still marked `integrating` by a process that
+    // is gone may be retried. Nothing is lost by retrying: the integration worktree is reset to its
+    // pinned base below, and the gate is re-run from scratch.
+    let stalled_integration = wave["status"].as_str() == Some("integrating")
+        && wave["integration_supervisor_pid"]
+            .as_i64()
+            .is_some_and(|pid| !supervisor_process_is_live(pid));
+    if !stalled_integration
+        && !matches!(
+            wave["status"].as_str(),
+            Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+        )
+    {
         bail!("conflict/precondition: wave {wave_id} is not ready for integration")
     }
     let items = wave["items"]
@@ -13447,6 +13465,7 @@ fn integrate_wave(
         }
     }
     wave["status"] = json!("integrating");
+    wave["integration_supervisor_pid"] = json!(std::process::id());
     wave["integration_order"] = json!(order);
     state.waves.insert(wave_id.to_string(), wave.clone());
     state.revision += 1;
@@ -13497,13 +13516,39 @@ fn integrate_wave(
             .collect::<Vec<_>>();
         for item in repo_items {
             let (item_repository, story_index) = wave_story_indices(&wave, &item)?;
-            let commit = wave["topology"]["repositories"][item_repository]["stories"][story_index]
-                ["handoff"]["commit"]
+            let story = &wave["topology"]["repositories"][item_repository]["stories"][story_index];
+            let commit = story["handoff"]["commit"]
                 .as_str()
                 .context("validation/gate: handoff commit missing")?
                 .to_string();
+            // Integrate the worker's whole RANGE, not the single commit it cited.
+            //
+            // A handoff names one commit, and a story worker legitimately makes several — implementation
+            // then documentation is the shape the contract actually asks for. `cherry-pick <commit>`
+            // therefore applied only the LAST one and silently dropped everything before it. Measured on
+            // one real wave: `flux/C-562` is two commits and only its docs commit was applied;
+            // `flux/C-542` is five and only its docs commit was applied. This surfaced as a conflict,
+            // which was the lucky outcome — a clean apply would have produced a candidate documenting
+            // code that was not in it, and a gate that never compiles the missing part could even pass.
+            //
+            // The evidence already assumed the range: handoff verification computes the write set with
+            // `diff <base> <commit>`, so the record described a range the integration never applied.
+            // That contradiction is the proof of which unit is intended.
+            let story_base = story["base_commit"]
+                .as_str()
+                .unwrap_or(base.as_str())
+                .to_string();
+            let range = format!("{story_base}..{commit}");
             if !command.dry_run {
-                let output = guarded_git(&integration_worktree, &["cherry-pick", &commit])?;
+                // An empty range is an error to `cherry-pick`, and it means the worker committed nothing
+                // — which the handoff gate refuses long before here, so treat it as a contract violation
+                // rather than silently producing an unchanged candidate.
+                if story_base == commit {
+                    bail!(
+                        "validation/gate: {item} handoff cites its own base {commit}, so it carries no commit to integrate"
+                    )
+                }
+                let output = guarded_git(&integration_worktree, &["cherry-pick", &range])?;
                 if output.exit_code != 0 {
                     let conflicts = git_output(
                         &integration_worktree,
@@ -13527,6 +13572,13 @@ fn integrate_wave(
                         "wave.integration.conflict",
                         wave["conflict"].clone(),
                     )?;
+                    // Leave the worktree usable. The conflict evidence is already recorded in state
+                    // above, so keeping the half-applied cherry-pick on disk buys nothing and costs the
+                    // retry: a wedged worktree fails the next attempt's "clean at its pinned base"
+                    // precondition, so the wave reports a DIFFERENT reason the second time and never
+                    // recovers on its own.
+                    let _ = guarded_git(&integration_worktree, &["cherry-pick", "--abort"]);
+                    let _ = guarded_git(&integration_worktree, &["reset", "--hard", &base]);
                     // Record and move on, rather than aborting integration for every repository.
                     //
                     // A conflict is a property of ONE repository's commits. Bailing here meant a
@@ -13599,6 +13651,18 @@ fn integrate_wave(
         }
     }
     if !failures.is_empty() {
+        // Release ownership before reporting: the run is over either way, and a wave left owned by a dead
+        // process is the trap this field exists to close.
+        wave["integration_supervisor_pid"] = Value::Null;
+        state.waves.insert(wave_id.to_string(), wave.clone());
+        state.revision += 1;
+        persist_fleet_mutation(
+            command,
+            root,
+            &state,
+            "wave.integration.finished",
+            json!({"wave": wave_id, "failures": failures}),
+        )?;
         // The wave failed, and every repository that did not is now sitting on a gated candidate that
         // `apply --only <repository>` can accept. Naming them in the error is the difference between
         // "this wave is stuck" and "this half of it is ready".
@@ -13627,6 +13691,7 @@ fn integrate_wave(
         )
     }
     wave["status"] = json!("green");
+    wave["integration_supervisor_pid"] = Value::Null;
     wave["apply_eligible"] = json!(true);
     state.waves.insert(wave_id.to_string(), wave.clone());
     state.revision += 1;
