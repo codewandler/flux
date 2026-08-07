@@ -47,3 +47,8 @@ operations mutate the operator's configuration rather than reporting on a substr
       byte-identical for the same inputs.
 - [ ] The docs state the split plainly: the agent can prepare access, a human decides it may be
       used, and neither half is a rubber stamp for the other.
+
+
+## Comments
+
+- Security constraint from C-684, must be handled in this story's review: a malformed-PEM refusal on a declared ca_cert can echo a short prefix of the file's bytes. Today ca_cert is operator-authored config, so that is an operator seeing their own file. The moment an agent can populate ca_cert through a proposal operation, that error path becomes a narrow arbitrary-file-prefix read — so any agent-writable field whose value is parsed must have its refusal bounded to not echo content, not just its value validated.
