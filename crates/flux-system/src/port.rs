@@ -85,6 +85,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
@@ -364,6 +365,59 @@ pub trait GuardedHttp: Send + Sync {
     ) -> Guarded<'a, HttpResponse> {
         let _ = (request, allow);
         Box::pin(async { Err(deny("perform a guarded HTTP request")) })
+    }
+}
+
+/// The HTTP backend a **composition site** handed to a native substrate (C-675) — the one field
+/// behind [`System::with_http`], and the whole of how a selected native substrate comes to serve
+/// [`GuardedHttp`].
+///
+/// # Why this exists at all
+///
+/// The workspace's one HTTP client is in `flux-web` (L5) and this crate is L2, so the native
+/// implementation of this family cannot live here — C-652 settled that, and a `System` that serves
+/// no HTTP is the honest consequence. It is *also* a gap the moment a substrate is selected: a
+/// confined peer composing this same `System` then refuses web effects that an unselected run
+/// performs, which is a capability the operator lost by asking for confinement rather than a
+/// boundary anything needed.
+///
+/// The seam that closes it without moving the client is a value: the surface that already
+/// constructs both halves — `flux-cli` builds the egress client *and* the substrate it installs —
+/// joins them here. Dependency arrows still point downward, because what travels is an
+/// implementation of **this crate's own trait**, reached through `dyn`. `flux-system` gains no
+/// dependency, constructs no client, and holds no ambient default: an unattached value is exactly
+/// the fail-closed substrate C-652 shipped.
+///
+/// # What it is not
+///
+/// It is not an IO seam. Attaching does not let a substrate open a socket it could not open —
+/// whoever built the backend already could, and its guarantees (the shared egress guard, the
+/// connection pin, the redirect bound, the per-hop secret re-authorization, the byte cap) are the
+/// backend's own, unchanged by being reached through here. And it is not ambient: this is a field
+/// on one value, cloned with it, never a process-global registry a later caller could consult or
+/// replace.
+#[derive(Clone, Default)]
+pub(crate) struct AttachedHttp(Option<Arc<dyn GuardedHttp>>);
+
+impl AttachedHttp {
+    /// Attach `backend` as the HTTP implementation this substrate serves.
+    pub(crate) fn new(backend: Arc<dyn GuardedHttp>) -> Self {
+        Self(Some(backend))
+    }
+
+    /// The attached backend, or `None` where the composition site attached none.
+    pub(crate) fn backend(&self) -> Option<&Arc<dyn GuardedHttp>> {
+        self.0.as_ref()
+    }
+}
+
+impl std::fmt::Debug for AttachedHttp {
+    /// Whether a backend is attached, never what it is: a `dyn` backend has no useful `Debug`, and
+    /// the security-relevant fact is the presence of one.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("AttachedHttp")
+            .field(&self.0.is_some())
+            .finish()
     }
 }
 
@@ -761,19 +815,36 @@ impl GuardedMetrics for System {
     }
 }
 
-/// The native backend serves **no** HTTP of its own, and that is a decision rather than a gap.
+/// The native backend serves **no HTTP of its own**, and that is a decision rather than a gap. What
+/// it serves is whatever backend a composition site attached to it ([`System::with_http`], C-675).
 ///
 /// `flux-system` is a crate the portable core has to compile, and its dependency set is deliberately
 /// `flux-core` + `tokio` + `url`. An HTTP client here would be the workspace's *second* one — the
 /// first lives in `flux-web`, where it is already the reviewed broker that owns redirect handling,
 /// connection pinning and the response-byte cap — and `flux-codegate`'s `Http` census exists
-/// precisely to keep that count at one.
+/// precisely to keep that count at one. So the native HTTP implementation is `flux_web::NativeHttp`,
+/// a layer up, wrapping that same client.
 ///
-/// So the native HTTP implementation is `flux_web::NativeHttp`, a layer up, wrapping that same
-/// client; a bare [`System`] answers the family with the port's own refusal. That is the fail-closed
-/// direction: a caller holding only a `System` gets "this substrate serves no HTTP", never a request
-/// sent through some other path.
-impl GuardedHttp for System {}
+/// Nothing about that changed; only *who may hold it* did. This method makes exactly one call, on a
+/// backend it was handed, and constructs nothing — so the count of clients is still the census's,
+/// and the guarantees on the wire are still the backend's own.
+///
+/// **Unattached is the default and stays fail-closed.** A `System` nobody attached a backend to
+/// answers the port's own refusal, so a caller holding only a `System` gets "this substrate serves
+/// no HTTP" rather than a request sent through some other path — the C-652 posture, unchanged for
+/// every consumer that does not deliberately compose one.
+impl GuardedHttp for System {
+    fn http_request<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, HttpResponse> {
+        match self.attached_http().backend() {
+            Some(backend) => backend.http_request(request, allow),
+            None => Box::pin(async { Err(deny("perform a guarded HTTP request")) }),
+        }
+    }
+}
 
 impl GuardedHostFiles for System {
     fn host_path_identity(&self, path: &str) -> Result<String> {
@@ -1295,6 +1366,10 @@ mod tests {
     /// HTTP client in the workspace lives a layer up in `flux-web`. The native backend therefore
     /// denies HTTP in the port's own words instead of growing a second client — and this test is what
     /// stops a later edit from "fixing" that by adding one here.
+    ///
+    /// C-675 attaches a backend built elsewhere ([`System::with_http`]) rather than building one, so
+    /// this is still the answer for every `System` nobody composed one onto — which is every
+    /// `System` this crate constructs.
     #[tokio::test]
     async fn the_native_system_denies_http_rather_than_growing_a_second_client() {
         let system = System::new(Workspace::new(std::env::temp_dir()).unwrap());
@@ -1307,6 +1382,73 @@ mod tests {
         assert!(
             matches!(&error, Error::GuardedIo(failure) if failure.kind() == GuardedIoFailure::Unserved),
             "the native refusal must classify as unserved: {error}"
+        );
+    }
+
+    /// One HTTP backend, of the kind a composition site attaches: it answers, and it records the
+    /// operation it was asked for so a test can prove the call reached *it*.
+    #[derive(Default)]
+    struct AttachedBackend(std::sync::Mutex<Vec<String>>);
+
+    impl GuardedHttp for AttachedBackend {
+        fn http_request<'a>(
+            &'a self,
+            request: &'a HttpRequest,
+            _allow: &'a PrivateNetAllow,
+        ) -> Guarded<'a, HttpResponse> {
+            self.0.lock().unwrap().push(request.operation.clone());
+            Box::pin(async {
+                Ok(HttpResponse {
+                    status: 204,
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                    truncated: false,
+                })
+            })
+        }
+    }
+
+    /// C-675 — a `System` serves the HTTP backend a composition site attached to it, and only that.
+    ///
+    /// The whole seam is here: the surface that holds the workspace's one client hands it down as an
+    /// implementation of this crate's own trait, and the native substrate serves that. Nothing is
+    /// constructed here, nothing is ambient — the *same* system without the attachment is still the
+    /// fail-closed one the test above pins, which is what makes this a composition rather than a
+    /// default.
+    #[tokio::test]
+    async fn the_native_system_serves_the_http_backend_a_composition_site_attached() {
+        let backend = Arc::new(AttachedBackend::default());
+        let bare = System::new(Workspace::new(std::env::temp_dir()).unwrap());
+        let composed = bare.clone().with_http(backend.clone());
+
+        let served = GuardedHttp::http_request(
+            &composed,
+            &http_fixture("http.request"),
+            &PrivateNetAllow::Any,
+        )
+        .await
+        .expect("an attached backend is what this substrate serves");
+        assert_eq!(served.status, 204);
+        assert_eq!(
+            backend.0.lock().unwrap().as_slice(),
+            ["http.request".to_string()],
+            "the call must reach the attached backend, not a client built here"
+        );
+
+        // The attachment travels with the value (a re-rooted system is the entered worktree, and the
+        // backend is not workspace-relative), and never leaks onto a system nobody composed.
+        let rerooted = composed.rerooted(std::env::temp_dir()).unwrap();
+        assert!(
+            GuardedHttp::http_request(&rerooted, &http_fixture("web.fetch"), &PrivateNetAllow::Any)
+                .await
+                .is_ok(),
+            "a re-rooted system must still serve the backend it was composed with"
+        );
+        assert!(
+            GuardedHttp::http_request(&bare, &http_fixture("web.fetch"), &PrivateNetAllow::Any)
+                .await
+                .is_err(),
+            "attaching to one value must not reach another — this is a field, not an ambient default"
         );
     }
 

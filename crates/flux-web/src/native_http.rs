@@ -22,6 +22,15 @@
 //! implementation lives where the client already is, under its own reviewed
 //! `no_unreviewed_guarded_port_backend_outside_system` entry.
 //!
+//! ## How a selected native substrate reaches it (C-675)
+//!
+//! Downward, never upward. A [`NativeHttp`] built here is **attached** to the `System` a selection
+//! is composed from (`flux_system::System::with_http`) by the surface that holds both — `flux-cli`,
+//! at selection-install time — and the substrate serves the family by delegating to that system.
+//! `flux-system` still names no client and gains no dependency: what crosses is an implementation
+//! of its own `GuardedHttp`. So a sandboxed selection makes its requests through this file, with
+//! its own audit sink, and a substrate nobody composed one onto still refuses.
+//!
 //! ## What stays with the caller
 //!
 //! Redaction. What a *model* may see is a turn-level decision made with the turn's `Redactor`, over
@@ -331,5 +340,251 @@ mod tests {
                 .status,
             200
         );
+    }
+}
+
+/// C-675 — the **composition** the surface assembles: a selected native substrate serving the HTTP
+/// port through this file's backend.
+///
+/// These tests live here rather than beside the two ops because the thing under test is the joint —
+/// the confinement peer, the native `System` it composes, the backend the composition site attached
+/// to that system, and the one egress client this file wraps — and because the sandboxed fixture
+/// touches the process environment, which is safe to do exactly once, under one lock.
+#[cfg(test)]
+mod selected_substrate_tests {
+    use super::*;
+    use crate::fetch::WebFetchTool;
+    use crate::http::HttpRequestTool;
+    use flux_runtime::{Tool, ToolContext};
+    use flux_system::sandbox::{Sandbox, SandboxMode, SandboxSettings};
+    use flux_system::sandboxed::SandboxedSystem;
+    use flux_system::{System, Workspace};
+    use serde_json::json;
+    use std::sync::Mutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Serialises the two tests that resolve a `Sandbox` from the process environment. The marker is
+    /// read during `Sandbox::resolve` alone, so the lock only has to span the fixture.
+    static SANDBOX_FIXTURE: Mutex<()> = Mutex::new(());
+
+    /// An [`flux_plugin::EgressAudit`] that keeps what it was told, so a test can ask *which*
+    /// backend made the request: the grant-source label rides along on every admit.
+    #[derive(Default)]
+    struct RecordingAudit(Mutex<Vec<String>>);
+
+    impl RecordingAudit {
+        fn admits(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl flux_plugin::EgressAudit for RecordingAudit {
+        fn record_private_admit(&self, operation: &str, _host: &str, grant_source: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{operation} via {grant_source}"));
+        }
+    }
+
+    /// A one-shot loopback server that answers `body` with a 200 and reports its base URL.
+    async fn one_shot_server(body: &'static str, content_type: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn workspace(tag: &str) -> System {
+        let dir = std::env::temp_dir().join(format!(
+            "flux-web-c675-{tag}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        System::new(Workspace::new(&dir).unwrap())
+    }
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The **sandboxed selection**, assembled the way the surface assembles it: a native `System`
+    /// carrying the HTTP backend the composition site built, admitted as the confinement peer.
+    ///
+    /// The nested-flux fixture is the deterministic door into `SandboxedSystem` — an ambient posture
+    /// that already concluded (and disclosed) outer confinement — so nothing here depends on this
+    /// machine having a bubblewrap.
+    fn sandboxed_selection(tag: &str, http: Arc<dyn GuardedHttp>) -> SandboxedSystem {
+        let _guard = SANDBOX_FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("FLUX_SANDBOXED", "1");
+        let ambient = Sandbox::resolve(SandboxSettings {
+            mode: SandboxMode::Require,
+            ..SandboxSettings::off()
+        });
+        std::env::remove_var("FLUX_SANDBOXED");
+        assert!(
+            ambient.confined_by_parent(),
+            "the fixture must really be confined by a parent, or it proves nothing"
+        );
+        SandboxedSystem::from_env(workspace(tag).with_sandbox(ambient).with_http(http))
+            .expect("an ambient posture that already trusted the marker admits the peer")
+    }
+
+    /// C-675 (acceptance 1 + 2) — a sandboxed selection serves `http.request` through the one
+    /// reviewed egress client, with the audit sink the *substrate's* backend was built with.
+    ///
+    /// Two sinks with different grant-source labels tell the two candidate paths apart: the op's own
+    /// native backend (which a selection must never reach) and the substrate's. The loopback target
+    /// is a private range, so an admit is recorded on whichever backend actually sent — which makes
+    /// "the selection served it" and "the local client stayed off the path" one observation rather
+    /// than two hopeful ones.
+    #[tokio::test]
+    async fn a_sandboxed_selection_serves_http_request_through_its_own_egress_client() {
+        let base = one_shot_server("{\"ok\":true}", "application/json").await;
+        let op_audit = Arc::new(RecordingAudit::default());
+        let selection_audit = Arc::new(RecordingAudit::default());
+
+        let tool = HttpRequestTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            audit: Some(op_audit.clone()),
+            grant_source: Some("op-native".into()),
+            ..Default::default()
+        });
+        let substrate_http: Arc<dyn GuardedHttp> = Arc::new(NativeHttp::new(&WebOptions {
+            audit: Some(selection_audit.clone()),
+            grant_source: Some("selection".into()),
+            ..Default::default()
+        }));
+        let peer = sandboxed_selection("http-request", substrate_http);
+        let ctx = ToolContext::new(Arc::new(workspace("http-request-ctx")))
+            .with_execution_system(Arc::new(peer));
+
+        let result = tool
+            .execute(&ctx, json!({ "url": format!("{base}/v1") }))
+            .await
+            .expect("a sandboxed selection must serve http.request");
+
+        let record: serde_json::Value = serde_json::from_str(&result.content)
+            .expect("http.request answers with its record (C-304)");
+        assert_eq!(
+            record["status"], 200,
+            "the selection's response must reach the op unchanged: {}",
+            result.content
+        );
+        assert_eq!(record["body"]["ok"], true, "{}", result.content);
+        assert_eq!(
+            selection_audit.admits(),
+            vec!["web:http.request via selection".to_string()],
+            "the request must go through the substrate's own backend and audit sink"
+        );
+        assert!(
+            op_audit.admits().is_empty(),
+            "a selection in force must never fall back to the op's own local client: {:?}",
+            op_audit.admits()
+        );
+    }
+
+    /// C-675 (acceptance 1) — and the same for `web.fetch`, the other op the family moved.
+    #[tokio::test]
+    async fn a_sandboxed_selection_serves_web_fetch_through_its_own_egress_client() {
+        let base = one_shot_server("<html><body><p>served</p></body></html>", "text/html").await;
+        let op_audit = Arc::new(RecordingAudit::default());
+        let selection_audit = Arc::new(RecordingAudit::default());
+
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            audit: Some(op_audit.clone()),
+            grant_source: Some("op-native".into()),
+            ..Default::default()
+        });
+        let substrate_http: Arc<dyn GuardedHttp> = Arc::new(NativeHttp::new(&WebOptions {
+            audit: Some(selection_audit.clone()),
+            grant_source: Some("selection".into()),
+            ..Default::default()
+        }));
+        let peer = sandboxed_selection("web-fetch", substrate_http);
+        let ctx = ToolContext::new(Arc::new(workspace("web-fetch-ctx")))
+            .with_execution_system(Arc::new(peer));
+
+        let result = tool
+            .execute(&ctx, json!({ "url": base }))
+            .await
+            .expect("a sandboxed selection must serve web.fetch");
+
+        assert!(
+            result.content.starts_with("[200 OK]"),
+            "the selection's read must reach the op unchanged: {}",
+            result.content
+        );
+        assert!(result.content.contains("served"), "{}", result.content);
+        assert_eq!(
+            selection_audit.admits(),
+            vec!["web:web.fetch via selection".to_string()],
+            "the read must go through the substrate's own backend and audit sink"
+        );
+        assert!(
+            op_audit.admits().is_empty(),
+            "a selection in force must never fall back to the op's own local client: {:?}",
+            op_audit.admits()
+        );
+    }
+
+    /// C-675 (acceptance 2) — the branch stays **kind-blind**, so a selection that serves no HTTP
+    /// still refuses rather than borrowing the caller's process.
+    ///
+    /// The composition is what serves HTTP, not the substrate's kind: the same confinement peer,
+    /// composed over a system with no backend attached, answers the port's `Unserved` — and the
+    /// live loopback fixture is never contacted, which is what makes the refusal mean "nothing sent"
+    /// rather than "nothing reachable".
+    #[tokio::test]
+    async fn a_selection_with_no_http_backend_refuses_instead_of_sending_locally() {
+        let base = one_shot_server("{\"ok\":true}", "application/json").await;
+        let op_audit = Arc::new(RecordingAudit::default());
+        let tool = HttpRequestTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            audit: Some(op_audit.clone()),
+            grant_source: Some("op-native".into()),
+            ..Default::default()
+        });
+        let bare = sandboxed_selection_without_http("no-backend");
+        let ctx = ToolContext::new(Arc::new(workspace("no-backend-ctx")))
+            .with_execution_system(Arc::new(bare));
+
+        let error = tool
+            .execute(&ctx, json!({ "url": format!("{base}/v1") }))
+            .await
+            .expect_err("a substrate with no HTTP backend must refuse the request");
+
+        assert!(
+            error.to_string().starts_with(flux_system::port::UNSERVED),
+            "the refusal must be the port's own, not an improvised error: {error}"
+        );
+        assert!(
+            op_audit.admits().is_empty(),
+            "nothing may be sent from the caller's process while a selection is in force: {:?}",
+            op_audit.admits()
+        );
+    }
+
+    /// The same peer, composed over a system the surface attached nothing to.
+    fn sandboxed_selection_without_http(tag: &str) -> SandboxedSystem {
+        let _guard = SANDBOX_FIXTURE.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("FLUX_SANDBOXED", "1");
+        let ambient = Sandbox::resolve(SandboxSettings {
+            mode: SandboxMode::Require,
+            ..SandboxSettings::off()
+        });
+        std::env::remove_var("FLUX_SANDBOXED");
+        SandboxedSystem::from_env(workspace(tag).with_sandbox(ambient))
+            .expect("an ambient posture that already trusted the marker admits the peer")
     }
 }

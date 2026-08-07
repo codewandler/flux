@@ -3998,11 +3998,15 @@ impl Exec for Double {}
                 "GuardedMetrics",
                 "RemoteSystem",
             ),
-            // C-652 — the HTTP family. Two of these three are refusals and the third is the
-            // workspace's one HTTP client, which is why the family adds no new IO path.
+            // C-652 — the HTTP family. Two of these three send nothing of their own and the third
+            // is the workspace's one HTTP client, which is why the family adds no new IO path.
             //
-            // `System`'s impl is empty: `flux-system` holds no HTTP client by design, so the native
-            // backend inherits the port's fail-closed default rather than growing a second one.
+            // `System`'s impl constructs nothing: `flux-system` holds no HTTP client by design, so
+            // the native backend serves the backend a composition site attached to it (C-675's
+            // `System::with_http`, one call on an `Arc<dyn GuardedHttp>` it was handed) and answers
+            // the port's fail-closed default when nobody attached one — which is every `System`
+            // this crate constructs. The client count is unaffected: attaching decides who may ask
+            // an existing backend, never who builds one.
             // `RemoteSystem`'s impl is a typed `Unserved` naming the missing wire support — it
             // cannot send anything.
             ("crates/flux-system/src/port.rs", "GuardedHttp", "System"),
@@ -4077,14 +4081,21 @@ impl Exec for Double {}
                 "GuardedMetrics",
                 "SandboxedSystem",
             ),
-            // HTTP (C-652) is the opposite call, and deliberately so: the impl is empty, so every
-            // operation inherits `port.rs`'s fail-closed `Unserved`. The peer delegates to a
-            // `System`, and a bare `System` serves no HTTP — the native client is
-            // `flux_web::NativeHttp` at L5, which this L2 type may not reach. Inventing a client
-            // here would be a second egress path, which is precisely what the `Http` census exists
-            // to prevent. So a sandboxed selection refuses HTTP by name rather than silently
-            // borrowing the caller's; teaching a selected native substrate to serve it is a
-            // follow-up story, not something to improvise inside this allowance.
+            // HTTP (C-675) is one delegating call and nothing else:
+            // `GuardedHttp::http_request(&self.inner, request, allow)`, forwarding to the composed
+            // `System` exactly as the network and metrics families above do. It adds no IO path
+            // because it opens nothing and builds nothing — the callee is the native backend, which
+            // itself only serves a backend a composition site attached to it (`System::with_http`),
+            // and answers the port's `Unserved` when none was. So a peer composed over an
+            // unattached system still refuses by name (pinned by test), and one composed by
+            // `flux-cli` over the system carrying `flux_web::NativeHttp` serves web effects through
+            // the same reviewed egress client, guard and audit sink an unselected run uses.
+            //
+            // C-652 left this impl empty for the reason that still holds: the native client is at
+            // L5 and this L2 type may not reach it, so inventing a client here would be the second
+            // egress path the `Http` census exists to prevent. Delegation is how the peer gets one
+            // without reaching upward — an edit that constructed a client inside this allowance
+            // would be exactly the thing that reasoning forbids.
             (
                 "crates/flux-system/src/sandboxed.rs",
                 "GuardedHttp",
@@ -4171,8 +4182,9 @@ impl Exec for Double {}
         // `GUARDED_PORT_TRAITS`: a port that joins the guarded set but not the execution bundle
         // would otherwise be demanded of this backend by drift alone.
         //
-        // Serving a port is not the same as answering it — `GuardedHttp` is an empty impl that
-        // inherits the port's `Unserved` denial. The claim under test is that the peer *is* a
+        // Implementing a port is not the same as serving it: every impl here delegates to the
+        // composed `System`, and what that answers for `GuardedHttp` depends on whether a
+        // composition site attached a backend (C-675). The claim under test is that the peer *is* a
         // complete `ExecutionSystem`, which is what makes an omission a compile error at a distant
         // call site rather than a silent gap here.
         const EXECUTION_PORTS: &[&str] = &[
