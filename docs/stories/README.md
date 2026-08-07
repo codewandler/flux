@@ -142,6 +142,7 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 
 ### Fleet harness throughput
 _Wave 1 closed the confidentiality holes. This wave is about the thing the operator originally asked_
+- [C-631 — flux fleet drive replaces the bash autopilot](C-631-flux-fleet-drive-replaces-the-bash-autopilot.md) · Core · the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged
 - [C-664 — cargo test --workspace --lib never tests flux-cli](C-664-cargo-test-workspace-lib-never-tests-flux-cli.md) · Core
 - [C-660 — fleet run returns as soon as workers are dispatched](C-660-fleet-run-returns-as-soon-as-workers-are-dispatched.md) · Core
 - [C-617 — Fleet reclaims wave storage and refuses to dispatch without disk headroom](C-617-fleet-reclaims-wave-storage-and-refuses-to-dispatch-without-disk-headroom.md) · Core
@@ -416,11 +417,6 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 - [A-115 — JiraBoard through Exchange-governed operations, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · re-pointed by Decision 0006: the vendor mapping is a connector board member and every write an admitted Exchange operation — the plugin path this was written over is deleted by Milestone 5; the status↔State mapping stays config, not code
 - [A-118 — GitlabBoard — a second Exchange-governed tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · re-pointed by Decision 0006 away from plugins/gitlab (Milestone 5 deletes the plugin path); deferrable — its value is the proof that WorkBoard is not 'Jira with a trait on top'
 
-### First-class hosts
-_The substrate abstraction already exists — `flux-system` owns the guarded port, `flux-codegate`_
-- [C-651 — Sandboxed is a selectable peer backend](C-651-sandboxed-is-a-selectable-peer-backend.md) · Core · Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a spawn-time modifier; codegate census entry under review
-- [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
-
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
 - [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
@@ -435,7 +431,6 @@ _Wave 1 closed the confidentiality holes. This wave is about the thing the opera
 - [C-628 — Typed cargo operations run offline by default in fenced worktrees](C-628-typed-cargo-operations-run-offline-by-default-in-fenced-worktrees.md) · Core · workers read crates.io DNS failures as test failures; CARGO_NET_OFFLINE cannot reach workers through SAFE_ENV; the exchange gate itself starts with cargo fetch --locked
 - [C-629 — Constrained board.transition and board.create become admitted operations](C-629-constrained-board-transition-and-board-create-become-admitted-operations.md) · Core · decision 0015 (roadmap) runs the planner host-side until these exist; direction-constrained transition (backlog->ready) plus create, both committing their writes
 - [C-630 — fleet integrate --only salvages the non-conflicting subset of a wave](C-630-fleet-integrate-only-salvages-the-non-conflicting-subset-of-a-wave.md) · Core · wave-346 parked whole while two of three stories were independently integrable
-- [C-631 — flux fleet drive replaces the bash autopilot](C-631-flux-fleet-drive-replaces-the-bash-autopilot.md) · Core · the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged
 - [C-632 — Every worker turn records usage, including failed turns](C-632-every-worker-turn-records-usage-including-failed-turns.md) · Core · no recent worker turn carries rounds or tokens; you cannot see how close a worker was to its round budget before it died; activity.ndjson has no timestamps, no turn id, and a proven torn write at line 556
 - [C-659 — Fleet state.json stops carrying every agent's last turn](C-659-fleet-state-json-stops-carrying-every-agent-s-last-turn.md) · Core · every fleet verb fully parses state.json; last_turn blobs accumulate per agent and nothing prunes them
 
@@ -492,7 +487,6 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 
 ### Host metrics seam
 _A host exposes nothing about itself. Dispatch-layer telemetry, substrate provenance and the usage_
-- [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
 - [C-654 — Host metrics over the remote protocol and the host surface](C-654-host-metrics-over-the-remote-protocol-and-the-host-surface.md) · Core · Decision 0018 rule 6: host.metrics bounded wire operation under a protocol version bump; flux host metrics CLI and usage-observatory projection
 - [C-655 — A Kubernetes host serves node metrics](C-655-a-kubernetes-host-serves-node-metrics.md) · Core · Decision 0018 rule 6: node/pod metrics mapped into the same closed vocabulary; follows the container/Kubernetes backend (C-397, C-480)
 
@@ -1178,6 +1172,9 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-648 — A host config table, HostRef and session registry](C-648-a-host-config-table-hostref-and-session-registry.md) · Core · Decision 0018 rules 1-2: declare named hosts the way endpoints are declared; credential references, never values
 - [C-649 — flux host CLI family and host.* operations](C-649-flux-host-cli-family-and-host-operations.md) · Core · Decision 0018 rule 1: ls/add/show/rm/probe plus an ambient-gated host.* op group, mirroring the endpoint surface
 - [C-650 — A named host binding selects the execution substrate](C-650-a-named-host-binding-selects-the-execution-substrate.md) · Core · Decision 0018 rules 2 and 4: --host NAME resolves a registered binding to the selected ExecutionSystem; --remote stays as ephemeral sugar
+- [C-651 — Sandboxed is a selectable peer backend](C-651-sandboxed-is-a-selectable-peer-backend.md) · Core · Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a spawn-time modifier; codegate census entry under review
+- [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
+- [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
 - [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)

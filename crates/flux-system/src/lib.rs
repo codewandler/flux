@@ -135,10 +135,12 @@ use std::time::Duration;
 
 use flux_core::{Error, Result};
 
+pub mod metrics;
 pub mod net;
 pub mod port;
 pub mod remote;
 pub mod sandbox;
+pub mod sandboxed;
 pub mod secret_scope;
 pub mod websocket;
 
@@ -1443,6 +1445,7 @@ pub struct System {
     workspace: Workspace,
     sandbox: Sandbox,
     worktree_base: WorktreeBase,
+    metrics_roots: metrics::MetricsRoots,
 }
 
 impl System {
@@ -1460,6 +1463,7 @@ impl System {
             workspace,
             sandbox: Sandbox::disabled(),
             worktree_base: WorktreeBase::from_process(),
+            metrics_roots: metrics::MetricsRoots::native(),
         }
     }
 
@@ -1474,6 +1478,7 @@ impl System {
             workspace,
             sandbox,
             worktree_base: WorktreeBase::from_process(),
+            metrics_roots: metrics::MetricsRoots::native(),
         })
     }
 
@@ -1496,6 +1501,21 @@ impl System {
     /// The base this system allocates worktree parents under.
     pub fn worktree_base(&self) -> &WorktreeBase {
         &self.worktree_base
+    }
+
+    /// Pin the kernel interfaces the host-metrics reader consults (C-653) — the same
+    /// value-held-environment shape as [`System::with_worktree_base`]. Production keeps the
+    /// default `/proc` + `/sys`; a test points them at procfs/sysfs fixtures it owns, so both the
+    /// served and the explicitly-unavailable face are reachable without depending on what the
+    /// running machine happens to expose.
+    pub fn with_metrics_roots(mut self, roots: metrics::MetricsRoots) -> Self {
+        self.metrics_roots = roots;
+        self
+    }
+
+    /// The kernel interfaces this system reads host metrics from.
+    pub fn metrics_roots(&self) -> &metrics::MetricsRoots {
+        &self.metrics_roots
     }
 
     /// Allocate a fresh private worktree parent under this system's base — the guarded entry point
@@ -1526,6 +1546,7 @@ impl System {
             workspace: self.workspace.with_root(root)?,
             sandbox: self.sandbox.clone(),
             worktree_base: self.worktree_base.clone(),
+            metrics_roots: self.metrics_roots.clone(),
         })
     }
 

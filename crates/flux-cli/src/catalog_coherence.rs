@@ -627,6 +627,68 @@ fn every_production_operation_declares_execution_placement() {
     );
 }
 
+/// C-652, the placement census for the web pack: HTTP is on the guarded port, so a web *effect*
+/// follows the operator's selected substrate instead of being pinned to the coordinator's process.
+///
+/// Deliberately per-operation rather than per-pack. `flux-web` registers three tiers through one
+/// registrar and they do **not** share a placement: `http.request` and `web.fetch` are guarded HTTP
+/// and nothing else, so they are `SelectedExecutionSystem`; `browser.*` owns a live Chromium child,
+/// a CDP pipe and a session registry in *this* process, so it stays `NativeSystemOnly` and is
+/// hidden rather than mis-served under a selected substrate. `web.crawl` stays native-only too —
+/// it drives its own frontier across many fetches and Decision 0018 rule 5 moves only the
+/// operations "where their semantics allow", which this story reads as the two it names.
+///
+/// This pins the decision so a later pack-wide edit cannot silently promote `browser.*` (which
+/// would claim a remote substrate can drive a local browser) or demote the two HTTP tiers back.
+#[test]
+fn web_effect_operations_declare_the_placement_http_on_the_port_gives_them() {
+    let catalog = production_catalog();
+    for (operation, expected) in [
+        (
+            "http.request",
+            flux_runtime::OperationPlacement::SelectedExecutionSystem,
+        ),
+        (
+            "web.fetch",
+            flux_runtime::OperationPlacement::SelectedExecutionSystem,
+        ),
+        (
+            "web.crawl",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.open",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.goto",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.snapshot",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.act",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.close",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "html_to_markdown",
+            flux_runtime::OperationPlacement::LocalControlPlane,
+        ),
+    ] {
+        assert_eq!(
+            catalog.declared_placement(operation),
+            Some(expected),
+            "`{operation}` no longer declares the placement C-652 decided for it"
+        );
+    }
+}
+
 /// A-131, the named failing-first test: A-116 landed `fleet.dispatch` / `.status` / `.cancel`, but
 /// they were constructed nowhere outside their own module — the only other mention in the workspace
 /// was a re-export. An op the production assembly never registers cannot be called by a Program, so

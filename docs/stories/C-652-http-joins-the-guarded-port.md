@@ -2,7 +2,7 @@
 id: C-652
 title: "HTTP joins the guarded port"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system, flux-web]
 design: first-class-hosts
@@ -22,11 +22,11 @@ versioned protocol change.
 
 ## Acceptance
 
-- [ ] `GuardedHttp` joins the port with a fail-closed `Unserved` default and a reviewed codegate
+- [x] `GuardedHttp` joins the port with a fail-closed `Unserved` default and a reviewed codegate
       census entry.
-- [ ] The native implementation routes through the existing pinned egress guard and redactor; no
+- [x] The native implementation routes through the existing pinned egress guard and redactor; no
       second HTTP client appears anywhere (the codegate `Http` census stays clean).
-- [ ] `http.request` and `web.fetch` placement moves to `SelectedExecutionSystem`; `browser.*`
+- [x] `http.request` and `web.fetch` placement moves to `SelectedExecutionSystem`; `browser.*`
       stays `NativeSystemOnly`; the placement census test is updated deliberately.
-- [ ] `RemoteSystem` answers HTTP with a typed `Unserved` naming the missing wire support rather
+- [x] `RemoteSystem` answers HTTP with a typed `Unserved` naming the missing wire support rather
       than approximating.

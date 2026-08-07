@@ -2,7 +2,7 @@
 id: C-653
 title: "Typed host metrics vocabulary and the native backend"
 pillar: "Core"
-status: backlog
+status: done
 epic: host-metrics-seam
 areas: [flux-system]
 design: host-metrics-seam
@@ -22,12 +22,12 @@ fixes for unsupported dimensions.
 
 ## Acceptance
 
-- [ ] A `GuardedMetrics` trait with a closed `MetricKind` vocabulary joins `ExecutionSystem`;
+- [x] A `GuardedMetrics` trait with a closed `MetricKind` vocabulary joins `ExecutionSystem`;
       defaults are `Unserved`; the codegate census entry is reviewed.
-- [ ] The native `System` serves cpu, memory, disk, load and uptime on Linux; temperature and fan
+- [x] The native `System` serves cpu, memory, disk, load and uptime on Linux; temperature and fan
       serve where hwmon exposes them and answer explicitly-unavailable otherwise; tests cover both
       faces.
-- [ ] Readings are typed and unit-bearing, bounded in size, and carry a sampled-at timestamp; no
+- [x] Readings are typed and unit-bearing, bounded in size, and carry a sampled-at timestamp; no
       free-form string metrics exist.
-- [ ] Dependency additions follow the existing `flux-system` policy; the parsing lives in
+- [x] Dependency additions follow the existing `flux-system` policy; the parsing lives in
       `flux-system`, not in a consumer crate.

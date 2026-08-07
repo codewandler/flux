@@ -31,6 +31,22 @@
   never silently inherits a permission granted only to interactive use. `--remote <url>` still
   works for one-off connections.
 
+- **Web requests follow the host you select.** Until now, fetching a page or calling an API always
+  ran from the machine hosting the agent, even when a different execution host was selected. Now
+  HTTP requests and page fetches run against the host you picked with `--host` — and if that
+  host's connection cannot carry web traffic yet, the request refuses with a plain answer naming
+  what is missing, instead of quietly running on the local machine. Browser automation and site
+  crawling still run locally, since they drive a local browser.
+
+- **Confinement is now a host you can name.** `[[host]] backend = "sandboxed"` declares a host that
+  runs guarded effects under the operating-system sandbox (bubblewrap on Linux, Seatbelt on macOS)
+  — and it fails closed: on a machine with no usable confinement, selecting it refuses at startup
+  and names the reason, instead of quietly running unconfined. A forged or stale "already confined"
+  environment marker is refused the same way. `flux host probe` reports which backend a sandboxed
+  host would use, and an autonomy posture that must not run unconfined selects it automatically for
+  named local work. `--sandbox`/`--no-sandbox` behave exactly as before, with one deliberate limit:
+  they never lower an explicitly selected sandboxed host.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

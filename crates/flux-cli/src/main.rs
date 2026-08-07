@@ -118,8 +118,8 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts,
+        backend_under_floor, build_datasources, build_invoke_input, coerce_arg_value,
+        cost_annotation, credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts,
         exchange_binding_from_config, fleet_status_line, format_evidence, host_ref_from_parts,
         implicit_plugin_group, integration_plugin_caps, loop_machinery_label, merge_config_hosts,
         merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
@@ -1548,6 +1548,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("flux-host-sel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        // The supervised floor imposes no confinement of its own, so every backend below resolves
+        // exactly as its binding declares it (C-651's raising is pinned separately).
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
         let reg = flux_capabilities::HostRegistry::new();
         reg.put(HostRecord::config(HostRef {
             grant: vec![HostGrant::Operator],
@@ -1559,16 +1562,16 @@ mod tests {
         )));
         reg.put(HostRecord::config(HostRef {
             grant: vec![HostGrant::Operator],
-            ..HostRef::declared("boxed", HostBackend::Sandboxed)
+            ..HostRef::declared("boxed", HostBackend::Container)
         }));
 
-        let err = resolve_named_host("nope", &reg, HostGrant::Operator, &local)
+        let err = resolve_named_host("nope", &reg, HostGrant::Operator, &local, floor)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("known bindings"), "{err}");
         assert!(err.to_string().contains("here"), "names them: {err}");
 
-        let err = resolve_named_host("ungranted", &reg, HostGrant::Operator, &local)
+        let err = resolve_named_host("ungranted", &reg, HostGrant::Operator, &local, floor)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not granted"), "{err}");
@@ -1578,13 +1581,13 @@ mod tests {
         );
 
         // An unattended surface never inherits the operator grant — no silent widening.
-        let err = resolve_named_host("here", &reg, HostGrant::Unattended, &local)
+        let err = resolve_named_host("here", &reg, HostGrant::Unattended, &local, floor)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not granted"), "{err}");
         assert!(err.to_string().contains("unattended"), "{err}");
 
-        let selected = resolve_named_host("here", &reg, HostGrant::Operator, &local)
+        let selected = resolve_named_host("here", &reg, HostGrant::Operator, &local, floor)
             .await
             .expect("a granted local binding selects");
         assert_eq!(selected.binding, "here");
@@ -1593,10 +1596,116 @@ mod tests {
             "a local binding keeps the native workspace-following path"
         );
 
-        let err = resolve_named_host("boxed", &reg, HostGrant::Operator, &local)
+        let err = resolve_named_host("boxed", &reg, HostGrant::Operator, &local, floor)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("fails closed"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-651 (acceptance 3, second half): a posture's `SandboxFloor` may force selection of the
+    /// sandboxed backend. `raise_mode` already made a floor able to tighten the spawn-time
+    /// *modifier*; this is the same tightest-wins rule applied to the *backend*, so a posture that
+    /// will not run unconfined does not quietly select a bare native substrate when a binding is
+    /// named. It raises `local` only, never lowers anything, and never redirects a backend whose
+    /// boundary lives somewhere else.
+    #[test]
+    fn a_require_posture_floor_raises_a_local_binding_to_the_confinement_peer() {
+        use flux_runtime::AutonomyPosture;
+        use flux_secret::host::HostBackend;
+
+        for posture in [
+            AutonomyPosture::BoundedAutonomy,
+            AutonomyPosture::Exploratory,
+        ] {
+            let floor = posture.sandbox_floor();
+            assert_eq!(
+                backend_under_floor(HostBackend::Local, floor),
+                HostBackend::Sandboxed,
+                "`{posture}` will not run unconfined, so it must select the confinement peer"
+            );
+            // A floor tightens; it never re-points a binding whose boundary is elsewhere.
+            for elsewhere in [
+                HostBackend::Remote,
+                HostBackend::Container,
+                HostBackend::Kubernetes,
+            ] {
+                assert_eq!(backend_under_floor(elsewhere, floor), elsewhere);
+            }
+            assert_eq!(
+                backend_under_floor(HostBackend::Sandboxed, floor),
+                HostBackend::Sandboxed
+            );
+        }
+
+        for posture in [AutonomyPosture::Supervised, AutonomyPosture::Refusing] {
+            let floor = posture.sandbox_floor();
+            assert_eq!(
+                backend_under_floor(HostBackend::Local, floor),
+                HostBackend::Local,
+                "`{posture}` imposes no confinement floor, so it selects nothing"
+            );
+            assert_eq!(
+                backend_under_floor(HostBackend::Sandboxed, floor),
+                HostBackend::Sandboxed,
+                "and it may never lower an explicitly declared backend"
+            );
+        }
+    }
+
+    /// C-651: a `sandboxed` binding is a **wired** backend — selecting it either installs the
+    /// confinement peer (which reports its own kind) or refuses because this platform has no usable
+    /// confinement backend. Both outcomes are asserted because which one a machine takes is a
+    /// property of the machine; what must never happen again is the third one, "the backend has no
+    /// selectable implementation", which is what this asserted at the merge base.
+    ///
+    /// The deterministic halves of this behaviour — the refusal face and the truthful confinement
+    /// report — are pinned in `flux-system`'s own `sandboxed` tests, where the resolved `Sandbox`
+    /// can be supplied rather than discovered.
+    #[tokio::test]
+    async fn a_sandboxed_binding_selects_the_confinement_peer_or_fails_closed() {
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-boxed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("boxed", HostBackend::Sandboxed)
+        }));
+
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        match resolve_named_host("boxed", &reg, HostGrant::Operator, &local, floor).await {
+            Ok(selected) => {
+                assert_eq!(selected.binding, "boxed");
+                let system = selected
+                    .system
+                    .expect("the confinement peer is a system override, not the native path");
+                let identity =
+                    flux_system::port::ExecutionIdentity::substrate_identity(system.as_ref());
+                assert_eq!(identity.kind, "sandboxed");
+                assert!(
+                    !identity.remotely_reported,
+                    "the peer observes locally: {identity:?}"
+                );
+                assert!(
+                    !identity.confinement.contains("off")
+                        && !identity.confinement.contains("unavailable"),
+                    "a selected peer must never report an unconfined posture: {identity:?}"
+                );
+            }
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("fails closed"),
+                    "an unusable confinement backend must refuse, in those words: {text}"
+                );
+                assert!(
+                    !text.contains("no selectable implementation"),
+                    "the `sandboxed` backend is wired now — this is the merge-base refusal: {text}"
+                );
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

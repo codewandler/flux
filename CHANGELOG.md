@@ -90,6 +90,45 @@ All notable changes to this project are documented in this file. The format is b
   coordinator operation takes the same `independent` flag, because the coordinator is the caller
   that actually chooses waves — a batch selector only a human can reach is one nothing uses.
 
+- **The guarded port measures the substrate itself: `GuardedMetrics` and a closed metric
+  vocabulary (Decision 0018 rule 6, C-653).** A typed, closed `MetricKind` vocabulary — CPU usage
+  and load, memory, swap, per-mount disk, uptime, hwmon temperature and fan — joins
+  `ExecutionSystem` with fail-closed `Unserved` defaults, and the answer taxonomy keeps two
+  negatives distinct: "this substrate serves no metrics" (`Unserved`) versus "this machine has no
+  such instrument" (`Unavailable`), so an absent thermometer can never render as 0 °C. The native
+  backend reads procfs/sysfs/statvfs inside `flux-system` with no new dependency; readings are
+  unit-bearing, bounded (32 mounts, 64 sensors, 64-byte labels) and carry a sampled-at timestamp.
+  `RemoteSystem` deliberately serves nothing until the remote protocol gains a versioned metrics
+  frame (C-654). The codegate census gains the family and two reviewed allowances.
+
+- **HTTP joins the guarded port, so web effects follow the selected substrate (Decision 0018
+  rule 5, C-652).** `GuardedHttp` joins `ExecutionSystem` with a fail-closed `Unserved` default;
+  `http.request` and `web.fetch` move from `NativeSystemOnly` to `SelectedExecutionSystem` and
+  route through the selected substrate whenever one is in force — the branch is on whether a
+  substrate was selected, never on its kind, so nothing can send locally under a selection. The
+  native implementation is `flux_web::NativeHttp`, wrapping the one reviewed egress client
+  (redirect-disabled, response-byte-capped, per-hop secret-scope re-authorization behind the
+  port); the codegate `Http` census still counts exactly two `reqwest::Client` construction
+  points. `RemoteSystem` answers a typed `Unserved` naming the missing wire support rather than
+  approximating; `browser.*` and `web.crawl` stay `NativeSystemOnly`, pinned by a new
+  placement-census test.
+
+- **Sandboxed is a selectable peer backend (Decision 0018 rules 3 and 8, C-651).**
+  `SandboxedSystem` in `flux-system` composes the native `System` with the OS sandbox and
+  implements all seven guarded port families by delegation — no added or removed permission, no
+  second spawn path; seven reviewed single-use codegate allowances plus a completeness test pin
+  it. Admission is evidence-gated: `resolve` admits only an active sandbox, and an
+  outer-confinement conclusion is inherited only from the ambient posture that already trusted
+  and audit-disclosed the `FLUX_SANDBOXED` marker — a bare marker fails closed with a refusal
+  naming it. A `Require` posture floor raises a named local binding to the sandboxed peer;
+  `--no-sandbox` never lowers an explicitly selected binding (tightest-wins);
+  `SubstrateIdentity` reports `kind = "sandboxed"` on every admission path, which keeps
+  `browser.*`/`web.crawl` hidden under a sandboxed selection. The `--sandbox`/`--no-sandbox`
+  modifier path is byte-for-byte unchanged, and an admitted peer is a workspace snapshot that
+  does not follow a later re-root (pinned by test). GuardedMetrics delegates to the composed
+  system (same machine, same narrowable roots); GuardedHttp inherits the port's `Unserved` until
+  a selected native substrate gains an HTTP backend.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
