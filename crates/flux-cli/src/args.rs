@@ -1564,6 +1564,12 @@ pub(super) enum HostAction {
         /// `plugin/<p>/<i>/<slot>`. Omit for an unauthenticated binding. Never a value.
         #[arg(long, value_name = "REF")]
         credential_ref: Option<String>,
+        /// Path to the PEM certificate of the private CA this binding's endpoint chains to — the
+        /// binding-scoped equivalent of `--remote-ca`. Omit for ordinary public trust. An
+        /// unreadable or malformed certificate refuses the binding; it never downgrades to the
+        /// default trust store.
+        #[arg(long = "ca-cert", value_name = "PEM")]
+        ca_cert: Option<String>,
         /// Repeatable surface class granted to *select* this binding: `operator` (attended
         /// sessions, the default — your explicit add is the grant) and/or `unattended` (serving
         /// and `--yes` surfaces; grant deliberately, widening is an escalation). A `[[host]]`

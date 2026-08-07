@@ -486,6 +486,24 @@ an unknown backend kind is a hard config error, and an unknown key in a `[[host]
 rather than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a
 location (the same reference forms as endpoints), never a secret value; non-secret `labels` are
 optional.
+
+`ca_cert` is the path to the PEM certificate of the private CA the binding's endpoint chains to —
+the binding-scoped equivalent of `--remote-ca`, and what makes a Kubernetes pod, a VM guest or a
+container with an operator-issued certificate reachable *by name*. Omit it for ordinary public
+trust. It is a filesystem location, not a secret reference: a CA certificate is public material, so
+it is neither redacted nor addressed through the secret schemes, and `flux host ls` shows which
+anchor a binding uses. What it borrows from `credential_ref` is that the config declares a location
+and resolution validates it — an unreadable or malformed certificate refuses the binding, naming
+the binding and the file, and **never** falls back to the default trust store. There is no flag
+that relaxes this; an endpoint whose certificate does not chain to the declared CA is refused with
+the TLS failure named.
+
+The path may be absolute and outside the workspace — `/etc/flux/ca.pem`, a path under `~`, wherever
+your deployment put it — because a CA belongs to the machine or the cluster, not to the project you
+happen to be working in. Flux reads exactly the file you named and nothing else, so naming one does
+not open a directory. This is the same rule for `ca_cert`, `[host.ssh] ca` and `--remote-ca`: one
+field, one meaning, one set of paths it can name.
+
 Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
 user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
 
@@ -562,8 +580,14 @@ id = "vm-guest"
 backend = "microvm"
 url = "https://guest.internal:8790"
 credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+ca_cert = "/etc/flux/guest-ca.pem"
 grant = ["operator"]
 ```
+
+That guest profile installs a certificate at `/etc/flux/tls/tls.crt`, and the Kubernetes profile
+takes one as a `tls` Secret; both are normally issued by an operator-managed CA rather than a
+public one. `ca_cert` is where the client names that CA, so the binding reaches the substrate by
+name instead of only through `--remote … --remote-ca`.
 
 Declared without a `url`, a `microvm` binding is still legal, and honestly **unwired**: `flux host
 ls` says so and selection fails closed naming the missing endpoint, because that gap is closed by

@@ -1469,6 +1469,7 @@ mod tests {
             HostBackend::Remote,
             Some("https://user:secret@farm.example:8443"),
             None,
+            None,
             &[],
             labels(),
         )
@@ -1484,6 +1485,7 @@ mod tests {
             HostBackend::Remote,
             Some("https://farm.example:8443"),
             Some("hunter2-not-a-ref"),
+            None,
             &[],
             labels(),
         )
@@ -1491,13 +1493,14 @@ mod tests {
         assert!(err.to_string().contains("invalid credential ref"), "{err}");
 
         // A remote binding without an address is unusable; a local one with an address is a lie.
-        let err = host_ref_from_parts("farm", HostBackend::Remote, None, None, &[], labels())
+        let err = host_ref_from_parts("farm", HostBackend::Remote, None, None, None, &[], labels())
             .unwrap_err();
         assert!(err.to_string().contains("needs a `url`"), "{err}");
         let err = host_ref_from_parts(
             "here",
             HostBackend::Local,
             Some("https://somewhere.example"),
+            None,
             None,
             &[],
             labels(),
@@ -1516,11 +1519,72 @@ mod tests {
                 HostBackend::Remote,
                 Some("https://farm.example:8443"),
                 Some(scheme),
+                None,
                 &[],
                 labels(),
             )
             .unwrap_or_else(|e| panic!("`{scheme}` is a valid location: {e}"));
         }
+
+        // C-684: a declared CA is a *location*, so only its shape is judged here — whether the
+        // file is readable and holds a usable anchor is a resolution-time question. An empty
+        // declaration is a mistake, and one on a substrate that terminates no TLS is dead config,
+        // refused for the same reason a `url` on one is.
+        let err = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://farm.example:8443"),
+            Some("env/FARM_TOKEN"),
+            Some("   "),
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("`ca_cert` must not be empty"),
+            "{err}"
+        );
+
+        let err = host_ref_from_parts(
+            "here",
+            HostBackend::Local,
+            None,
+            None,
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("terminates no TLS"), "{err}");
+
+        // C-683 landed an ssh-local anchor at `[host.ssh] ca`. `ca_cert` means the same thing on
+        // every kind that dials TLS, so an ssh binding accepts it here rather than refusing the
+        // word; which anchor an ssh bootstrap uses is settled at resolution, where both are
+        // visible.
+        let reference = host_ref_from_parts(
+            "builder",
+            HostBackend::Ssh,
+            Some("ssh://build@builder.example"),
+            Some("env/FARM_TOKEN"),
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .expect("`ca_cert` is the binding-level anchor on every TLS-dialling kind");
+        assert_eq!(reference.ca_cert.as_deref(), Some("/etc/flux/ca.pem"));
+
+        // A path is accepted as-is: it is not parsed as a secret ref, and it is not read here.
+        let reference = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://farm.example:8443"),
+            Some("env/FARM_TOKEN"),
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .expect("a CA location is a plain path, not a secret reference");
+        assert_eq!(reference.ca_cert.as_deref(), Some("/etc/flux/ca.pem"));
     }
 
     /// C-648: `[[host]]` declarations register in the session `HostRegistry` at startup — list/get
@@ -1536,6 +1600,7 @@ mod tests {
                     backend: flux_config::HostBackendKind::Remote,
                     url: Some("https://farm.example:8443".into()),
                     credential_ref: Some("env/FARM_TOKEN".into()),
+                    ca_cert: None,
                     grant: vec!["operator".into()],
                     labels: Default::default(),
                     ssh: None,
@@ -1545,6 +1610,7 @@ mod tests {
                     backend: flux_config::HostBackendKind::Local,
                     url: None,
                     credential_ref: None,
+                    ca_cert: None,
                     grant: Vec::new(),
                     labels: Default::default(),
                     ssh: None,
@@ -1555,6 +1621,7 @@ mod tests {
                     backend: flux_config::HostBackendKind::Remote,
                     url: Some("https://u:p@farm.example".into()),
                     credential_ref: None,
+                    ca_cert: None,
                     grant: Vec::new(),
                     labels: Default::default(),
                     ssh: None,
@@ -1750,6 +1817,7 @@ mod tests {
             backend: flux_config::HostBackendKind::Remote,
             url: Some(url.into()),
             credential_ref: Some("env/FARM_TOKEN".into()),
+            ca_cert: None,
             grant: vec!["operator".into()],
             labels: Default::default(),
             ssh: None,
@@ -2167,6 +2235,217 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A throwaway self-signed CA, committed as a *test anchor* only. A CA certificate is public
+    /// material — it is the location that is declared and the parse that is validated, not a value
+    /// to redact — so pinning one here leaks nothing. No private key exists for it in this
+    /// repository, and nothing outside these tests trusts it.
+    #[cfg(test)]
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDHzCCAgegAwIBAgIUfYtFEfUAVt6NnkLSm1Ioz3xxNmMwDQYJKoZIhvcNAQEL
+BQAwHzEdMBsGA1UEAwwUZmx1eCB0ZXN0IHByaXZhdGUgQ0EwHhcNMjYwODA3MTIw
+NzQwWhcNNDYwODAyMTIwNzQwWjAfMR0wGwYDVQQDDBRmbHV4IHRlc3QgcHJpdmF0
+ZSBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKHpnT77d63x2Df/
+Jn2jzTU95yXyJJmPObF2AjhqxrSfzGtyFTwBjCIxJRWDA25Twsu4D1aaF5WNGQO/
+qCYWtAdULeHQVLnT1ECKeaScqGkseQNohyEopOSdJUHDuAr22e+fVM9iG+SCMWl6
+hNw8wsFzPju5tevX3SRS1adJAtcMvZePV3tAxo+ZbOhaHsv5lqYQkkIRb+3Tkitg
+cykCvjW8oUM+oKW+VmzgxKTEZ5TOAE5Goam0YzG6M7sKrlcXlupaat8AJIXN6dO7
+sdvn+Yf3swh0IPLo6/+AoTyDaOHwbX0jL1f8eWyYDBz/7ynKw4/gdC9GCnE+x7Lm
+Mn8/d6cCAwEAAaNTMFEwHQYDVR0OBBYEFFtOcxU1PRyyIsy7ZLWxJKUdl6w0MB8G
+A1UdIwQYMBaAFFtOcxU1PRyyIsy7ZLWxJKUdl6w0MA8GA1UdEwEB/wQFMAMBAf8w
+DQYJKoZIhvcNAQELBQADggEBAF+3Wnzqc8k6Ucbe2wnPqT4rOkhOWaQ/J+1J+2uM
+LODUI/PWtQRsIownYAyvZc++t2/zpvzwi5WLGNZzq2h0L44x8hmkLwKmh9oukiQi
+dUtUAuxYzeBtWaapzJEFWvncGfshPtPExc2VbQlmnha8RP4/KC7f1QhT7sKqjwsX
+fDc9wdteGTrGPotkSLOu2Ea37k4qrvhnWBYCaOAYAMeXHDwBPFaXiQrofUBS9Lp4
+pfYXTVi7LeICBLa622RTzN6DNbH0ypmbEQlrTXIQ5bAU8ycJqFGLinEnNxsG41Nw
+sqR3JAysdJBljWp4mVhFw3iPuGfa6RI5keoUH/fk23Lbsgs=
+-----END CERTIFICATE-----
+";
+
+    /// C-684, acceptances 1 and 2: a named binding declares its own private CA, and **all three**
+    /// binding-resolution paths consult it — selection, probe and the metrics read.
+    ///
+    /// The proof is ordering, not plumbing. A declared CA is read and parsed *before* the client is
+    /// built, so a binding whose trust anchor is unusable never reaches the wire: an unreadable or
+    /// malformed `ca_cert` refuses with the binding and the file named, while the same binding with
+    /// no CA at all — or with a usable one — gets as far as the transport and fails there. Those
+    /// two outcomes are distinguishable exactly because the CA is not silently dropped in favour of
+    /// the default trust store, which is the failure mode this story exists to prevent.
+    #[tokio::test]
+    async fn a_binding_declaring_a_private_ca_fails_closed_on_every_resolution_path() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+
+        let dir = std::env::temp_dir().join(format!("flux-host-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The CA lives inside the workspace because it is read through the guarded `System`, the
+        // same jailed read `--remote-ca` has always used. Parity with the flag is the point.
+        let good_ca = dir.join("ca.pem");
+        std::fs::write(&good_ca, TEST_CA_PEM).unwrap();
+        let junk_ca = dir.join("junk.pem");
+        std::fs::write(&junk_ca, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
+        let absent_ca = dir.join("no-such-ca.pem");
+
+        std::env::set_var("C684_CA_TOKEN", "guest-token");
+        // A loopback address nothing listens on: admission gets to the transport and no further.
+        let binding = |ca: Option<&std::path::Path>| HostRef {
+            url: Some("https://127.0.0.1:1".into()),
+            credential_ref: Some(flux_secret::Ref::env("C684_CA_TOKEN")),
+            ca_cert: ca.map(|p| p.to_string_lossy().into_owned()),
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("private-ca-host", HostBackend::Remote)
+        };
+
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let registry = |host: HostRef| {
+            let reg = flux_capabilities::HostRegistry::new();
+            reg.put(HostRecord::config(host));
+            reg
+        };
+
+        // Face one: an unusable CA refuses at resolution, naming the binding and the file — on the
+        // probe, on selection and on the metrics read alike.
+        for (ca, what) in [(&junk_ca, "malformed"), (&absent_ca, "unreadable")] {
+            let host = binding(Some(ca));
+            let file = ca.to_string_lossy().into_owned();
+
+            match prober.probe(&host).await.unwrap_err() {
+                HostProbeFailure::BackendUnavailable { detail, .. } => {
+                    assert!(
+                        detail.contains("private-ca-host") && detail.contains(&file),
+                        "{what} CA: the refusal must name the binding and the file: {detail}"
+                    );
+                }
+                other => panic!("{what} CA: expected a fail-closed CA refusal, got {other:?}"),
+            }
+
+            match prober.read_metrics(&host).await.unwrap_err() {
+                HostProbeFailure::BackendUnavailable { detail, .. } => {
+                    assert!(
+                        detail.contains("private-ca-host") && detail.contains(&file),
+                        "{what} CA: the metrics read must refuse the same way: {detail}"
+                    );
+                }
+                other => panic!("{what} CA: expected a fail-closed CA refusal, got {other:?}"),
+            }
+
+            let text = resolve_named_host(
+                "private-ca-host",
+                &registry(host),
+                HostGrant::Operator,
+                &local,
+                floor,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                text.contains("private-ca-host") && text.contains(&file),
+                "{what} CA: selection must refuse naming the binding and the file: {text}"
+            );
+        }
+
+        // Face two: the ordinary public-trust path is untouched when no CA is declared, and a
+        // *usable* declared CA is accepted and carried to the client rather than rejected here.
+        // Both reach the transport, which is the only thing left to fail.
+        for ca in [None, Some(good_ca.as_path())] {
+            let host = binding(ca);
+            match prober.probe(&host).await.unwrap_err() {
+                HostProbeFailure::Connect { .. } => {}
+                other => panic!("declared_ca={ca:?}: expected a transport failure, got {other:?}"),
+            }
+            let text = resolve_named_host(
+                "private-ca-host",
+                &registry(host),
+                HostGrant::Operator,
+                &local,
+                floor,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                text.contains("connect host `private-ca-host`"),
+                "declared_ca={ca:?}: selection reached the client: {text}"
+            );
+        }
+
+        std::env::remove_var("C684_CA_TOKEN");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-684 review: one declared field, one reachability envelope.
+    ///
+    /// A CA certificate is public material that lives where the deployment put it — `/etc/flux`,
+    /// `~/.kube`, a path chosen by the cluster, never inside the project being worked on. Reading
+    /// it through the workspace jail would mean the documented `ca_cert = "/etc/flux/guest-ca.pem"`
+    /// refuses on a `microvm` binding while the identical declaration works on an `ssh` one, which
+    /// has always used the scoped host-file port. That split is the same class of defect this story
+    /// was filed to remove, so it is pinned here rather than left to the docs to apologise for.
+    ///
+    /// The grant stays exactly one file: the scope is the declared path itself, so this widens
+    /// *which* path an operator may name, never how many.
+    #[tokio::test]
+    async fn a_declared_ca_outside_the_workspace_is_readable_on_every_kind() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+
+        let base = std::env::temp_dir().join(format!("flux-host-ca-out-{}", std::process::id()));
+        let workspace = base.join("project");
+        let elsewhere = base.join("etc-flux");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // Deliberately a sibling of the workspace, never under it: this is the whole point.
+        let ca = elsewhere.join("guest-ca.pem");
+        std::fs::write(&ca, TEST_CA_PEM).unwrap();
+
+        std::env::set_var("C684_OUT_TOKEN", "guest-token");
+        let host = HostRef {
+            url: Some("https://127.0.0.1:1".into()),
+            credential_ref: Some(flux_secret::Ref::env("C684_OUT_TOKEN")),
+            ca_cert: Some(ca.to_string_lossy().into_owned()),
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("vm-guest", HostBackend::Microvm)
+        };
+
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&workspace).unwrap(),
+            )),
+        };
+        // The anchor is accepted, so the only thing left to fail is the transport. A jailed read
+        // would refuse here with "cannot be read" and never reach the wire at all.
+        match prober.probe(&host).await.unwrap_err() {
+            HostProbeFailure::Connect { .. } => {}
+            other => panic!("a CA outside the workspace must still be readable, got {other:?}"),
+        }
+
+        let local = flux_system::System::new(flux_system::Workspace::new(&workspace).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(host));
+        let text = resolve_named_host("vm-guest", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("connect host `vm-guest`"),
+            "selection reads the same anchor and reaches the client: {text}"
+        );
+        assert!(
+            !text.contains("cannot be read"),
+            "the workspace jail must not be what decides where a CA may live: {text}"
+        );
+
+        std::env::remove_var("C684_OUT_TOKEN");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// C-677, acceptance 4 — the pin C-651 made for the confinement peer, made here for the guest.
     ///
     /// C-652's `Executor::non_native_target` reads `kind != "native" || remotely_reported` as "a
@@ -2256,6 +2535,7 @@ mod tests {
             &reg,
             "https://farm.example:8443",
             "FLUX_REMOTE_SYSTEM_TOKEN",
+            None,
         );
         let record = reg.get("@session/remote").expect("recorded");
         assert_eq!(record.host.source, HostSource::Ephemeral);
@@ -2269,6 +2549,7 @@ mod tests {
         let err = host_ref_from_parts(
             "@session/mine",
             HostBackend::Local,
+            None,
             None,
             None,
             &[],

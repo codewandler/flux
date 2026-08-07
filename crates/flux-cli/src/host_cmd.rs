@@ -54,6 +54,7 @@ pub(super) fn host_ref_from_parts(
     backend: HostBackend,
     url: Option<&str>,
     credential_ref: Option<&str>,
+    ca_cert: Option<&str>,
     grant: &[String],
     labels: std::collections::BTreeMap<String, String>,
 ) -> Result<HostRef> {
@@ -95,6 +96,22 @@ pub(super) fn host_ref_from_parts(
             );
         }
     }
+    // C-684: the CA is a declared *location*, so only its shape is checked here — whether the file
+    // is readable and holds a usable trust anchor is a resolution-time question, answered where the
+    // guarded `System` can read it and where a failure can refuse the binding rather than the whole
+    // config. Declaring one on an addressless backend is a dead declaration, refused for the same
+    // reason a `url` on one is.
+    if let Some(path) = ca_cert {
+        if path.trim().is_empty() {
+            bail!("host `{id}`: `ca_cert` must not be empty when given");
+        }
+        if matches!(backend, HostBackend::Local | HostBackend::Sandboxed) {
+            bail!(
+                "host `{id}` binds the {backend} substrate, which terminates no TLS; drop \
+                 `ca_cert`"
+            );
+        }
+    }
     let credential_ref = match credential_ref {
         Some(s) => Some(
             flux_secret::Ref::parse(s)
@@ -113,6 +130,7 @@ pub(super) fn host_ref_from_parts(
     Ok(HostRef {
         url: url.map(str::to_string),
         credential_ref,
+        ca_cert: ca_cert.map(str::to_string),
         grant,
         labels,
         ..HostRef::declared(id, backend)
@@ -133,6 +151,7 @@ pub(super) fn merge_config_hosts(
             backend_from_config(host.backend),
             host.url.as_deref(),
             host.credential_ref.as_deref(),
+            host.ca_cert.as_deref(),
             &host.grant,
             host.labels.clone(),
         ) {
@@ -211,6 +230,12 @@ pub(super) fn render_host_row(record: &HostRecord) -> String {
         owner = record.owner,
         cred = host_credential_location(record),
     );
+    // C-684: a declared trust anchor is shown, not hidden. It is a public *location*, and an
+    // operator debugging a refused endpoint needs to see which anchor the binding is using — or
+    // that it is using none.
+    if let Some(path) = &host.ca_cert {
+        row.push_str(&format!("  ca: {path}"));
+    }
     if !host.labels.is_empty() {
         let labels: Vec<String> = host
             .labels
@@ -232,6 +257,7 @@ fn host_view(record: &HostRecord) -> serde_json::Value {
         "availability": flux_capabilities::binding_availability(host),
         "owner": record.owner,
         "credential_ref": host.credential_ref.as_ref().map(ToString::to_string),
+        "ca_cert": host.ca_cert,
         "grant": host.grant.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
         "labels": host.labels,
     })
@@ -319,6 +345,96 @@ fn missing_endpoint_failure(backend: HostBackend) -> flux_capabilities::HostProb
         _ => flux_capabilities::HostProbeFailure::Connect {
             detail: "binding has no url".to_string(),
         },
+    }
+}
+
+/// A CA bundle is a handful of certificates; anything larger is a misdeclaration, not a bundle.
+pub(super) const MAX_CA_PEM_BYTES: usize = 256 * 1024;
+
+/// Read a declared CA certificate — the single reachability envelope for every surface that names
+/// one (`[[host]] ca_cert`, `[host.ssh] ca`, and `--remote-ca`).
+///
+/// A CA is *public* material that legitimately lives at a system path — `/etc/flux/ca.pem`,
+/// `~/.kube/…`, wherever the deployment put it — so it is read through the scoped host-file port
+/// rather than the workspace jail, which is exactly what that port exists for. Confining it to the
+/// workspace would mean the flagship case this story was filed to fix ("reach my own cluster")
+/// required copying the cluster CA into the project, and it would have left the ssh bootstrap
+/// (which has always used this port) able to name paths the other kinds could not.
+///
+/// The scope is the declared path *itself*, so the grant is exactly the one file the operator
+/// wrote in their own configuration — nothing broader. Both the request and the scope are reduced
+/// to physical identities first, so an in-scope symlink cannot name an out-of-scope target, and the
+/// read is capped: a path that is not a CA bundle is refused for its size rather than slurped.
+pub(super) async fn read_ca_pem(system: &System, path: &str) -> Result<Vec<u8>> {
+    let read =
+        flux_system::port::GuardedHostFiles::read_file_scoped(system, path, path, MAX_CA_PEM_BYTES)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // Say *why* it was refused. Dropping this flag would let an oversized file fall through to the
+    // PEM parser and be reported as malformed, which is fail-closed but tells the operator to go
+    // looking for a corrupt certificate instead of the wrong path.
+    if read.truncated {
+        anyhow::bail!(
+            "`{path}` is larger than the {MAX_CA_PEM_BYTES} byte limit for a trust anchor, so it \
+             was refused rather than read — check the path names a CA bundle and not something else"
+        );
+    }
+    Ok(read.bytes)
+}
+
+/// Read and validate the private CA a binding declares (C-684), or `Ok(None)` when it declares
+/// none and the ordinary public trust store applies.
+///
+/// One helper, three callers — selection, `probe` and the metrics read — because a binding that
+/// probes green against one trust decision and then executes against another is exactly the
+/// inconsistency a named binding is supposed to remove.
+///
+/// It reads through [`read_ca_pem`], which is also what the ssh bootstrap uses, so one declared
+/// field has one reachability envelope on every backend kind that dials TLS.
+///
+/// Both failures are fail-closed and both name the binding and the file, because those are the two
+/// things an operator needs to act: nothing here ever falls back to the default trust store, since
+/// silently reaching a *different* endpoint than the one an operator pinned is worse than not
+/// reaching it at all. The returned `String` is already a complete sentence; each caller only wraps
+/// it in its own error type.
+async fn declared_ca_pem(
+    system: &System,
+    host: &HostRef,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    let Some(path) = host.ca_cert.as_deref() else {
+        return Ok(None);
+    };
+    let pem = read_ca_pem(system, path).await.map_err(|error| {
+        format!(
+            "host `{}` declares the private CA `{path}`, which cannot be read: {error}. The \
+             binding refuses rather than falling back to the default trust store",
+            host.id
+        )
+    })?;
+    flux_server::system::validate_ca_pem(&pem).map_err(|error| {
+        format!(
+            "host `{}` declares the private CA `{path}`, which is not a usable trust anchor: \
+             {error}. The binding refuses rather than falling back to the default trust store",
+            host.id
+        )
+    })?;
+    Ok(Some(pem))
+}
+
+/// A declared-CA failure as a typed probe failure.
+///
+/// [`BackendUnavailable`](flux_capabilities::HostProbeFailure), not
+/// [`Connect`](flux_capabilities::HostProbeFailure): nothing was dialled. The remote backend is
+/// wired and the endpoint may well be up — what is absent is a usable trust anchor *on this
+/// machine*, which is the same shape as a `sandboxed` binding with no confinement backend, and it
+/// is the distinction an operator acts on (fix the file here, do not go looking at the endpoint).
+fn ca_unavailable_failure(
+    backend: HostBackend,
+    detail: String,
+) -> flux_capabilities::HostProbeFailure {
+    flux_capabilities::HostProbeFailure::BackendUnavailable {
+        backend: backend.as_str().to_string(),
+        detail,
     }
 }
 
@@ -429,10 +545,25 @@ pub(super) async fn resolve_named_host(
                      an empty token"
                 ),
             };
-            let system =
-                flux_server::system::connect_remote_system(url, token, &fleet_private_net())
+            // C-684: a binding that declares a private CA is reached through the CA-aware client;
+            // one that does not keeps the ordinary public-trust path untouched.
+            let ca_pem = declared_ca_pem(local, &host)
+                .await
+                .map_err(|detail| anyhow::anyhow!("{detail}"))?;
+            let private_net = fleet_private_net();
+            let system = match &ca_pem {
+                Some(pem) => {
+                    flux_server::system::connect_remote_system_with_ca_pem(
+                        url,
+                        token,
+                        &private_net,
+                        pem,
+                    )
                     .await
-                    .with_context(|| format!("connect host `{name}`"))?;
+                }
+                None => flux_server::system::connect_remote_system(url, token, &private_net).await,
+            }
+            .with_context(|| format!("connect host `{name}`"))?;
             Ok(SelectedSubstrate {
                 binding: host.id,
                 system: Some(Arc::new(system)),
@@ -488,10 +619,14 @@ pub(super) fn record_ephemeral_remote(
     hosts: &flux_capabilities::HostRegistry,
     url: &str,
     token_env: &str,
+    ca_cert: Option<&str>,
 ) {
     hosts.put(HostRecord::session(HostRef {
         url: Some(url.to_string()),
         credential_ref: Some(flux_secret::Ref::env(token_env)),
+        // C-684: the session binding records the anchor the session is actually using, so probing
+        // `@session/remote` asks the same question `--remote --remote-ca` already answered.
+        ca_cert: ca_cert.map(str::to_string),
         ..HostRef::ephemeral("@session/remote", HostBackend::Remote)
     }));
 }
@@ -630,9 +765,27 @@ impl flux_capabilities::HostProber for CliHostProber {
                         })
                     }
                 };
-                match flux_server::system::probe_remote_system(url, token, &fleet_private_net())
+                // C-684: the probe makes the *same* trust decision selection will, so a binding
+                // cannot verify green here and then execute against a different anchor.
+                let ca_pem = declared_ca_pem(&self.system, host)
                     .await
-                {
+                    .map_err(|detail| ca_unavailable_failure(host.backend, detail))?;
+                let private_net = fleet_private_net();
+                let attempt = match &ca_pem {
+                    Some(pem) => {
+                        flux_server::system::probe_remote_system_with_ca_pem(
+                            url,
+                            token,
+                            &private_net,
+                            pem,
+                        )
+                        .await
+                    }
+                    None => {
+                        flux_server::system::probe_remote_system(url, token, &private_net).await
+                    }
+                };
+                match attempt {
                     Ok(handshake) => Ok(HostProbeReport {
                         kind: handshake.substrate_kind,
                         workspace: handshake.workspace,
@@ -771,11 +924,27 @@ impl CliHostProber {
                 })
             }
         };
-        flux_server::system::connect_remote_system(url, token, &fleet_private_net())
+        // C-684: the metrics read reaches a live substrate, so it resolves the declared CA exactly
+        // as `probe` and selection do.
+        let ca_pem = declared_ca_pem(&self.system, host)
             .await
-            .map_err(|error| HostProbeFailure::Connect {
-                detail: error.to_string(),
-            })
+            .map_err(|detail| ca_unavailable_failure(host.backend, detail))?;
+        let private_net = fleet_private_net();
+        match &ca_pem {
+            Some(pem) => {
+                flux_server::system::connect_remote_system_with_ca_pem(
+                    url,
+                    token,
+                    &private_net,
+                    pem,
+                )
+                .await
+            }
+            None => flux_server::system::connect_remote_system(url, token, &private_net).await,
+        }
+        .map_err(|error| HostProbeFailure::Connect {
+            detail: error.to_string(),
+        })
     }
 }
 
@@ -833,6 +1002,7 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
             backend,
             url,
             credential_ref,
+            ca_cert,
             grant,
             labels,
         } => {
@@ -846,6 +1016,7 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
                 backend,
                 url.as_deref(),
                 credential_ref.as_deref(),
+                ca_cert.as_deref(),
                 &grant,
                 labels.clone(),
             )?;
@@ -854,6 +1025,7 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
                 backend: config_kind_from_backend(backend),
                 url: reference.url.clone(),
                 credential_ref: reference.credential_ref.as_ref().map(ToString::to_string),
+                ca_cert: reference.ca_cert.clone(),
                 grant: reference.grant.iter().map(ToString::to_string).collect(),
                 labels,
                 // An `ssh` binding's far-side contract is declarative only, so `[[host]].ssh` is

@@ -262,6 +262,13 @@ pub struct HostEntry {
     /// `kubernetes/<ns>/<name>/<key>`, `plugin/<p>/<i>/<slot>`); optional. Never a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// Filesystem *location* of the private CA certificate (PEM) this binding's endpoint chains to
+    /// — the `[[host]]` equivalent of `--remote-ca` (C-684). Optional; omit for ordinary public
+    /// trust. A CA certificate is public material, so this is a plain path rather than a secret
+    /// reference; what it keeps from `credential_ref` is that the config declares a *location* and
+    /// resolution validates it, failing closed rather than falling back to the default trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
     /// Surface classes granted to *select* this binding (`operator`, `unattended`). The default
     /// is deny (Decision 0018 rule 4): an ungranted binding lists and probes but selects for
     /// nobody. Held as plain strings here; the surface crate validates the vocabulary.
@@ -2397,6 +2404,7 @@ id = "build-farm"
 backend = "remote"
 url = "https://farm.example:8443"
 credential_ref = "env/FARM_TOKEN"
+ca_cert = "/etc/flux/farm-ca.pem"
 labels = { region = "eu" }
 
 [[host]]
@@ -2411,7 +2419,13 @@ backend = "local"
         assert_eq!(farm.backend, HostBackendKind::Remote);
         assert_eq!(farm.url.as_deref(), Some("https://farm.example:8443"));
         assert_eq!(farm.credential_ref.as_deref(), Some("env/FARM_TOKEN"));
+        // C-684: the private CA the endpoint chains to is a declarable *location*, so a binding
+        // can reach an operator-managed substrate by name. It parses as an ordinary key rather
+        // than being refused by `deny_unknown_fields`.
+        assert_eq!(farm.ca_cert.as_deref(), Some("/etc/flux/farm-ca.pem"));
         assert_eq!(farm.labels.get("region").map(String::as_str), Some("eu"));
+        // Omitted is the public-trust default, not an empty string.
+        assert!(cfg.hosts[1].ca_cert.is_none());
         // A minimal declaration: just a name and a backend kind (the local substrate needs no
         // address and no credential).
         assert_eq!(cfg.hosts[1].id, "here");
@@ -2501,6 +2515,7 @@ backend = "microvm"
             backend: HostBackendKind::Remote,
             url: Some(url.into()),
             credential_ref: None,
+            ca_cert: None,
             grant: Vec::new(),
             labels: Default::default(),
             ssh: None,
@@ -2526,6 +2541,7 @@ backend = "microvm"
             backend: HostBackendKind::Remote,
             url: Some("https://farm.example:8443".into()),
             credential_ref: Some("env/FARM_TOKEN".into()),
+            ca_cert: None,
             grant: Vec::new(),
             labels: Default::default(),
             ssh: None,
