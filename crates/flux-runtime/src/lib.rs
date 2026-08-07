@@ -1501,6 +1501,21 @@ impl ToolContext {
             .unwrap_or_else(|| self.workspace.active())
     }
 
+    /// The substrate the operator **selected**, or `None` when execution follows the native default.
+    ///
+    /// [`Self::execution_system`] resolves `None` to the native `System`, which is what a port-aware
+    /// op wants for every family the native backend serves. This is the narrower question, and one
+    /// op family has to ask it: `flux-system` holds no HTTP client by design (C-652), so the native
+    /// backend answers [`flux_system::port::GuardedHttp`] fail-closed and the reviewed
+    /// implementation lives a layer up with the client. A web effect therefore goes to the selected
+    /// substrate when there is one — including when that substrate refuses it — and to the op's own
+    /// reviewed native backend when the operator selected nothing. The distinction is *whether a
+    /// substrate was chosen*, never what kind it is, so nothing here can smuggle an effect past a
+    /// selection.
+    pub fn selected_execution_system(&self) -> Option<Arc<dyn ExecutionSystem>> {
+        self.execution_system.clone()
+    }
+
     /// Select the execution-facing guarded substrate while retaining the native control-plane
     /// system. This is host assembly, never a model-facing operation.
     pub fn with_execution_system(mut self, system: Arc<dyn ExecutionSystem>) -> Self {

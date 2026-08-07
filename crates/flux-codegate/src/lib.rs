@@ -1236,6 +1236,8 @@ const GUARDED_PORT_TRAITS: &[&str] = &[
     "GuardedHostFiles",
     "GuardedWorkspaceFiles",
     "GuardedNetwork",
+    "GuardedMetrics",
+    "GuardedHttp",
 ];
 
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
@@ -3956,6 +3958,13 @@ impl Exec for Double {}
             ),
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
             ("crates/flux-system/src/port.rs", "GuardedNetwork", "System"),
+            // C-653. Read-only and measurement-only: the native metrics backend opens no file
+            // outside `/proc` and `/sys` (the roots are a value on the `System`, so a caller can
+            // narrow them but never widen them into the workspace), starts no process, and writes
+            // nothing. What the review is actually about is the *answer* shape — an unsupported
+            // metric must stay explicitly unavailable rather than becoming a zero a projection
+            // would read as a measurement.
+            ("crates/flux-system/src/port.rs", "GuardedMetrics", "System"),
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedProcess",
@@ -3980,16 +3989,59 @@ impl Exec for Double {}
                 "crates/flux-system/src/remote.rs",
                 "GuardedNetwork",
                 "RemoteSystem",
+            ),
+            // C-653: an empty impl, so every metrics operation inherits `port.rs`'s `Unserved`
+            // denial. A delegating backend may not improvise a wire operation; C-654 is where the
+            // protocol gains one, and that commit replaces this entry with a delegating impl.
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedMetrics",
+                "RemoteSystem",
+            ),
+            // C-652 — the HTTP family. Two of these three are refusals and the third is the
+            // workspace's one HTTP client, which is why the family adds no new IO path.
+            //
+            // `System`'s impl is empty: `flux-system` holds no HTTP client by design, so the native
+            // backend inherits the port's fail-closed default rather than growing a second one.
+            // `RemoteSystem`'s impl is a typed `Unserved` naming the missing wire support — it
+            // cannot send anything.
+            ("crates/flux-system/src/port.rs", "GuardedHttp", "System"),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedHttp",
+                "RemoteSystem",
+            ),
+            // The one that actually performs HTTP, and the reason the family exists. `NativeHttp`
+            // adds no client: it wraps the redirect-disabled, proxy-free `reqwest::Client` that
+            // `flux-web`'s reviewed egress broker already owned, and every request still goes
+            // through `flux_system::net`'s admission, C-77's connection pin, the bounded redirect
+            // chain and the response-byte cap. What is new is only *who may ask* — so this reads as
+            // one reviewed backend on the existing egress path rather than a second path.
+            //
+            // It lives in `flux-web` (L5) rather than beside the port (L2) because that is where the
+            // client is, and `flux-codegate`'s `Http` census keeps the count of clients at one. The
+            // layer map forbids the alternative outright.
+            (
+                "crates/flux-web/src/native_http.rs",
+                "GuardedHttp",
+                "NativeHttp",
             ),
             // C-651's confinement peer. Reviewable on the same grounds as `remote.rs`'s entries,
-            // and on one narrower one: `SandboxedSystem` holds a native `System` and every
-            // operation forwards to that system's own inherent method, so it can neither add a
-            // permission nor remove one — the guarantees stay exactly the ones `System` enforces,
-            // including the single `build_command` spawn choke point the sandbox wraps. What it
-            // owns is *admission*: it refuses to exist unless the composed `Sandbox` actually
-            // confines, which makes the type itself the evidence of the posture it reports. A
-            // future edit that widened it beyond delegation would be a new backend wearing this
-            // allowance — read `crates/flux-system/src/sandboxed.rs` before extending it.
+            // and on one narrower one: `SandboxedSystem` holds a native `System` and every served
+            // operation forwards straight back to that system — to its inherent guarded method
+            // where it has one (process, files, env), and to its own `port.rs` trait impl for the
+            // families that live there (network, metrics). Either way the callee is the reviewed
+            // native backend, so the peer can neither add a permission nor remove one: the
+            // guarantees stay exactly the ones `System` enforces, including the single
+            // `build_command` spawn choke point the sandbox wraps.
+            //
+            // What it owns is *admission*, and that is the part to re-read on any change. It
+            // refuses to exist unless the composed `Sandbox` confines this process's own spawns,
+            // and it will not revive a bare `FLUX_SANDBOXED` marker that the ambient posture left
+            // inert — the marker is trusted only where `apply_sandbox_env` already trusted and
+            // disclosed it. A future edit that widened this type beyond delegation, or softened
+            // that admission, would be a new backend wearing this allowance — read
+            // `crates/flux-system/src/sandboxed.rs` before extending it.
             (
                 "crates/flux-system/src/sandboxed.rs",
                 "GuardedProcess",
@@ -4013,6 +4065,29 @@ impl Exec for Double {}
             (
                 "crates/flux-system/src/sandboxed.rs",
                 "GuardedNetwork",
+                "SandboxedSystem",
+            ),
+            // Metrics delegate rather than deny (C-653): the peer confines what this process
+            // *spawns*, and a metric read happens in this process against this machine — the same
+            // machine the composed `System` measures, through the same narrowable `/proc`+`/sys`
+            // roots. An `Unserved` here would be a false negative about a host flux can genuinely
+            // measure.
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedMetrics",
+                "SandboxedSystem",
+            ),
+            // HTTP (C-652) is the opposite call, and deliberately so: the impl is empty, so every
+            // operation inherits `port.rs`'s fail-closed `Unserved`. The peer delegates to a
+            // `System`, and a bare `System` serves no HTTP — the native client is
+            // `flux_web::NativeHttp` at L5, which this L2 type may not reach. Inventing a client
+            // here would be a second egress path, which is precisely what the `Http` census exists
+            // to prevent. So a sandboxed selection refuses HTTP by name rather than silently
+            // borrowing the caller's; teaching a selected native substrate to serve it is a
+            // follow-up story, not something to improvise inside this allowance.
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedHttp",
                 "SandboxedSystem",
             ),
         ];
@@ -4091,12 +4166,20 @@ impl Exec for Double {}
     ///   that the backend it allows actually exists and is whole.
     #[test]
     fn the_confinement_peer_backend_is_reviewed_and_complete() {
-        // The `ExecutionSystem` constituent ports as of C-651. Deliberately spelled out rather than
-        // read from `GUARDED_PORT_TRAITS`: a port that joins the guarded set but not the execution
-        // bundle would otherwise be demanded of this backend by drift alone.
+        // The `ExecutionSystem` constituent ports as of C-651, plus C-653's `GuardedMetrics` and
+        // C-652's `GuardedHttp`. Deliberately spelled out rather than read from
+        // `GUARDED_PORT_TRAITS`: a port that joins the guarded set but not the execution bundle
+        // would otherwise be demanded of this backend by drift alone.
+        //
+        // Serving a port is not the same as answering it — `GuardedHttp` is an empty impl that
+        // inherits the port's `Unserved` denial. The claim under test is that the peer *is* a
+        // complete `ExecutionSystem`, which is what makes an omission a compile error at a distant
+        // call site rather than a silent gap here.
         const EXECUTION_PORTS: &[&str] = &[
             "GuardedEnv",
             "GuardedHostFiles",
+            "GuardedHttp",
+            "GuardedMetrics",
             "GuardedNetwork",
             "GuardedProcess",
             "GuardedWorkspaceFiles",

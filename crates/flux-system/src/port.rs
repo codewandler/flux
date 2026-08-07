@@ -53,10 +53,10 @@
 //! `Command::new` itself. What these traits are is a *contract*, not a permission — implementing one
 //! grants no ability, it only claims to uphold the guarantees documented on each method.
 //!
-//! **The gate is in-repo only, and it enumerates all five ports.** `flux-codegate`'s
+//! **The gate is in-repo only, and it enumerates every port.** `flux-codegate`'s
 //! `no_unreviewed_guarded_port_backend_outside_system` reports every production `impl` of
-//! [`GuardedProcess`], [`GuardedHostFiles`], [`GuardedWorkspaceFiles`], [`GuardedNetwork`] and
-//! [`GuardedEnv`] — resolving renamed imports, and
+//! [`GuardedProcess`], [`GuardedHostFiles`], [`GuardedWorkspaceFiles`], [`GuardedNetwork`],
+//! [`GuardedMetrics`], [`GuardedHttp`] and [`GuardedEnv`] — resolving renamed imports, and
 //! excusing only `#[cfg(test)]` — so a second backend for one of those cannot appear inside flux
 //! without a reviewed allowance. Its reach ends at this repo's two workspaces: it walks
 //! `crates/*/src` and `plugins/*/src` and nothing else. It says nothing about downstream
@@ -65,8 +65,9 @@
 //! `#[path]`.
 //!
 //! C-467 closed the former `GuardedWorkspaceFiles` blind spot, and C-435 adds the network family to
-//! the same census in the commit that introduces it. A sixth `Guarded*` trait now fails the census
-//! until the reviewer explicitly teaches the gate about its implementors.
+//! the same census in the commit that introduces it, as C-653 does for [`GuardedMetrics`] and C-652
+//! for [`GuardedHttp`]. A new `Guarded*` trait fails the census until the reviewer explicitly
+//! teaches the gate about its implementors.
 //!
 //! So: inside flux, "one guarded path starts every OS process" is mechanically enforced. Outside
 //! flux, a consumer that implements these traits is taking responsibility for the guarantees itself.
@@ -88,10 +89,12 @@ use std::time::Duration;
 
 pub use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 
+use crate::metrics::{MetricAnswer, MetricKind};
 use crate::net::{
     BindExposure, DatagramEndpoint, DialTarget, InboundLimits, NetworkListener, NetworkStream,
     PrivateNetAllow,
 };
+use crate::secret_scope::{GuardedSecretTarget, InjectionSite, SecretAllowlist};
 use crate::websocket::{GuardedWebSocketSession, WebSocketConnect};
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead, System};
 use std::net::SocketAddr;
@@ -263,6 +266,107 @@ pub trait GuardedNetwork: Send + Sync {
     }
 }
 
+/// The `$secret` grants one guarded HTTP request carries, so the substrate that actually follows the
+/// redirect chain can re-authorize them at **every hop** rather than only at the first (C-459).
+///
+/// This travels with the request instead of staying at the caller because the hop the credential
+/// would leak on is the one the caller never named: a `Location` the server chose. Only the
+/// substrate that follows it can refuse it. Values never appear here — a scope is names, sites and
+/// grants.
+#[derive(Debug, Clone, Default)]
+pub struct HttpSecretScope {
+    /// The operator's allowlist, with each entry's declared destination/principal/site axes.
+    pub allowlist: SecretAllowlist,
+    /// The allowlisted names this request actually carries, and where each one was placed.
+    pub carried: Vec<(String, InjectionSite)>,
+    /// The principal the turn runs as, for a grant that declares `by=`. `None` refuses such a grant.
+    pub principal: Option<String>,
+}
+
+/// One guarded HTTP request, stated so a **non-native** substrate can serve it.
+///
+/// The target is a [`GuardedSecretTarget`] rather than a bare string: it can only be minted by
+/// `flux-system`'s own egress guard, and it keeps the admitted URL, the addresses that guard vetted,
+/// and the destination token secret authorization was measured against as **one correlated value**.
+/// A caller therefore cannot hand a substrate a URL it claims was admitted, and the substrate sends
+/// to exactly what was vetted — the C-77 pin and the C-459 destination stay the same decision rather
+/// than two resolutions that can disagree.
+///
+/// A substrate in *another* address space treats the pinned addresses as what they are — this
+/// process's answer, not its own — and re-admits at its own boundary, where [`Self::secrets`] gives
+/// it everything the local guard had.
+#[derive(Debug)]
+pub struct HttpRequest {
+    /// The operation whose effect this is (`http.request`, `web.fetch`). Diagnostics and audit
+    /// records name it, so a refusal reads the way the op's own refusals read.
+    pub operation: String,
+    /// The HTTP method, upper-cased. Model input never reaches this un-validated: the caller parses
+    /// it before the request is built.
+    pub method: String,
+    /// The admitted target: URL, vetted addresses, and destination token, correlated by the guard.
+    pub target: GuardedSecretTarget,
+    /// Request headers, already resolved (a `$secret` marker is a value by the time it is here).
+    pub headers: Vec<(String, String)>,
+    /// The request body, if any.
+    pub body: Option<Vec<u8>>,
+    /// Wall-clock budget for the whole request, redirect chain included.
+    pub timeout: Duration,
+    /// Cap on the response bytes retained. A substrate stops buffering at the cap rather than
+    /// reading a whole body and truncating afterwards.
+    pub max_response_bytes: usize,
+    /// The secret grants this request carries. Empty for a request that carries none.
+    pub secrets: HttpSecretScope,
+}
+
+/// What a guarded HTTP request answered.
+///
+/// Deliberately not a `reqwest::Response`: a port type that named one client's response would make
+/// that client part of the contract, and a substrate that is not this process has none. A non-2xx
+/// status is *data* here, exactly as it is for the ops — the error arm is for a guard's refusal, a
+/// broken link or an unserved family, never for a status code.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    /// The final response status.
+    pub status: u16,
+    /// Response headers in wire order, duplicates preserved. A value that is not valid header text
+    /// is reported as `<binary>` rather than dropped, so the caller still sees the name.
+    pub headers: Vec<(String, String)>,
+    /// At most [`HttpRequest::max_response_bytes`] of the body, undecoded.
+    pub body: Vec<u8>,
+    /// Whether the body was cut at the cap.
+    pub truncated: bool,
+}
+
+/// Make HTTP requests through the one guarded egress policy — the *application*-level counterpart to
+/// [`GuardedNetwork`], and the family that lets a web effect follow the operator's selected substrate
+/// instead of being pinned to the coordinator's process (Decision 0018 rule 5).
+///
+/// The implementation owns admission for every hop, the connection pin, the redirect bound, the
+/// response-byte cap and the per-hop secret-scope re-authorization. It does **not** own redaction:
+/// what a model may see is a turn-level decision the caller makes with its own `Redactor`, over the
+/// bytes this returns.
+///
+/// # Fail-closed, and why this family especially
+///
+/// The single operation defaults to a refusal, so a substrate serves HTTP only by saying so. That
+/// matters more here than anywhere else on the port: the tempting default — send it from the
+/// caller's own process — is not a degraded answer but a *wrong* one. It would put the request, the
+/// source address the far end sees, and any credential it carries on the coordinator while the
+/// operator's provenance says the effect landed on the substrate they selected. A substrate that
+/// cannot make HTTP requests says so and the operation refuses.
+pub trait GuardedHttp: Send + Sync {
+    /// Admit, pin, send and read back one HTTP request on this execution substrate, following at
+    /// most a bounded redirect chain and re-admitting every hop under `allow`.
+    fn http_request<'a>(
+        &'a self,
+        request: &'a HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, HttpResponse> {
+        let _ = (request, allow);
+        Box::pin(async { Err(deny("perform a guarded HTTP request")) })
+    }
+}
+
 /// Read files that legitimately live **outside** the workspace jail, admitted by an explicit path
 /// scope rather than by workspace confinement.
 ///
@@ -417,6 +521,66 @@ pub trait GuardedWorkspaceFiles: Send + Sync {
     }
 }
 
+/// Read bounded, typed measurements about the substrate **itself** — CPU, memory, disk, load,
+/// uptime, temperature and fans — as opposed to about the work flowing through it.
+///
+/// The vocabulary is closed and lives in [`crate::metrics`]; read that module for why there is no
+/// free-form string metric and what each unit is. What belongs *here* is the port's own posture,
+/// and it turns on there being **two distinct negatives**, never collapsed into one:
+///
+/// - `Err(Unserved)` — this substrate does not serve metrics at all. Every operation below defaults
+///   to it, so bringing a substrate up starts from "measures nothing" exactly as the rest of the
+///   port does.
+/// - `Ok(`[`MetricAnswer::Unavailable`]`)` — it serves the family and this machine has no such
+///   instrument: no hwmon fan tachometer, no swap area, no mounted filesystem.
+///
+/// Neither is ever a zero reading. A fabricated zero is the failure mode this trait exists to make
+/// unrepresentable: a monitoring projection cannot tell "0 °C" from "no thermometer", and an
+/// operator acting on the first when the truth is the second is acting on a measurement that was
+/// never taken.
+pub trait GuardedMetrics: Send + Sync {
+    /// The kinds this substrate can attempt at all.
+    ///
+    /// Deny-by-default: a substrate that has not opted in claims nothing, which is also what makes
+    /// [`read_metrics`](Self::read_metrics) fail closed rather than hand back an empty snapshot.
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        Vec::new()
+    }
+
+    /// One metric kind, as a typed answer.
+    ///
+    /// Fail-closed default. There is no safe degradation: the whole point of the seam is that a
+    /// consumer can trust the number, so a substrate that cannot measure says so.
+    fn read_metric(&self, kind: MetricKind) -> Guarded<'_, MetricAnswer> {
+        let _ = kind;
+        Box::pin(async { Err(deny("read a host metric")) })
+    }
+
+    /// Every kind this substrate serves, once each, in [`MetricKind::ALL`] order.
+    ///
+    /// Bounded by construction rather than by a cap the caller has to remember: the result is a
+    /// subset of a closed vocabulary, so it can never be longer than `MetricKind::ALL`. The
+    /// reduction to [`read_metric`](Self::read_metric) is the same shape the file port's text
+    /// operations use — serving one primitive earns the snapshot.
+    fn read_metrics(&self) -> Guarded<'_, Vec<MetricAnswer>> {
+        Box::pin(async move {
+            let served = self.served_metric_kinds();
+            if served.is_empty() {
+                // Not an empty `Vec`: that is the wrong answer ("this machine measured nothing"),
+                // and a caller would render it as a healthy host with no instruments.
+                return Err(deny("read host metrics"));
+            }
+            let mut answers = Vec::with_capacity(served.len().min(MetricKind::ALL.len()));
+            for kind in MetricKind::ALL {
+                if served.contains(&kind) {
+                    answers.push(self.read_metric(kind).await?);
+                }
+            }
+            Ok(answers)
+        })
+    }
+}
+
 /// The complete execution-facing guarded substrate available to a tool turn.
 ///
 /// This bundle is declared at the consumer boundary, following the same pattern as
@@ -430,6 +594,8 @@ pub trait ExecutionSystem:
     + GuardedEnv
     + GuardedWorkspaceFiles
     + GuardedNetwork
+    + GuardedMetrics
+    + GuardedHttp
     + ExecutionIdentity
 {
 }
@@ -440,6 +606,8 @@ impl<T> ExecutionSystem for T where
         + GuardedEnv
         + GuardedWorkspaceFiles
         + GuardedNetwork
+        + GuardedMetrics
+        + GuardedHttp
         + ExecutionIdentity
         + ?Sized
 {
@@ -579,6 +747,33 @@ impl GuardedNetwork for System {
         Box::pin(crate::net::bind_udp(addr, exposure, limits, allow))
     }
 }
+
+/// The native backend reads the local machine. Which kernel interfaces it reads is a value on the
+/// `System` ([`crate::metrics::MetricsRoots`]), and the parsing lives in [`crate::metrics`] — this
+/// file states the port, not the format of `/proc/meminfo`.
+impl GuardedMetrics for System {
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        crate::metrics::native_served_kinds()
+    }
+
+    fn read_metric(&self, kind: MetricKind) -> Guarded<'_, MetricAnswer> {
+        Box::pin(crate::metrics::read_native(self.metrics_roots(), kind))
+    }
+}
+
+/// The native backend serves **no** HTTP of its own, and that is a decision rather than a gap.
+///
+/// `flux-system` is a crate the portable core has to compile, and its dependency set is deliberately
+/// `flux-core` + `tokio` + `url`. An HTTP client here would be the workspace's *second* one — the
+/// first lives in `flux-web`, where it is already the reviewed broker that owns redirect handling,
+/// connection pinning and the response-byte cap — and `flux-codegate`'s `Http` census exists
+/// precisely to keep that count at one.
+///
+/// So the native HTTP implementation is `flux_web::NativeHttp`, a layer up, wrapping that same
+/// client; a bare [`System`] answers the family with the port's own refusal. That is the fail-closed
+/// direction: a caller holding only a `System` gets "this substrate serves no HTTP", never a request
+/// sent through some other path.
+impl GuardedHttp for System {}
 
 impl GuardedHostFiles for System {
     fn host_path_identity(&self, path: &str) -> Result<String> {
@@ -1042,6 +1237,94 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&read_root).ok();
+    }
+
+    /// One guarded HTTP request aimed at a closed loopback port, admitted under an `Any` grant.
+    ///
+    /// A literal address pins without a DNS lookup, so the fixture is hermetic and the tests below
+    /// are about the *port's* answer rather than about a network.
+    fn http_fixture(operation: &str) -> HttpRequest {
+        let target = crate::net::guard_url_scoped_for_secret(
+            "http://127.0.0.1:9/probe",
+            &PrivateNetAllow::Any,
+        )
+        .expect("a loopback literal is admitted under an `Any` grant");
+        HttpRequest {
+            operation: operation.to_string(),
+            method: "GET".into(),
+            target,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(1),
+            max_response_bytes: 1024,
+            secrets: HttpSecretScope::default(),
+        }
+    }
+
+    /// C-652 — HTTP joins the port fail-closed.
+    ///
+    /// A substrate that says nothing about HTTP serves nothing. That is the whole posture: bringing
+    /// a substrate up starts from "serves nothing", and an HTTP request is the operation where a
+    /// well-meaning default would be actively dangerous — sending it from the *caller's* process
+    /// while the operator selected another substrate puts the effect, its source address and its
+    /// credentials somewhere the operator did not choose.
+    #[tokio::test]
+    async fn the_http_port_denies_for_a_substrate_that_serves_no_http() {
+        struct Silent;
+        impl GuardedHttp for Silent {}
+
+        let port: &dyn GuardedHttp = &Silent;
+        let error = port
+            .http_request(&http_fixture("http.request"), &PrivateNetAllow::Any)
+            .await
+            .expect_err("HTTP must fail closed, never fall back to the caller's own client");
+
+        assert!(
+            matches!(&error, Error::GuardedIo(failure) if failure.kind() == GuardedIoFailure::Unserved),
+            "the refusal must classify structurally as unserved: {error}"
+        );
+        assert!(
+            error.to_string().starts_with(UNSERVED),
+            "the refusal must use the port's one spelling: {error}"
+        );
+    }
+
+    /// C-652 — the native `System` is such a substrate, deliberately.
+    ///
+    /// `flux-system`'s dependency set is `flux-core` + `tokio` + `url` by design, so the one reviewed
+    /// HTTP client in the workspace lives a layer up in `flux-web`. The native backend therefore
+    /// denies HTTP in the port's own words instead of growing a second client — and this test is what
+    /// stops a later edit from "fixing" that by adding one here.
+    #[tokio::test]
+    async fn the_native_system_denies_http_rather_than_growing_a_second_client() {
+        let system = System::new(Workspace::new(std::env::temp_dir()).unwrap());
+        let port: &dyn GuardedHttp = &system;
+
+        let error = port
+            .http_request(&http_fixture("web.fetch"), &PrivateNetAllow::Any)
+            .await
+            .expect_err("the native System serves no HTTP of its own");
+        assert!(
+            matches!(&error, Error::GuardedIo(failure) if failure.kind() == GuardedIoFailure::Unserved),
+            "the native refusal must classify as unserved: {error}"
+        );
+    }
+
+    /// C-652 — HTTP is *in* the bundle, so a consumer holding one erased substrate reaches it
+    /// alongside the process, file, env and network families rather than through a side channel.
+    #[tokio::test]
+    async fn the_execution_system_bundle_spans_the_http_family() {
+        let system = System::new(Workspace::new(std::env::temp_dir()).unwrap());
+        let substrate: &dyn ExecutionSystem = &system;
+
+        assert!(
+            substrate
+                .http_request(&http_fixture("http.request"), &PrivateNetAllow::Any)
+                .await
+                .is_err(),
+            "`ExecutionSystem` must span `GuardedHttp` — a web effect cannot follow the selected \
+             substrate if the bundle cannot express it"
+        );
     }
 
     /// A substrate implementing only the two required primitives still answers the text operations,

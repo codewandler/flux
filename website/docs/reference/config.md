@@ -475,8 +475,29 @@ fails closed: on a platform with no usable confinement backend the binding refus
 names the reason, instead of quietly running unconfined. `flux host probe <id>` reports whether
 this machine can serve it, and which backend it would use. An autonomy posture that will not run
 unconfined (`bounded-autonomy`, `exploratory`) selects this backend for a named `local` binding —
-a posture may tighten a selection, never loosen one — while `--sandbox`/`--no-sandbox` continue to
-control the spawn-time sandbox exactly as before.
+a posture may tighten a selection, never loosen one.
+
+Three consequences are worth stating plainly before you declare one.
+
+- **A bare `FLUX_SANDBOXED` marker does not satisfy it.** A flux running inside a flux sandbox is
+  confined by that outer sandbox and a `sandboxed` binding inherits it — but only where the run's
+  own sandbox posture established it (`FLUX_SANDBOX=on|require`, `[sandbox]`, or an unattended
+  profile), which is also what makes flux print the auditable "trusting FLUX_SANDBOXED=1" startup
+  line. A marker left in the environment with confinement otherwise off is refused by name, so a
+  stale one is a clear error rather than a silent claim of confinement.
+- **`--no-sandbox` does not disable an explicitly selected `sandboxed` binding.** The flag governs
+  the spawn-time sandbox, which it still turns off exactly as before; a binding you selected by
+  name is a separate, explicit request, and confinement resolves tightest-wins everywhere in flux.
+  To run unconfined, select a different binding (or none) rather than expecting the flag to
+  override the selection.
+- **Selecting any substrate pins the workspace.** A selected binding — `sandboxed` or `remote` —
+  is resolved once at startup, so guarded effects continue against the root it was selected with
+  even after a worktree transition (`git_worktree_enter`, `fleet.isolate`) moves the native path.
+  With no `--host`, nothing is pinned and the native path follows transitions as it always has.
+- **It serves no HTTP, and browser operations are hidden.** Like every selected substrate, a
+  `sandboxed` binding refuses guarded HTTP rather than sending the request from the calling process
+  behind your back, and `browser.*` / `web.crawl` are withheld while a selection is in force. Use a
+  binding-free run for those.
 
 ```toml
 [[host]]
