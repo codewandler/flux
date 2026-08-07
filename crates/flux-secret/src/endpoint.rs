@@ -46,6 +46,8 @@ pub struct EndpointRef {
     /// Where the credential lives — a *reference*, never a value. `None` for unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<Ref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>, // a `[[host]]` binding id; None = reachable from wherever the caller is
     /// Free-form non-secret labels (region, namespace, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
@@ -71,6 +73,7 @@ impl EndpointRef {
             protocol: None,
             source: SourceKind::Discovered,
             credential_ref: None,
+            host: None,
             labels: BTreeMap::new(),
         }
     }
@@ -84,6 +87,7 @@ impl EndpointRef {
             protocol: None,
             source: SourceKind::Config,
             credential_ref: None,
+            host: None,
             labels: BTreeMap::new(),
         }
     }

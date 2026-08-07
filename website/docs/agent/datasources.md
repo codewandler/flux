@@ -178,6 +178,47 @@ Filter values, cursors, and ids do not become permission subjects. Planning and 
 the same typed requirements, and denial happens before the backend executes. The backend must still
 perform real IO through flux's guarded host facilities.
 
+### Where the connection is made from
+
+Three things compose, and each answers exactly one question:
+
+- a **[host binding](../reference/config.md#host-bindings-host)** is *where the connection is made
+  from*—the machine an effect lands on;
+- an **[endpoint](./endpoints.md)** is *what is connected to*—the service, and where its credential
+  lives;
+- a **grant** is *who may*—the surface class allowed to select that host, deny-by-default.
+
+A datasource is the governed read over that composition, so it has to say which machine its
+connection needs. `postgres://db.default.svc.cluster.local:5432` is meaningless on a laptop and
+exactly right inside the cluster, and nothing in the URL tells the two apart. The endpoint record's
+`host` field names the binding it is reachable from, and the backend carries that answer into its
+own declaration:
+
+```rust
+// The endpoint says where it is reachable from; the access declaration copies that answer
+// rather than re-deriving one.
+LiveAccess::connection("tcp:db.default.svc.cluster.local:5432").from_endpoint(&endpoint)
+```
+
+What follows from the declaration:
+
+- **The connection is made from that host.** `live_connection_system` hands the backend the selected
+  substrate, so the connection is opened on the machine the binding names, with that machine's name
+  resolution and private-network scope rather than the coordinator's.
+- **A host the session cannot select is refused at admission.** If the session selected a different
+  host—or none—the generated operation refuses *before entering the backend*, naming both the host
+  the endpoint needs and the host the session actually has. It is not a connection timeout several
+  layers down.
+- **A declaration naming two hosts is refused at registration.** One session selects one host, so a
+  backend that could only be read from two machines at once never advertises operations at all.
+- **An endpoint with no `host` behaves exactly as before.** No admission runs, and the operation
+  stays native-only.
+
+The backend must reach the substrate through the guarded surface its `LiveAccess` names; one that
+built its own HTTP client or dialled its own socket would send from the coordinator no matter which
+host the operator selected. That is a repository gate, not a review convention—`flux-codegate`
+enumerates every shipped live backend and fails on a self-built client.
+
 ### Honest catalog surfacing
 
 Live operations are evidence-gated per domain. SDK registration with
@@ -261,6 +302,7 @@ scoped to one item can never move another. `transition` validates the edge again
 
 - [Operations](../language/ops.md)—the catalog both datasource forms and work boards use.
 - [Endpoints](./endpoints.md)—discover and consume live service connections as weak references.
+- [Host bindings](../reference/config.md#host-bindings-host)—the machine a connection is made from.
 - [Multi-agent programs](./programs.md)—declare indexed knowledge in a program file.
 - [Plugin authoring](../plugins/authoring.md)—contribute records from an integration.
 - [Storage](../reference/storage.md#datasource-records)—persist indexed records.

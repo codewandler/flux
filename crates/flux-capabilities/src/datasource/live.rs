@@ -17,9 +17,38 @@ use flux_evidence::{SignalMatch, ToolGroup, KIND_SIGNAL};
 use flux_runtime::{
     AuthorityRequirement, OperationPlacement, Tool, ToolContext, ToolRegistry, ToolResult,
 };
+use flux_secret::endpoint::EndpointRef;
 use flux_spec::{AccessKind, Effect, ToolSpec};
+use flux_system::port::ExecutionSystem;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+
+/// Where a declared access is reachable from — the third leg of the host/endpoint/datasource
+/// composition (C-716).
+///
+/// A host binding says *where* a connection is made from, an endpoint says *what* is connected to,
+/// and this is how the datasource carries the endpoint's answer to the first question into its own
+/// contract. `postgres://db.default.svc.cluster.local:5432` is meaningless on a laptop and exactly
+/// right inside the cluster; nothing in a URL distinguishes the two, so the binding id does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum LiveLocality {
+    /// Reachable from wherever the caller already is. The default, and the behaviour of every
+    /// declaration written before this existed: no host is required and nothing is admitted.
+    #[default]
+    Anywhere,
+    /// Reachable only from the named `[[host]]` binding — [`EndpointRef::host`].
+    Host(String),
+}
+
+impl LiveLocality {
+    /// The `[[host]]` binding id this locality requires, or `None` for [`Anywhere`](Self::Anywhere).
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Anywhere => None,
+            Self::Host(host) => Some(host.as_str()),
+        }
+    }
+}
 
 /// External guarded resource used by a live backend in addition to its datasource identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -28,27 +57,185 @@ pub enum LiveAccess {
     Network {
         /// Exact policy subject, normally a guarded origin or URL.
         subject: String,
+        /// Where the connection has to be made from.
+        from: LiveLocality,
     },
     /// Raw or driver-owned connection target.
     Connection {
         /// Exact policy subject, such as `tcp:db.example:5432`.
         subject: String,
+        /// Where the connection has to be made from.
+        from: LiveLocality,
     },
 }
 
 impl LiveAccess {
-    /// Concrete policy subject carried by this declaration.
-    pub fn subject(&self) -> &str {
-        match self {
-            Self::Network { subject } | Self::Connection { subject } => subject,
+    /// URL-addressed egress reachable from wherever the caller is. Pair with
+    /// [`from_host`](Self::from_host) or [`from_endpoint`](Self::from_endpoint) to bind it to a host.
+    pub fn network(subject: impl Into<String>) -> Self {
+        Self::Network {
+            subject: subject.into(),
+            from: LiveLocality::Anywhere,
         }
     }
 
-    fn kind(&self) -> &'static str {
+    /// A driver-owned connection target reachable from wherever the caller is.
+    pub fn connection(subject: impl Into<String>) -> Self {
+        Self::Connection {
+            subject: subject.into(),
+            from: LiveLocality::Anywhere,
+        }
+    }
+
+    /// Bind this access to a `[[host]]` binding: the connection is made from there or not at all.
+    pub fn from_host(self, host: impl Into<String>) -> Self {
+        self.with_locality(LiveLocality::Host(host.into()))
+    }
+
+    /// Take this access's locality from the endpoint record it describes.
+    ///
+    /// This is the joint: `host` is the endpoint's own statement of where it is reachable from
+    /// (C-709), and copying it here rather than re-deriving one keeps the datasource from
+    /// disagreeing with the record it reads.
+    pub fn from_endpoint(self, endpoint: &EndpointRef) -> Self {
+        self.with_locality(match &endpoint.host {
+            Some(host) => LiveLocality::Host(host.clone()),
+            None => LiveLocality::Anywhere,
+        })
+    }
+
+    fn with_locality(self, locality: LiveLocality) -> Self {
+        match self {
+            Self::Network { subject, .. } => Self::Network {
+                subject,
+                from: locality,
+            },
+            Self::Connection { subject, .. } => Self::Connection {
+                subject,
+                from: locality,
+            },
+        }
+    }
+
+    /// Concrete policy subject carried by this declaration.
+    pub fn subject(&self) -> &str {
+        match self {
+            Self::Network { subject, .. } | Self::Connection { subject, .. } => subject,
+        }
+    }
+
+    /// Where this access has to be connected from.
+    pub fn locality(&self) -> &LiveLocality {
+        match self {
+            Self::Network { from, .. } | Self::Connection { from, .. } => from,
+        }
+    }
+
+    /// The `[[host]]` binding this access requires, or `None` when it needs no particular vantage.
+    pub fn required_host(&self) -> Option<&str> {
+        self.locality().host()
+    }
+
+    pub(super) fn kind(&self) -> &'static str {
         match self {
             Self::Network { .. } => "network",
             Self::Connection { .. } => "connection",
         }
+    }
+}
+
+/// The single `[[host]]` binding a declared access set requires, or `None` when every access is
+/// reachable from wherever the caller is.
+///
+/// Single because a session selects one substrate: [`validate_live_contract`] refuses a declaration
+/// naming two, so there is exactly one answer to admit against by the time this is asked.
+pub fn declared_host(access: &[LiveAccess]) -> Option<&str> {
+    access.iter().find_map(LiveAccess::required_host)
+}
+
+/// Where a live backend's operations may run, derived from what its access declares.
+///
+/// A datasource that needs no particular vantage point stays [`NativeSystemOnly`] exactly as it was.
+/// A host-bound one is *not* native-only: hiding it under a selection would refuse it without ever
+/// naming the host it needs, and the whole point of the declaration is that the operator is told.
+///
+/// [`NativeSystemOnly`]: OperationPlacement::NativeSystemOnly
+pub(super) fn access_placement(access: &[LiveAccess]) -> OperationPlacement {
+    match declared_host(access) {
+        Some(_) => OperationPlacement::SelectedExecutionSystem,
+        None => OperationPlacement::NativeSystemOnly,
+    }
+}
+
+/// Admit one live-datasource invocation against the locality its declared access requires.
+///
+/// This is the admission decision the story asks for: it runs in the generated operation, before
+/// the backend is entered, so an endpoint that is only reachable from inside a cluster refuses by
+/// *declaration* rather than as a connection timeout several layers down. The refusal names both
+/// sides — the host the endpoint needs and the host the session actually selected — because
+/// "connection refused" is not something an operator can act on and "select `prod-cluster`" is.
+pub fn admit_live_locality(ctx: &ToolContext, domain: &str, access: &[LiveAccess]) -> Result<()> {
+    admit_locality(ctx, &format!("live datasource `{domain}`"), access)
+}
+
+/// [`admit_live_locality`] with the diagnostic's subject supplied, so the work board says
+/// ``work board `sprint` `` where the datasource says ``live datasource `tickets` ``.
+pub(super) fn admit_locality(ctx: &ToolContext, what: &str, access: &[LiveAccess]) -> Result<()> {
+    let Some(required) = declared_host(access) else {
+        return Ok(());
+    };
+    match ctx.execution_binding() {
+        Some(selected) if selected == required => Ok(()),
+        Some(selected) => Err(Error::Other(format!(
+            "{what}: its endpoint is reachable only from host `{required}`, but this session \
+             selected host `{selected}`"
+        ))),
+        None => Err(Error::Other(format!(
+            "{what}: its endpoint is reachable only from host `{required}`, but this session \
+             selected no host — select it with `--host {required}`"
+        ))),
+    }
+}
+
+/// The guarded substrate a live datasource backend makes its connection through.
+///
+/// This is how a backend honours the trait's standing requirement to do real IO through flux's
+/// guarded surfaces *and* the locality its [`LiveAccess`] declares, in one call:
+///
+/// * a host-bound access hands back the **selected** substrate, so the connection is opened from
+///   the machine the binding names, with that machine's name resolution and private-network scope
+///   rather than the coordinator's;
+/// * an access with no declared host hands back [`ToolContext::execution_system`] — the same
+///   substrate every port-aware operation already uses, which is the native system for an
+///   unselected run.
+///
+/// It re-runs [`admit_live_locality`] rather than trusting the caller to have done so: the whole
+/// value of the declaration is that a mismatch cannot end with a connection from the coordinator,
+/// and a backend calling this directly (from a helper, a retry, a second entity) must get the same
+/// refusal the generated operation gives.
+pub fn live_connection_system(
+    ctx: &ToolContext,
+    domain: &str,
+    access: &[LiveAccess],
+) -> Result<Arc<dyn ExecutionSystem>> {
+    connection_system(ctx, &format!("live datasource `{domain}`"), access)
+}
+
+/// [`live_connection_system`] with the diagnostic's subject supplied.
+pub(super) fn connection_system(
+    ctx: &ToolContext,
+    what: &str,
+    access: &[LiveAccess],
+) -> Result<Arc<dyn ExecutionSystem>> {
+    admit_locality(ctx, what, access)?;
+    match declared_host(access) {
+        // Admission passed, so a binding was selected. A binding that installs no substrate
+        // override (a named `local` one) still resolves to the native system here, which is the
+        // machine that binding names.
+        Some(_) => Ok(ctx
+            .selected_execution_system()
+            .unwrap_or_else(|| ctx.execution_system())),
+        None => Ok(ctx.execution_system()),
     }
 }
 
@@ -104,16 +291,27 @@ pub fn live_datasource_tools(
     domain: &str,
     backend: Arc<dyn LiveDatasource>,
 ) -> Result<Vec<Arc<dyn Tool>>> {
+    Ok(live_tools(live_projection(domain, backend)?))
+}
+
+/// Snapshot and validate one backend's contract exactly once.
+///
+/// `access()` is called a single time here and never again: the placement, the advertised authority
+/// and the admission decision all read the same snapshot, so a backend cannot widen its own
+/// locality after registration any more than it can widen its own authority.
+fn live_projection(domain: &str, backend: Arc<dyn LiveDatasource>) -> Result<Arc<LiveProjection>> {
     let schema = backend.schema();
     let access = backend.access();
     validate_live_contract(domain, &schema, &access)?;
-
-    let projection = Arc::new(LiveProjection {
+    Ok(Arc::new(LiveProjection {
         domain: domain.to_string(),
         schema,
         access,
         backend,
-    });
+    }))
+}
+
+fn live_tools(projection: Arc<LiveProjection>) -> Vec<Arc<dyn Tool>> {
     let list = LiveListOp {
         spec: list_spec(&projection.domain, &projection.schema, &projection.access),
         projection: projection.clone(),
@@ -122,7 +320,7 @@ pub fn live_datasource_tools(
         spec: get_spec(&projection.domain, &projection.schema, &projection.access),
         projection,
     };
-    Ok(vec![Arc::new(list), Arc::new(get)])
+    vec![Arc::new(list), Arc::new(get)]
 }
 
 /// Atomically install exactly the list/get pair for one live datasource domain.
@@ -134,11 +332,12 @@ pub fn try_register_live_datasource(
     domain: &str,
     backend: Arc<dyn LiveDatasource>,
 ) -> Result<LiveDatasourceSurface> {
-    let tools = live_datasource_tools(domain, backend)?;
+    let projection = live_projection(domain, backend)?;
+    let placement = access_placement(&projection.access);
     registry.try_register_all_from_with_placement(
         live_source(domain),
-        tools,
-        OperationPlacement::NativeSystemOnly,
+        live_tools(projection),
+        placement,
     )?;
     Ok(live_surface(domain))
 }
@@ -184,8 +383,10 @@ impl LiveProjection {
             permission_subject.clone(),
         )];
         requirements.extend(self.access.iter().map(|access| match access {
-            LiveAccess::Network { subject } => AuthorityRequirement::network_fetch(subject),
-            LiveAccess::Connection { subject } => AuthorityRequirement::connection_dial(subject),
+            LiveAccess::Network { subject, .. } => AuthorityRequirement::network_fetch(subject),
+            LiveAccess::Connection { subject, .. } => {
+                AuthorityRequirement::connection_dial(subject)
+            }
         }));
         LiveInvocationContract {
             permission_subject,
@@ -242,6 +443,7 @@ impl Tool for LiveListOp {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let operation = &self.spec.name;
+        admit_live_locality(ctx, &self.projection.domain, &self.projection.access)?;
         let input: LiveListInput = parse(operation, params)?;
         let entity = self.projection.entity(operation, &input.entity)?;
         let filters = normalize_filters(
@@ -292,6 +494,7 @@ impl Tool for LiveGetOp {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let operation = &self.spec.name;
+        admit_live_locality(ctx, &self.projection.domain, &self.projection.access)?;
         let input: LiveGetInput = parse(operation, params)?;
         self.projection.entity(operation, &input.entity)?;
         let row = self
@@ -684,14 +887,49 @@ pub fn validate_live_contract(
                 declared.kind()
             )));
         }
-        if !resources.insert(declared) {
+        // Keyed on kind + subject rather than the whole value, so one subject declared twice with
+        // two different localities is a duplicate rather than two contradictory declarations.
+        if !resources.insert((declared.kind(), subject)) {
             return Err(Error::Other(format!(
                 "live datasource `{domain}` declares duplicate {} authority `{subject}`",
                 declared.kind()
             )));
         }
     }
+    validate_locality(&format!("live datasource `{domain}`"), access)
+}
 
+/// Validate the locality half of one declared access set (C-716).
+///
+/// Shared by the live-datasource and work-board contracts — `what` is the already-formatted subject
+/// of the diagnostic (``work board `sprint` ``) — because both declare the same [`LiveAccess`] and
+/// an unsatisfiable declaration must be refused identically on either surface.
+pub(super) fn validate_locality(what: &str, access: &[LiveAccess]) -> Result<()> {
+    let mut required: Option<&str> = None;
+    for declared in access {
+        let Some(host) = declared.required_host() else {
+            continue;
+        };
+        if host.trim().is_empty() || host.trim() != host {
+            return Err(Error::Other(format!(
+                "{what} {} authority `{}` names a blank or whitespace-padded host binding",
+                declared.kind(),
+                declared.subject()
+            )));
+        }
+        // One session selects one substrate, so a declaration naming two hosts can never be
+        // satisfied. Refusing it at registration is the same fail-closed direction as every other
+        // contract error here: an unsatisfiable backend must not advertise operations at all.
+        match required {
+            Some(first) if first != host => {
+                return Err(Error::Other(format!(
+                    "{what} declares access from two hosts (`{first}`, `{host}`); one session \
+                     selects one host"
+                )));
+            }
+            _ => required = Some(host),
+        }
+    }
     Ok(())
 }
 
