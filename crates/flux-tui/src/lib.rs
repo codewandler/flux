@@ -6,6 +6,7 @@
 //! be resumed with their durable activity; PgUp/PgDn/wheel scroll; Ctrl-C interrupts; and guarded
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
+pub mod attach;
 mod controller;
 pub mod fleet;
 mod interaction;
@@ -20,6 +21,10 @@ pub mod splash;
 mod state;
 mod terminal_io;
 
+use attach::{
+    announce_attachment, apply_attach_update, refuse_local_only, replay_remote_history,
+    spawn_attached_approval_poll, spawn_attached_cancel, spawn_attached_turn, Attachment,
+};
 pub use controller::ApprovalView;
 use controller::{
     approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
@@ -110,6 +115,13 @@ pub struct TuiRunOptions {
     pub operations_refresh_token: Option<String>,
     /// Surface workspace root when it differs from the process cwd (Fleet-root attachment).
     pub workspace_root: Option<String>,
+    /// C-686: an agent that lives on another machine to attach to instead of running turns on the
+    /// local engine. `None` is the ordinary local agent.
+    ///
+    /// The engine still has to be handed in — the surface shell (themes, panes, the composer) is
+    /// built around one — but under an attachment it runs no turn and its event store is never
+    /// written to.
+    pub attached: Option<Arc<dyn attach::AttachedAgent>>,
 }
 
 impl TuiRunOptions {
@@ -127,6 +139,7 @@ impl TuiRunOptions {
             operations_initial_snapshot: None,
             operations_refresh_token: None,
             workspace_root: None,
+            attached: None,
         }
     }
 }
@@ -1178,7 +1191,21 @@ impl ChatState {
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
             operations: None,
+            attachment: None,
         }
+    }
+
+    /// A state for a conversation whose agent lives on another machine (C-686).
+    ///
+    /// ⚠ The session id is **empty by construction**, and that is the mechanism, not an omission:
+    /// an attached conversation has no local session, writes nothing to the local event store, and
+    /// must never appear in `flux sessions` or `flux replay`. The remote's own store is
+    /// authoritative and is read back through [`crate::attach::AttachedAgent::history`].
+    pub fn attached(model: String, attachment: crate::attach::Attachment) -> Self {
+        let mut state = Self::for_session(model, String::new());
+        crate::attach::apply_attached_invariants(&mut state);
+        state.attachment = Some(attachment);
+        state
     }
 
     /// Apply one pane command (C-221). Bounds — count, rows, width — are enforced by
@@ -2692,6 +2719,12 @@ impl ChatState {
             .map(|target| format!(" · {target}"))
             .unwrap_or_default();
         let mut identity = Vec::new();
+        // C-686: remoteness first and unmissable. An operator who forgets that the agent lives
+        // somewhere else reads its output as their own machine's — the same lesson C-436 learned
+        // for the substrate axis, and worse here, because the approval stage moved too.
+        if let Some(attachment) = &self.attachment {
+            identity.push(format!("attached {}", attachment.label));
+        }
         if let Some(surface) = surface {
             identity.push(surface);
         }
@@ -3623,9 +3656,22 @@ pub async fn run_with_options(
     // same `FLUX_AUTO_RESURRECT=0` opt-out as the CLI's REPL and one-shot `flux run`) and before
     // `project_session`/`load_history` project the session below, so the resurrected turn's own
     // persisted messages show up in the transcript like any other turn's.
-    resurrect_on_open(&agent, &session_id).await;
+    //
+    // C-686: skipped under an attachment. An attach invocation has no local session to resurrect,
+    // and running an interrupted *local* turn to completion because the operator asked to watch a
+    // *remote* agent would be an effect nobody requested.
+    if options.attached.is_none() {
+        resurrect_on_open(&agent, &session_id).await;
+    }
 
     let mut state = session_state(&agent, &session_id, &options)?;
+    // C-686: seed the pane from the remote's own history before the terminal opens, so a reattach
+    // is truthful about what happened while the operator was detached. Awaited here rather than in
+    // `session_state` (which is sync) and rendered as a notice on failure rather than swallowed.
+    if let Some(attached) = options.attached.clone() {
+        let history = attached.history().await;
+        replay_remote_history(&mut state, history);
+    }
     // A-94: share the composer's follow-up queue with the engine, which drains it into the
     // running turn at the next planner consultation instead of waiting for the turn to finish.
     agent.set_steering(Some(state.queue.clone()));
@@ -3719,6 +3765,18 @@ pub fn session_state(
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
     state.execution_target = options.execution_target.clone();
+    // C-686: an attached conversation has no local session. Do not project one, do not count local
+    // sessions as this session's neighbours, and leave `session_id` empty — the header then says
+    // "attached <agent>" and nothing claims a local transcript that does not exist. The composer's
+    // *input* history is still local, because that is this terminal's typing, not the agent's work.
+    if let Some(attached) = options.attached.clone() {
+        let attachment = Attachment::new(attached);
+        attach::apply_attached_invariants(&mut state);
+        announce_attachment(&mut state, &attachment);
+        state.attachment = Some(attachment);
+        state.history = load_history(&agent.events);
+        return Ok(state);
+    }
     state.project_session(&agent.events, session_id)?;
     state.previous_sessions = previous_session_count(&agent.events, session_id)?;
     state.history = load_history(&agent.events);
@@ -3848,6 +3906,21 @@ where
         Duration::from_secs(1),
     );
     operations_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // C-686: the attached agent's parked-approval poll. Its own ticker rather than the operations
+    // one, because it is armed by a different condition and must keep running while a turn is in
+    // flight — a guarded effect is parked *during* the turn, which is exactly when it must be seen.
+    let mut attach_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    attach_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let attach_approvals_answerable = state
+        .attachment
+        .as_ref()
+        .is_some_and(|a| a.capabilities.approvals.is_answerable());
+    // Ids already raised, so a request that stays parked between polls is not asked twice.
+    let attach_seen_approvals: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::default();
     let mut operations_refresh_in_flight = false;
     let mut operations_force_refresh_pending = false;
     let mut operations_last_refresh_token = operations_refresh_token;
@@ -4037,6 +4110,10 @@ where
                         });
                     }
                 }
+                // C-686: one update from an agent on another machine. It reaches the same
+                // transcript mutators a local turn uses, through the one crossing point that never
+                // touches the local event store.
+                UiEvent::Attached(update) => apply_attach_update(state, *update),
                 UiEvent::Finished => {
                     if complete_attached_requirements(state, operations_source.as_ref()) {
                         request_operations_snapshot(
@@ -4127,6 +4204,12 @@ where
                             }
                         }
                     }
+                }
+                continue;
+            },
+            _ = attach_tick.tick(), if attach_approvals_answerable => {
+                if let Some(attachment) = state.attachment.clone() {
+                    spawn_attached_approval_poll(&attachment, &tx, attach_seen_approvals.clone());
                 }
                 continue;
             },
@@ -4455,7 +4538,12 @@ where
                         }
                         state.interaction = None;
                         if interrupt_turn {
-                            interrupt_active_action(state, &cancel, &mut interrupted_action_id);
+                            interrupt_active_action(
+                                state,
+                                &tx,
+                                &cancel,
+                                &mut interrupted_action_id,
+                            );
                         }
                     }
                     continue;
@@ -5004,7 +5092,12 @@ where
                     KeyCode::Char('c') if ctrl => {
                         if running {
                             state.clear_ctrl_c_arm();
-                            interrupt_active_action(state, &cancel, &mut interrupted_action_id);
+                            interrupt_active_action(
+                                state,
+                                &tx,
+                                &cancel,
+                                &mut interrupted_action_id,
+                            );
                             state.push(Entry::Notice {
                                 text: "(interrupting…)".into(),
                                 sev: Sev::Info,
@@ -5114,6 +5207,7 @@ where
                                 if running {
                                     interrupt_active_action(
                                         state,
+                                        &tx,
                                         &cancel,
                                         &mut interrupted_action_id,
                                     );
@@ -5174,12 +5268,22 @@ where
 ///
 /// The action id is retained until its `Finished` event so a tool call that was already queued
 /// behind the keypress cannot reintroduce a running card after this immediate seal.
+///
+/// C-686: under an attachment the local token only stops *this client* pumping, which would leave
+/// the remote agent working while the operator watched a stopped spinner. So the same keypress also
+/// asks the remote to abort, and the outcome — including "this agent cannot be cancelled" — is
+/// reported into the transcript rather than swallowed.
 fn interrupt_active_action(
     state: &mut ChatState,
+    tx: &mpsc::UnboundedSender<UiEvent>,
     cancel: &CancellationToken,
     interrupted_action_id: &mut Option<u64>,
 ) {
     *interrupted_action_id = state.active_action_id;
+    if let (Some(attachment), Some(action_id)) = (state.attachment.clone(), state.active_action_id)
+    {
+        spawn_attached_cancel(&attachment, tx, action_id);
+    }
     state.cancel_running_tools();
     cancel.cancel();
 }
@@ -5212,6 +5316,17 @@ async fn handle_command(
     if busy && !read_only && !matches!(name, "quit" | "exit") {
         state.push(Entry::Notice {
             text: format!("/{name} waits for an idle session — interrupt the current action first"),
+            sev: Sev::Warn,
+        });
+        return Ok(false);
+    }
+    // C-686: a command that acts on *this* machine's engine or session store is refused by name
+    // under an attachment. The failure it prevents is silent and specific: the operator believes
+    // they compacted (or switched the model of, or read the evidence of) the agent they are
+    // watching, and instead they touched an idle local engine producing none of the output.
+    if let Some(refusal) = refuse_local_only(state, name) {
+        state.push(Entry::Notice {
+            text: refusal,
             sev: Sev::Warn,
         });
         return Ok(false);
@@ -6016,6 +6131,13 @@ fn start_turn(
     state.gather_mode = false;
 
     let cancel = CancellationToken::new();
+    // C-686: under an attachment the turn runs on the other machine. Everything above this line —
+    // the action id, the spinner, the steering queue, the transcript row — is identical, because
+    // the surface's turn bookkeeping must not learn which kind of turn it is watching.
+    if let Some(attachment) = state.attachment.clone() {
+        spawn_attached_turn(&attachment, tx, action_id, input);
+        return cancel;
+    }
     let task_agent = agent.clone();
     let task_sid = state.session_id.clone();
     let task_tx = tx.clone();
@@ -11006,7 +11128,8 @@ mod tests {
         let action_id = state.begin_action();
         let cancel = CancellationToken::new();
         let mut interrupted_action_id = None;
-        interrupt_active_action(&mut state, &cancel, &mut interrupted_action_id);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        interrupt_active_action(&mut state, &tx, &cancel, &mut interrupted_action_id);
 
         assert!(cancel.is_cancelled());
         assert_eq!(interrupted_action_id, Some(action_id));

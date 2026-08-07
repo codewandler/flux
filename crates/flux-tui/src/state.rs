@@ -164,6 +164,14 @@ pub struct ChatState {
     pub(super) fleet_rows: Vec<crate::fleet::WorkerRow>,
     /// Attached Board/Fleet operations projection. `None` is an explicitly standalone chat.
     pub(super) operations: Option<crate::operations::OperationsState>,
+    /// C-686: the agent this surface is attached to, when the whole agent lives on another
+    /// machine. `None` is the ordinary local agent.
+    ///
+    /// Its presence changes three things and nothing else: turns are dispatched to the remote
+    /// instead of the local engine, local-only slash commands are refused by name, and the header
+    /// says where you are. It deliberately does **not** create a local session — see
+    /// [`crate::attach`].
+    pub(crate) attachment: Option<crate::attach::Attachment>,
 }
 
 /// One model call of the turn in progress, as the `/usage` overlay renders it (C-140). Sourced from
