@@ -6,8 +6,8 @@
 //! be resumed with their durable activity; PgUp/PgDn/wheel scroll; Ctrl-C interrupts; and guarded
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
-pub mod attach;
 mod agent_loop;
+pub mod attach;
 mod controller;
 pub mod fleet;
 mod interaction;
