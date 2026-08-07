@@ -20922,9 +20922,10 @@ mod tests {
 
     /// A fleet that is running, with no worker in flight and no wave claiming anything.
     fn drive_fixture_state() -> FleetState {
-        let mut state = FleetState::default();
-        state.running = true;
-        state
+        FleetState {
+            running: true,
+            ..Default::default()
+        }
     }
 
     fn drive_fixture_schedule(items: &[&str]) -> Value {
