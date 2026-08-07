@@ -501,6 +501,28 @@ Repair refuses anything that would discard work and reports the reason instead o
 holding an uncommitted change, one git cannot inspect, and one sitting on the commit its gate recorded
 as the candidate. An applied or cancelled wave is refused outright, because its worktrees are gone on
 purpose.
+## Parking a wave
+
+Some waves have to wait for a human — an open question, an unavailable dependency, a review that has
+not happened. `park` records that pause on the wave itself, with the reason and the state the wave
+returns to.
+
+```sh
+flux fleet park wave-7 --reason "waiting on the API decision" --output json
+flux fleet status --output json          # the pause and its reason are on the wave row
+flux fleet unpark wave-7 --output json   # back to the state it held
+```
+
+Parking is a lifecycle state, not an annotation. `fleet status` reports the reason on the wave row in
+both its JSON and human forms, so a paused wave is legible without reading durable state and nothing
+re-decides it every minute; `unpark` restores the recorded previous status, so leaving the pause is a
+verb rather than an edit. A wave parked by exhausted rework rounds carries no recorded previous
+status and returns to `awaiting-handoffs`.
+
+Parking never overwrites an existing reason: a second `park` is a `conflict/precondition`, as is
+unparking a wave that is not parked. A parked wave is not counted as requiring attention — the
+decision to pause has already been made — and its build output stays reclaimable, because its commits
+live on branches.
 
 ## Restart and resume
 

@@ -926,6 +926,20 @@ pub(super) enum FleetAction {
     Cancel {
         target: String,
     },
+    /// Park a wave with a recorded reason, so it stops being re-decided while a human deliberates.
+    ///
+    /// Parking used to be a line in a driver-owned text file: invisible to `fleet status`, so the
+    /// coordinator re-decided a parked wave every minute, and unparking meant editing text.
+    Park {
+        wave: String,
+        /// Why the wave is paused. Recorded on the wave and reported by `fleet status`.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Return a parked wave to the lifecycle state it held when it was parked.
+    Unpark {
+        wave: String,
+    },
     Resume {
         target: Option<String>,
     },
@@ -5570,6 +5584,8 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Cancel { target } => {
             fleet_control_mutation(command, root, state, "cancelled", target)
         }
+        FleetAction::Park { wave, reason } => park_wave(command, root, state, wave, reason),
+        FleetAction::Unpark { wave } => unpark_wave(command, root, state, wave),
         FleetAction::Resume { target } => {
             let target = target.as_deref().unwrap_or("main");
             state.running = true;
@@ -5796,6 +5812,8 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Task { .. }
             | FleetAction::Message { .. }
             | FleetAction::Cancel { .. }
+            | FleetAction::Park { .. }
+            | FleetAction::Unpark { .. }
             | FleetAction::Resume { .. }
             | FleetAction::Apply { .. }
             | FleetAction::Note { .. }
@@ -5961,6 +5979,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "task",
         "message",
         "cancel",
+        "park",
+        "unpark",
         "resume",
         "apply",
         "status",
@@ -13068,6 +13088,116 @@ fn outcomes_len(data: &Value) -> usize {
     data["waves"].as_array().map_or(0, Vec::len)
 }
 
+/// The status a wave parked without a park record returns to.
+///
+/// Rework escalation parks a wave by writing `parked` straight onto it, so the only wave that carries
+/// no recorded previous status is one that ran out of rework rounds while awaiting handoffs. That is
+/// exactly the wave a human unparks after answering the review, which is why `unpark` has to work on it
+/// rather than refusing for want of a record it never had.
+const PARK_DEFAULT_RETURN_STATUS: &str = "awaiting-handoffs";
+
+/// Park a wave with a recorded reason.
+///
+/// Parking was a line in a driver-owned text file — invisible to `fleet status`, so a parked wave was
+/// re-decided every minute, and unparking meant editing text. Recording it on the wave makes the pause,
+/// its reason and the status it returns to durable state, and makes leaving it a verb.
+fn park_wave(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+    reason: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("input/schema: park --reason must not be empty");
+    }
+    let reason = redact(reason);
+    let wave = state
+        .waves
+        .get(wave_id)
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let previous_status = wave["status"].as_str().unwrap_or("unknown").to_string();
+    if previous_status == "parked" {
+        // Never overwrite the first reason. The recorded reason is why the wave is paused, and a second
+        // park replacing it would lose the fact the pause was made for.
+        let recorded = wave["park"]["reason"]
+            .as_str()
+            .unwrap_or("no reason recorded");
+        bail!("conflict/precondition: wave {wave_id} is already parked ({recorded})")
+    }
+    let park = json!({
+        "reason": reason,
+        "previous_status": previous_status,
+        // Revision rather than a wall clock: fleet state records no timestamps, and the revision is the
+        // ordering every other fleet record is already read against.
+        "revision": state.revision + 1,
+    });
+    let data = json!({"wave": wave_id, "status": "parked", "park": park});
+    let event = data.clone();
+    persist_delta_mutation(command, root, &mut state, "wave.parked", event, |state| {
+        let wave = state
+            .waves
+            .get_mut(wave_id)
+            .with_context(|| format!("not-found: wave {wave_id}"))?;
+        wave["status"] = json!("parked");
+        wave["park"] = park.clone();
+        Ok(())
+    })?;
+    Ok((
+        format!("{wave_id} parked: {reason}"),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
+/// Return a parked wave to the lifecycle state it held, and clear the park record.
+fn unpark_wave(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let wave = state
+        .waves
+        .get(wave_id)
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let status = wave["status"].as_str().unwrap_or("unknown");
+    if status != "parked" {
+        bail!("conflict/precondition: wave {wave_id} is {status}, not parked")
+    }
+    let restored = wave["park"]["previous_status"]
+        .as_str()
+        .unwrap_or(PARK_DEFAULT_RETURN_STATUS)
+        .to_string();
+    let data = json!({
+        "wave": wave_id,
+        "status": restored,
+        "previous_status": "parked",
+        "reason": wave["park"]["reason"].clone(),
+    });
+    let event = data.clone();
+    let target = restored.clone();
+    persist_delta_mutation(command, root, &mut state, "wave.unparked", event, |state| {
+        let wave = state
+            .waves
+            .get_mut(wave_id)
+            .with_context(|| format!("not-found: wave {wave_id}"))?;
+        wave["status"] = json!(target);
+        if let Some(record) = wave.as_object_mut() {
+            record.remove("park");
+        }
+        Ok(())
+    })?;
+    Ok((
+        format!("{wave_id} unparked: {restored}"),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
 fn fleet_control_mutation(
     command: &FleetCommand,
     root: &Path,
@@ -13872,6 +14002,25 @@ fn wave_gate_summary(wave: &Value) -> Option<String> {
     (!red.is_empty()).then(|| bounded_text(&format!("red gate: {}", red.join(", ")), 200))
 }
 
+/// The recorded park on a wave, bounded for the status projection.
+///
+/// A parked wave is deliberately NOT counted as attention: the pause is a decision already taken, and
+/// the whole point of recording it is that nothing re-decides it every minute. What status owes the
+/// operator is the reason, so the pause is legible without reading `state.json`.
+fn wave_park_summary(wave: &Value) -> Option<Value> {
+    let park = wave.get("park")?.as_object()?;
+    Some(json!({
+        "reason": bounded_status_text(
+            park.get("reason").and_then(Value::as_str).unwrap_or("no reason recorded"),
+            300,
+        ),
+        "previous_status": bounded_status_ref(
+            park.get("previous_status").and_then(Value::as_str),
+        ),
+        "revision": park.get("revision").and_then(Value::as_u64),
+    }))
+}
+
 /// C-562: the bounded default projection behind `fleet status` and `fleet dashboard`. It reports
 /// operational truth — main state, active/attention worker counts, wave/item state, exact BoardRefs,
 /// repositories, current sessions, last transition/error summaries and the current revision — and
@@ -13940,6 +14089,7 @@ fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
                 "items": value_strings(&wave["items"]).iter().take(FLEET_STATUS_MAX_REF_ROWS)
                     .map(|item| bounded_status_text(item, 200)).collect::<Vec<_>>(),
                 "gate": wave_gate_summary(wave),
+                "park": wave_park_summary(wave),
             })
         })
         .collect::<Vec<_>>();
@@ -14154,10 +14304,14 @@ fn fleet_status_human(data: &Value) -> String {
         .flatten()
         .map(|wave| {
             format!(
-                "{}={} ({} item(s))",
+                "{}={} ({} item(s)){}",
                 wave["id"].as_str().unwrap_or("?"),
                 wave["status"].as_str().unwrap_or("unknown"),
-                wave["item_count"]
+                wave["item_count"],
+                wave["park"]["reason"]
+                    .as_str()
+                    .map(|reason| format!(" parked: {reason}"))
+                    .unwrap_or_default(),
             )
         })
         .collect::<Vec<_>>()

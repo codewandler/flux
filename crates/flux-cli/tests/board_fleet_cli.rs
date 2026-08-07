@@ -3024,6 +3024,124 @@ fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     );
 }
 
+/// C-639: parking used to live in a driver-owned text file — invisible to `fleet status`, so a parked
+/// wave was re-decided every minute, and unparking meant editing text. Parking is a lifecycle state of
+/// the wave, with a reason, and returning from it is a verb.
+#[test]
+fn parking_a_wave_records_the_reason_and_unparking_restores_the_state_it_held() {
+    let (root, _story) = one_story_wave("park-lifecycle");
+
+    let parked = flux(
+        &root,
+        &[
+            "fleet",
+            "park",
+            "wave-2",
+            "--reason",
+            "waiting on a human decision",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        parked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parked.stdout)
+    );
+    let parked: serde_json::Value = serde_json::from_slice(&parked.stdout).unwrap();
+    assert_eq!(parked["data"]["wave"], "wave-2");
+    assert_eq!(parked["data"]["status"], "parked");
+    assert_eq!(
+        parked["data"]["park"]["reason"],
+        "waiting on a human decision"
+    );
+    assert_eq!(parked["data"]["park"]["previous_status"], "accepted");
+    assert!(parked["data"]["park"]["revision"].is_number());
+
+    // The whole point: the pause and its reason are visible without reading `state.json`.
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let wave = status["data"]["waves"]["listed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|wave| wave["id"] == "wave-2")
+        .expect("the parked wave is listed");
+    assert_eq!(wave["status"], "parked");
+    assert_eq!(wave["park"]["reason"], "waiting on a human decision");
+    let human = flux(&root, &["fleet", "status"]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("parked: waiting on a human decision"),
+        "the human status must name the park reason: {human}"
+    );
+
+    // A second park is a typed conflict, never a silent overwrite of the recorded reason.
+    let again = flux(
+        &root,
+        &[
+            "fleet",
+            "park",
+            "wave-2",
+            "--reason",
+            "another reason",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(again.status.code(), Some(4));
+
+    let unparked = flux(&root, &["fleet", "unpark", "wave-2", "--output", "json"]);
+    assert!(
+        unparked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unparked.stdout)
+    );
+    let unparked: serde_json::Value = serde_json::from_slice(&unparked.stdout).unwrap();
+    assert_eq!(unparked["data"]["status"], "accepted");
+    assert_eq!(unparked["data"]["previous_status"], "parked");
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let wave = status["data"]["waves"]["listed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|wave| wave["id"] == "wave-2")
+        .expect("the unparked wave is listed");
+    assert_eq!(wave["status"], "accepted");
+    assert!(wave["park"].is_null(), "the park record is cleared");
+
+    // Unparking a wave that is not parked, and parking one that does not exist, are typed failures.
+    let twice = flux(&root, &["fleet", "unpark", "wave-2", "--output", "json"]);
+    assert_eq!(twice.status.code(), Some(4));
+    let missing = flux(
+        &root,
+        &[
+            "fleet", "park", "wave-404", "--reason", "absent", "--output", "json",
+        ],
+    );
+    assert_eq!(missing.status.code(), Some(3));
+
+    // Both verbs are journalled, so the pause survives a restart with its reason.
+    let events = flux(
+        &root,
+        &["fleet", "events", "--limit", "200", "--output", "json"],
+    );
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).unwrap();
+    let kinds = events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"wave.parked"), "{kinds:?}");
+    assert!(kinds.contains(&"wave.unparked"), "{kinds:?}");
+
+    fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
     let (root, _story) = one_story_wave("scriptless-inspection");
