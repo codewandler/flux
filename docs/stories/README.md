@@ -423,6 +423,7 @@ _The substrate abstraction already exists — `flux-system` owns the guarded por
 - [C-677 — A microvm binding resolves to a served guest substrate](C-677-a-microvm-binding-resolves-to-a-served-guest-substrate.md) · Core · Decision 0018 rule 3 within C-480's boundary: flux never provisions a VM; a microvm host is the remote protocol served from the C-480 guest profile
 - [C-678 — End users see only host bindings granted to them](C-678-end-users-see-only-host-bindings-granted-to-them.md) · Core · Decision 0018 rule 4's second sentence is unimplemented across the flux host surface; C-654's review measured the gap
 - [C-679 — The remote client bounds every response it decodes](C-679-the-remote-client-bounds-every-response-it-decodes.md) · Core · the server caps requests (MAX_REQUEST_BYTES); the client caps nothing — response.json() on the wire answer and the handshake are unbounded
+- [C-680 — flux system serve accepts a file-shaped token](C-680-flux-system-serve-accepts-a-file-shaped-token.md) · Core · C-480 review: the k8s manifest carries the bearer token as a pod env var only because serve offers nothing but --token-env; file-shaped is the decision 0007/0008 direction
 
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
