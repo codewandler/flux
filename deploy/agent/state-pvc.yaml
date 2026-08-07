@@ -1,0 +1,23 @@
+# The agent's durable state. Two directories live on this claim, under separate subPaths:
+#
+#   state/      the session store `--store` names — `events.db` (conversations, run traces, turn
+#               telemetry) and `flow.db`. Also `$HOME`, so anything flux resolves under `~/.flux`
+#               (installed plugins, `endpoints.toml`) lands here rather than on the read-only rootfs.
+#   workspace/  the agent's working directory. Every file the agent reads and writes is under it,
+#               because the container's own filesystem is read-only.
+#
+# ReadWriteOnce is correct and not a limitation to work around: SQLite in WAL mode is a
+# single-writer store on a local file, so one replica per claim is the supported topology. Two pods
+# sharing this volume is not a coordination mechanism, which is why the strategy is `Recreate`.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flux-agent-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # Uncomment and name a class whose reclaim policy you have actually checked.
+  # storageClassName: ""
