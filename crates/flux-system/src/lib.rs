@@ -140,6 +140,7 @@ pub mod net;
 pub mod port;
 pub mod remote;
 pub mod sandbox;
+pub mod sandboxed;
 pub mod secret_scope;
 pub mod websocket;
 
