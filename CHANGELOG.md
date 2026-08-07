@@ -229,6 +229,19 @@ All notable changes to this project are documented in this file. The format is b
   it re-reads files that already exist. `/fleet:reclaim` was considered and **excluded** for exactly that
   reason: reclamation deletes worktrees, which is on the far side of the line.
 
+- **A Kubernetes profile for the agent surface (C-685).** `deploy/agent/` runs `flux app run
+  --serve` from the same released image as the substrate profile — the tag is derived from
+  `deploy/kubernetes/`, not restated — as a sibling base rather than an overlay, because a
+  different program, port, secret, volume and health posture would leave an overlay patching
+  everything it inherited and colliding on object names wherever both run. An unauthenticated
+  public listener is not expressible: the artifact test assembles argv from `command` and `args`,
+  errs toward "public" for any address it cannot parse, derives the token env-var name from the
+  server source so a rename breaks the test rather than the deployment, and refuses to pass
+  vacuously when extraction yields nothing. Probes target routes derived from flux-server's own
+  auth-exempt set (`/health` and the two agent-card paths), so a probe cannot drift onto a
+  protected route. `--yes` ships as the declared posture with `--remote-approval` one commented
+  line away and the C-687 caveat stated in all three places an operator reads.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

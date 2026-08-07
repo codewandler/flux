@@ -68,8 +68,9 @@ spec:
           # an HTTP request has no terminal to prompt at, so the choice cannot be defaulted
           # (`ServedApprovalPosture::select`, crates/flux-cli/src/app_cmd.rs).
           #
-          #   --yes              Never ask. Authorization policy, the sandbox floor and the
-          #                      resource budgets are what constrain this agent. This is the
+          #   --yes              Never ask. Authorization policy, the pod's own confinement
+          #                      and the resource budgets are what constrain this agent — the
+          #                      sandbox floor is waived here (see --no-sandbox above). This is the
           #                      posture shipped here, because a pod has nobody attached to it:
           #                      an unanswered effect under the other posture is a DENIED effect,
           #                      so a deployment that nobody is watching would slowly refuse

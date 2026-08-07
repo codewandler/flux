@@ -127,8 +127,9 @@ code execution.
 `flux app run --serve` with no program refuses to start until you choose one, because an HTTP
 request has no terminal to prompt at:
 
-- **`--yes`** — never ask. Authorization policy, the sandbox floor and the resource budgets are what
-  constrain the agent. The shipped manifest uses this, because a deployed pod normally has nobody
+- **`--yes`** — never ask. Authorization policy, the pod's own confinement and the resource budgets
+  are what constrain the agent; the sandbox floor is waived in this profile (see `--no-sandbox`
+  below), so the pod boundary is carrying that weight. The shipped manifest uses this, because a deployed pod normally has nobody
   attached to it.
 - **`--remote-approval`** — a human answers each guarded effect at `GET /approvals` and
   `POST /approvals/{id}`. An effect nobody answers within `FLUX_APPROVAL_TIMEOUT_SECS` (default 120)

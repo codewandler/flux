@@ -93,8 +93,9 @@ kubectl -n flux-agent rollout status deployment/flux-agent
 (`ServedApprovalPosture::select`, `crates/flux-cli/src/app_cmd.rs`) — an HTTP request has no
 terminal to prompt at, so the choice cannot be defaulted:
 
-- **`--yes`** — never ask. Authorization policy, the sandbox floor and the resource budgets are what
-  constrain the agent. This is what `deployment.yaml` ships, because a pod has nobody attached to
+- **`--yes`** — never ask. Authorization policy, the pod's own confinement and the resource budgets
+  are what constrain the agent; the sandbox floor is waived in this profile (see `--no-sandbox`
+  below), so the pod boundary is carrying that weight. This is what `deployment.yaml` ships, because a pod has nobody attached to
   it by default.
 - **`--remote-approval`** — a human answers each guarded effect at `GET /approvals` /
   `POST /approvals/{id}`. Silence for `FLUX_APPROVAL_TIMEOUT_SECS` (default 120) **denies**. Swap it

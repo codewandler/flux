@@ -78,6 +78,14 @@
   unwired and refuses selection naming the missing endpoint, instead of quietly falling back to
   your machine.
 
+- **Deploy the agent itself, not just the machine it acts on.** Alongside the serving-daemon
+  profiles, Flux now ships Kubernetes manifests that run the agent surface from the same released
+  image — the HTTP/A2A endpoint you talk to with `flux a2a`, with its bearer token and model
+  credential as Secret references, a persistent session volume, and network policy that denies by
+  default in both directions. The manifests cannot express an unauthenticated public listener: a
+  bind that reaches beyond loopback without a token fails the shipped checks, and the running
+  daemon refuses it too.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
