@@ -2939,6 +2939,7 @@ fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
         ("activity", None),
         ("worktree", None),
         ("integration", Some("wave-2")),
+        ("gate", Some("wave-2")),
         ("source", Some("repo")),
         ("search", Some("wave")),
         ("story", Some("repo/C-1")),

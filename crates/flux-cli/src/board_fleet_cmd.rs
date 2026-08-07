@@ -954,6 +954,9 @@ pub(super) enum FleetAction {
         #[arg(value_enum)]
         view: InspectView,
         target: Option<String>,
+        /// `inspect gate` only: narrow a wave's gate output to one repository of its topology.
+        #[arg(long)]
+        repository: Option<String>,
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
@@ -1044,6 +1047,8 @@ pub(super) enum InspectView {
     Activity,
     Worktree,
     Integration,
+    /// A wave's repository gates: argv, exit code and the gate's own captured output, tail first.
+    Gate,
     Source,
     Search,
     Story,
@@ -5631,9 +5636,17 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Inspect {
             view,
             target,
+            repository,
             limit,
         } => {
-            let data = fleet_inspect(root, &state, *view, target.as_deref(), *limit)?;
+            let data = fleet_inspect(
+                root,
+                &state,
+                *view,
+                target.as_deref(),
+                *limit,
+                repository.as_deref(),
+            )?;
             Ok((
                 serde_json::to_string_pretty(&data)?,
                 data,
@@ -12549,12 +12562,42 @@ fn read_event_lines(root: &Path, limit: usize) -> Result<Vec<Value>> {
     Ok(lines)
 }
 
+/// The per-line character bound of one projected gate output line, applied before the structural
+/// byte budget so a single pathological line cannot consume the whole projection.
+const GATE_OUTPUT_LINE_CHARS: usize = 2_000;
+
+/// One captured gate stream, most recent line first.
+///
+/// A gate's verdict is the LAST thing it wrote, and a repository gate writes tens of thousands of
+/// lines of compilation banner before it. A head-first projection therefore spends its entire bound
+/// on progress noise and drops the one line the operator opened the view for — which is exactly why
+/// reading `topology.repositories[].gate.evidence.stdout` by hand meant a `jq`/Python expression that
+/// sliced the tail. The tail is emitted first and the bound applies to the tail, so the reason
+/// survives both `--limit` and the structural byte budget. `line_count` reports what the gate
+/// actually wrote, so a truncated tail is never mistaken for a short log.
+fn gate_output_tail(value: &Value, limit: usize) -> Value {
+    let text = value.as_str().unwrap_or_default();
+    let line_count = text.lines().count();
+    let lines = text
+        .lines()
+        .rev()
+        .take(limit)
+        .map(|line| bounded_text(line, GATE_OUTPUT_LINE_CHARS))
+        .collect::<Vec<_>>();
+    json!({
+        "lines": lines,
+        "line_count": line_count,
+        "truncated": line_count > lines.len(),
+    })
+}
+
 fn fleet_inspect(
     root: &Path,
     state: &FleetState,
     view: InspectView,
     target: Option<&str>,
     limit: usize,
+    repository: Option<&str>,
 ) -> Result<Value> {
     let limit = limit.min(10_000);
     let target_required = || target.context("input/schema: this inspect view requires a target");
@@ -12638,6 +12681,45 @@ fn fleet_inspect(
                 .with_context(|| format!("not-found: wave {target}"))?;
             json!({"wave":target,"status":wave["status"],"apply_eligible":wave["apply_eligible"],"integration_order":wave["integration_order"],"repositories":wave["topology"]["repositories"].as_array().into_iter().flatten().map(|repository|json!({"id":repository["id"],"base_commit":repository["base_commit"],"integration":repository["integration"],"candidate":repository["candidate"],"gate":repository["gate"]})).take(limit).collect::<Vec<_>>()})
         }
+        InspectView::Gate => {
+            let target = target_required()?;
+            let wave = state
+                .waves
+                .get(target)
+                .with_context(|| format!("not-found: wave {target}"))?;
+            let mut repositories = Vec::new();
+            for entry in wave["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let id = entry["id"].as_str().unwrap_or_default();
+                if repository.is_some_and(|wanted| wanted != id) {
+                    continue;
+                }
+                let gate = &entry["gate"];
+                let evidence = &gate["evidence"];
+                repositories.push(json!({
+                    "id": id,
+                    "status": gate["status"],
+                    "candidate": gate["candidate"].as_str().or_else(|| entry["candidate"].as_str()),
+                    "runs": gate["runs"],
+                    // Why a gate never ran at all — `missing final gate argv`, or a candidate
+                    // unchanged since its red gate — is recorded instead of evidence, not beside it.
+                    "reason": gate["reason"],
+                    "argv": evidence["argv"],
+                    "exit_code": evidence["exit_code"],
+                    "stdout": gate_output_tail(&evidence["stdout"], limit),
+                    "stderr": gate_output_tail(&evidence["stderr"], limit),
+                }));
+            }
+            if repositories.is_empty() {
+                if let Some(repository) = repository {
+                    bail!("not-found: repository {repository} in wave {target}")
+                }
+            }
+            json!({"wave":target,"order":"tail-first","repositories":repositories})
+        }
         InspectView::Source => {
             let mut sources = fleet_sources(root)?;
             if let Some(target) = target {
@@ -12680,7 +12762,8 @@ fn fleet_inspect(
                 .into_iter()
                 .find(|story| story.id == target)
                 .with_context(|| format!("not-found: story {target}"))?;
-            let execution = fleet_inspect(root, state, InspectView::Result, Some(target), limit)?;
+            let execution =
+                fleet_inspect(root, state, InspectView::Result, Some(target), limit, None)?;
             json!({"planning":story,"execution":execution})
         }
         InspectView::PullRequest => {
@@ -12702,6 +12785,7 @@ fn fleet_inspect(
         "schema":"flux.fleet-inspect/v1",
         "view":format!("{view:?}").to_ascii_lowercase(),
         "target":target.map(redact),
+        "repository":repository.map(redact),
         "bounded":true,
         "limit":limit,
         "budget_bytes":FLEET_INSPECT_BUDGET_BYTES,
@@ -13472,7 +13556,7 @@ fn fleet_status_next_command(data: &Value) -> String {
         .find(|wave| wave["gate"].is_string())
     {
         return format!(
-            "flux fleet inspect integration {} --limit 50 --output json",
+            "flux fleet inspect gate {} --limit 50 --output json",
             wave["id"].as_str().unwrap_or("WAVE")
         );
     }
@@ -16963,7 +17047,8 @@ mod tests {
             "events": [{"payload": "y".repeat(1_000_000)}],
         }));
 
-        let snapshot = fleet_inspect(&root, &state, InspectView::Snapshot, None, 100).unwrap();
+        let snapshot =
+            fleet_inspect(&root, &state, InspectView::Snapshot, None, 100, None).unwrap();
         let encoded = serde_json::to_vec(&snapshot).unwrap();
 
         assert_eq!(snapshot["data"]["main_agent"]["id"], "main");
@@ -18075,6 +18160,7 @@ mod tests {
             InspectView::Worker,
             Some("wave-346-worker-1"),
             100,
+            None,
         )
         .unwrap();
         let encoded = serde_json::to_vec(&data).unwrap();
@@ -18102,6 +18188,143 @@ mod tests {
                 "omission metadata carried the omitted payload"
             );
         }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_inspect_gate_prints_a_repository_gate_output_tail_first() {
+        let root = fleet_tui_fixture("inspect-gate");
+        let mut state = populated_fleet_tui_state();
+        let mut stdout = (1..=500)
+            .map(|unit| format!("compiling unit {unit}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        stdout.push_str("\nerror: test `keeps_the_contract` failed\n");
+        state.waves.insert(
+            "wave-gated".into(),
+            json!({
+                "status":"red",
+                "topology":{"repositories":[
+                    {"id":"flux","candidate":"abc123","gate":{
+                        "status":"red","runs":1,"candidate":"abc123",
+                        "evidence":{"argv":["cargo","test","--workspace"],"exit_code":101,
+                                    "stdout":stdout,"stderr":""}
+                    }},
+                    {"id":"api","candidate":"def456","gate":{
+                        "status":"green","runs":1,"candidate":"def456",
+                        "evidence":{"argv":["cargo","test"],"exit_code":0,"stdout":"ok","stderr":""}
+                    }}
+                ]}
+            }),
+        );
+
+        let data = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-gated"),
+            5,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(data["view"], "gate");
+        assert_eq!(data["bounded"], true);
+        assert_eq!(data["data"]["wave"], "wave-gated");
+        assert_eq!(data["data"]["order"], "tail-first");
+        let repositories = data["data"]["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 2);
+        let failing = &repositories[0];
+        assert_eq!(failing["id"], "flux");
+        assert_eq!(failing["status"], "red");
+        assert_eq!(failing["candidate"], "abc123");
+        assert_eq!(failing["exit_code"], 101);
+        assert_eq!(failing["argv"], json!(["cargo", "test", "--workspace"]));
+        let tail = failing["stdout"]["lines"].as_array().unwrap();
+        assert_eq!(
+            tail[0], "error: test `keeps_the_contract` failed",
+            "the gate's reason is the last line it wrote, so it must be printed first"
+        );
+        assert_eq!(tail[1], "compiling unit 500");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(failing["stdout"]["line_count"], 501);
+        assert_eq!(failing["stdout"]["truncated"], true);
+        assert_eq!(failing["stderr"]["line_count"], 0);
+
+        let narrowed = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-gated"),
+            5,
+            Some("api"),
+        )
+        .unwrap();
+        assert_eq!(narrowed["repository"], "api");
+        let narrowed = narrowed["data"]["repositories"].as_array().unwrap().clone();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0]["id"], "api");
+        assert_eq!(narrowed[0]["status"], "green");
+        assert_eq!(narrowed[0]["stdout"]["lines"], json!(["ok"]));
+        assert_eq!(narrowed[0]["stdout"]["truncated"], false);
+
+        let unknown_repository = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-gated"),
+            5,
+            Some("absent"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown_repository.contains("not-found"),
+            "{unknown_repository}"
+        );
+        assert!(fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-absent"),
+            5,
+            None
+        )
+        .is_err());
+        assert!(fleet_inspect(&root, &state, InspectView::Gate, None, 5, None).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_inspect_gate_keeps_the_failure_reason_inside_the_projection_budget() {
+        let root = fleet_tui_fixture("inspect-gate-budget");
+        let state = dogfood_shaped_fleet_state();
+
+        let data = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-346"),
+            10_000,
+            None,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&data).unwrap();
+
+        assert!(
+            encoded.len() <= FLEET_INSPECT_BUDGET_BYTES,
+            "inspect gate returned {} bytes",
+            encoded.len()
+        );
+        let repository = &data["data"]["repositories"][0];
+        assert_eq!(repository["status"], "red");
+        assert_eq!(repository["exit_code"], 101);
+        assert!(repository["stdout"]["lines"][0]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
 
         fs::remove_dir_all(root).ok();
     }

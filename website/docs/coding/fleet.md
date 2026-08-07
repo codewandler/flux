@@ -528,6 +528,8 @@ flux fleet inspect result api/C-41 --limit 100 --output json
 flux fleet inspect activity --limit 100 --output json
 flux fleet inspect worktree worker-1 --limit 100 --output json
 flux fleet inspect integration wave-7 --limit 100 --output json
+flux fleet inspect gate wave-7 --limit 100 --output json
+flux fleet inspect gate wave-7 --repository api --limit 100 --output json
 flux fleet inspect source api --limit 100 --output json
 flux fleet inspect search C-41 --limit 100 --output json
 flux fleet inspect story api/C-41 --limit 100 --output json
@@ -539,6 +541,14 @@ flux fleet dashboard --output json
 `flux fleet agents` lists every durable worker as a bounded summary: id, role, task kind, status,
 Board ref, wave, session and resolved loop identity. It never returns worker instructions or full
 historical turn receipts; use a targeted inspect view when deeper evidence is needed.
+
+`flux fleet inspect gate <wave>` answers the most-wanted question about a red wave — *why did the gate
+fail* — without knowing the shape of `state.json`. It returns each repository's gate status,
+candidate, argv, exit code and the gate's own captured `stdout`/`stderr`, **tail first**: the last
+line the gate wrote is the first line reported, because that is where the failure is and a gate log
+is far longer than any bound. Each stream reports `line_count` and `truncated`, so a bounded tail is
+never mistaken for a short log. `--repository <id>` narrows a multi-repository wave to one gate, and
+a gate that never ran reports its `reason` instead of evidence.
 
 `flux fleet status` and `dashboard` use the same bounded operational projection. They report current
 coordinator, worker, wave, Board-ref, session, repository and attention state without copying
