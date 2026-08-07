@@ -2,8 +2,7 @@
 id: C-618
 title: "fleet resume must not replay the coordinator inbox into a story worker"
 pillar: "Core"
-status: ready
-priority: 6
+status: done
 epic: fleet-harness-throughput
 areas: [flux-cli]
 ---

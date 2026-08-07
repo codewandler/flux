@@ -2,8 +2,7 @@
 id: C-636
 title: "fleet inspect gate prints a repository gate's own output, tail first"
 pillar: "Core"
-status: ready
-priority: 9
+status: done
 epic: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
 areas: [flux-cli]
 design: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven

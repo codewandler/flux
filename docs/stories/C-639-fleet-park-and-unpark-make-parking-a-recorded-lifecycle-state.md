@@ -2,8 +2,7 @@
 id: C-639
 title: "fleet park and unpark make parking a recorded lifecycle state"
 pillar: "Core"
-status: ready
-priority: 11
+status: done
 epic: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
 areas: [flux-cli]
 design: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven

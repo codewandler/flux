@@ -2,8 +2,7 @@
 id: C-635
 title: "fleet doctor reports runtime health, not only configuration"
 pillar: "Core"
-status: ready
-priority: 8
+status: done
 epic: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
 areas: [flux-cli]
 design: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven

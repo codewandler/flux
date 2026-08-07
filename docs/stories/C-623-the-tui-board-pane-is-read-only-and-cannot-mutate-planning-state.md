@@ -2,8 +2,7 @@
 id: C-623
 title: "The TUI board pane is read-only and cannot mutate planning state"
 pillar: "Core"
-status: ready
-priority: 23
+status: done
 epic: tui-board-surface
 areas: [flux-tui]
 design: docs/designs/the-tui-board-is-a-real-board-collapsed-expandable-clickable-items-rendering-markdown-detail.md
