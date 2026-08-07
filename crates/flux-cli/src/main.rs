@@ -1377,10 +1377,11 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("terminates no TLS"), "{err}");
 
-        // C-683 landed a per-binding anchor for the ssh bootstrap at `[host.ssh] ca`. Two
-        // spellings of "the CA this binding trusts" would mean one of them is silently ignored,
-        // so the collision is refused and the refusal names the field that works.
-        let err = host_ref_from_parts(
+        // C-683 landed an ssh-local anchor at `[host.ssh] ca`. `ca_cert` means the same thing on
+        // every kind that dials TLS, so an ssh binding accepts it here rather than refusing the
+        // word; which anchor an ssh bootstrap uses is settled at resolution, where both are
+        // visible.
+        let reference = host_ref_from_parts(
             "builder",
             HostBackend::Ssh,
             Some("ssh://build@builder.example"),
@@ -1389,11 +1390,8 @@ mod tests {
             &[],
             labels(),
         )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("[host.ssh]"),
-            "names the field that works: {err}"
-        );
+        .expect("`ca_cert` is the binding-level anchor on every TLS-dialling kind");
+        assert_eq!(reference.ca_cert.as_deref(), Some("/etc/flux/ca.pem"));
 
         // A path is accepted as-is: it is not parsed as a secret ref, and it is not read here.
         let reference = host_ref_from_parts(

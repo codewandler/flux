@@ -111,16 +111,6 @@ pub(super) fn host_ref_from_parts(
                  `ca_cert`"
             );
         }
-        // An `ssh` binding trusts its far side through `[host.ssh] ca` (C-683), because the anchor
-        // has to survive the bootstrap that *makes* the endpoint. Accepting a second spelling here
-        // would mean silently ignoring one of them, which is the exact failure this field exists to
-        // prevent — so the collision is refused, naming the field that works.
-        if backend == HostBackend::Ssh {
-            bail!(
-                "host `{id}` binds the ssh substrate, whose trust anchor is declared as `ca` in \
-                 its [host.ssh] table; move the path there and drop the top-level `ca_cert`"
-            );
-        }
     }
     let credential_ref = match credential_ref {
         Some(s) => Some(
