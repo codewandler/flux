@@ -176,6 +176,63 @@ There is no bypass path:
 
 Sub-agents inherit the identical chain: their loops and operation calls face the same checks.
 
+## Execution hosts
+
+A provider decides *which model* answers. A **host** decides *which machine* the effects land on.
+Declare one by name and select it with `--host`:
+
+```bash
+flux host add build --backend remote --url https://build.internal --credential-ref env/BUILD_TOKEN
+flux host probe build      # identity check — executes nothing on the substrate
+flux --host build run "cargo test"
+```
+
+The credential is always a *reference* to where it lives (`env/…`, `plugin/…`, `kubernetes/…`),
+never a value — `add` refuses an inline secret before anything is written, and the URL must be
+credential-free. Selection is permission-gated: each binding declares who may use it, the default
+posture is deny, and unattended automation never inherits a grant given only to interactive use. The
+selected host is immutable for the session and inherited by sub-agents, and the audit trail records
+which host every action ran on.
+
+| `backend` | Runs effects on |
+| --- | --- |
+| `local` | this machine |
+| `sandboxed` | this machine under the OS sandbox (bubblewrap on Linux, Seatbelt on macOS) — **fails closed** if no usable confinement exists |
+| `container` | a container substrate |
+| `kubernetes` | a pod substrate |
+| `microvm` | a VM/microVM guest serving the remote protocol |
+| `remote` | another machine over the authenticated remote protocol |
+
+The vocabulary is closed — an unknown kind is a hard config error, and `[[host]]` refuses unknown
+keys outright, because a silently dropped typo in a substrate binding would change where effects
+land. Flux never provisions the machine: a binding consumes an endpoint that already exists, and one
+declared before its endpoint exists lists as *unwired* and refuses selection naming what is missing,
+rather than quietly falling back to your machine. Web requests follow the selection too; browser
+automation and crawling stay local, since they drive a local browser.
+
+<details>
+<summary><strong><code>[[host]]</code> in <code>~/.flux/config.toml</code></strong></summary>
+
+```toml
+[[host]]
+id = "build"
+backend = "remote"
+url = "https://build.internal"
+credential_ref = "env/BUILD_TOKEN"
+
+[[host]]
+id = "confined"
+backend = "sandboxed"
+```
+
+`flux host ls` / `show` render id, backend kind, address and availability (`--output json` is the
+automation API); `flux host metrics <name>` reports that machine's own condition — CPU, load,
+memory, swap, disk, uptime, temperature, fans — with anything it cannot measure reported as
+explicitly unavailable with a reason, never as zero. The agent gets the same views (`host.list`,
+`host.info`, `host.probe`) and never reads a credential value.
+
+</details>
+
 ## Providers
 
 A provider is a **wire codec × credential** pair, selected with `-m <provider>/<model>`.

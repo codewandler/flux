@@ -84,6 +84,23 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   take effect. It waits rather than interrupting: if a worker is still running it tells you instead of
   restarting underneath it. `/fleet:refresh` re-reads fleet state when you want the current picture now.
 
+- **When a fleet goes wrong, you can now ask it what happened.** Diagnosing a stuck run used to mean
+  reading the fleet's internal state file by hand. Now each question has a command: `flux fleet doctor`
+  reports whether the running system is actually healthy — not just whether its configuration is valid
+  — and names things like a worker recorded as working with no process behind it. `flux fleet inspect
+  gate <wave>` shows why a run went red by printing the gate's own output, newest first, so the verdict
+  is the part you see. `flux board reconcile` tells you which items already have their work in the
+  tree while their status still says otherwise, so nobody is sent to build something twice; it reports
+  and never changes anything.
+
+- **Pausing, repairing and pausing-for-upgrade are commands now, not procedures.** `flux fleet park
+  <wave> --reason` pauses a run and records *why*, and `flux fleet unpark` resumes it — the pause and
+  its reason show up in `flux fleet status`, so a paused run stays paused instead of being reconsidered
+  every minute. `flux fleet repair` rebuilds working directories a run expects but disk no longer has.
+  And `flux fleet quiesce` stops new work and confirms nothing is still running, so you can install a
+  new version safely; `flux fleet resume` lifts it. Each replaces a hand-run sequence that was easy to
+  get half-right.
+
 ## [0.58.0] - 2026-08-07
 
 ### New

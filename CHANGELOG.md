@@ -6,33 +6,66 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
-### Fixed
-
-- **A finished worker turn now records its own handoff, so a wave advances with nobody watching
-  (C-670).** `handoff-accepted` was reachable only from `flux fleet handoff`, and no agent in the
-  fleet could invoke it: the story worker holds no fleet operations, the coordinator's native
-  operation set has no `fleet.handoff`, and the integrator's `fleet.integrate` refuses until every
-  story is already accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human
-  could move it — ten workers once ended their turns and left nine commits the fleet never recorded.
-  A wave now records each finished turn from the worktree it finished in, deriving branch, commit and
-  the `base..HEAD` write set, and reaches `handoffs-ready` on its own.
-
-  The record is **provisional and says so**. It proves the same git facts as the operator path
-  through a shared `verify_story_commit` — the commit is the worktree HEAD, the branch points at it,
-  it descends from the pinned base, the tree is clean, and the observed write set is non-empty — but
-  it carries no targeted validation evidence, because a turn that has already ended cannot be asked
-  to cite the argv it ran. The entry is marked `provisional` with an empty `test_argv`, and
-  integration still runs the repository's full gate, which is what decides whether the wave is green.
-  A turn that ends at its pinned base with no commit records *that*, rather than nothing, so an empty
-  worker is no longer indistinguishable from an unrecorded one. Recording can never fail a wave:
-  every refusal becomes a reason on the story. The worker gains no capability — the fleet observes
-  what it left behind rather than asking it to vouch for it.
-
 ### Added
+
+- **Recovery and inspection became verbs instead of hand-driven procedures (C-635, C-636, C-637,
+  C-638, C-639, C-641, C-642).** Every one of these questions had a single correct answer computable
+  from data the fleet already recorded, and every one was being asked by writing `jq` over
+  `state.json` — or worse, reimplemented: the unattended driver grew its own `/proc` scanner because
+  nothing reported a worker recorded `working` with no process behind it.
+
+  - `flux fleet doctor` reports **runtime** health, not only configuration — a worker recorded
+    `working` with no process, waves each holding an attempt at the same story, and the other
+    mechanical questions that were previously answered by reading state by hand.
+  - `flux fleet inspect gate <wave>` returns a repository gate's own captured output **tail first**,
+    so the verdict survives both the view's `--limit` and its structural byte budget. Why a wave went
+    red was the most-wanted recorded fact and the only one that still required knowing the shape of
+    `state.json`.
+  - `flux board reconcile` reports items whose work is **already present** while their status still
+    says outstanding. It reports and never repairs: detection is the whole value, since the fix is a
+    transition anyone can make once they know.
+  - `flux fleet repair` rebuilds structure a wave's topology names and disk lacks — the hand-written
+    `git worktree add` against a base read out of `state.json`, and the `git reset --hard <base>` an
+    integration worktree needed repeatedly before handoffs would verify.
+  - `flux fleet park <wave> --reason` / `flux fleet unpark <wave>` make parking a **recorded
+    lifecycle state of the wave** rather than a line in a driver-owned text file, and `fleet status`
+    reports the pause and its reason — so a parked wave is not re-decided every minute.
+  - `flux fleet handoff --from-worktree` derives the write set from the story worktree's `base..HEAD`
+    range and the owning worker from the agent that wave assigned to it, instead of asking for facts
+    the fleet already recorded.
+  - `flux fleet quiesce` records a durable maintenance window that refuses every dispatch and
+    confirms nothing is in flight; `flux fleet resume` lifts it. The hand-driven version — scan the
+    process table, then install — went wrong twice in one evening, once corrupting a full workspace
+    test run.
+
+- **Every agent start resolves and snapshots an explicit loop binding (C-569).** Loop selection is now
+  a required resolved field of the common agent-start contract, so a top-level, sub-agent, Fleet or
+  served start says exactly which behavior harness it is running. Previously each start path defaulted
+  its own loop independently and nothing durable recorded which one ran, leaving a Fleet writer, a
+  `task` child, an app agent and a served A2A task indistinguishable from a general CLI agent in the
+  record. A resolved `AgentLoopBinding` carries logical profile and revision, runner kind, an
+  immutable source reference and digest, entry point and required runtime features; receipts expose
+  bounded identity and digest metadata and never loop source or prompts. An omitted selector resolves
+  to the explicit versioned adaptive preset, a sub-agent resolves its own role policy and never
+  implicitly copies the parent's loop, and Fleet task roles require an explicit policy-selected
+  binding. Missing profiles, changed digests, invalid source and unsupported runtime features refuse
+  **before the first model call** with the exact mismatch. Message, restart, resume, rework and
+  recovery reconstruct the admitted binding; switching a live worker requires an explicit new
+  admission.
+
+- **A board item expands into its rendered story body, and the pane stays read-only (C-621, C-623).**
+  Expanding an item in the TUI renders Goal, Acceptance and Notes as markdown in place — headings,
+  lists, fenced code and checkbox state visually distinct from prose — so reading an item's contract
+  no longer means leaving the TUI. Rendering is width-aware and wraps within the pane, and a long body
+  scrolls inside its own box rather than pushing the board off screen. The pane remains strictly
+  read-only: no interaction changes status, priority or any other planning field, status changes stay
+  the Board CLI's responsibility so the transition is validated, and a test drives every board-pane
+  interaction asserting the board revision is unchanged afterwards.
 
 - **`[[host]]` declares named execution-substrate bindings (Decision 0018, C-648).** A host is now
   a first-class entity: `id`, a typed `backend` kind (`local` | `sandboxed` | `container` |
-  `kubernetes` | `remote`), an optional bare `url`, a `credential_ref` *location* (the existing
+  `kubernetes` | `remote`; `microvm` joins them below with C-677, so the vocabulary this release
+  ships is all six), an optional bare `url`, a `credential_ref` *location* (the existing
   `env/` / `plugin/` / `kubernetes/` reference vocabulary — never a value), and display labels.
   The backend vocabulary is closed and an unknown kind is a hard config error, and — unlike
   `[[endpoint.static]]` — a `[[host]]` entry refuses unknown keys outright, because a silently
@@ -174,40 +207,6 @@ All notable changes to this project are documented in this file. The format is b
   at binding granularity where `static_availability` could only answer per kind. Nothing in the
   change creates, starts, stops or destroys a guest.
 
-### Performance
-
-- **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
-  time and the on-disk size that actually caps how many workers fit, and a worker's build output
-  exists only to explain a failing test — file and line in a panic is all of it that is ever read.
-  Set through the per-worker environment, so an operator's own rebuilds keep full debug info.
-
-- **Board and fleet operations no longer re-read every story with its own process.** Resolving a
-  workspace member ran one `git show` per story file: across this workspace's four members that is
-  roughly 1,690 guarded process spawns on *every* board call, including `board get`, which needs
-  exactly one story and took over six seconds to return 759 bytes. Every native coordinator
-  operation paid it twice over, because each one shells out to a nested CLI that resolves the board
-  again. Reads now go through `git cat-file --batch`, chunked against the guarded port's 1 MiB
-  output cap using the blob sizes `git ls-tree -l` already reports. Measured on this board,
-  interleaved: `board get` **6.32s to 0.85s**. Chunking is the load-bearing part — an unbounded
-  batch is truncated by the cap, fails to frame, and silently falls back to the per-file path, which
-  is exactly what the first attempt did on the two largest members while looking like it worked.
-
-### Fixed
-
-- **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every
-  worker reaches handoff at once. A held state reservation is a queue, not a conflict — the error even said
-  "retry" and nothing did, so a handoff simply failed. A compare-and-set failure means the state moved and
-  must be recomputed, in both of its branches, not waited out. And recomputing has to be expressed as a
-  *delta*: a wave record holds every story, so recomputing a private copy and inserting it discards the
-  sibling stories other workers updated in the same instant — four concurrent handoffs each reported success
-  and the wave ended holding one. Handoff is now applied as a delta against whatever state is current, so a
-  wave advances to `handoffs-ready` only once the last sibling has genuinely landed.
-- **A worker's turn record lands on current state** rather than on the snapshot its call started from, so the
-  loser of a race no longer loses its receipt — including the failure evidence of a failed turn, which is
-  the most expensive thing to drop.
-
-### Added
-
 - **`/restart` in the terminal UI** relaunches flux on the currently installed binary, reusing the exact
   command line and resuming the same durable session. It exists because the alternative is a four-step dance
   performed by hand — confirm nothing is in flight, stop the surface, install, respawn — whose last step is
@@ -229,6 +228,63 @@ All notable changes to this project are documented in this file. The format is b
   release, deploy, apply a candidate or clean worktrees. Restart publishes nothing and destroys nothing —
   it re-reads files that already exist. `/fleet:reclaim` was considered and **excluded** for exactly that
   reason: reclamation deletes worktrees, which is on the far side of the line.
+
+### Performance
+
+- **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
+  time and the on-disk size that actually caps how many workers fit, and a worker's build output
+  exists only to explain a failing test — file and line in a panic is all of it that is ever read.
+  Set through the per-worker environment, so an operator's own rebuilds keep full debug info.
+
+- **Board and fleet operations no longer re-read every story with its own process.** Resolving a
+  workspace member ran one `git show` per story file: across this workspace's four members that is
+  roughly 1,690 guarded process spawns on *every* board call, including `board get`, which needs
+  exactly one story and took over six seconds to return 759 bytes. Every native coordinator
+  operation paid it twice over, because each one shells out to a nested CLI that resolves the board
+  again. Reads now go through `git cat-file --batch`, chunked against the guarded port's 1 MiB
+  output cap using the blob sizes `git ls-tree -l` already reports. Measured on this board,
+  interleaved: `board get` **6.32s to 0.85s**. Chunking is the load-bearing part — an unbounded
+  batch is truncated by the cap, fails to frame, and silently falls back to the per-file path, which
+  is exactly what the first attempt did on the two largest members while looking like it worked.
+
+### Fixed
+
+- **A resumed story worker no longer inherits the coordinator's inbox (C-618).** `fleet resume
+  <worker>` handed the resumed agent `main`'s pending messages, so a story worker was asked to answer
+  correspondence addressed to the coordinator — assignment context it was explicitly started without.
+  A resumed agent now receives only its own assignment.
+
+- **A finished worker turn now records its own handoff, so a wave advances with nobody watching
+  (C-670).** `handoff-accepted` was reachable only from `flux fleet handoff`, and no agent in the
+  fleet could invoke it: the story worker holds no fleet operations, the coordinator's native
+  operation set has no `fleet.handoff`, and the integrator's `fleet.integrate` refuses until every
+  story is already accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human
+  could move it — ten workers once ended their turns and left nine commits the fleet never recorded.
+  A wave now records each finished turn from the worktree it finished in, deriving branch, commit and
+  the `base..HEAD` write set, and reaches `handoffs-ready` on its own.
+
+  The record is **provisional and says so**. It proves the same git facts as the operator path
+  through a shared `verify_story_commit` — the commit is the worktree HEAD, the branch points at it,
+  it descends from the pinned base, the tree is clean, and the observed write set is non-empty — but
+  it carries no targeted validation evidence, because a turn that has already ended cannot be asked
+  to cite the argv it ran. The entry is marked `provisional` with an empty `test_argv`, and
+  integration still runs the repository's full gate, which is what decides whether the wave is green.
+  A turn that ends at its pinned base with no commit records *that*, rather than nothing, so an empty
+  worker is no longer indistinguishable from an unrecorded one. Recording can never fail a wave:
+  every refusal becomes a reason on the story. The worker gains no capability — the fleet observes
+  what it left behind rather than asking it to vouch for it.
+
+- **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every
+  worker reaches handoff at once. A held state reservation is a queue, not a conflict — the error even said
+  "retry" and nothing did, so a handoff simply failed. A compare-and-set failure means the state moved and
+  must be recomputed, in both of its branches, not waited out. And recomputing has to be expressed as a
+  *delta*: a wave record holds every story, so recomputing a private copy and inserting it discards the
+  sibling stories other workers updated in the same instant — four concurrent handoffs each reported success
+  and the wave ended holding one. Handoff is now applied as a delta against whatever state is current, so a
+  wave advances to `handoffs-ready` only once the last sibling has genuinely landed.
+- **A worker's turn record lands on current state** rather than on the snapshot its call started from, so the
+  loser of a race no longer loses its receipt — including the failure evidence of a failed turn, which is
+  the most expensive thing to drop.
 
 ## [0.58.0] - 2026-08-07
 
