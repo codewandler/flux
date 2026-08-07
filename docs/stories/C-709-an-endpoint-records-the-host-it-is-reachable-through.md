@@ -47,3 +47,8 @@ whatever found it — so a destination that only exists somewhere says so.
       known, and does not require it where it is not.
 - [ ] Discovery stamps the host it discovered through (composes with C-715), and `import` preserves
       it, so the discover → import → use loop keeps the fact rather than dropping it.
+
+
+## Comments
+
+- Semver decision this story owns, found by C-716: codewandler-flux-secret is at 1.2.1 and published, and EndpointRef is an all-public struct with no #[non_exhaustive]. Adding a public host field is a breaking change for any downstream struct literal. Three options: mark EndpointRef #[non_exhaustive] in the same change (itself breaking, but breaking once and never again), accept the break and cut flux-secret 2.0.0, or add the field behind a constructor and keep literals working. Decide deliberately — C-716 already added the field on its own branch to compile, so whichever way this goes, both branches must agree.
