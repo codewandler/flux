@@ -281,11 +281,20 @@ partitioned by job, and each long-lived credential occurrence is named on an exp
 | Actions control | `release-control`, ambient `GITHUB_TOKEN` with `actions: write`, `contents: read` | dispatch/observe exact cut CI, candidate and tag runs; never move a git ref |
 | attestation | separate job, `id-token: write` + `attestations: write` | attest the already-checked asset set |
 | GitHub Release | separate job, step-scoped `RELEASE_TOKEN` | create/upload one Release |
+| container registry | separate job, ambient `GITHUB_TOKEN` with `packages: write` + `id-token`/`attestations: write` | repack the checked asset set into one image, push `ghcr.io/<owner>/flux-system:<version>`, attest it by digest |
 | plugin signing | separate job, step-scoped `MINISIGN_SECRET_KEY` | sign `plugins-index.json` |
 | crates.io | separate job, step-scoped `CARGO_REGISTRY_TOKEN` | publish the closure / host-kit |
 
 `scripts/check-release-authority.sh` parses all four release workflows and fails if any of these
 composes with another, escapes into a workflow/job `env`, or becomes reachable from a manual event.
+
+The attestation identity has exactly **two** homes, not one (C-696): `attest` covers the release
+archives, and `publish-container-image` covers the image, which does not exist until after `attest`
+has finished. `scripts/check-release-integrity.sh` holds that allowlist by name and then checks the
+second name is really the image publisher — it must consume the checked asset set, must not compile
+anything, and must attest the pushed manifest *digest*. Widening `attest` instead would have put the
+archives' signing identity in the same job as a registry session. A third name on that list is a
+deliberate decision; read the reason recorded at the allowlist before adding one.
 
 `workflow_dispatch` on `release-flow.yml` is deliberately **not** another publish button. Its
 default `apply: false` is a read-only preview; `apply: true` cuts only inside the ephemeral runner as
@@ -470,6 +479,16 @@ silently forgiven.
 
 ## 6. Post-publish
 
+- **Once, after the first release that publishes the container image:** make the GHCR package
+  public. A package created by Actions is **private** by default, so until this is done the
+  `docker pull ghcr.io/<owner>/flux-system:<version>` in the deployment docs fails for anyone
+  outside the org — and that is the first thing an operator tries. GitHub has no supported REST
+  endpoint for container-package visibility, and the ambient `GITHUB_TOKEN`'s `packages: write` is
+  push/read authority, not admin, so the workflow cannot do it: it is a web-UI action, at
+  `https://github.com/orgs/<owner>/packages/container/flux-system/settings` → Danger Zone → Change
+  visibility → Public. Later releases inherit the package's visibility, so this is genuinely once
+  and not per release. Verify with an unauthenticated
+  `docker pull ghcr.io/<owner>/flux-system:<version>`.
 - `cargo owner --add <github-team-or-user> <crate>` on each crate.
 - Confirm docs.rs built each crate (`https://docs.rs/codewandler-flux-sdk`, …).
 - Smoke-test from a scratch project: `cargo add codewandler-flux-sdk codewandler-flux-providers`, then
