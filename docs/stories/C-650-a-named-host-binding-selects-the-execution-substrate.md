@@ -2,7 +2,7 @@
 id: C-650
 title: "A named host binding selects the execution substrate"
 pillar: "Core"
-status: backlog
+status: in-progress
 epic: first-class-hosts
 areas: [flux-cli, flux-runtime]
 design: first-class-hosts
@@ -22,12 +22,12 @@ Exchange catalogue binding likewise becomes nameable, giving the transitional
 
 ## Acceptance
 
-- [ ] `--host <name>` resolves a declared binding; an unknown name is a typed startup refusal that
+- [x] `--host <name>` resolves a declared binding; an unknown name is a typed startup refusal that
       names the known bindings.
-- [ ] `--remote <url>` behaves exactly as before and is recorded as an ephemeral binding.
-- [ ] Substrate provenance on dispatch records carries the binding name alongside the existing
+- [x] `--remote <url>` behaves exactly as before and is recorded as an ephemeral binding.
+- [x] Substrate provenance on dispatch records carries the binding name alongside the existing
       kind and `remotely_reported` fields.
-- [ ] Selection honors Decision 0018 rule 4: a binding not granted to the invoking surface refuses
+- [x] Selection honors Decision 0018 rule 4: a binding not granted to the invoking surface refuses
       by default, and unattended/serving surfaces cannot widen a grant silently.
-- [ ] A named exchange binding resolves origin and token reference where the transitional env pair
+- [x] A named exchange binding resolves origin and token reference where the transitional env pair
       is absent; the pair keeps working until C-656 retires it.

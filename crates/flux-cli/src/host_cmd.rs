@@ -1,6 +1,10 @@
 use super::*;
 
-use flux_secret::host::{HostBackend, HostRecord, HostRef};
+use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+
+/// The reserved prefix for session-constructed binding names (the `--remote` sugar records as
+/// `@session/remote`); a declared binding may not claim it.
+pub(super) const SESSION_HOST_PREFIX: &str = "@";
 
 /// The ambient signal a session emits when host bindings are declared (mirrors the `endpoint`
 /// store signal); the `host` tool group surfaces on it.
@@ -27,10 +31,17 @@ pub(super) fn host_ref_from_parts(
     backend: HostBackend,
     url: Option<&str>,
     credential_ref: Option<&str>,
+    grant: &[String],
     labels: std::collections::BTreeMap<String, String>,
 ) -> Result<HostRef> {
     if id.trim().is_empty() {
         bail!("host id must not be empty");
+    }
+    if id.starts_with(SESSION_HOST_PREFIX) {
+        bail!(
+            "`{id}` uses the reserved `{SESSION_HOST_PREFIX}` prefix (that is for \
+             session-constructed bindings); pick a bare name like `build-farm`"
+        );
     }
     match (backend, url) {
         (HostBackend::Remote, None) => {
@@ -59,9 +70,18 @@ pub(super) fn host_ref_from_parts(
         ),
         None => None,
     };
+    let grant = grant
+        .iter()
+        .map(|class| {
+            class
+                .parse::<HostGrant>()
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .collect::<Result<Vec<HostGrant>>>()?;
     Ok(HostRef {
         url: url.map(str::to_string),
         credential_ref,
+        grant,
         labels,
         ..HostRef::declared(id, backend)
     })
@@ -81,6 +101,7 @@ pub(super) fn merge_config_hosts(
             backend_from_config(host.backend),
             host.url.as_deref(),
             host.credential_ref.as_deref(),
+            &host.grant,
             host.labels.clone(),
         ) {
             Ok(reference) => registry.put(HostRecord::config(reference)),
@@ -171,8 +192,159 @@ fn host_view(record: &HostRecord) -> serde_json::Value {
         "availability": flux_capabilities::static_availability(host.backend),
         "owner": record.owner,
         "credential_ref": host.credential_ref.as_ref().map(ToString::to_string),
+        "grant": host.grant.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
         "labels": host.labels,
     })
+}
+
+/// The outcome of an explicit substrate selection (C-650): the binding name every dispatch
+/// record's provenance will carry, and the execution system to install where the backend is not
+/// the native default (a named `local` binding records its name but keeps the native
+/// workspace-following path).
+pub(super) struct SelectedSubstrate {
+    pub(super) binding: String,
+    pub(super) system: Option<Arc<dyn flux_system::port::ExecutionSystem>>,
+}
+
+impl std::fmt::Debug for SelectedSubstrate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SelectedSubstrate")
+            .field("binding", &self.binding)
+            .field("system_override", &self.system.is_some())
+            .finish()
+    }
+}
+
+/// Resolve `--host <name>`: a registered binding, granted to `surface`, selects the execution
+/// substrate. Every refusal is a startup refusal — an unknown name lists the known bindings, an
+/// ungranted binding names the missing class (an unattended surface never inherits `operator`,
+/// so a serving surface cannot widen a grant silently), and an unwired backend fails closed.
+pub(super) async fn resolve_named_host(
+    name: &str,
+    hosts: &flux_capabilities::HostRegistry,
+    surface: HostGrant,
+    local: &System,
+) -> Result<SelectedSubstrate> {
+    let Some(record) = hosts.get(name) else {
+        return Err(unknown_binding_error(name, hosts));
+    };
+    let host = record.host;
+    if !host.grant.contains(&surface) {
+        let granted = if host.grant.is_empty() {
+            "none".to_string()
+        } else {
+            host.grant
+                .iter()
+                .map(|g| g.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        bail!(
+            "host `{name}` is not granted to this surface (surface class `{surface}`, granted: \
+             {granted}); the default is deny — add `grant = [\"{surface}\"]` to its [[host]] \
+             entry deliberately, since widening a grant is an escalation"
+        );
+    }
+    match host.backend {
+        HostBackend::Local => Ok(SelectedSubstrate {
+            binding: host.id,
+            system: None,
+        }),
+        HostBackend::Sandboxed | HostBackend::Container | HostBackend::Kubernetes => bail!(
+            "host `{name}` binds the `{}` backend, which has no selectable implementation wired \
+             yet; selection fails closed",
+            host.backend
+        ),
+        HostBackend::Remote => {
+            let Some(url) = host.url.as_deref() else {
+                // Unreachable through validated construction, but the store is operator-editable.
+                bail!("host `{name}` has no url; a remote binding needs one");
+            };
+            let token = match &host.credential_ref {
+                Some(reference) if reference.scheme == flux_secret::Scheme::Env => local
+                    .env(&reference.slot)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "host `{name}`: credential `{reference}` unavailable — environment \
+                             variable `{}` is unset or empty",
+                            reference.slot
+                        )
+                    })?,
+                Some(reference) => bail!(
+                    "host `{name}`: only an env-scheme credential resolves for substrate \
+                     selection today (got `{reference}`)"
+                ),
+                None => bail!(
+                    "host `{name}` names no credential reference; the serving endpoint refuses \
+                     an empty token"
+                ),
+            };
+            let system =
+                flux_server::system::connect_remote_system(url, token, &fleet_private_net())
+                    .await
+                    .with_context(|| format!("connect host `{name}`"))?;
+            Ok(SelectedSubstrate {
+                binding: host.id,
+                system: Some(Arc::new(system)),
+            })
+        }
+    }
+}
+
+/// The named Exchange catalogue binding (C-650): `[exchange] host = "<name>"` resolves through
+/// the session registry to `(binding name, origin url, token reference)`. Only an env-scheme
+/// reference resolves on this transitional path — it replaces exactly the environment pair — and
+/// every misdeclaration is a dim diagnostic plus a disabled catalogue, never a hard startup
+/// failure (matching the pair's own partial-configuration behavior).
+pub(super) fn exchange_binding_from_config(
+    cfg: &flux_config::Config,
+    hosts: &flux_capabilities::HostRegistry,
+) -> Option<(String, String, flux_secret::Ref)> {
+    let name = cfg.exchange.host.as_deref()?;
+    let dim_skip = |detail: &str| {
+        eprintln!(
+            "{}",
+            style::dim(&format!(
+                "(exchange host `{name}`: {detail}; catalogue disabled)"
+            ))
+        );
+    };
+    let Some(record) = hosts.get(name) else {
+        dim_skip("no such [[host]] binding");
+        return None;
+    };
+    let host = record.host;
+    let Some(url) = host.url else {
+        dim_skip("the binding has no url");
+        return None;
+    };
+    let Some(reference) = host.credential_ref else {
+        dim_skip("the binding names no credential reference");
+        return None;
+    };
+    if reference.scheme != flux_secret::Scheme::Env {
+        dim_skip(&format!(
+            "only an env-scheme credential resolves here (got `{reference}`)"
+        ));
+        return None;
+    }
+    Some((host.id, url, reference))
+}
+
+/// Record the anonymous `--remote <url>` selection as the session's ephemeral binding
+/// (`@session/remote`) so it lists and probes like any named one. Session-owned: no production
+/// path ever persists it, and it carries no grant — it *is* the selection, not a reusable one.
+pub(super) fn record_ephemeral_remote(
+    hosts: &flux_capabilities::HostRegistry,
+    url: &str,
+    token_env: &str,
+) {
+    hosts.put(HostRecord::session(HostRef {
+        url: Some(url.to_string()),
+        credential_ref: Some(flux_secret::Ref::env(token_env)),
+        ..HostRef::ephemeral("@session/remote", HostBackend::Remote)
+    }));
 }
 
 fn unknown_binding_error(id: &str, registry: &flux_capabilities::HostRegistry) -> anyhow::Error {
@@ -328,6 +500,7 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
             backend,
             url,
             credential_ref,
+            grant,
             labels,
         } => {
             let backend: HostBackend = backend
@@ -340,6 +513,7 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
                 backend,
                 url.as_deref(),
                 credential_ref.as_deref(),
+                &grant,
                 labels.clone(),
             )?;
             let entry = flux_config::HostEntry {
@@ -347,6 +521,7 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
                 backend: config_kind_from_backend(backend),
                 url: reference.url.clone(),
                 credential_ref: reference.credential_ref.as_ref().map(ToString::to_string),
+                grant: reference.grant.iter().map(ToString::to_string).collect(),
                 labels,
             };
             flux_runtime::metadata::persist_user_host_in(

@@ -1638,10 +1638,19 @@ pub(super) fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
 
 /// Resolve the explicit execution target. Absence is meaningful: the environment then follows its
 /// native [`WorkspaceContext`], preserving local worktree transitions exactly as before.
+///
+/// C-650: `--host <name>` resolves a registered, granted binding through the session registry;
+/// `--remote <url>` remains as sugar constructing an ephemeral unnamed binding, recorded in the
+/// registry as `@session/remote` so it lists and probes like any named one.
 async fn resolve_selected_execution_system(
     flags: &AgentFlags,
     local: &System,
-) -> Result<Option<Arc<dyn flux_system::port::ExecutionSystem>>> {
+    hosts: &flux_capabilities::HostRegistry,
+    surface: flux_secret::host::HostGrant,
+) -> Result<Option<SelectedSubstrate>> {
+    if let Some(name) = flags.host.as_deref() {
+        return Ok(Some(resolve_named_host(name, hosts, surface, local).await?));
+    }
     let Some(endpoint) = flags.remote.as_deref() else {
         return Ok(None);
     };
@@ -1666,7 +1675,11 @@ async fn resolve_selected_execution_system(
         flux_server::system::connect_remote_system(endpoint, token, &private_net).await
     }
     .with_context(|| format!("connect remote execution system `{endpoint}`"))?;
-    Ok(Some(Arc::new(remote)))
+    record_ephemeral_remote(hosts, endpoint, &flags.remote_token_env);
+    Ok(Some(SelectedSubstrate {
+        binding: "@session/remote".to_string(),
+        system: Some(Arc::new(remote)),
+    }))
 }
 
 /// The whole fleet surface, in one place: worker **lifecycle** (C-243) plus outbound A2A **dispatch**
@@ -2242,7 +2255,23 @@ pub(super) async fn build_agent_with(
     } else {
         None
     };
-    let selected_execution_system = resolve_selected_execution_system(flags, &system).await?;
+    // One session host registry (C-648..C-650): substrate selection, the host op pack and the
+    // ambient signal all read the same instance, so an ephemeral `--remote` binding is listable.
+    let host_registry = session_host_registry(&cfg);
+    // Rule-4 surface classification: anything that runs without a human approving each effect —
+    // `--yes`, an attached fleet coordinator/integrator, an enforced operation ceiling — is the
+    // `unattended` class, and it never inherits an `operator` grant.
+    let host_surface = if flags.yes
+        || flags.operation_ceiling
+        || attached_native_fleet_main
+        || attached_native_fleet_integrator
+    {
+        flux_secret::host::HostGrant::Unattended
+    } else {
+        flux_secret::host::HostGrant::Operator
+    };
+    let selected_substrate =
+        resolve_selected_execution_system(flags, &system, &host_registry, host_surface).await?;
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
@@ -2476,6 +2505,7 @@ pub(super) async fn build_agent_with(
         backend.clone(),
         false,
         &cfg,
+        host_registry.clone(),
         events.clone(),
         &session_id,
         &redactor,
@@ -2495,40 +2525,34 @@ pub(super) async fn build_agent_with(
     // unavailable binding leaves core Flux intact and advertises no Exchange operation; the
     // turn-boundary refresher retries and publishes only complete effective generations through
     // C-318's live catalogue.
-    let mut catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
+    // C-650: the transitional environment pair wins while present; with the pair absent, a
+    // `[exchange] host = "<binding>"` declaration resolves the same origin + token through a
+    // named `[[host]]` binding (the token stays a reference — an env-var name — resolved here).
+    let exchange_origin: Option<(String, String)> = match (
         std::env::var("FLUX_EXCHANGE_URL").ok(),
         std::env::var("FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN").ok(),
     ) {
         (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-            match flux_web::exchange::ExchangeClient::new(&url, &token, redactor.clone()) {
-                Ok(client) => {
-                    let client = Arc::new(client);
-                    if let Err(error) = client.refresh_registry(&mut registry).await {
-                        eprintln!(
-                            "{}",
-                            style::dim(&format!(
-                                "(Exchange catalogue unavailable at startup: {})",
-                                redactor.redact(&error.to_string())
-                            ))
-                        );
-                    }
-                    Some(Arc::new(flux_web::exchange::ExchangeCatalogRefresher::new(
-                        client,
-                    )))
-                }
-                Err(error) => {
+            Some((url, token))
+        }
+        (None, None) => exchange_binding_from_config(&cfg, &host_registry).and_then(
+            |(name, url, reference)| match std::env::var(&reference.slot)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(token) => Some((url, token)),
+                None => {
                     eprintln!(
                         "{}",
                         style::dim(&format!(
-                            "(Exchange binding refused: {})",
-                            redactor.redact(&error.to_string())
+                            "(exchange host `{name}`: token environment variable `{}` is unset                              or empty; catalogue disabled)",
+                            reference.slot
                         ))
                     );
                     None
                 }
-            }
-        }
-        (None, None) => None,
+            },
+        ),
         _ => {
             eprintln!(
                 "{}",
@@ -2540,6 +2564,39 @@ pub(super) async fn build_agent_with(
             None
         }
     };
+    let mut catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> =
+        match exchange_origin {
+            Some((url, token)) => {
+                match flux_web::exchange::ExchangeClient::new(&url, &token, redactor.clone()) {
+                    Ok(client) => {
+                        let client = Arc::new(client);
+                        if let Err(error) = client.refresh_registry(&mut registry).await {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "(Exchange catalogue unavailable at startup: {})",
+                                    redactor.redact(&error.to_string())
+                                ))
+                            );
+                        }
+                        Some(Arc::new(flux_web::exchange::ExchangeCatalogRefresher::new(
+                            client,
+                        )))
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            style::dim(&format!(
+                                "(Exchange binding refused: {})",
+                                redactor.redact(&error.to_string())
+                            ))
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
     // A-96: the `consult` op's group surfaces only when a target is configured, exactly like the
     // `endpoint` ambient signal above — computed once here from config, never re-probed per turn,
     // so surfacing can't churn the prompt prefix mid-session (A-95).
@@ -2663,8 +2720,13 @@ pub(super) async fn build_agent_with(
         resource_limits,
     )
     .with_workspace(session_workspace);
-    if let Some(selected) = selected_execution_system {
-        environment = environment.with_execution_system(selected);
+    if let Some(selected) = selected_substrate {
+        if let Some(selected_system) = selected.system {
+            environment = environment.with_execution_system(selected_system);
+        }
+        // A named `local` binding installs no system override — the native workspace-following
+        // path is preserved — but its name still rides every dispatch record's provenance.
+        environment = environment.with_execution_binding(selected.binding);
     }
     let executor = environment.into_executor();
     // C-162: resolve `[tools] disable` against the now-final registry (exact op names or

@@ -119,15 +119,16 @@ fn main() -> Result<()> {
 mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, fleet_status_line,
-        format_evidence, host_ref_from_parts, implicit_plugin_group, integration_plugin_caps,
-        loop_machinery_label, merge_config_hosts, merge_static_endpoints, new_render_suffix,
-        parse_labels, plugin_binaries_in, plugin_status_one, redact_plugin_echo,
-        render_endpoint_row, render_host_row, render_review_markdown,
-        resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
-        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill,
-        CliHostProber, EndpointAction, EventStore, EventStoreCrossPluginAudit,
-        EventStoreEgressAudit, Liveness, PluginAction, RedactorSecretSink, ReviewSeverity,
+        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts,
+        exchange_binding_from_config, fleet_status_line, format_evidence, host_ref_from_parts,
+        implicit_plugin_group, integration_plugin_caps, loop_machinery_label, merge_config_hosts,
+        merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
+        plugin_status_one, record_ephemeral_remote, redact_plugin_echo, render_endpoint_row,
+        render_host_row, render_review_markdown, resolve_named_host, resolve_plugin_operation_name,
+        run_endpoint_in, run_plugin_in, run_usage_with, should_fail, tool_preview, truncate,
+        url_has_userinfo, usage_annotation, write_generated_skill, Cli, CliHostProber,
+        EndpointAction, EventStore, EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness,
+        PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
@@ -1283,6 +1284,7 @@ mod tests {
             HostBackend::Remote,
             Some("https://user:secret@farm.example:8443"),
             None,
+            &[],
             labels(),
         )
         .unwrap_err();
@@ -1297,20 +1299,22 @@ mod tests {
             HostBackend::Remote,
             Some("https://farm.example:8443"),
             Some("hunter2-not-a-ref"),
+            &[],
             labels(),
         )
         .unwrap_err();
         assert!(err.to_string().contains("invalid credential ref"), "{err}");
 
         // A remote binding without an address is unusable; a local one with an address is a lie.
-        let err =
-            host_ref_from_parts("farm", HostBackend::Remote, None, None, labels()).unwrap_err();
+        let err = host_ref_from_parts("farm", HostBackend::Remote, None, None, &[], labels())
+            .unwrap_err();
         assert!(err.to_string().contains("needs a `url`"), "{err}");
         let err = host_ref_from_parts(
             "here",
             HostBackend::Local,
             Some("https://somewhere.example"),
             None,
+            &[],
             labels(),
         )
         .unwrap_err();
@@ -1327,6 +1331,7 @@ mod tests {
                 HostBackend::Remote,
                 Some("https://farm.example:8443"),
                 Some(scheme),
+                &[],
                 labels(),
             )
             .unwrap_or_else(|e| panic!("`{scheme}` is a valid location: {e}"));
@@ -1346,6 +1351,7 @@ mod tests {
                     backend: flux_config::HostBackendKind::Remote,
                     url: Some("https://farm.example:8443".into()),
                     credential_ref: Some("env/FARM_TOKEN".into()),
+                    grant: vec!["operator".into()],
                     labels: Default::default(),
                 },
                 flux_config::HostEntry {
@@ -1353,6 +1359,7 @@ mod tests {
                     backend: flux_config::HostBackendKind::Local,
                     url: None,
                     credential_ref: None,
+                    grant: Vec::new(),
                     labels: Default::default(),
                 },
                 // Invalid (credential-bearing URL) — must be skipped, not abort the merge.
@@ -1361,6 +1368,7 @@ mod tests {
                     backend: flux_config::HostBackendKind::Remote,
                     url: Some("https://u:p@farm.example".into()),
                     credential_ref: None,
+                    grant: Vec::new(),
                     labels: Default::default(),
                 },
             ],
@@ -1435,6 +1443,7 @@ mod tests {
             backend: flux_config::HostBackendKind::Remote,
             url: Some(url.into()),
             credential_ref: Some("env/FARM_TOKEN".into()),
+            grant: vec!["operator".into()],
             labels: Default::default(),
         };
         flux_runtime::metadata::persist_user_host_in(entry("https://one.example:8443"), &env)
@@ -1527,6 +1536,154 @@ mod tests {
             other => panic!("expected BackendUnwired, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-650: `--host <name>` resolution is deny-by-default and typed at startup — an unknown
+    /// name lists the known bindings, an ungranted binding refuses, an `operator` grant does not
+    /// cover an unattended surface (no silent widening), a granted `local` binding selects with
+    /// its name and no system override, and an unwired backend fails closed.
+    #[tokio::test]
+    async fn named_host_selection_enforces_grants_and_fails_closed() {
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("here", HostBackend::Local)
+        }));
+        reg.put(HostRecord::config(HostRef::declared(
+            "ungranted",
+            HostBackend::Local,
+        )));
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("boxed", HostBackend::Sandboxed)
+        }));
+
+        let err = resolve_named_host("nope", &reg, HostGrant::Operator, &local)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("known bindings"), "{err}");
+        assert!(err.to_string().contains("here"), "names them: {err}");
+
+        let err = resolve_named_host("ungranted", &reg, HostGrant::Operator, &local)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not granted"), "{err}");
+        assert!(
+            err.to_string().contains("deny"),
+            "states the posture: {err}"
+        );
+
+        // An unattended surface never inherits the operator grant — no silent widening.
+        let err = resolve_named_host("here", &reg, HostGrant::Unattended, &local)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not granted"), "{err}");
+        assert!(err.to_string().contains("unattended"), "{err}");
+
+        let selected = resolve_named_host("here", &reg, HostGrant::Operator, &local)
+            .await
+            .expect("a granted local binding selects");
+        assert_eq!(selected.binding, "here");
+        assert!(
+            selected.system.is_none(),
+            "a local binding keeps the native workspace-following path"
+        );
+
+        let err = resolve_named_host("boxed", &reg, HostGrant::Operator, &local)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fails closed"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-650: the anonymous `--remote <url>` selection records as the session's ephemeral
+    /// `@session/remote` binding — listable, session-owned, carrying the token *reference* — and
+    /// the `@` prefix is reserved: no declared binding can claim it.
+    #[test]
+    fn ephemeral_remote_records_a_session_binding() {
+        use flux_secret::host::{HostBackend, HostSource};
+        let reg = flux_capabilities::HostRegistry::new();
+        record_ephemeral_remote(
+            &reg,
+            "https://farm.example:8443",
+            "FLUX_REMOTE_SYSTEM_TOKEN",
+        );
+        let record = reg.get("@session/remote").expect("recorded");
+        assert_eq!(record.host.source, HostSource::Ephemeral);
+        assert_eq!(record.owner, "session");
+        assert_eq!(record.host.backend, HostBackend::Remote);
+        assert_eq!(
+            record.host.credential_ref.as_ref().map(ToString::to_string),
+            Some("env/FLUX_REMOTE_SYSTEM_TOKEN".into())
+        );
+
+        let err = host_ref_from_parts(
+            "@session/mine",
+            HostBackend::Local,
+            None,
+            None,
+            &[],
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    /// C-650: with the transitional environment pair absent, `[exchange] host = "<binding>"`
+    /// resolves the Exchange origin and token *reference* from the named binding; a missing or
+    /// misdeclared binding disables the catalogue rather than failing startup.
+    #[test]
+    fn exchange_binding_resolves_origin_and_token_reference() {
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            url: Some("https://exchange.example:8443".into()),
+            credential_ref: Some(flux_secret::Ref::env("EXCHANGE_SA_TOKEN")),
+            ..HostRef::declared("corp-exchange", HostBackend::Remote)
+        }));
+        let cfg = flux_config::Config {
+            exchange: flux_config::ExchangeConfig {
+                host: Some("corp-exchange".into()),
+            },
+            ..Default::default()
+        };
+        let (name, url, reference) =
+            exchange_binding_from_config(&cfg, &reg).expect("declared binding resolves");
+        assert_eq!(name, "corp-exchange");
+        assert_eq!(url, "https://exchange.example:8443");
+        assert_eq!(reference.to_string(), "env/EXCHANGE_SA_TOKEN");
+
+        // No [exchange] declaration, or a binding the registry does not know: no catalogue.
+        assert!(exchange_binding_from_config(&flux_config::Config::default(), &reg).is_none());
+        let cfg = flux_config::Config {
+            exchange: flux_config::ExchangeConfig {
+                host: Some("gone".into()),
+            },
+            ..Default::default()
+        };
+        assert!(exchange_binding_from_config(&cfg, &reg).is_none());
+    }
+
+    /// C-650: `--host` and `--remote` are mutually exclusive at parse time — one explicit
+    /// selection per session.
+    #[test]
+    fn host_and_remote_flags_conflict_at_parse_time() {
+        use clap::Parser;
+        let err = Cli::try_parse_from([
+            "flux",
+            "run",
+            "--host",
+            "build-farm",
+            "--remote",
+            "https://farm.example:8443",
+            "hi",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"), "{err}");
     }
 
     /// D-116 e2e (gated on `TEST_POSTGRES_URL`, like the pg backend tests): an operator-added

@@ -122,6 +122,13 @@ pub(super) struct AgentFlags {
     #[arg(long = "remote-ca", value_name = "PEM", requires = "remote")]
     pub(super) remote_ca: Option<std::path::PathBuf>,
 
+    /// Execute guarded tool effects on the named `[[host]]` binding. The binding must be granted
+    /// to this surface class — the default posture is deny — and the selected target is immutable
+    /// for the session and inherited by sub-agents. `--remote` remains as sugar for an ephemeral
+    /// unnamed binding.
+    #[arg(long, value_name = "NAME", conflicts_with = "remote")]
+    pub(super) host: Option<String>,
+
     /// Ask capable providers/models to expose adaptive thinking for every call owned by this agent.
     #[arg(long)]
     pub(super) think: bool,
@@ -1510,6 +1517,12 @@ pub(super) enum HostAction {
         /// `plugin/<p>/<i>/<slot>`. Omit for an unauthenticated binding. Never a value.
         #[arg(long, value_name = "REF")]
         credential_ref: Option<String>,
+        /// Repeatable surface class granted to *select* this binding: `operator` (attended
+        /// sessions, the default — your explicit add is the grant) and/or `unattended` (serving
+        /// and `--yes` surfaces; grant deliberately, widening is an escalation). A `[[host]]`
+        /// entry written by hand defaults to deny instead.
+        #[arg(long = "grant", value_name = "CLASS", default_values_t = [String::from("operator")])]
+        grant: Vec<String>,
         /// Repeatable non-secret label `key=value` (region, cluster, tags) for display/filtering.
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,

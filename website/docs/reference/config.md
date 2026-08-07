@@ -463,14 +463,26 @@ than dropped. A `remote` binding needs a credential-free `url`; `credential_ref`
 Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
 user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
 
+Selecting a binding (`flux --host <name> …`) is granted, never ambient: `grant` lists the surface
+classes allowed to select it — `operator` (attended sessions) and/or `unattended` (serving and
+`--yes` surfaces) — and the default is deny. The classes are exact: an unattended surface never
+inherits an `operator` grant. A granted `remote` binding executes guarded effects on its serving
+endpoint; `--remote <url>` keeps working as sugar for an ephemeral, session-only binding.
+
 ```toml
 [[host]]
 id = "build-farm"
 backend = "remote"
 url = "https://farm.internal:8443"
 credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+grant = ["operator"]
 labels = { region = "eu" }
 ```
+
+`[exchange] host = "<binding>"` names the `[[host]]` entry serving the Exchange catalogue — the
+declared home for what the transitional `FLUX_EXCHANGE_URL`/token environment pair configures.
+The pair keeps working and wins while present; the named binding's `url` is the origin and its
+`credential_ref` locates the service-account token.
 
 ## Scheduled wake-ups (`[wakeup]`)
 

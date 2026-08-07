@@ -75,6 +75,55 @@ impl std::str::FromStr for HostBackend {
     }
 }
 
+/// A surface class a host binding may be granted to (Decision 0018 rule 4). Host authority is
+/// granted, never ambient: a binding carries the classes that may select it, the default is deny,
+/// and the classes are exact — an unattended surface never inherits an `operator` grant, so a
+/// serving surface cannot widen a grant silently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostGrant {
+    /// An attended, operator-driven surface (the interactive CLI/TUI).
+    Operator,
+    /// An unattended or serving surface (`--yes` runs, `app run --serve`, daemons).
+    Unattended,
+}
+
+impl HostGrant {
+    /// Every grant class, in display order.
+    pub const ALL: [Self; 2] = [Self::Operator, Self::Unattended];
+
+    /// The lowercase wire/display form (matches the serde encoding).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Unattended => "unattended",
+        }
+    }
+}
+
+impl fmt::Display for HostGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for HostGrant {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|g| g.as_str() == s)
+            .ok_or_else(|| {
+                let known: Vec<&str> = Self::ALL.into_iter().map(Self::as_str).collect();
+                format!(
+                    "unknown host grant `{s}`; known surface classes: {}",
+                    known.join(", ")
+                )
+            })
+    }
+}
+
 /// Where a host binding came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +153,10 @@ pub struct HostRef {
     /// Where the credential lives — a *reference*, never a value. `None` for unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<Ref>,
+    /// The surface classes granted to select this binding (Decision 0018 rule 4). Empty means
+    /// deny: the binding is listable and probeable but selects for nobody.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant: Vec<HostGrant>,
     /// Free-form non-secret labels (region, cluster, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
@@ -118,6 +171,7 @@ impl HostRef {
             url: None,
             source: HostSource::Config,
             credential_ref: None,
+            grant: Vec::new(),
             labels: BTreeMap::new(),
         }
     }

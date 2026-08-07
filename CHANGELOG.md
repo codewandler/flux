@@ -35,6 +35,22 @@ All notable changes to this project are documented in this file. The format is b
   placement census, the group manifest test, and the website ops reference. Integration-assembly
   tools now carry their placement per pack instead of assuming one shared placement.
 
+- **A named host binding selects the execution substrate (C-650).** `flux --host <name>` resolves
+  a declared `[[host]]` binding through the session registry to the selected execution system —
+  the same guarded-port path `--remote <url>` walks, which stays as sugar and is now recorded as
+  the session's ephemeral `@session/remote` binding (the `@` prefix is reserved). Selection is
+  granted, never ambient (Decision 0018 rule 4): a binding carries `grant = ["operator" |
+  "unattended"]`, the default is deny, an unknown name is a typed startup refusal naming the known
+  bindings, and the classes are exact — `--yes`, fleet-attached and operation-ceiling surfaces
+  classify as `unattended` and never inherit an `operator` grant, so a serving surface cannot
+  widen a grant silently. A granted `local` binding keeps the native workspace-following path but
+  its name still rides provenance; `sandboxed`/`container`/`kubernetes` fail closed until their
+  backends wire in. Dispatch-record provenance now carries the binding *name* (a label, never an
+  address) beside `kind` and `remotely_reported`. The Exchange catalogue binding becomes nameable:
+  `[exchange] host = "<binding>"` resolves origin and token reference where the transitional
+  `FLUX_EXCHANGE_URL`/token pair is absent — the pair keeps working and wins until C-656 retires
+  it.
+
 - **`flux board next --independent` returns the largest wave-safe set instead of the
   highest-priority prefix.** Dependency satisfaction says only that nothing an item *waits on* is
   outstanding; it says nothing about whether two ready items can be built at the same time.

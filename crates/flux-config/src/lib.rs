@@ -211,9 +211,32 @@ pub struct HostEntry {
     /// `kubernetes/<ns>/<name>/<key>`, `plugin/<p>/<i>/<slot>`); optional. Never a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// Surface classes granted to *select* this binding (`operator`, `unattended`). The default
+    /// is deny (Decision 0018 rule 4): an ungranted binding lists and probes but selects for
+    /// nobody. Held as plain strings here; the surface crate validates the vocabulary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant: Vec<String>,
     /// Non-secret labels (region, cluster, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// The `[exchange]` table — the declared home for the Exchange catalogue binding (C-650). Names a
+/// `[[host]]` binding whose `url` is the Exchange origin and whose `credential_ref` locates the
+/// service-account token. The transitional `FLUX_EXCHANGE_URL`/token environment pair keeps
+/// working and wins while present.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExchangeConfig {
+    /// The `[[host]]` binding name serving the Exchange catalogue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl ExchangeConfig {
+    fn is_default(&self) -> bool {
+        self.host.is_none()
+    }
 }
 
 /// The `[skills]` table — skill-discovery settings (L-02).
@@ -773,6 +796,9 @@ pub struct Config {
     /// Named execution-substrate bindings (`[[host]]`, Decision 0018).
     #[serde(default, rename = "host", skip_serializing_if = "Vec::is_empty")]
     pub hosts: Vec<HostEntry>,
+    /// The named home for the Exchange catalogue binding (`[exchange] host = "<binding>"`).
+    #[serde(default, skip_serializing_if = "ExchangeConfig::is_default")]
+    pub exchange: ExchangeConfig,
     /// Opt into the generic `bash` op (the `shell` group). Off by default — the agent works through
     /// the dedicated ops; setting this surfaces `bash` as an escape hatch. The CLI exports
     /// `FLUX_ENABLE_BASH` from this so the runtime's `shell` signal fires.
@@ -1360,6 +1386,9 @@ fn merge(user: Config, project: Config) -> Config {
             ),
         },
         hosts: merge_hosts(user.hosts, project.hosts),
+        exchange: ExchangeConfig {
+            host: project.exchange.host.or(user.exchange.host),
+        },
         enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
@@ -2333,6 +2362,7 @@ backend = "local"
             backend: HostBackendKind::Remote,
             url: Some(url.into()),
             credential_ref: None,
+            grant: Vec::new(),
             labels: Default::default(),
         };
         let user = vec![
@@ -2356,6 +2386,7 @@ backend = "local"
             backend: HostBackendKind::Remote,
             url: Some("https://farm.example:8443".into()),
             credential_ref: Some("env/FARM_TOKEN".into()),
+            grant: Vec::new(),
             labels: Default::default(),
         };
         let body = render_host_upsert(Some(("test", base)), entry.clone()).unwrap();

@@ -24,6 +24,13 @@
   the host's identity without running anything on it. Declared hosts also become visible to the
   agent, which can list, inspect and probe them (never reading a credential value).
 
+- **Run on a named host with `--host <name>`.** Instead of pasting a URL every time, select a
+  declared host by name and the session executes its effects there; the audit trail records which
+  host every action ran on. Selection is permission-gated: each host says who may use it
+  (interactive sessions, unattended automation, both — or nobody, the default), and automation
+  never silently inherits a permission granted only to interactive use. `--remote <url>` still
+  works for one-off connections.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

@@ -149,6 +149,7 @@ pub(super) async fn assemble_integrations(
     backend: Arc<dyn flux_capabilities::DatasourceBackend>,
     datasource_bridge: bool,
     cfg: &flux_config::Config,
+    host_registry: Arc<flux_capabilities::HostRegistry>,
     events: Arc<EventStore>,
     stream: &str,
     redactor: &flux_secret::Redactor,
@@ -163,8 +164,8 @@ pub(super) async fn assemble_integrations(
     // Host bindings are session substrate state, not a plugin integration — they register even
     // when no plugins directory exists (C-648). The pack is LocalControlPlane (C-649): the ops
     // describe and verify substrate bindings and must stay operable when a non-native substrate
-    // is selected.
-    let host_registry = session_host_registry(cfg);
+    // is selected. The registry is the caller's session instance (C-650), so a binding selected
+    // or recorded before assembly — the ephemeral `--remote` one included — is listable here.
     if !host_registry.is_empty() {
         assembly.ambient_signals.push(HOST_SIGNAL.to_string());
     }
@@ -807,6 +808,7 @@ pub(super) async fn run_app(
         backend,
         true,
         &cfg,
+        session_host_registry(&cfg),
         app_events.clone(),
         &app_run_stream,
         &redactor,
