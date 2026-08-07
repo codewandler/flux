@@ -262,6 +262,28 @@ flux board done C-552 --changelog "Add the example" --if-revision REV \
   --idempotency-key done-C-552 --output json
 ```
 
+### Status that drifted from the tree
+
+`flux board reconcile` reports every item whose status says the work is outstanding while evidence of
+that work is already present. It writes nothing: detection is the whole value, and the repair is a
+transition anyone can make once they know which one.
+
+Two independent signals count as evidence, and each finding names which fired:
+
+- `implementation-landed` — a commit reachable from `HEAD` names the item *and* touches a path
+  outside `docs/stories/`. Commits confined to the board's own documents — adding the item, flipping
+  its status, re-rendering the marker region — are the status record, not the work.
+- `acceptance-complete` — every checkbox under the item's `## Acceptance` heading is ticked.
+
+Each finding carries the profile-valid `transition_path` that would close it. History reading is
+bounded to the most recent commits, and a scan that reaches that ceiling warns rather than reporting
+a partial answer as complete. On a workspace board each member's own history is read, because that is
+where its commits are.
+
+```sh
+flux board reconcile --output json
+```
+
 ## The stable agent API
 
 Human rendering is for terminals. JSON is the agent API:

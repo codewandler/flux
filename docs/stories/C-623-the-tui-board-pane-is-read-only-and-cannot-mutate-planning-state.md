@@ -17,9 +17,9 @@ Keep the board pane read-only. It renders planning state and never mutates it.
 
 ## Acceptance
 
-- [ ] No interaction in the board pane changes an item's status, priority, or any other planning field.
-- [ ] Status changes remain the Board CLI's responsibility, which validates the transition; the pane offers no bypass.
-- [ ] Failing first: a test drives every board-pane interaction and asserts the board revision is unchanged afterwards.
+- [x] No interaction in the board pane changes an item's status, priority, or any other planning field.
+- [x] Status changes remain the Board CLI's responsibility, which validates the transition; the pane offers no bypass.
+- [x] Failing first: a test drives every board-pane interaction and asserts the board revision is unchanged afterwards.
 
 ## Notes
 

@@ -11,6 +11,7 @@ use std::str::Chars;
 use std::sync::Arc;
 
 use anyhow::Result;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -413,6 +414,96 @@ impl OperationsState {
             .clone();
         Some((decision.decision_ref.clone(), option))
     }
+
+    /// Route one key while the overlay is open, returning what the event loop still owes.
+    ///
+    /// Every effect on presentation state is applied here; the returned command is the only way an
+    /// interaction reaches the [`FleetBoardSource`], and [`OperationsCommand::Decide`] is the only
+    /// variant that reaches a write. Routing lives beside the state rather than inline in the
+    /// terminal event loop so the Board pane's read-only invariant (C-623) is drivable by a test.
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> OperationsCommand {
+        match key.code {
+            KeyCode::Esc if self.confirm_decision => self.confirm_decision = false,
+            KeyCode::Esc if self.detail_open => {
+                self.detail_open = false;
+                self.confirm_decision = false;
+            }
+            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
+                self.open = false;
+                self.detail_open = false;
+                self.confirm_decision = false;
+            }
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                let tab = self.tab.cycle(-1);
+                self.select_tab(tab);
+            }
+            KeyCode::Tab => {
+                let tab = self.tab.cycle(1);
+                self.select_tab(tab);
+            }
+            KeyCode::Char('1') => self.select_tab(OperationsTab::Overview),
+            KeyCode::Char('2') => self.select_tab(OperationsTab::Board),
+            KeyCode::Char('3') => self.select_tab(OperationsTab::Workers),
+            KeyCode::Char('4') => self.select_tab(OperationsTab::Decisions),
+            KeyCode::Char('5') => self.select_tab(OperationsTab::Stats),
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::Left if self.detail_open && self.tab == OperationsTab::Decisions => {
+                self.decision_option = self.decision_option.saturating_sub(1);
+                self.confirm_decision = false;
+            }
+            KeyCode::Right if self.detail_open && self.tab == OperationsTab::Decisions => {
+                let options = self
+                    .selected_decision()
+                    .map_or(0, |decision| decision.options.len());
+                self.decision_option = (self.decision_option + 1).min(options.saturating_sub(1));
+                self.confirm_decision = false;
+            }
+            KeyCode::Enter if self.detail_open && self.tab == OperationsTab::Decisions => {
+                if let Some((decision_ref, outcome)) = self.confirm_selected_decision() {
+                    return OperationsCommand::Decide {
+                        decision_ref,
+                        outcome,
+                    };
+                }
+            }
+            KeyCode::Enter => self.detail_open = true,
+            KeyCode::Char('r') => return OperationsCommand::Refresh,
+            _ => {}
+        }
+        OperationsCommand::None
+    }
+
+    /// Route one mouse event while the overlay is open. Scrolling moves the selection and nothing
+    /// else, so no mouse interaction on any tab can ask for a mutation.
+    pub(crate) fn handle_mouse(&mut self, kind: MouseEventKind) {
+        match kind {
+            MouseEventKind::ScrollUp => self.move_selection(-1),
+            MouseEventKind::ScrollDown => self.move_selection(1),
+            _ => {}
+        }
+    }
+}
+
+/// What an overlay interaction still owes the event loop once surface state is updated.
+///
+/// The Board pane can only ever produce [`Self::None`] or [`Self::Refresh`] — both reads. A status,
+/// priority or any other planning field changes through the Board CLI, which validates the
+/// transition; the surface offers no bypass.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum OperationsCommand {
+    /// Surface-local state changed; nothing durable to do.
+    #[default]
+    None,
+    /// Re-read the durable projection.
+    Refresh,
+    /// A twice-confirmed Board decision — the overlay's single durable write.
+    Decide {
+        decision_ref: String,
+        outcome: String,
+    },
 }
 
 /// Terminal rows one collapsed Board box occupies: top border, one content row, bottom border.
@@ -1907,5 +1998,135 @@ mod tests {
         let deep_text = pane_text(&deep);
         assert!(deep_text.contains("item 0800"), "{deep_text}");
         assert!(!deep_text.contains("item 0000"), "{deep_text}");
+    }
+
+    /// A board carrying work in every status *and* an open decision, so the single mutation the
+    /// overlay owns is genuinely reachable — from the Decisions tab. The Board pane must not be
+    /// able to spend it.
+    fn read_only_snapshot() -> FleetBoardSnapshot {
+        let mut value = grouped_board_snapshot();
+        let decisions = attention_snapshot().decisions;
+        value.decisions_total = decisions.len();
+        value.decisions = decisions;
+        value
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Every key the Board pane can receive: its own bindings, the overlay bindings reachable while
+    /// it is focused, and every printable character a future binding might claim.
+    fn board_pane_keys() -> Vec<KeyEvent> {
+        let mut keys: Vec<KeyEvent> = [
+            KeyCode::Up,
+            KeyCode::Down,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Backspace,
+            KeyCode::Delete,
+            KeyCode::Insert,
+            KeyCode::F(2),
+            KeyCode::F(5),
+        ]
+        .into_iter()
+        .map(key)
+        .collect();
+        keys.push(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        keys.extend((0x20u8..=0x7e).map(|byte| key(KeyCode::Char(char::from(byte)))));
+        keys
+    }
+
+    /// C-623: the Board pane is read-only. Every interaction it accepts, driven through the same
+    /// routing the event loop uses, leaves planning state untouched: no command that reaches
+    /// [`FleetBoardSource`]'s one mutation, and an unchanged snapshot — same revision, same status
+    /// and priority on every item. Status transitions stay the Board CLI's, which validates them.
+    #[test]
+    fn no_board_pane_interaction_mutates_planning_state() {
+        let before = read_only_snapshot();
+
+        for detail_open in [false, true] {
+            for event in board_pane_keys() {
+                let mut state = OperationsState::new(before.clone());
+                state.open = true;
+                state.select_tab(OperationsTab::Board);
+                state.selected = 1;
+                state.detail_open = detail_open;
+                // Pre-arm the confirmation the Decisions tab spends on its second Enter: the Board
+                // pane must not be a second, unvalidated way to spend it.
+                state.confirm_decision = true;
+
+                let command = state.handle_key(event);
+
+                assert!(
+                    !matches!(command, OperationsCommand::Decide { .. }),
+                    "board pane key {event:?} requested a planning mutation"
+                );
+                assert_eq!(
+                    state.snapshot, before,
+                    "board pane key {event:?} changed planning state"
+                );
+            }
+        }
+
+        // The same keys as one uninterrupted session, plus the pane's mouse interactions. A
+        // tab-switching key leaves the pane, so return to it and keep going.
+        let mut state = OperationsState::new(before.clone());
+        state.open = true;
+        state.select_tab(OperationsTab::Board);
+        for event in board_pane_keys() {
+            let command = state.handle_key(event);
+            assert!(
+                !matches!(command, OperationsCommand::Decide { .. }),
+                "board pane key {event:?} requested a planning mutation"
+            );
+            state.open = true;
+            if state.tab != OperationsTab::Board {
+                state.select_tab(OperationsTab::Board);
+            }
+            state.handle_mouse(MouseEventKind::ScrollDown);
+            state.handle_mouse(MouseEventKind::ScrollUp);
+            state.handle_mouse(MouseEventKind::Moved);
+            assert_eq!(
+                state.snapshot, before,
+                "board pane interaction {event:?} changed planning state"
+            );
+        }
+        assert_eq!(state.snapshot.revision, before.revision);
+    }
+
+    /// The negative control for the invariant above: the same driver does observe the overlay's one
+    /// mutation where it legitimately lives — the Decisions tab, after an explicit second Enter.
+    #[test]
+    fn the_decisions_tab_still_reaches_the_one_confirmed_mutation() {
+        let mut state = OperationsState::new(read_only_snapshot());
+        state.open = true;
+        state.select_tab(OperationsTab::Decisions);
+
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            OperationsCommand::None
+        );
+        assert!(state.detail_open);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            OperationsCommand::None
+        );
+        assert!(state.confirm_decision);
+        assert_eq!(
+            state.handle_key(key(KeyCode::Enter)),
+            OperationsCommand::Decide {
+                decision_ref: "workspace/D-7".into(),
+                outcome: "strict".into(),
+            }
+        );
     }
 }

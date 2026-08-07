@@ -339,6 +339,11 @@ flux fleet handoff wave-7 api/C-41 --commit FULL_SHA \
   --failing-before --passing-after --summary "Implemented the accepted contract" --output json
 ```
 
+`--from-worktree` replaces the repeated `--write-set` when the commit range already proves it: the
+host derives the write set from `base..HEAD` in the story worktree, and the owning worker from the
+agent that wave assigned to that worktree. Neither recorded fact is retyped, so neither can be
+mistyped.
+
 ## Review and bounded rework
 
 A fresh read-only reviewer inspects the exact handoff commit. Findings are structured path/line,
@@ -474,6 +479,51 @@ retained with the reason, and a branch is deleted only when git agrees it holds 
 A wave that can still advance is refused rather than reclaimed: deleting a build it is about to use
 would cost work rather than space.
 
+## Repairing a wave's structure
+
+Reclamation, a hand-deleted directory or an interrupted assembly can leave a wave whose topology names
+a worktree disk no longer has, or whose integration checkout sits somewhere other than the base it is
+pinned to. Both are mechanical to fix from records the fleet already holds — the source checkout, the
+branch, the pinned base — and both were previously hand-written `git` under pressure.
+
+```sh
+flux fleet repair wave-7 --dry-run --output json   # what it would rebuild
+flux fleet repair wave-7 --output json
+```
+
+A missing checkout is recreated on its **recorded branch**, so a worker's committed work comes back
+with it; only a branch that is gone too is created afresh at the pinned base. A derived worktree — the
+integration assembly and the pinned verification checkout — is put back on its base when it has
+drifted off. A story worktree is never rewound: its commits are the deliverable, and being ahead of the
+base is its correct state.
+
+Repair refuses anything that would discard work and reports the reason instead of acting: a worktree
+holding an uncommitted change, one git cannot inspect, and one sitting on the commit its gate recorded
+as the candidate. An applied or cancelled wave is refused outright, because its worktrees are gone on
+purpose.
+## Parking a wave
+
+Some waves have to wait for a human — an open question, an unavailable dependency, a review that has
+not happened. `park` records that pause on the wave itself, with the reason and the state the wave
+returns to.
+
+```sh
+flux fleet park wave-7 --reason "waiting on the API decision" --output json
+flux fleet status --output json          # the pause and its reason are on the wave row
+flux fleet unpark wave-7 --output json   # back to the state it held
+```
+
+Parking is a lifecycle state, not an annotation. `fleet status` reports the reason on the wave row in
+both its JSON and human forms, so a paused wave is legible without reading durable state and nothing
+re-decides it every minute; `unpark` restores the recorded previous status, so leaving the pause is a
+verb rather than an edit. A wave parked by exhausted rework rounds carries no recorded previous
+status and returns to `awaiting-handoffs`.
+
+Parking never overwrites an existing reason: a second `park` is a `conflict/precondition`, as is
+unparking a wave that is not parked. A parked wave is not counted as requiring attention — the
+decision to pause has already been made — and its build output stays reclaimable, because its commits
+live on branches.
+
 ## Restart and resume
 
 The durable state/event log pins board revisions, source commits, write sets, worktrees, sessions,
@@ -489,6 +539,32 @@ flux fleet stop --output json
 ```
 
 Status has an independent read lane, so a busy or stuck worker cannot make fleet inspection hang.
+
+Resume is addressed. Each pending item records the agent it was sent to — coordinator intake and
+tasks belong to `main`, a message belongs to the worker it names — and a resumed agent is asked to
+continue its own assignment plus the items addressed to it and nothing else. Resuming a worker
+therefore neither shows nor acknowledges the coordinator's queue, so every item is still delivered at
+most once, to the agent it was addressed to.
+### Quiescing before an install
+
+Installing a new Flux binary while a wave is in flight is the one maintenance act that can corrupt a
+run in progress. `fleet quiesce` makes it a verb instead of a procedure.
+
+```sh
+flux fleet quiesce --reason "install 0.9.0" --output json
+flux fleet resume --output json
+```
+
+`quiesce` records a durable maintenance window on fleet state and then reports what is still moving.
+The window is recorded first and unconditionally: `run`, `spawn` and `task` refuse while it is set,
+so no wave can be dispatched between the check and the install. The command itself **fails** with
+`conflict/precondition` while any worker turn is still in flight, naming each one, so
+`flux fleet quiesce && install` cannot walk past a live worker. Re-run it once they settle to
+confirm; `data.safe_to_install` is the machine-readable form of that confirmation.
+
+Inspection, `handoff`, `integrate`, `apply` and `reclaim` stay available while quiesced — the window
+stops new work, it does not blindfold the operator. `fleet status` reports the window under
+`quiesce`, and only `fleet resume` lifts it.
 
 `status` and `dashboard` are bounded projections, not a dump of durable state. They report main
 state, active and attention worker counts, wave and item state, exact board references,
@@ -517,6 +593,8 @@ flux fleet inspect result api/C-41 --limit 100 --output json
 flux fleet inspect activity --limit 100 --output json
 flux fleet inspect worktree worker-1 --limit 100 --output json
 flux fleet inspect integration wave-7 --limit 100 --output json
+flux fleet inspect gate wave-7 --limit 100 --output json
+flux fleet inspect gate wave-7 --repository api --limit 100 --output json
 flux fleet inspect source api --limit 100 --output json
 flux fleet inspect search C-41 --limit 100 --output json
 flux fleet inspect story api/C-41 --limit 100 --output json
@@ -528,6 +606,14 @@ flux fleet dashboard --output json
 `flux fleet agents` lists every durable worker as a bounded summary: id, role, task kind, status,
 Board ref, wave, session and resolved loop identity. It never returns worker instructions or full
 historical turn receipts; use a targeted inspect view when deeper evidence is needed.
+
+`flux fleet inspect gate <wave>` answers the most-wanted question about a red wave — *why did the gate
+fail* — without knowing the shape of `state.json`. It returns each repository's gate status,
+candidate, argv, exit code and the gate's own captured `stdout`/`stderr`, **tail first**: the last
+line the gate wrote is the first line reported, because that is where the failure is and a gate log
+is far longer than any bound. Each stream reports `line_count` and `truncated`, so a bounded tail is
+never mistaken for a short log. `--repository <id>` narrows a multi-repository wave to one gate, and
+a gate that never ran reports its `reason` instead of evidence.
 
 `flux fleet status` and `dashboard` use the same bounded operational projection. They report current
 coordinator, worker, wave, Board-ref, session, repository and attention state without copying
