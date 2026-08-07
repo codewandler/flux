@@ -1691,7 +1691,16 @@ async fn resolve_selected_execution_system(
         flux_server::system::connect_remote_system(endpoint, token, &private_net).await
     }
     .with_context(|| format!("connect remote execution system `{endpoint}`"))?;
-    record_ephemeral_remote(hosts, endpoint, &flags.remote_token_env);
+    let session_ca = flags
+        .remote_ca
+        .as_deref()
+        .map(|path| path.to_string_lossy());
+    record_ephemeral_remote(
+        hosts,
+        endpoint,
+        &flags.remote_token_env,
+        session_ca.as_deref(),
+    );
     Ok(Some(SelectedSubstrate {
         binding: "@session/remote".to_string(),
         system: Some(Arc::new(remote)),

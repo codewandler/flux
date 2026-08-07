@@ -1872,7 +1872,7 @@ impl HttpDelegate {
             .bearer_auth(&token)
             .send()
             .await
-            .map_err(|error| Error::Other(format!("remote-system handshake: {error}")))?
+            .map_err(|error| Error::Other(format!("remote-system handshake: {}", causes(&error))))?
             .error_for_status()
             .map_err(|error| Error::Other(format!("remote-system handshake: {error}")))?
             .json::<SystemHandshake>()
@@ -2550,6 +2550,28 @@ impl WsTransport {
     }
 }
 
+/// Render a transport error together with its cause chain.
+///
+/// `reqwest::Error`'s own `Display` stops at "error sending request for url (…)" — the one thing
+/// the operator already knows. *Why* it could not be sent (an unknown issuer, a bad signature, a
+/// name that does not match the SAN) lives in `source()`, so a refusal that does not walk the chain
+/// cannot name the TLS failure it is refusing on. C-684 requires that it does: "could not connect"
+/// and "this certificate does not chain to the CA you declared" call for completely different
+/// actions, and only the second one is true.
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        let text = cause.to_string();
+        if !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        next = cause.source();
+    }
+    rendered
+}
+
 fn websocket_connector(ca_pem: Option<&[u8]>) -> Result<tokio_tungstenite::Connector> {
     use rustls::pki_types::{pem::PemObject, CertificateDer};
 
@@ -2676,6 +2698,35 @@ pub async fn probe_remote_system(
 ) -> Result<SystemHandshake> {
     let (_delegate, handshake) = HttpDelegate::connect(endpoint, token, private_net).await?;
     Ok(handshake)
+}
+
+/// Perform the identity handshake while trusting an operator-supplied private CA certificate —
+/// the CA-aware twin of [`probe_remote_system`], and the seam `flux host probe` needs so that
+/// probing a binding and *selecting* it make the same trust decision. Without it a binding could
+/// only be verified against the public trust store it does not use.
+pub async fn probe_remote_system_with_ca_pem(
+    endpoint: &str,
+    token: String,
+    private_net: &flux_system::net::PrivateNetAllow,
+    ca_pem: &[u8],
+) -> Result<SystemHandshake> {
+    let (_delegate, handshake) =
+        HttpDelegate::connect_with_ca_pem(endpoint, token, private_net, ca_pem).await?;
+    Ok(handshake)
+}
+
+/// Check that `ca_pem` is usable as an additional trust anchor, without connecting to anything.
+///
+/// This runs exactly the two parsers the CA-aware client builds from — the HTTP client's root
+/// certificate and the WebSocket connector's root store — so it cannot drift from what a later
+/// connect would accept. It exists so a caller holding a *declared location* (a `[[host]]`
+/// binding's `ca_cert`) can refuse an unusable certificate where it still knows which binding and
+/// which file to name, instead of surfacing it as an anonymous connection failure.
+pub fn validate_ca_pem(ca_pem: &[u8]) -> Result<()> {
+    reqwest::Certificate::from_pem(ca_pem)
+        .map_err(|error| Error::Config(format!("remote-system CA certificate: {error}")))?;
+    websocket_connector(Some(ca_pem))?;
+    Ok(())
 }
 
 /// Connect while trusting an operator-supplied private CA certificate.
@@ -3157,6 +3208,133 @@ mod tests {
         .await
         .unwrap();
         (cert_pem, tls)
+    }
+
+    /// A loopback TLS server whose certificate **chains to a generated private CA**, rather than
+    /// being its own anchor. That is the shape an operator-managed deployment actually produces —
+    /// `deploy/vm/install-flux-system.sh` and `deploy/kubernetes/` both issue a leaf for the name
+    /// the client dials from a root the client is given separately — and it is the shape a trust
+    /// decision can be wrong about, because the leaf alone proves nothing.
+    ///
+    /// Returns the **CA's** PEM: the only certificate a client is ever handed, and the only one a
+    /// `[[host]]` binding names.
+    async fn private_ca_tls() -> (String, axum_server::tls_rustls::RustlsConfig) {
+        use rcgen::{
+            BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+        };
+        ensure_crypto_provider();
+
+        let mut ca_params = CertificateParams::default();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        ca_params
+            .distinguished_name
+            .push(DnType::CommonName, "flux test private CA");
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+
+        let leaf_params = CertificateParams::new(vec!["localhost".into()]).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let issuer = Issuer::from_params(&ca_params, &ca_key);
+        let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            format!("{}{ca_pem}", leaf_cert.pem()).into_bytes(),
+            leaf_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        (ca_pem, tls)
+    }
+
+    /// C-684: an endpoint whose certificate chains to an operator-managed private CA is reachable
+    /// when — and only when — that CA is the one declared.
+    ///
+    /// Both faces are asserted against the same running endpoint, because either alone is
+    /// worthless. Accepting the declared CA is only trust if a *different* CA still fails, and a
+    /// failure is only meaningful if the endpoint would otherwise have been reachable. The third
+    /// assertion closes the loop from the other side: with no CA declared at all, the public trust
+    /// store refuses this endpoint — so the success above is the declared anchor doing the work,
+    /// not an unconditional acceptance hiding in the client.
+    ///
+    /// Both client seams are covered, because `flux host probe` and substrate *selection* are
+    /// separate entry points into the same trust decision and a binding must not be able to probe
+    /// green and then select against the default trust store.
+    #[tokio::test]
+    async fn a_declared_private_ca_admits_an_endpoint_and_a_foreign_ca_is_refused() {
+        let (root, system) = workspace_system("remote-private-ca");
+        let (ca_pem, tls) = private_ca_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+        let endpoint = format!("https://localhost:{}", address.port());
+        let private_net = PrivateNetAllow::from_hosts(["localhost".into()]);
+
+        // Face one, the probe seam: the declared CA admits the endpoint and the handshake completes.
+        let handshake = probe_remote_system_with_ca_pem(
+            &endpoint,
+            "test-token".into(),
+            &private_net,
+            ca_pem.as_bytes(),
+        )
+        .await
+        .expect("an endpoint chaining to the declared private CA is reachable");
+        assert_eq!(handshake.protocol_version, PROTOCOL_VERSION);
+
+        // Face one, the selection seam: the same anchor installs a live substrate.
+        let remote = connect_remote_system_with_ca_pem(
+            &endpoint,
+            "test-token".into(),
+            &private_net,
+            ca_pem.as_bytes(),
+        )
+        .await
+        .expect("selection composes the same CA-aware client");
+        assert!(
+            flux_system::port::ExecutionIdentity::substrate_identity(&remote).remotely_reported,
+            "a selected remote substrate reports its identity as remotely observed"
+        );
+
+        // Face two: a different private CA does not chain. The refusal names the TLS failure
+        // itself — never a downgrade to the default store, and there is no flag anywhere that
+        // would make this pass.
+        let (foreign_ca, _unused) = private_ca_tls().await;
+        let message = probe_remote_system_with_ca_pem(
+            &endpoint,
+            "test-token".into(),
+            &private_net,
+            foreign_ca.as_bytes(),
+        )
+        .await
+        .expect_err("a certificate that does not chain to the declared CA must be refused")
+        .to_string();
+        assert!(
+            message.contains("invalid peer certificate"),
+            "the refusal must name the TLS failure, not just 'could not send a request': {message}"
+        );
+
+        // And the endpoint really was unreachable without the declaration — this is the gap a
+        // named binding could not close before C-684.
+        let undeclared = probe_remote_system(&endpoint, "test-token".into(), &private_net)
+            .await
+            .expect_err("a private-CA endpoint is not publicly trusted")
+            .to_string();
+        assert!(
+            undeclared.contains("invalid peer certificate"),
+            "without a declared CA the public trust store refuses it: {undeclared}"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
     }
 
     /// Serve a router over TLS on a fresh loopback port; abort the handle to stop it. The router is

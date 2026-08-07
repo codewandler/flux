@@ -160,6 +160,16 @@ pub struct HostRef {
     /// Where the credential lives — a *reference*, never a value. `None` for unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<Ref>,
+    /// Where the private CA certificate this binding trusts lives — a filesystem *location*, never
+    /// the certificate itself (C-684). `None` means ordinary public trust.
+    ///
+    /// This is deliberately not a [`Ref`]: a CA certificate is **public** material, so it is not
+    /// addressed through the secret schemes and it is never redacted. What it shares with
+    /// `credential_ref` is the discipline that matters here — the binding declares a location and
+    /// resolution validates it, so a binding is inert until something reads what it points at, and
+    /// an unusable anchor fails closed instead of quietly reverting to the default trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
     /// The surface classes granted to select this binding (Decision 0018 rule 4). Empty means
     /// deny: the binding is listable and probeable but selects for nobody.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -178,6 +188,7 @@ impl HostRef {
             url: None,
             source: HostSource::Config,
             credential_ref: None,
+            ca_cert: None,
             grant: Vec::new(),
             labels: BTreeMap::new(),
         }
@@ -330,6 +341,35 @@ mod tests {
             serde_json::from_str::<HostRef>(&json).unwrap(),
             reference,
             "the binding round-trips"
+        );
+    }
+
+    /// C-684: a binding can declare the private CA its endpoint chains to, and what it declares is
+    /// a *location*. The field is absent from a binding that does not use it, so an existing store
+    /// round-trips byte-identically and an operator reading `flux host ls --output json` can tell
+    /// "public trust" from "an anchor was declared" — the distinction the resolution paths act on.
+    #[test]
+    fn a_binding_declares_its_private_ca_as_a_location() {
+        let reference = HostRef {
+            url: Some("https://guest.internal:8790".into()),
+            credential_ref: Some(Ref::env("GUEST_TOKEN")),
+            ca_cert: Some("/etc/flux/ca.pem".into()),
+            ..HostRef::declared("vm-guest", HostBackend::Microvm)
+        };
+        let json = serde_json::to_string(&reference).unwrap();
+        assert!(json.contains("/etc/flux/ca.pem"), "{json}");
+        assert!(
+            !json.contains("BEGIN CERTIFICATE"),
+            "the binding names where the certificate is, never carries it: {json}"
+        );
+        assert_eq!(serde_json::from_str::<HostRef>(&json).unwrap(), reference);
+
+        // Public trust stays the unstated default: no key at all, not an empty one.
+        let plain = HostRef::declared("farm", HostBackend::Remote);
+        assert!(plain.ca_cert.is_none());
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("ca_cert"),
+            "an undeclared anchor is absent from the persisted form"
         );
     }
 

@@ -42,6 +42,28 @@ The token is never a command-line argument, so it cannot be read out of a proces
 refuses to start on an empty one: a guest whose operator has not delivered a secret yet fails closed
 rather than serving unauthenticated.
 
+## Trusting the guest's certificate
+
+`/etc/flux/tls/tls.crt` is normally issued by your own CA, not a public one, so a client has to be
+told which CA to trust. A named binding takes that CA directly, which is how the guest becomes
+reachable as `--host vm-guest` rather than only as `--remote … --remote-ca`:
+
+```toml
+[[host]]
+id = "vm-guest"
+backend = "microvm"
+url = "https://guest.internal:8790"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+ca_cert = "/etc/flux/guest-ca.pem"
+grant = ["operator"]
+```
+
+`ca_cert` is the path to the CA certificate **on the client machine** — a location, not the
+certificate itself, and not a secret. `flux host probe vm-guest` verifies the guest against it and
+reports the negotiated protocol version. An unreadable or malformed certificate refuses the binding
+and names it; nothing falls back to the public trust store, and no flag relaxes that. See
+[Host bindings](../../website/docs/reference/config.md#host-bindings-host).
+
 ## The sandbox floor
 
 This profile does **not** pass `--no-sandbox`, and that is the substantive reason to run a guest
