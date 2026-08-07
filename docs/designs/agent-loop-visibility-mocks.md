@@ -28,7 +28,10 @@ records a *different* run; nothing regenerates that file.
 ## The recommendation
 
 ```text
-BUILD THE AXES, AND SHIP THESE DEFAULTS: depth ALL · condense ON · pane OFF.
+BUILD THE AXES, AND SHIP THESE DEFAULTS: depth ALL · condense UNIFORM · pane OFF.
+A-137 took section 2's fourth decision: condensing is THREE-VALUED (off / uniform / top-level),
+because one bit cannot express it. UNIFORM is the default — top-level withholds every
+non-focused turn's interior, which is more, not less.
 Do not adopt a picture. And do not expect the axes to give you mock 3 — they do not, and section 2
 is the measurement that says so.
 
@@ -58,6 +61,18 @@ a depth limit and an optional pane IS the split'.
    step PLUS THE FOCUSED TOP-LEVEL STEP'S ENTIRE SUBTREE — including that subtree's COMPLETED work,
    which condensing by definition folds away. So the rail discriminates on FOCUS and condensing
    discriminates on STATUS. With one root the two rules coincide; with nine turns they cannot.
+
+   ⚠⚠ A-137 TOOK THAT DECISION, AND IT PARTLY CLOSES THIS GAP. Condensing is now three-valued and
+   `top-level` IS the rail's rule. Re-measured over the same envelope:
+     fan-out (hand-authored, 0 failures)   42 eligible viewports, 36 reproduced by top-level
+     long run (recorded, 9 turns, 1 failure) 24 eligible viewports,  0 reproduced by top-level
+   So the split is reachable after all — on a run with no failure in it. On RECORDED load it is
+   still not, and the salient difference is that one recorded `git_stage` error: `condensable`
+   refuses to fold a subtree holding a failure, so the root the rail would fold to a single row
+   stays open. ⚠ That mechanism is the LEADING CANDIDATE, not a measured cause — the numbers are
+   pinned by `top_level_condensing_reaches_the_split_only_on_a_run_without_a_failure`, the mechanism
+   is not. Either way the useful reading is that on real load the acceptance criterion 'condensing
+   never swallows a failure' and the split's rail are in tension, and the acceptance wins.
 
    ⚠ WHAT A-137 ACTUALLY OWES, THEN: not a fourth picture but a fourth DECISION — condensing's
    GRANULARITY. 'Finished work collapses to one row' does not say at what level, and the answer
@@ -1365,16 +1380,18 @@ A-144 drew five layouts and A-145 re-checked them against a real recorded run. A
 |---|---|---|
 | `depth ∞ · condense off · pane off` | 40×6 | **the flat thread's view** (and the tree's, on a real run) — exactly |
 | `depth ∞ · condense off · pane on` | 64×10 | the split *only* where the split hides nothing |
-| `depth ∞ · condense on · pane off` | 40×6 | **the recommended default** |
-| `depth ∞ · condense on · pane on` | 64×10 | — |
+| `depth ∞ · condense uniform · pane off` | 40×6 | **the recommended default** |
+| `depth ∞ · condense uniform · pane on` | 64×10 | — |
 | `depth 3 · condense off · pane off` | 40×6 | — |
 | `depth 3 · condense off · pane on` | 64×10 | — |
-| `depth 3 · condense on · pane off` | 40×6 | — |
-| `depth 3 · condense on · pane on` | 64×10 | — |
+| `depth 3 · condense uniform · pane off` | 40×6 | — |
+| `depth 3 · condense uniform · pane on` | 64×10 | — |
 | `depth 1 · condense off · pane off` | 40×6 | — |
 | `depth 1 · condense off · pane on` | 64×10 | — |
-| `depth 1 · condense on · pane off` | 40×6 | — |
-| `depth 1 · condense on · pane on` | 64×10 | — |
+| `depth 1 · condense uniform · pane off` | 40×6 | — |
+| `depth 1 · condense uniform · pane on` | 64×10 | — |
+| `depth ∞ · condense top-level · pane off` | 40×6 | the rail's *shape* — one row per finished top-level step, the focused one in full |
+| `depth ∞ · condense top-level · pane on` | 64×10 | — |
 
 And separately, `depth 6 · condense off · pane off` reproduces **the nested tree** exactly, on every load case — 6 being `plan.rs`'s `MAX_TREE_DEPTH`, the bound mock 2 borrows from the live plan renderer.
 
@@ -1419,12 +1436,12 @@ The story's stated risk was that condensing would swallow it. On the real nine-t
 … 166 of 191 steps not shown
 ```
 
-### long run · `depth ∞ · condense on · pane off` · 100×28
+### long run · `depth ∞ · condense uniform · pane off` · 100×28
 
 **condense on (the default)** — six clean turns fold to a row each, **turn 7 refuses to fold because it holds a failure**, and `✗ → git_stage` is on screen with its clean sibling folded to `+2`.
 
 ```text
-◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense on · pane off recorded s_1477 @…
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense uniform · pane off recorded s_1…
 ↑ 6 above
 ├─ ✓ ✻ detect_intent                                                                            4.8s
 ├─ ✓ § explore                                                                                 47.5s
@@ -1562,12 +1579,12 @@ The three are independent: each is settable without the others and each changes 
 … 12 of 23 steps not shown
 ```
 
-### long run · depth ∞ · condense on · pane on · 100×28
+### long run · depth ∞ · condense uniform · pane on · 100×28
 
 **all three on.** The nearest point in the space to mock 3 — and, per section 2 of the recommendation, still not mock 3.
 
 ```text
-◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense on · pane on recorded s_1477 @ …
+◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · condense uniform · pane on recorded s_14…
 ↑ 6 above                                │ turn 9 › present_results
 ├─ ✓ ✻ detect_intent                4.8s │ ▶ ✻ present_results                                   2ms
 ├─ ✓ § explore                     47.5s │ started +1991.1s   in 17.3k · out 342 · cache 0
@@ -1601,7 +1618,7 @@ The three are independent: each is settable without the others and each changes 
 
 A-144 charged the split a 64×10 floor and recommended the flat thread as a separate sub-64-column fallback. The floor belongs to the **pane**: with it off, the same view draws at 40×6 — the lowest floor of the five. So the fallback is not a second layout, it is this layout with a toggle off.
 
-### `depth ∞ · condense on · pane off` · tidy · 40×6
+### `depth ∞ · condense uniform · pane off` · tidy · 40×6
 
 ```text
 ◆ docs gap audit, fix, commit, release …
@@ -1612,7 +1629,7 @@ A-144 charged the split a 64×10 floor and recommended the flat thread as a sepa
 … 16 of 18 steps not shown
 ```
 
-### `depth ∞ · condense on · pane off` · tidy · 52×20
+### `depth ∞ · condense uniform · pane off` · tidy · 52×20
 
 ```text
 ◆ docs gap audit, fix, commit, release · s_1477  de…
@@ -1636,15 +1653,15 @@ A-144 charged the split a 64×10 floor and recommended the flat thread as a sepa
 … 2 of 18 steps not shown
 ```
 
-### `depth ∞ · condense on · pane on` · tidy · 52×20
+### `depth ∞ · condense uniform · pane on` · tidy · 52×20
 
 ```text
-depth ∞ · condense on · pane on
+depth ∞ · condense uniform · pane on
 needs 64 cols
 have 52
 ```
 
-### `depth ∞ · condense on · pane on` · tidy · 64×10
+### `depth ∞ · condense uniform · pane on` · tidy · 64×10
 
 ```text
 ◆ docs gap audit, fix, commit, release · s_1477  depth ∞ · cond…

@@ -142,6 +142,7 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 
 ### Fleet harness throughput
 _Wave 1 closed the confidentiality holes. This wave is about the thing the operator originally asked_
+- [C-631 — flux fleet drive replaces the bash autopilot](C-631-flux-fleet-drive-replaces-the-bash-autopilot.md) · Core · the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged
 - [C-664 — cargo test --workspace --lib never tests flux-cli](C-664-cargo-test-workspace-lib-never-tests-flux-cli.md) · Core
 - [C-660 — fleet run returns as soon as workers are dispatched](C-660-fleet-run-returns-as-soon-as-workers-are-dispatched.md) · Core
 - [C-617 — Fleet reclaims wave storage and refuses to dispatch without disk headroom](C-617-fleet-reclaims-wave-storage-and-refuses-to-dispatch-without-disk-headroom.md) · Core
@@ -430,7 +431,6 @@ _Wave 1 closed the confidentiality holes. This wave is about the thing the opera
 - [C-628 — Typed cargo operations run offline by default in fenced worktrees](C-628-typed-cargo-operations-run-offline-by-default-in-fenced-worktrees.md) · Core · workers read crates.io DNS failures as test failures; CARGO_NET_OFFLINE cannot reach workers through SAFE_ENV; the exchange gate itself starts with cargo fetch --locked
 - [C-629 — Constrained board.transition and board.create become admitted operations](C-629-constrained-board-transition-and-board-create-become-admitted-operations.md) · Core · decision 0015 (roadmap) runs the planner host-side until these exist; direction-constrained transition (backlog->ready) plus create, both committing their writes
 - [C-630 — fleet integrate --only salvages the non-conflicting subset of a wave](C-630-fleet-integrate-only-salvages-the-non-conflicting-subset-of-a-wave.md) · Core · wave-346 parked whole while two of three stories were independently integrable
-- [C-631 — flux fleet drive replaces the bash autopilot](C-631-flux-fleet-drive-replaces-the-bash-autopilot.md) · Core · the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged
 - [C-632 — Every worker turn records usage, including failed turns](C-632-every-worker-turn-records-usage-including-failed-turns.md) · Core · no recent worker turn carries rounds or tokens; you cannot see how close a worker was to its round budget before it died; activity.ndjson has no timestamps, no turn id, and a proven torn write at line 556
 - [C-659 — Fleet state.json stops carrying every agent's last turn](C-659-fleet-state-json-stops-carrying-every-agent-s-last-turn.md) · Core · every fleet verb fully parses state.json; last_turn blobs accumulate per agent and nothing prunes them
 
@@ -517,7 +517,6 @@ _Debugging an agent today means reading a transcript after the fact and running 
 
 ### Recovery and inspection have no CLI, so every failure is hand-driven
 _The happy path has verbs. `fleet run`, `handoff`, `integrate`, `apply`, `reclaim` each do one thing well._
-- [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
 - [C-671 — A turn's evidence outlives the process that ran it](C-671-a-turn-s-evidence-outlives-the-process-that-ran-it.md) · Core · the receipt is written after the turn by the process that ran it, so a killed supervisor loses the commit sha, write set and test argv even though the commit landed
 
 ### Release trust residuals — 2026-08-04
@@ -1176,6 +1175,7 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-651 — Sandboxed is a selectable peer backend](C-651-sandboxed-is-a-selectable-peer-backend.md) · Core · Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a spawn-time modifier; codegate census entry under review
 - [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
 - [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
+- [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

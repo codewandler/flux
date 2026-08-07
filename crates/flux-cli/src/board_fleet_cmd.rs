@@ -5582,14 +5582,35 @@ worktree_root = ".flux/fleet/worktrees"
                         }
                     }
                 }
+                // C-670: this is where the loop used to end. Every worker completed, the wave went to
+                // `awaiting-handoffs`, and nothing in the fleet could invoke the verb that leaves that
+                // state — so the wave waited for a human who, on the night this was found, was not
+                // there. Recording now, from the worktrees the turns just finished in, is what makes a
+                // wave able to advance on its own.
+                let handoffs = record_provisional_handoffs(&mut state, &wave);
+                let handed_off = handoffs
+                    .iter()
+                    .filter(|report| report["recorded"] == json!(true))
+                    .count();
                 if let Some(record) = state.waves.get_mut(&wave) {
-                    record["status"] = json!(if errors.is_empty() {
+                    let outstanding = record["topology"]["repositories"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|repository| {
+                            repository["stories"].as_array().into_iter().flatten()
+                        })
+                        .any(|story| story["status"].as_str() != Some("handoff-accepted"));
+                    record["status"] = json!(if !errors.is_empty() {
+                        "agent-turn-failed"
+                    } else if outstanding {
                         "awaiting-handoffs"
                     } else {
-                        "agent-turn-failed"
+                        "handoffs-ready"
                     });
                     record["agent_turns"] = json!(receipts);
                     record["agent_errors"] = json!(errors);
+                    record["provisional_handoffs"] = json!(handoffs);
                 }
                 state.revision += 1;
                 persist_fleet_mutation(
@@ -5611,8 +5632,11 @@ worktree_root = ".flux/fleet/worktrees"
                     )
                 }
                 return Ok((
-                    format!("{wave} agents completed; handoffs required"),
-                    json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "completed", "topology": topology, "receipts": receipts}),
+                    format!(
+                        "{wave} agents completed; {handed_off} of {} handed off provisionally",
+                        handoffs.len()
+                    ),
+                    json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "completed", "topology": topology, "receipts": receipts, "handoffs": handoffs}),
                     vec![],
                     state.revision,
                 ));
@@ -15271,6 +15295,166 @@ fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
     }))
 }
 
+/// Verify that a commit really is what a story worktree delivered, and return its observed write set.
+///
+/// Extracted so the operator-driven handoff and the provisional one recorded when a turn ends
+/// (`C-670`) prove the *same* git facts. Two copies would drift, and the copy that drifted would be
+/// the automatic one — the one nobody reads until a wave has already been assembled from it.
+///
+/// This is deliberately only the git half. Targeted validation evidence is the operator's claim and
+/// stays in `fleet_handoff`, which is exactly what makes a provisional record weaker and why it is
+/// marked as such rather than quietly presented as the same thing.
+fn verify_story_commit(
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+    commit: &str,
+) -> Result<Vec<String>> {
+    let resolved = git_output(
+        worktree,
+        &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+    )
+    .context("validation/gate: handoff commit does not exist")?;
+    if resolved != commit {
+        bail!("input/schema: handoff commit must be the full exact object id {resolved}")
+    }
+    if git_output(worktree, &["rev-parse", "HEAD"]).as_deref() != Some(commit) {
+        bail!("conflict/precondition: handoff commit is not the story worktree HEAD")
+    }
+    if git_output(worktree, &["rev-parse", branch]).as_deref() != Some(commit) {
+        bail!("conflict/precondition: handoff branch does not point at the exact commit")
+    }
+    let ancestor = guarded_git(worktree, &["merge-base", "--is-ancestor", base, commit])?;
+    if ancestor.exit_code != 0 {
+        bail!("conflict/precondition: handoff commit does not descend from its pinned wave base")
+    }
+    if git_output(worktree, &["status", "--porcelain"])
+        .is_some_and(|status| !worker_dirt(&status).is_empty())
+    {
+        bail!(
+            "conflict/precondition: story worktree is dirty at handoff: {}",
+            worker_dirt(&git_output(worktree, &["status", "--porcelain"]).unwrap_or_default())
+                .join(", ")
+        )
+    }
+    diff_write_set(worktree, base, commit)
+}
+
+/// Turn every finished worker turn in a wave into a handoff, so the wave advances with nobody
+/// watching.
+///
+/// C-670. `handoff-accepted` used to be reachable only from the CLI verb, and no agent in the fleet
+/// could invoke it: the worker holds no fleet operations, the coordinator's native operation set has
+/// no `fleet.handoff`, and the integrator's `fleet.integrate` refuses until every story is already
+/// accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human could move it.
+/// Ten workers once ended their turns and left nine commits the fleet never recorded.
+///
+/// What is recorded here is **provisional**: the git facts are proved by the same
+/// [`verify_story_commit`] the operator path uses, but there is no targeted validation evidence,
+/// because a turn that has already ended cannot be asked to cite the argv it ran. That is why the
+/// entry says so. Integration still runs the repository's full gate, which is what actually decides
+/// whether the wave is green — a provisional handoff moves work forward, it does not bless it.
+///
+/// This can never fail the wave. Every refusal becomes a recorded reason on the story, because a
+/// wave that dies during bookkeeping is strictly worse than one that reports what it could not do.
+fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Value> {
+    let Some(record) = state.waves.get(wave_id).cloned() else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    let repositories = record["topology"]["repositories"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for (repository_index, repository) in repositories.iter().enumerate() {
+        let stories = repository["stories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for (story_index, story) in stories.iter().enumerate() {
+            let item = story["board_ref"].as_str().unwrap_or_default().to_string();
+            if story["status"].as_str() == Some("handoff-accepted") {
+                continue;
+            }
+            let (Some(worktree), Some(branch), Some(base)) = (
+                story["worktree"].as_str(),
+                story["branch"].as_str(),
+                story["base_commit"].as_str(),
+            ) else {
+                reports.push(json!({"item": item, "recorded": false, "reason": "story assignment is incomplete"}));
+                continue;
+            };
+            let worktree_path = PathBuf::from(worktree);
+            // Same resolution as the operator path: the worktree disambiguates an item that more than
+            // one wave has attempted.
+            let Some((worker, agent)) = state.agents.iter().find(|(_, agent)| {
+                agent["board_ref"].as_str() == Some(item.as_str())
+                    && agent["assignment"]["worktree"].as_str() == Some(worktree)
+            }) else {
+                reports.push(json!({"item": item, "recorded": false, "reason": "no worker records this worktree"}));
+                continue;
+            };
+            let worker = worker.clone();
+            let session = agent["session"].as_str().unwrap_or_default().to_string();
+            let Some(commit) = git_output(&worktree_path, &["rev-parse", "HEAD"]) else {
+                reports.push(json!({"item": item, "worker": worker, "recorded": false, "reason": "worktree HEAD could not be read"}));
+                continue;
+            };
+            // A turn that produced nothing is a fact worth recording. Silence here is what made an
+            // empty worker indistinguishable from an unrecorded one.
+            if commit == base {
+                reports.push(json!({"item": item, "worker": worker, "recorded": false, "reason": "turn ended at the pinned base with no commit"}));
+                continue;
+            }
+            let observed = match verify_story_commit(&worktree_path, branch, base, &commit) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    reports.push(json!({"item": item, "worker": worker, "recorded": false, "reason": redact(&error.to_string())}));
+                    continue;
+                }
+            };
+            let entry = json!({
+                "schema": "flux.fleet-handoff/v1",
+                "board_ref": item,
+                "worker": worker,
+                "session": session,
+                "worktree": display_path(&worktree_path),
+                "branch": branch,
+                "commit": commit,
+                "write_set": observed,
+                "test_argv": [],
+                "failing_before": Value::Null,
+                "passing_after": Value::Null,
+                "summary": "recorded from the worker's worktree when its turn ended",
+                "status": "accepted",
+                "provisional": true,
+            });
+            if let Some(story) = state.waves.get_mut(wave_id).and_then(|record| {
+                record["topology"]["repositories"]
+                    .get_mut(repository_index)
+                    .and_then(|repository| repository["stories"].get_mut(story_index))
+            }) {
+                if !story["handoffs"].is_array() {
+                    story["handoffs"] = json!([]);
+                }
+                if let Some(handoffs) = story["handoffs"].as_array_mut() {
+                    handoffs.push(entry.clone());
+                }
+                story["handoff"] = entry.clone();
+                story["status"] = json!("handoff-accepted");
+            }
+            if let Some(agent) = state.agents.get_mut(&worker) {
+                agent["status"] = json!("handoff-accepted");
+                agent["commit"] = json!(commit);
+            }
+            reports.push(
+                json!({"item": item, "worker": worker, "recorded": true, "commit": commit, "write_set": entry["write_set"]}),
+            );
+        }
+    }
+    reports
+}
+
 fn fleet_handoff(
     command: &FleetCommand,
     root: &Path,
@@ -15305,41 +15489,7 @@ fn fleet_handoff(
     let base = story["base_commit"]
         .as_str()
         .context("validation/gate: story assignment has no base commit")?;
-    let resolved = git_output(
-        &worktree,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("{}^{{commit}}", input.commit),
-        ],
-    )
-    .context("validation/gate: handoff commit does not exist")?;
-    if resolved != input.commit {
-        bail!("input/schema: handoff commit must be the full exact object id {resolved}")
-    }
-    if git_output(&worktree, &["rev-parse", "HEAD"]).as_deref() != Some(input.commit) {
-        bail!("conflict/precondition: handoff commit is not the story worktree HEAD")
-    }
-    if git_output(&worktree, &["rev-parse", branch]).as_deref() != Some(input.commit) {
-        bail!("conflict/precondition: handoff branch does not point at the exact commit")
-    }
-    let ancestor = guarded_git(
-        &worktree,
-        &["merge-base", "--is-ancestor", base, input.commit],
-    )?;
-    if ancestor.exit_code != 0 {
-        bail!("conflict/precondition: handoff commit does not descend from its pinned wave base")
-    }
-    if git_output(&worktree, &["status", "--porcelain"])
-        .is_some_and(|status| !worker_dirt(&status).is_empty())
-    {
-        bail!(
-            "conflict/precondition: story worktree is dirty at handoff: {}",
-            worker_dirt(&git_output(&worktree, &["status", "--porcelain"]).unwrap_or_default())
-                .join(", ")
-        )
-    }
-    let observed = diff_write_set(&worktree, base, input.commit)?;
+    let observed = verify_story_commit(&worktree, branch, base, input.commit)?;
     // `--from-worktree` declines to restate what the range already proves. The observed set is what
     // gets recorded either way, so a hand-typed claim only adds a way to be wrong — and a wrong write
     // set is not a typo, it is false evidence. An empty range is still refused below.
@@ -17349,6 +17499,151 @@ mod tests {
             vec![root.join("website/node_modules")]
         );
         std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A story worktree holding one commit on its branch, above a pinned base.
+    ///
+    /// Returns `(worktree, branch, base, commit)`. Built with real git because the whole point of a
+    /// provisional handoff is that it reads the worktree rather than trusting a record.
+    fn story_worktree_with_a_commit(label: &str) -> (std::path::PathBuf, String, String, String) {
+        let root = reclaim_test_dir(label);
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        std::fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add base");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+        guarded_git(&root, &["checkout", "-b", "story"]).expect("branch");
+        std::fs::write(root.join("delivered.rs"), "// delivered\n").expect("write delivered");
+        guarded_git(&root, &["add", "."]).expect("add delivered");
+        guarded_git(&root, &["commit", "-m", "deliver"]).expect("commit delivered");
+        let commit = git_output(&root, &["rev-parse", "HEAD"]).expect("commit sha");
+        (root, "story".to_string(), base, commit)
+    }
+
+    fn wave_with_one_story(worktree: &Path, branch: &str, base: &str) -> FleetState {
+        let mut state = FleetState::default();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "id": "wave-1",
+                "status": "awaiting-handoffs",
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "stories": [{
+                        "board_ref": "flux/C-1",
+                        "branch": branch,
+                        "base_commit": base,
+                        "worktree": worktree.display().to_string(),
+                        "handoff": Value::Null,
+                    }],
+                }]},
+            }),
+        );
+        state.agents.insert(
+            "wave-1-worker-1".into(),
+            json!({
+                "role": "writer",
+                "status": "completed",
+                "session": "s-1",
+                "board_ref": "flux/C-1",
+                "assignment": {"wave": "wave-1", "board_ref": "flux/C-1", "worktree": worktree.display().to_string()},
+            }),
+        );
+        state
+    }
+
+    /// C-670: the whole defect in one assertion. A worker finished, committed, and its turn ended —
+    /// and the wave must now be able to advance without an operator typing anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_turn_hands_off_from_its_own_worktree_with_no_operator() {
+        let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-auto");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+
+        let reports = record_provisional_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
+        assert_eq!(reports[0]["commit"], json!(commit));
+        let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
+        assert_eq!(story["status"], json!("handoff-accepted"));
+        // Distinguishable from an operator-verified handoff: it proved the commit, not the tests.
+        assert_eq!(story["handoff"]["provisional"], json!(true));
+        assert_eq!(story["handoff"]["write_set"], json!(["delivered.rs"]));
+        assert_eq!(story["handoff"]["test_argv"], json!([]));
+        assert_eq!(
+            state.agents["wave-1-worker-1"]["status"],
+            json!("handoff-accepted")
+        );
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// A turn that produced nothing must say so. Recording nothing at all is what made an empty
+    /// worker indistinguishable from one whose record was simply never written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_ended_at_its_base_records_that_it_delivered_nothing() {
+        let (worktree, branch, base, _) = story_worktree_with_a_commit("handoff-empty");
+        guarded_git(&worktree, &["reset", "--hard", &base]).expect("rewind to base");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+
+        let reports = record_provisional_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports[0]["recorded"], json!(false), "{reports:?}");
+        assert!(
+            reports[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no commit")),
+            "{reports:?}"
+        );
+        let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
+        assert_ne!(story["status"], json!("handoff-accepted"));
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// The refusals the operator path has always made, now proved on the shared verification rather
+    /// than assumed.
+    ///
+    /// `verify_story_commit` was extracted so an automatic handoff proves the same git facts as a
+    /// typed one. That is only worth anything if the facts are still actually checked — and the
+    /// existing suite pins the happy paths, so an extraction that quietly dropped a check would have
+    /// passed it. A provisional handoff over a dirty worktree would record a write set that does not
+    /// match what is committed, which is false evidence rather than a missing record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shared_verification_still_refuses_a_dirty_tree_and_a_foreign_commit() {
+        let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-refusals");
+
+        std::fs::write(worktree.join("uncommitted.txt"), "work in progress\n").expect("dirty it");
+        let dirty = verify_story_commit(&worktree, &branch, &base, &commit);
+        assert!(
+            dirty
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("dirty")),
+            "a dirty story worktree must still be refused: {dirty:?}"
+        );
+        std::fs::remove_file(worktree.join("uncommitted.txt")).expect("clean it");
+
+        // A commit that exists but does not descend from the pinned base is not this wave's work.
+        guarded_git(&worktree, &["checkout", "-b", "elsewhere", &base]).expect("orphan branch");
+        std::fs::write(worktree.join("other.txt"), "other\n").expect("write other");
+        guarded_git(&worktree, &["add", "."]).expect("add other");
+        guarded_git(&worktree, &["commit", "-m", "other"]).expect("commit other");
+        let foreign = git_output(&worktree, &["rev-parse", "HEAD"]).expect("foreign sha");
+        let wrong_base = verify_story_commit(&worktree, "elsewhere", &commit, &foreign);
+        assert!(
+            wrong_base
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("does not descend")),
+            "a commit off the pinned base must still be refused: {wrong_base:?}"
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
     }
 
     /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not

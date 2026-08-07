@@ -91,16 +91,66 @@ impl Depth {
 /// deepest hand-authored case, and five past anything A-145 found in the log.
 const MAX_EXPLORED_DEPTH: usize = 8;
 
-/// One point in the space: a setting for each of the three controls.
+/// **At what level finished work folds** — the fourth decision A-146 measured its way into.
 ///
-/// The three are genuinely independent — every one of the [`AXIS_SPACE`] combinations renders, and
-/// `each_axis_moves_the_drawing_on_its_own` checks that each one changes the drawing with the other two held
-/// fixed, which is what "orthogonal" has to mean if it is to mean anything testable.
+/// A one-bit `condense` flag cannot express this, and A-146 says so explicitly: "Fold uniformly and
+/// you get every turn's shape at one row per phase. Fold only at the top level and you get mock 3's
+/// rail. Both are defensible; they are not the same view." The rail discriminates on **focus**,
+/// condensing discriminates on **status** — with one root the two rules coincide, with nine turns
+/// they cannot, which is why the split was never a point in the axis space.
+///
+/// ⚠ The failure rule survives every setting. [`condensable`] still refuses to fold a subtree holding
+/// a failure, so `TopLevel` reproduces the rail's *shape* but never its ability to tidy an error out
+/// of sight. Where the two disagree, the acceptance wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Condense {
+    /// Nothing folds; every step draws its own row.
+    Off,
+    /// Any finished, wholly successful subtree folds, at any depth. One row per phase.
+    Uniform,
+    /// Only top-level steps fold. The focused one keeps its entire subtree — mock 3's rail.
+    TopLevel,
+}
+
+impl Condense {
+    /// Whether a step at `depth` may fold. Depth 0 is a top-level step.
+    fn folds_at(self, depth: usize) -> bool {
+        match self {
+            Condense::Off => false,
+            Condense::Uniform => true,
+            Condense::TopLevel => depth == 0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Condense::Off => "off",
+            Condense::Uniform => "uniform",
+            Condense::TopLevel => "top-level",
+        }
+    }
+
+    /// The next setting, for the explorer's `c` key. A three-way control cannot be a toggle, which
+    /// is the practical shape of A-146's finding that one bit could not express this choice.
+    pub fn cycle(self) -> Condense {
+        match self {
+            Condense::Off => Condense::Uniform,
+            Condense::Uniform => Condense::TopLevel,
+            Condense::TopLevel => Condense::Off,
+        }
+    }
+}
+
+/// One point in the space: a setting for each of the controls.
+///
+/// They are genuinely independent — every one of the [`AXIS_SPACE`] combinations renders, and
+/// `each_axis_moves_the_drawing_on_its_own` checks that each one changes the drawing with the others
+/// held fixed, which is what "orthogonal" has to mean if it is to mean anything testable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Axes {
     pub depth: Depth,
-    /// Finished, wholly successful work collapses to its own row.
-    pub condense: bool,
+    /// At what level finished, wholly successful work collapses to its own row.
+    pub condense: Condense,
     /// The detail pane for the step in focus. **Optional** — that is the point of the axis, and
     /// [`Axes::floor`] is where it shows up as a cost.
     pub pane: bool,
@@ -111,7 +161,7 @@ impl Axes {
     /// hides; the reasoning, and what each default shows and hides, is in [`super::RECOMMENDATION`].
     pub const DEFAULT: Axes = Axes {
         depth: Depth::All,
-        condense: true,
+        condense: Condense::Uniform,
         pane: false,
     };
 
@@ -120,7 +170,7 @@ impl Axes {
         format!(
             "{} · condense {} · pane {}",
             self.depth.label(),
-            if self.condense { "on" } else { "off" },
+            self.condense.label(),
             if self.pane { "on" } else { "off" },
         )
     }
@@ -156,62 +206,75 @@ const NO_PANE_MIN_COLS: usize = 40;
 pub const AXIS_SPACE: &[Axes] = &[
     Axes {
         depth: Depth::All,
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     },
     Axes {
         depth: Depth::All,
-        condense: false,
+        condense: Condense::Off,
         pane: true,
     },
     Axes {
         depth: Depth::All,
-        condense: true,
+        condense: Condense::Uniform,
         pane: false,
     },
     Axes {
         depth: Depth::All,
-        condense: true,
+        condense: Condense::Uniform,
         pane: true,
     },
     Axes {
         depth: Depth::Levels(3),
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     },
     Axes {
         depth: Depth::Levels(3),
-        condense: false,
+        condense: Condense::Off,
         pane: true,
     },
     Axes {
         depth: Depth::Levels(3),
-        condense: true,
+        condense: Condense::Uniform,
         pane: false,
     },
     Axes {
         depth: Depth::Levels(3),
-        condense: true,
+        condense: Condense::Uniform,
         pane: true,
     },
     Axes {
         depth: Depth::Levels(1),
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     },
     Axes {
         depth: Depth::Levels(1),
-        condense: false,
+        condense: Condense::Off,
         pane: true,
     },
     Axes {
         depth: Depth::Levels(1),
-        condense: true,
+        condense: Condense::Uniform,
         pane: false,
     },
     Axes {
         depth: Depth::Levels(1),
-        condense: true,
+        condense: Condense::Uniform,
+        pane: true,
+    },
+    // A-137's third condensing setting. Swept at full depth in both pane states, which is where it
+    // differs from `Uniform` at all: a depth limit of 1 already draws only top-level rows, so the two
+    // settings coincide there and a sweep point would measure nothing.
+    Axes {
+        depth: Depth::All,
+        condense: Condense::TopLevel,
+        pane: false,
+    },
+    Axes {
+        depth: Depth::All,
+        condense: Condense::TopLevel,
         pane: true,
     },
 ];
@@ -245,13 +308,26 @@ impl Shape {
 
 /// Draw the composed view at one point in the axis space.
 pub fn render_axes(axes: Axes, case: LoadCase, vp: Viewport, theme: &Theme) -> Render {
+    render_axes_of(axes, &super::fixture(case), vp, theme)
+}
+
+/// [`render_axes`] against a run the caller already holds, rather than a named load case.
+///
+/// A-137 makes this view the TUI's main display, drawing a **live** run. The measurement that chose
+/// the defaults, the floors, and the elision honesty was all done here against fixtures — so the live
+/// view has to be the same renderer pointed at a different tree, not a second implementation that
+/// merely resembles it. A parallel live renderer would be exactly the drift the axes work exists to
+/// prevent: the picture that was measured and the picture that ships would stop being the same one,
+/// and only the shipped one would be unverified.
+///
+/// The projection's job is therefore to build [`Fixture`]s, not to draw.
+pub fn render_axes_of(axes: Axes, fx: &Fixture, vp: Viewport, theme: &Theme) -> Render {
     let (min_cols, min_rows) = axes.floor();
     if vp.cols < min_cols || vp.rows < min_rows {
         return below_floor(&axes.label(), min_cols, min_rows, vp, theme);
     }
-    let fx = super::fixture(case);
     let mut tally = Tally::new(fx.step_count());
-    let body = draw(&fx, axes, vp, theme, &mut tally);
+    let body = draw(fx, axes, vp, theme, &mut tally);
     tally.finish(body, vp, theme)
 }
 
@@ -334,7 +410,8 @@ fn walk<'a>(
         // Condensing first: it is a statement about what *happened*, and a depth limit is a
         // statement about how much of the structure to draw. A subtree already folded away has no
         // depth left to limit.
-        let fold = axes.condense && !focus_path.contains(&step.id) && condensable(step);
+        let fold =
+            axes.condense.folds_at(depth) && !focus_path.contains(&step.id) && condensable(step);
         if fold {
             let condensed = count(step) - 1;
             hid.condensed += condensed;

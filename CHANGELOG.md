@@ -6,6 +6,28 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Fixed
+
+- **A finished worker turn now records its own handoff, so a wave advances with nobody watching
+  (C-670).** `handoff-accepted` was reachable only from `flux fleet handoff`, and no agent in the
+  fleet could invoke it: the story worker holds no fleet operations, the coordinator's native
+  operation set has no `fleet.handoff`, and the integrator's `fleet.integrate` refuses until every
+  story is already accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human
+  could move it — ten workers once ended their turns and left nine commits the fleet never recorded.
+  A wave now records each finished turn from the worktree it finished in, deriving branch, commit and
+  the `base..HEAD` write set, and reaches `handoffs-ready` on its own.
+
+  The record is **provisional and says so**. It proves the same git facts as the operator path
+  through a shared `verify_story_commit` — the commit is the worktree HEAD, the branch points at it,
+  it descends from the pinned base, the tree is clean, and the observed write set is non-empty — but
+  it carries no targeted validation evidence, because a turn that has already ended cannot be asked
+  to cite the argv it ran. The entry is marked `provisional` with an empty `test_argv`, and
+  integration still runs the repository's full gate, which is what decides whether the wave is green.
+  A turn that ends at its pinned base with no commit records *that*, rather than nothing, so an empty
+  worker is no longer indistinguishable from an unrecorded one. Recording can never fail a wave:
+  every refusal becomes a reason on the story. The worker gains no capability — the fleet observes
+  what it left behind rather than asking it to vouch for it.
+
 ### Added
 
 - **`[[host]]` declares named execution-substrate bindings (Decision 0018, C-648).** A host is now
