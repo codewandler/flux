@@ -150,6 +150,9 @@ pub(super) async fn assemble_integrations(
     datasource_bridge: bool,
     cfg: &flux_config::Config,
     host_registry: Arc<flux_capabilities::HostRegistry>,
+    // The `[[host]]` binding this session selected, if any (C-709). A host-bound endpoint resolves
+    // only from the substrate it is reachable through; `None` is the native local position.
+    selected_host: Option<String>,
     events: Arc<EventStore>,
     stream: &str,
     redactor: &flux_secret::Redactor,
@@ -173,7 +176,7 @@ pub(super) async fn assemble_integrations(
         system: system.clone(),
     }) as Arc<dyn flux_capabilities::HostProber>;
     assembly.tools.extend(
-        flux_capabilities::host_tools(host_registry, host_prober)
+        flux_capabilities::host_tools(host_registry.clone(), host_prober)
             .into_iter()
             .map(|tool| {
                 (
@@ -198,7 +201,9 @@ pub(super) async fn assemble_integrations(
             style::dim(&format!("(endpoints store not loaded: {error})"))
         );
     }
-    merge_static_endpoints(&endpoint_registry, cfg);
+    // C-709: an endpoint naming an undeclared `[[host]]` binding fails here, at load, naming both —
+    // never at dial time from whatever position the caller happens to occupy.
+    merge_static_endpoints(&endpoint_registry, &host_registry, cfg)?;
     assembly
         .ambient_signals
         .extend(session_ambient_signals(&endpoint_registry));
@@ -211,10 +216,11 @@ pub(super) async fn assemble_integrations(
         flux_capabilities::HostProviderInvoker::new(plugin_registry.clone())
             .with_redactor(redactor.clone()),
     );
-    let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
-        system.clone(),
-        endpoint_registry.config_bindings(),
-    ));
+    let static_resolver = Arc::new(
+        flux_capabilities::StaticResolver::new(system.clone(), endpoint_registry.config_bindings())
+            // C-709: a host-bound endpoint is dialled through its binding or not at all.
+            .with_selected_host(selected_host),
+    );
     let cross_plugin_audit: Arc<dyn flux_capabilities::CrossPluginAudit> =
         Arc::new(EventStoreCrossPluginAudit {
             store: events.clone(),
@@ -809,6 +815,8 @@ pub(super) async fn run_app(
         true,
         &cfg,
         session_host_registry(&cfg),
+        // `flux app run` selects no named binding of its own; it runs from the local position.
+        None,
         app_events.clone(),
         &app_run_stream,
         &redactor,

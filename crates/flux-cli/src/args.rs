@@ -1495,6 +1495,11 @@ pub(super) enum EndpointAction {
         /// Repeatable non-secret label `key=value` (region, tags) for display/filtering.
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,
+        /// The `[[host]]` binding this endpoint is reachable through (e.g. `k8s-dev`). Omit for an
+        /// endpoint reachable from wherever the caller is. A binding that is not declared is
+        /// refused here, not at dial time.
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
     },
     /// List the persisted endpoint records (id, product, bare URL, owner, ttl/health, credential
     /// location) — never a secret value.

@@ -34,13 +34,69 @@ pub(super) fn render_endpoint_row(record: &flux_secret::endpoint::EndpointRecord
     if ttl_health.is_empty() {
         ttl_health.push('-');
     }
+    // C-709: where it is reachable *from*, when that is known. An unbound endpoint renders exactly
+    // as before rather than growing an empty column.
+    let host = ep
+        .host
+        .as_deref()
+        .map(|h| format!("  host={h}"))
+        .unwrap_or_default();
     format!(
-        "{id}  [{product}]  {url}  owner={owner}  {ttl_health}  credential: {cred}",
+        "{id}  [{product}]  {url}{host}  owner={owner}  {ttl_health}  credential: {cred}",
         id = ep.id,
         url = ep.url,
         owner = record.owner,
         cred = credential_location(record),
     )
+}
+
+/// The `flux endpoint resolve` diagnostic block: what the reference WOULD bind to at connect time —
+/// source, bare url, the `[[host]]` binding it is reachable through, and the credential *location*.
+/// Never a secret value: the credential is resolved host-side at connect time.
+///
+/// C-709 adds the host line, so the diagnostic answers "from where" as well as "as whom". Rendered
+/// here rather than inline so the answer can be pinned by test, exactly like [`render_endpoint_row`].
+pub(super) fn render_endpoint_resolution(record: &flux_secret::endpoint::EndpointRecord) -> String {
+    let ep = &record.endpoint;
+    let mut out = format!(
+        "{}       {} (owner={})\n",
+        style::bold("source"),
+        match ep.source {
+            flux_secret::endpoint::SourceKind::Config => "config",
+            flux_secret::endpoint::SourceKind::Discovered => "discovered",
+        },
+        record.owner
+    );
+    out.push_str(&format!("{}          {}\n", style::bold("url"), ep.url));
+    // "From where": the binding this endpoint is reachable through. Absent means the endpoint is
+    // reachable from wherever the caller is — which is what every pre-C-709 record means.
+    match ep.host.as_deref() {
+        Some(binding) => out.push_str(&format!(
+            "{}         {binding} {}\n",
+            style::bold("host"),
+            style::dim("(select it with `--host` to dial this endpoint)")
+        )),
+        None => out.push_str(&format!(
+            "{}         {}\n",
+            style::bold("host"),
+            style::dim("none (reachable from wherever the caller is)")
+        )),
+    }
+    match &ep.credential_ref {
+        Some(cred) => {
+            out.push_str(&format!("{}   {cred}\n", style::bold("credential-ref")));
+            out.push_str(&format!(
+                "{}       {}",
+                style::bold("credential"),
+                style::dim("<resolved at connect time, host-side>")
+            ));
+        }
+        None => out.push_str(&format!(
+            "{}   none (unauthenticated)",
+            style::bold("credential-ref")
+        )),
+    }
+    out
 }
 
 /// `flux endpoint …` — the operator mirror of the agent's `endpoint.*` ops over the persisted
@@ -82,6 +138,7 @@ pub(super) fn endpoint_ref_from_parts(
     product: Option<&str>,
     protocol: Option<&str>,
     credential_ref: Option<&str>,
+    host: Option<&str>,
     labels: std::collections::BTreeMap<String, String>,
 ) -> Result<flux_secret::endpoint::EndpointRef> {
     use flux_secret::endpoint::{EndpointRef, ENDPOINT_REF_PREFIX};
@@ -110,22 +167,37 @@ pub(super) fn endpoint_ref_from_parts(
         ),
         None => None,
     };
+    let host = match host.map(str::trim) {
+        Some("") => bail!(
+            "endpoint host binding must not be empty; omit `--host` for an endpoint reachable \
+             from wherever the caller is"
+        ),
+        other => other.map(str::to_string),
+    };
     Ok(EndpointRef {
         product: product.unwrap_or_default().to_string(),
         protocol: protocol.map(str::to_string),
         credential_ref,
+        host,
         labels,
         ..EndpointRef::named(id, url)
     })
 }
 
 /// Merge operator-declared `[[endpoint.static]]` bindings (D-116) into `registry` as config-bound
-/// records so they surface, list, and resolve like a `flux endpoint add` record. An invalid entry is
-/// warned-and-skipped so one typo can't sink the rest.
+/// records so they surface, list, and resolve like a `flux endpoint add` record. A *malformed* entry
+/// is warned-and-skipped so one typo can't sink the rest.
+///
+/// C-709 makes exactly one thing fatal instead: an entry naming a `[[host]]` binding that was never
+/// declared. That is not a formatting mistake, it is a locality claim that cannot be honoured — and
+/// skipping it would leave the endpoint reachable-from-anywhere, so a typo'd binding name would
+/// silently *widen* where the endpoint is dialled from. It fails at load, naming both, for the same
+/// reason an unknown `[[host]]` backend kind is a hard config error.
 pub(super) fn merge_static_endpoints(
     registry: &flux_capabilities::EndpointRegistry,
+    hosts: &flux_capabilities::HostRegistry,
     cfg: &flux_config::Config,
-) {
+) -> Result<()> {
     for ep in &cfg.endpoint.static_endpoints {
         let product = Some(ep.product.as_str()).filter(|s| !s.is_empty());
         match endpoint_ref_from_parts(
@@ -134,9 +206,28 @@ pub(super) fn merge_static_endpoints(
             product,
             ep.protocol.as_deref(),
             ep.credential_ref.as_deref(),
+            ep.host.as_deref(),
             ep.labels.clone(),
         ) {
-            Ok(reference) => registry.put(flux_secret::endpoint::EndpointRecord::config(reference)),
+            Ok(reference) => {
+                if let Some(binding) = reference.host.as_deref() {
+                    if hosts.get(binding).is_none() {
+                        let known = hosts.known_names();
+                        let known = if known.is_empty() {
+                            "none declared".to_string()
+                        } else {
+                            known.join(", ")
+                        };
+                        bail!(
+                            "[[endpoint.static]] `{}` is reachable through host binding `{binding}`, \
+                             which is not declared; known bindings: {known} — declare a [[host]] \
+                             entry with that id or drop the `host` key",
+                            ep.id
+                        );
+                    }
+                }
+                registry.put(flux_secret::endpoint::EndpointRecord::config(reference))
+            }
             Err(e) => eprintln!(
                 "{}",
                 style::dim(&format!(
@@ -146,6 +237,7 @@ pub(super) fn merge_static_endpoints(
             ),
         }
     }
+    Ok(())
 }
 
 pub(super) fn run_endpoint(action: EndpointAction) -> Result<()> {
@@ -174,6 +266,7 @@ pub(super) fn run_endpoint_in(path: &std::path::Path, action: EndpointAction) ->
             protocol,
             credential_ref,
             labels,
+            host,
         } => {
             // Wire a weak, credential-free config-bound ref (D-116). The shared validator rejects a
             // credential-bearing URL / an `@endpoint/` id / an unparseable credential ref — the same
@@ -184,6 +277,7 @@ pub(super) fn run_endpoint_in(path: &std::path::Path, action: EndpointAction) ->
                 product.as_deref(),
                 protocol.as_deref(),
                 credential_ref.as_deref(),
+                host.as_deref(),
                 parse_labels(&labels)?,
             )?;
             registry.put(flux_secret::endpoint::EndpointRecord::config(
@@ -238,6 +332,10 @@ pub(super) fn run_endpoint_in(path: &std::path::Path, action: EndpointAction) ->
             if let Some(proto) = &ep.protocol {
                 println!("{}  {proto}", style::bold("protocol"));
             }
+            // C-709: where it is reachable *from*. Absent means "from wherever the caller is".
+            if let Some(binding) = &ep.host {
+                println!("{}      {binding}", style::bold("host"));
+            }
             println!("{}     {}", style::bold("owner"), r.owner);
             println!("{}    {:?}", style::bold("source"), ep.source);
             if let Some(ttl) = r.ttl_secs {
@@ -259,33 +357,11 @@ pub(super) fn run_endpoint_in(path: &std::path::Path, action: EndpointAction) ->
             let r = registry
                 .resolve(&id)
                 .ok_or_else(|| anyhow::anyhow!("no persisted endpoint `{id}`"))?;
-            let ep = &r.endpoint;
-            // Operator diagnostic: report what the reference WOULD bind to — source, bare host/url, and
-            // the credential-ref LOCATION. The value is deliberately not shown: it is resolved host-side
-            // at connect time (and may be a cross-plugin hop), never by this read-only operator command.
-            println!(
-                "{}       {} (owner={})",
-                style::bold("source"),
-                {
-                    match ep.source {
-                        flux_secret::endpoint::SourceKind::Config => "config",
-                        flux_secret::endpoint::SourceKind::Discovered => "discovered",
-                    }
-                },
-                r.owner
-            );
-            println!("{}          {}", style::bold("url"), ep.url);
-            match &ep.credential_ref {
-                Some(cred) => {
-                    println!("{}   {cred}", style::bold("credential-ref"));
-                    println!(
-                        "{}       {}",
-                        style::bold("credential"),
-                        style::dim("<resolved at connect time, host-side>")
-                    );
-                }
-                None => println!("{}   none (unauthenticated)", style::bold("credential-ref")),
-            }
+            // Operator diagnostic: report what the reference WOULD bind to — source, bare host/url,
+            // the host binding it is reachable through, and the credential-ref LOCATION. The value is
+            // deliberately not shown: it is resolved host-side at connect time (and may be a
+            // cross-plugin hop), never by this read-only operator command.
+            println!("{}", render_endpoint_resolution(&r));
             Ok(())
         }
         EndpointAction::Import { id, from_json } => {

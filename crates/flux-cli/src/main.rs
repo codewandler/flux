@@ -126,12 +126,12 @@ mod tests {
         exchange_binding_from_config, fleet_status_line, format_evidence, host_ref_from_parts,
         implicit_plugin_group, integration_plugin_caps, loop_machinery_label, merge_config_hosts,
         merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
-        plugin_status_one, record_ephemeral_remote, redact_plugin_echo, render_endpoint_row,
-        render_host_row, render_review_markdown, resolve_named_host, resolve_plugin_operation_name,
-        run_endpoint_in, run_plugin_in, run_usage_with, should_fail, tool_preview, truncate,
-        url_has_userinfo, usage_annotation, write_generated_skill, Cli, CliHostProber,
-        EndpointAction, EventStore, EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness,
-        PluginAction, RedactorSecretSink, ReviewSeverity,
+        plugin_status_one, record_ephemeral_remote, redact_plugin_echo, render_endpoint_resolution,
+        render_endpoint_row, render_host_row, render_review_markdown, resolve_named_host,
+        resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
+        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill, Cli,
+        CliHostProber, EndpointAction, EventStore, EventStoreCrossPluginAudit,
+        EventStoreEgressAudit, Liveness, PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
@@ -1087,6 +1087,7 @@ mod tests {
                 protocol: Some("postgres".into()),
                 credential_ref: Some("env/PGPASSWORD".into()),
                 labels: vec!["region=eu".into()],
+                host: None,
             },
         )
         .unwrap();
@@ -1144,6 +1145,156 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-709: `flux endpoint add --host <binding>` records the `[[host]]` binding the endpoint is
+    /// reachable through, the store keeps it, and `list`/`resolve` render it. The `resolve`
+    /// diagnostic answers "from where" alongside the credential *location* it already answers
+    /// "as whom" with.
+    #[test]
+    fn endpoint_add_records_and_renders_the_host_it_is_reachable_through() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "pg-cluster".into(),
+                url: "postgres://db.default.svc.cluster.local:5432/app".into(),
+                product: Some("postgres".into()),
+                protocol: Some("postgres".into()),
+                credential_ref: Some("env/PGPASSWORD".into()),
+                labels: vec![],
+                host: Some("k8s-dev".into()),
+            },
+        )
+        .unwrap();
+
+        let reg = EndpointRegistry::with_path(path.clone());
+        reg.load().unwrap();
+        let rec = reg.resolve("pg-cluster").expect("added ref persisted");
+        assert_eq!(
+            rec.endpoint.host.as_deref(),
+            Some("k8s-dev"),
+            "the store keeps the binding the endpoint is reachable through"
+        );
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("k8s-dev"),
+            "and it survives to disk"
+        );
+
+        // The list row says where it is reachable from, not just what it is.
+        let row = render_endpoint_row(&rec);
+        assert!(row.contains("host=k8s-dev"), "{row}");
+
+        // `resolve` answers "from where" and "as whom" in the same block.
+        let block = render_endpoint_resolution(&rec);
+        assert!(block.contains("k8s-dev"), "reports the host: {block}");
+        assert!(
+            block.contains("env/PGPASSWORD"),
+            "still reports the credential location: {block}"
+        );
+
+        // An endpoint with no binding renders as reachable from wherever the caller is, and never
+        // grows a bogus host column.
+        let unbound = flux_secret::endpoint::EndpointRecord::config(
+            flux_secret::endpoint::EndpointRef::named(
+                "pg-public",
+                "postgres://db.example.com:5432/app",
+            ),
+        );
+        assert!(!render_endpoint_row(&unbound).contains("host="));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-709: an `[[endpoint.static]]` naming a `[[host]]` binding that was never declared is a
+    /// **load-time** error naming both, not a dial-time surprise. A substrate reference that does
+    /// not resolve is the same class of problem as an unknown backend kind — the endpoint would
+    /// otherwise be silently dialled from wherever the caller happens to be.
+    #[test]
+    fn an_endpoint_naming_an_undeclared_host_binding_is_a_load_time_error() {
+        use flux_capabilities::{EndpointRegistry, HostRegistry};
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+
+        let hosts = HostRegistry::new();
+        hosts.put(HostRecord::config(HostRef::declared(
+            "k8s-dev",
+            HostBackend::Kubernetes,
+        )));
+
+        let cfg_with = |host: &str| flux_config::Config {
+            endpoint: flux_config::EndpointConfig {
+                static_endpoints: vec![flux_config::StaticEndpoint {
+                    id: "pg-cluster".into(),
+                    url: "postgres://db.default.svc.cluster.local:5432/app".into(),
+                    host: Some(host.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = merge_static_endpoints(&EndpointRegistry::new(), &hosts, &cfg_with("k8s-prod"))
+            .expect_err("an undeclared binding must not load");
+        let err = err.to_string();
+        assert!(err.contains("pg-cluster"), "names the endpoint: {err}");
+        assert!(err.contains("k8s-prod"), "names the binding: {err}");
+        assert!(
+            err.contains("k8s-dev"),
+            "names the bindings that do exist: {err}"
+        );
+
+        // A declared binding loads, and the wired record carries it through to the resolver table.
+        let reg = EndpointRegistry::new();
+        merge_static_endpoints(&reg, &hosts, &cfg_with("k8s-dev")).expect("a declared binding");
+        assert_eq!(
+            reg.config_bindings()["pg-cluster"].host.as_deref(),
+            Some("k8s-dev")
+        );
+    }
+
+    /// C-709 acceptance 5: `import` preserves the host an endpoint was discovered through, so the
+    /// discover → import → use loop keeps the fact rather than dropping it. (Stamping it at
+    /// discovery is C-715's half; this pins that the import path does not erase it.)
+    #[test]
+    fn endpoint_import_preserves_the_host_binding() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        let discovered = flux_secret::endpoint::EndpointRef {
+            host: Some("k8s-dev".into()),
+            ..flux_secret::endpoint::EndpointRef::discovered(
+                "pg-1",
+                "postgres://db.default.svc.cluster.local:5432/app",
+                "postgres",
+            )
+        };
+        run_endpoint_in(
+            &path,
+            EndpointAction::Import {
+                id: discovered.id.clone(),
+                from_json: Some(serde_json::to_string(&discovered).unwrap()),
+            },
+        )
+        .unwrap();
+
+        let reg = EndpointRegistry::with_path(path.clone());
+        reg.load().unwrap();
+        assert_eq!(
+            reg.resolve(&discovered.id)
+                .expect("imported")
+                .endpoint
+                .host
+                .as_deref(),
+            Some("k8s-dev"),
+            "import kept the host it was discovered through"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// D-116: `flux endpoint add` rejects a credential-bearing URL, an `@endpoint/` id, and an
     /// unparseable credential ref — and leaves the store untouched on rejection.
     #[test]
@@ -1163,6 +1314,7 @@ mod tests {
                 protocol: None,
                 credential_ref: None,
                 labels: vec![],
+                host: None,
             },
         )
         .unwrap_err();
@@ -1182,6 +1334,7 @@ mod tests {
                 protocol: None,
                 credential_ref: None,
                 labels: vec![],
+                host: None,
             },
         )
         .is_err());
@@ -1196,6 +1349,7 @@ mod tests {
                 protocol: None,
                 credential_ref: Some("not-a-ref".into()),
                 labels: vec![],
+                host: None,
             },
         )
         .is_err());
@@ -1217,12 +1371,29 @@ mod tests {
             None,
             None,
             None,
+            None,
             parse_labels(&[]).unwrap(),
         )
         .unwrap();
         assert_eq!(r.id, "m");
         assert_eq!(r.source, flux_secret::endpoint::SourceKind::Config);
         assert!(r.credential_ref.is_none());
+        assert!(
+            r.host.is_none(),
+            "no host declared means reachable anywhere"
+        );
+
+        // C-709: a blank host binding is a mistake, not a way to spell "anywhere" — omit the key.
+        assert!(endpoint_ref_from_parts(
+            "m",
+            "http://prom:9090",
+            None,
+            None,
+            None,
+            Some("  "),
+            Default::default()
+        )
+        .is_err());
 
         // Userinfo detection: authority `@` is a credential, a path `@` is not.
         assert!(url_has_userinfo("postgres://u:p@host:5432/db"));
@@ -1230,10 +1401,19 @@ mod tests {
         assert!(!url_has_userinfo("https://host/path@thing"));
 
         // Empty id / empty url are rejected.
+        assert!(endpoint_ref_from_parts(
+            "",
+            "http://x",
+            None,
+            None,
+            None,
+            None,
+            Default::default()
+        )
+        .is_err());
         assert!(
-            endpoint_ref_from_parts("", "http://x", None, None, None, Default::default()).is_err()
+            endpoint_ref_from_parts("m", "  ", None, None, None, None, Default::default()).is_err()
         );
-        assert!(endpoint_ref_from_parts("m", "  ", None, None, None, Default::default()).is_err());
         // A malformed label is rejected at parse time.
         assert!(parse_labels(&["novalue".to_string()]).is_err());
     }
@@ -1266,7 +1446,7 @@ mod tests {
             ..Default::default()
         };
         let reg = EndpointRegistry::new();
-        merge_static_endpoints(&reg, &cfg);
+        merge_static_endpoints(&reg, &flux_capabilities::HostRegistry::new(), &cfg).unwrap();
         let bindings = reg.config_bindings();
         assert!(
             bindings.contains_key("pg-prod"),
@@ -2202,6 +2382,7 @@ mod tests {
                 protocol: Some("postgres".into()),
                 credential_ref: Some(format!("env/{cred_key}")),
                 labels: vec![],
+                host: None,
             },
         )
         .unwrap();

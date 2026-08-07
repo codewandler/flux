@@ -2545,6 +2545,11 @@ pub(super) async fn build_agent_with(
         false,
         &cfg,
         host_registry.clone(),
+        // C-709: the binding this session selected, so a host-bound endpoint resolves only from the
+        // substrate it is reachable through rather than from wherever this process happens to run.
+        selected_substrate
+            .as_ref()
+            .map(|selected| selected.binding.clone()),
         events.clone(),
         &session_id,
         &redactor,

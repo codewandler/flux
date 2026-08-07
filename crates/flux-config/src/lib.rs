@@ -154,6 +154,12 @@ pub struct StaticEndpoint {
     /// `plugin/<p>/<i>/<slot>`); optional (unauthenticated when omitted). Never a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// The `[[host]]` binding this endpoint is reachable through, by id (C-709). A cluster-internal
+    /// name is meaningless on a laptop and exactly right inside the cluster; this is what tells the
+    /// two apart. Omitting it means "reachable from wherever the caller is". Held as a plain id here
+    /// (this crate stays `flux-secret`-free); the surface crate checks it names a declared binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Non-secret labels (region, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
@@ -2311,6 +2317,45 @@ url = "http://prom.internal:9090"
         // A declared static endpoint means the endpoint config is no longer default.
         assert!(!cfg.endpoint.is_default());
         assert!(Config::default().endpoint.is_default());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-709: `[[endpoint.static]]` may declare the `[[host]]` binding the endpoint is reachable
+    /// through, by id. A cluster-internal name is meaningless on a laptop and exactly right inside
+    /// the cluster; this is what tells the two apart. Omitting it keeps the pre-existing meaning —
+    /// reachable from wherever the caller is.
+    #[test]
+    fn static_endpoint_declares_the_host_binding_it_is_reachable_through() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[host]]
+id = "k8s-dev"
+backend = "kubernetes"
+
+[[endpoint.static]]
+id = "pg-cluster"
+url = "postgres://db.default.svc.cluster.local:5432/app"
+product = "postgres"
+host = "k8s-dev"
+
+[[endpoint.static]]
+id = "pg-public"
+url = "postgres://db.example.com:5432/app"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.endpoint.static_endpoints.len(), 2);
+        assert_eq!(
+            cfg.endpoint.static_endpoints[0].host.as_deref(),
+            Some("k8s-dev"),
+            "the declaration carries the binding id, not an address"
+        );
+        assert_eq!(
+            cfg.endpoint.static_endpoints[1].host, None,
+            "an endpoint that declares no host stays unbound"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

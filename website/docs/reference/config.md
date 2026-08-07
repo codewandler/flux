@@ -447,11 +447,36 @@ consumer any provider. The default is deny. This is only one part of the gate: f
 approval and is audited.
 
 Each `[[endpoint.static]]` table declares a named, weak endpoint reference. `id` and a
-credential-free `url` are required; `product`, `protocol`, `credential_ref`, and non-secret
+credential-free `url` are required; `product`, `protocol`, `credential_ref`, `host`, and non-secret
 `labels` are optional. A credential reference is a location such as `env/PGPASSWORD`,
 `kubernetes/<namespace>/<secret>/<key>`, or `plugin/<plugin>/<instance>/<slot>`—never a secret
 value. Project declarations override user declarations with the same id. Use `flux endpoint add`
 when you want the equivalent imperative surface. See [Endpoints](../agent/endpoints.md).
+
+`host` names the `[[host]]` binding the endpoint is reachable *through*, by id—the endpoint's
+locality. `postgres://db.default.svc.cluster.local:5432` is meaningless on a laptop and exactly
+right inside the cluster, and without this the record cannot tell the two apart:
+
+```toml
+[[host]]
+id = "k8s-dev"
+backend = "kubernetes"
+grant = ["operator"]
+
+[[endpoint.static]]
+id = "pg-cluster"
+url = "postgres://db.default.svc.cluster.local:5432/app"
+host = "k8s-dev"
+```
+
+Naming a binding that is not declared is a **load-time error** that names both, not a dial-time
+surprise—the same posture as an unknown `[[host]]` backend kind, because a typo'd binding name
+would otherwise silently widen where the endpoint is dialled from. A host-bound endpoint resolves
+only when that binding is the one the session selected (`flux --host k8s-dev …`); from any other
+position it is refused naming both, never quietly dialled from here. Omitting `host` keeps the
+prior meaning—reachable from wherever the caller is—so an endpoint without one behaves exactly as
+it always has. `flux endpoint add --host <name>` sets the same field imperatively, and
+`flux endpoint list`/`show`/`resolve` render it.
 
 ## Host bindings (`[[host]]`)
 
