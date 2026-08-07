@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
@@ -24,9 +23,11 @@ use flux_spec::{
     IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
+use flux_system::port::{GuardedHttp, HttpRequest, HttpSecretScope};
 
 use crate::{
-    condense, egress, RecordSink, WebOptions, WEB_PAGE_RECORD_SUBJECT, WRITE_DB_EFFECT_TAG,
+    condense, egress, NativeHttp, RecordSink, WebOptions, WEB_PAGE_RECORD_SUBJECT,
+    WRITE_DB_EFFECT_TAG,
 };
 
 /// Cap on the returned document (bytes, char-boundary safe) — applied *after* condensation so the
@@ -38,32 +39,19 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 /// `web.fetch`: fetch a URL and return its readable content as condensed markdown (HTML) or the raw
 /// body (everything else / `raw: true`).
 pub struct WebFetchTool {
-    http: reqwest::Client,
+    /// This op's own reviewed native HTTP backend — reached only when the operator selected no
+    /// execution substrate (C-652).
+    native: NativeHttp,
     private_net: PrivateNetAllow,
-    audit: Option<Arc<dyn flux_plugin::EgressAudit>>,
-    grant_source: String,
     records: Option<Arc<dyn RecordSink>>,
 }
 
 impl WebFetchTool {
     pub fn new(opts: &WebOptions) -> Self {
         Self {
-            http: egress::redirect_disabled_client(),
+            native: NativeHttp::new(opts),
             private_net: opts.private_net.clone(),
-            audit: opts.audit.clone(),
-            grant_source: opts
-                .grant_source
-                .clone()
-                .unwrap_or_else(|| "config:web".to_string()),
             records: opts.records.clone(),
-        }
-    }
-
-    fn audit_admit(&self, host: &str) {
-        if let Some(audit) = &self.audit {
-            if flux_system::net::host_resolves_private(host) {
-                audit.record_private_admit("web:web.fetch", host, &self.grant_source);
-            }
         }
     }
 }
@@ -175,42 +163,54 @@ impl Tool for WebFetchTool {
         set
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let raw_url = params
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Other("web.fetch: `url` required".into()))?;
         let raw_body = params.get("raw").and_then(Value::as_bool).unwrap_or(false);
 
-        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(raw_url, &self.private_net)?;
-        let response = egress::send_guarded(
-            &self.http,
-            egress::GuardedRequest {
-                url,
-                pinned,
-                method: reqwest::Method::GET,
-                headers: HeaderMap::new(),
-                body: None,
-                timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
-            },
-            "web.fetch",
-            |raw| flux_system::net::guard_url_scoped_pinned(raw, &self.private_net),
-            |url| {
-                if let Some(host) = url.host_str() {
-                    self.audit_admit(host);
-                }
-            },
-        )
-        .await?;
+        // The same admission `guard_url_scoped_pinned` performed, kept as the correlated value the
+        // port carries. `web.fetch` sends no credential, so its secret scope is empty.
+        let request = HttpRequest {
+            operation: "web.fetch".into(),
+            method: "GET".into(),
+            target: flux_system::net::guard_url_scoped_for_secret(raw_url, &self.private_net)?,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
+            max_response_bytes: MAX_BYTES,
+            secrets: HttpSecretScope::default(),
+        };
 
-        let status = response.status();
+        // The read lands wherever the operator said it lands (C-652). Only an *unselected* run
+        // reaches this op's own reviewed native backend.
+        let response = match ctx.selected_execution_system() {
+            Some(substrate) => substrate.http_request(&request, &self.private_net).await?,
+            None => {
+                self.native
+                    .http_request(&request, &self.private_net)
+                    .await?
+            }
+        };
+
+        // Rebuilt from the port's numeric status so `[200 OK]` keeps its reason phrase.
+        let status = reqwest::StatusCode::from_u16(response.status).map_err(|e| {
+            Error::Http(format!(
+                "web.fetch: the substrate reported an invalid status {}: {e}",
+                response.status
+            ))
+        })?;
         let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let capped = egress::read_body_capped(response, MAX_BYTES, "web.fetch").await?;
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        let capped = egress::CappedBody {
+            bytes: response.body,
+            truncated: response.truncated,
+        };
 
         // Classify from the *raw bytes* + content-type before any lossy UTF-8 decode (which would
         // corrupt a binary PDF). A PDF is either declared (`application/pdf`) or sniffed by its
@@ -427,6 +427,54 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// C-652 — `web.fetch` is `SelectedExecutionSystem` now, so the read follows the operator's
+    /// selection instead of being served from the coordinator's process.
+    ///
+    /// A `RemoteSystem` with no HTTP wire support refuses; the op surfaces that refusal. The
+    /// loopback server stands live and untouched, which is what makes the assertion mean "the local
+    /// client is off this path" rather than "the fixture was unreachable".
+    #[tokio::test]
+    async fn a_selected_substrate_that_serves_no_http_refuses_the_read() {
+        struct ServesNothing;
+        impl flux_system::remote::Delegate for ServesNothing {}
+
+        let base = one_shot("200 OK", "text/html", "<html><body>local</body></html>").await;
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+        let selected = Arc::new(flux_system::remote::RemoteSystem::new(Arc::new(
+            ServesNothing,
+        )));
+        let ctx = ctx().with_execution_system(selected);
+
+        let error = tool
+            .execute(&ctx, json!({ "url": base }))
+            .await
+            .expect_err("a selected substrate that serves no HTTP must refuse the read");
+        assert!(
+            error.to_string().contains("wire support"),
+            "the refusal must name what is missing: {error}"
+        );
+    }
+
+    /// C-652 — and with nothing selected, the read is exactly what it was.
+    #[tokio::test]
+    async fn an_unselected_read_still_reaches_the_native_backend() {
+        let base = one_shot("200 OK", "text/html", "<html><body><p>hi</p></body></html>").await;
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+
+        let result = tool
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .expect("no substrate selected means the native backend serves");
+        assert!(result.content.starts_with("[200 OK]"), "{}", result.content);
+        assert!(result.content.contains("hi"), "{}", result.content);
     }
 
     /// Like [`one_shot`] but serves an arbitrary **binary** body (headers, then the raw bytes) — the

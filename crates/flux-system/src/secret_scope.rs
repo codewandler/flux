@@ -139,6 +139,52 @@ impl GuardedSecretTarget {
     pub fn into_parts(self) -> (url::Url, Vec<SocketAddr>, Result<Destination>) {
         (self.url, self.pinned, self.destination)
     }
+
+    /// The admitted URL, borrowed. The non-consuming counterpart to [`into_parts`](Self::into_parts),
+    /// for a caller that has to *keep* the correlated value — a guarded HTTP request carries it to
+    /// the substrate that will send it, and splitting it first would be handing over three values
+    /// that are only trustworthy together.
+    pub fn url(&self) -> &url::Url {
+        &self.url
+    }
+
+    /// The addresses the guard vetted, borrowed. The connection must pin to exactly these.
+    pub fn pinned(&self) -> &[SocketAddr] {
+        &self.pinned
+    }
+
+    /// The destination token for secret authorization, borrowed, or the reason there is none.
+    pub fn destination(&self) -> std::result::Result<&Destination, String> {
+        self.destination
+            .as_ref()
+            .map_err(std::string::ToString::to_string)
+    }
+
+    /// Re-aim this admitted target at `url`, keeping the vetted addresses and destination token —
+    /// refused unless the **authority** is unchanged.
+    ///
+    /// A caller that appends a query *after* admission (so a `$secret` can be authorized against the
+    /// vetted destination before its value is ever read) still has to send the URL it built.
+    /// Appending a percent-encoded query ahead of the fragment cannot move the authority — and this
+    /// refuses rather than trusting that argument, because the alternative to checking is
+    /// re-resolving, which is the very TOCTOU the pin closes.
+    ///
+    /// Neither URL is quoted in the refusal: a query-placed credential lives in one of them.
+    pub fn with_url(mut self, url: url::Url) -> Result<Self> {
+        fn authority(url: &url::Url) -> (&str, Option<&str>, Option<u16>) {
+            (url.scheme(), url.host_str(), url.port_or_known_default())
+        }
+        if authority(&url) != authority(&self.url) {
+            let admitted = self.url.host_str().unwrap_or("<no host>").to_string();
+            let sent = url.host_str().unwrap_or("<no host>").to_string();
+            return Err(Error::Other(format!(
+                "the egress guard admitted `{admitted}` and the url to send names `{sent}`: \
+                 refusing to send to an authority the guard never vetted"
+            )));
+        }
+        self.url = url;
+        Ok(self)
+    }
 }
 
 // ---------------------------------------------------------------------------
