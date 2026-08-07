@@ -14,7 +14,7 @@ question is always *who may use a binding*, never merely whether an address is r
 
 Reuse the endpoint entity pattern wholesale: a `[[host]]` config table, a session registry, a
 `flux host` CLI family and an ambient-gated `host.*` operation group. The guarded port stays the
-only IO seam; backends become peers (local, sandboxed, container, kubernetes, remote) that each
+only IO seam; backends become peers (local, sandboxed, container, kubernetes, microvm, remote) that each
 pass the codegate census under review; `GuardedHttp` joins the port so `flux-web` placement can
 move to `SelectedExecutionSystem`; and middleware stays at the dispatch layer, where gating,
 telemetry, redaction and substrate provenance already flow through one choke point.
@@ -26,5 +26,8 @@ telemetry, redaction and substrate provenance already flow through one choke poi
 - C-650 — a named host binding selects the execution substrate
 - C-651 — sandboxed is a selectable peer backend
 - C-652 — HTTP joins the guarded port
+- C-677 — a microvm binding resolves to a served guest substrate: the `microvm` word over the
+  delivered remote client, unwired and fail-closed until it names an endpoint C-480's guest
+  profile serves. No provisioning verb; no new wire.
 - Context members delivered under earlier contracts: C-397 (container process backend), C-480
   (OCI image, manifests, microVM unit)

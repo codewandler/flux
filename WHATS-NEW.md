@@ -68,6 +68,24 @@
   still never provisions your Docker hosts, clusters or VMs — the artifacts run where you already
   have somewhere to run them.
 
+- **A VM or microVM guest is a host you can name.** Declare `backend = "microvm"` in a `[[host]]`
+  entry pointing at a guest that runs the serving daemon, and `--host <name>` runs guarded effects
+  inside it — same authenticated protocol, same handshake, same credential *reference* as a remote
+  host. `flux host probe` reports the negotiated protocol version and the guest's own substrate
+  identity, marked as reported by it. Flux still never creates, starts, stops or destroys a guest:
+  the binding consumes an endpoint that already exists, and the VM/microVM deployment profile is
+  how you make one. A binding declared before its guest exists is legal and says so — it lists as
+  unwired and refuses selection naming the missing endpoint, instead of quietly falling back to
+  your machine.
+
+- **Deploy the agent itself, not just the machine it acts on.** Alongside the serving-daemon
+  profiles, Flux now ships Kubernetes manifests that run the agent surface from the same released
+  image — the HTTP/A2A endpoint you talk to with `flux a2a`, with its bearer token and model
+  credential as Secret references, a persistent session volume, and network policy that denies by
+  default in both directions. The manifests cannot express an unauthenticated public listener: a
+  bind that reaches beyond loopback without a token fails the shipped checks, and the running
+  daemon refuses it too.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
@@ -76,6 +94,23 @@
   settings, type `/fleet:restart`, and the fleet stops and starts so the new configuration, loops and limits
   take effect. It waits rather than interrupting: if a worker is still running it tells you instead of
   restarting underneath it. `/fleet:refresh` re-reads fleet state when you want the current picture now.
+
+- **When a fleet goes wrong, you can now ask it what happened.** Diagnosing a stuck run used to mean
+  reading the fleet's internal state file by hand. Now each question has a command: `flux fleet doctor`
+  reports whether the running system is actually healthy — not just whether its configuration is valid
+  — and names things like a worker recorded as working with no process behind it. `flux fleet inspect
+  gate <wave>` shows why a run went red by printing the gate's own output, newest first, so the verdict
+  is the part you see. `flux board reconcile` tells you which items already have their work in the
+  tree while their status still says otherwise, so nobody is sent to build something twice; it reports
+  and never changes anything.
+
+- **Pausing, repairing and pausing-for-upgrade are commands now, not procedures.** `flux fleet park
+  <wave> --reason` pauses a run and records *why*, and `flux fleet unpark` resumes it — the pause and
+  its reason show up in `flux fleet status`, so a paused run stays paused instead of being reconsidered
+  every minute. `flux fleet repair` rebuilds working directories a run expects but disk no longer has.
+  And `flux fleet quiesce` stops new work and confirms nothing is still running, so you can install a
+  new version safely; `flux fleet resume` lifts it. Each replaces a hand-run sequence that was easy to
+  get half-right.
 
 ## [0.58.0] - 2026-08-07
 

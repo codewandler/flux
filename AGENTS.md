@@ -60,6 +60,11 @@ authorization → approval → guarded IO. Preserve these boundaries:
   and manifest-scoped.
 - Route web egress through the `flux-system` URL guards. Route every OS process through the single
   guarded `System` path with a workspace-pinned cwd, cleared environment, and capped output.
+- A selected execution host is deny-by-default, immutable for the session, and inherited by
+  sub-agents; unattended surfaces never inherit a grant given only to interactive use. A host
+  binding holds a credential *reference*, never a value. Selection failures fail closed — a
+  `sandboxed` host with no usable confinement, or a binding whose endpoint does not exist yet,
+  refuses and names what is missing rather than falling back to the local machine.
 - Keep served HTTP routes authenticated except the documented health/discovery endpoints; never
   permit an unauthenticated non-loopback agent listener.
 - Preserve provider-history validity on every termination path: no empty assistant message, split
