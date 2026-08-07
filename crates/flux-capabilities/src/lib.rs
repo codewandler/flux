@@ -23,6 +23,7 @@
 pub mod datasource;
 pub mod endpoint;
 pub mod harness;
+pub mod host;
 pub mod usage_observatory;
 
 pub use datasource::{
@@ -44,6 +45,7 @@ pub use endpoint::{
     EndpointBrokerHostCaps, EndpointRegistry, HostCredentialReader, HostProviderInvoker,
     PluginRegistry, ProviderEntry, ProviderInvoker, StaticResolver, ENDPOINT_GROUP,
 };
+pub use host::HostRegistry;
 
 #[cfg(feature = "embeddings")]
 pub use datasource::OpenAiEmbedder;

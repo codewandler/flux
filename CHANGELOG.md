@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **`[[host]]` declares named execution-substrate bindings (Decision 0018, C-648).** A host is now
+  a first-class entity: `id`, a typed `backend` kind (`local` | `sandboxed` | `container` |
+  `kubernetes` | `remote`), an optional bare `url`, a `credential_ref` *location* (the existing
+  `env/` / `plugin/` / `kubernetes/` reference vocabulary — never a value), and display labels.
+  The backend vocabulary is closed and an unknown kind is a hard config error, and — unlike
+  `[[endpoint.static]]` — a `[[host]]` entry refuses unknown keys outright, because a silently
+  dropped typo in a substrate binding would change where effects land. Declarations register in a
+  session `HostRegistry` (the `EndpointRegistry` persistence pattern: optional weak-ref TOML store,
+  config merged over it by id) at session start, and a `HostRef` joins `flux-secret`'s reference
+  vocabulary so a binding can be listed and inspected without ever holding credential material.
+  The entity is inert in this story: the `flux host` family arrives with C-649 and named selection
+  with C-650.
+
 - **`flux board next --independent` returns the largest wave-safe set instead of the
   highest-priority prefix.** Dependency satisfaction says only that nothing an item *waits on* is
   outstanding; it says nothing about whether two ready items can be built at the same time.

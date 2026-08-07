@@ -165,6 +165,57 @@ impl EndpointConfig {
     }
 }
 
+/// The closed backend vocabulary for a `[[host]]` declaration (Decision 0018 rule 3). Typed — not a
+/// free string — so an unknown backend kind is a **hard config error** at parse time, unlike the
+/// warn-and-skip semantic validation the string fields get in the surface crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostBackendKind {
+    Local,
+    Sandboxed,
+    Container,
+    Kubernetes,
+    Remote,
+}
+
+impl HostBackendKind {
+    /// The lowercase wire/display form (matches the serde encoding).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Sandboxed => "sandboxed",
+            Self::Container => "container",
+            Self::Kubernetes => "kubernetes",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// One `[[host]]` declaration: a named, first-class binding to an execution substrate
+/// (Decision 0018). Mirrors the weak `HostRef` — id + backend kind + bare address + a credential
+/// *reference* + labels — never a secret value. `deny_unknown_fields` because a silently dropped
+/// typo in a substrate binding is a safety problem, not a formatting one. The remaining semantic
+/// validation (credential-free url, parseable credential ref) happens in the surface crate against
+/// the same rules as `flux host add`, keeping this crate a `flux-secret`-free leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostEntry {
+    /// The binding name (a bare name, e.g. `build-farm`).
+    pub id: String,
+    /// Which substrate backend this binding selects.
+    pub backend: HostBackendKind,
+    /// Bare `scheme://host[:port]` for backends with an address — never with embedded credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Credential *location* in `scheme/...` form (`env/FLUX_FARM_TOKEN`,
+    /// `kubernetes/<ns>/<name>/<key>`, `plugin/<p>/<i>/<slot>`); optional. Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    /// Non-secret labels (region, cluster, tags) for display/filtering.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
 /// The `[skills]` table — skill-discovery settings (L-02).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -719,6 +770,9 @@ pub struct Config {
     /// Endpoint-discovery / cross-plugin credential brokerage grants (D-27).
     #[serde(default, skip_serializing_if = "EndpointConfig::is_default")]
     pub endpoint: EndpointConfig,
+    /// Named execution-substrate bindings (`[[host]]`, Decision 0018).
+    #[serde(default, rename = "host", skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<HostEntry>,
     /// Opt into the generic `bash` op (the `shell` group). Off by default — the agent works through
     /// the dedicated ops; setting this surfaces `bash` as an escape hatch. The CLI exports
     /// `FLUX_ENABLE_BASH` from this so the runtime's `shell` signal fires.
@@ -1271,6 +1325,7 @@ fn merge(user: Config, project: Config) -> Config {
                 project.endpoint.static_endpoints,
             ),
         },
+        hosts: merge_hosts(user.hosts, project.hosts),
         enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
             allow: [user.permissions.allow, project.permissions.allow].concat(),
@@ -1525,6 +1580,22 @@ fn merge_static_endpoints(
             *slot = ep;
         } else {
             out.push(ep);
+        }
+    }
+    out
+}
+
+/// Merge `[[host]]` declarations: user first, then project — a project entry with the same `id`
+/// overrides the user's (so a repo can retarget a named binding), otherwise it is appended.
+/// Insertion order is preserved (deterministic display / registry seeding), mirroring
+/// [`merge_static_endpoints`].
+fn merge_hosts(user: Vec<HostEntry>, project: Vec<HostEntry>) -> Vec<HostEntry> {
+    let mut out = user;
+    for host in project {
+        if let Some(slot) = out.iter_mut().find(|h| h.id == host.id) {
+            *slot = host;
+        } else {
+            out.push(host);
         }
     }
     out
@@ -2156,6 +2227,91 @@ url = "http://prom.internal:9090"
         assert_eq!(merged[0].id, "pg");
         assert_eq!(merged[0].url, "postgres://project-host:5432/app");
         assert_eq!(merged[1].id, "cache");
+    }
+
+    #[test]
+    fn hosts_parse_from_config() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[host]]
+id = "build-farm"
+backend = "remote"
+url = "https://farm.example:8443"
+credential_ref = "env/FLUX_FARM_TOKEN"
+labels = { region = "eu" }
+
+[[host]]
+id = "here"
+backend = "local"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.hosts.len(), 2);
+        let farm = &cfg.hosts[0];
+        assert_eq!(farm.id, "build-farm");
+        assert_eq!(farm.backend, HostBackendKind::Remote);
+        assert_eq!(farm.url.as_deref(), Some("https://farm.example:8443"));
+        assert_eq!(farm.credential_ref.as_deref(), Some("env/FLUX_FARM_TOKEN"));
+        assert_eq!(farm.labels.get("region").map(String::as_str), Some("eu"));
+        // A minimal declaration: just a name and a backend kind (the local substrate needs no
+        // address and no credential).
+        assert_eq!(cfg.hosts[1].id, "here");
+        assert_eq!(cfg.hosts[1].backend, HostBackendKind::Local);
+        assert!(cfg.hosts[1].url.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_host_backend_kind_is_a_hard_config_error() {
+        // C-648: the backend vocabulary is closed. A typo'd or unknown kind must fail the whole
+        // config parse — a substrate binding silently skipped is a safety problem.
+        let dir = temp_dir();
+        write_project(&dir, "[[host]]\nid = \"warp-farm\"\nbackend = \"warp\"\n");
+        let err = load(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("warp") || msg.contains("unknown variant"),
+            "names the bad kind: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_keys_in_host_entries_are_rejected() {
+        // Unlike `[[endpoint.static]]`, a `[[host]]` entry refuses unknown keys outright: a
+        // dropped `credentialref = …` typo would silently change which substrate a session binds.
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            "[[host]]\nid = \"h\"\nbackend = \"local\"\ncredentialref = \"env/X\"\n",
+        );
+        let err = load(&dir).unwrap_err();
+        assert!(err.to_string().contains("credentialref"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_hosts_project_overrides_user_by_id() {
+        let host = |id: &str, url: &str| HostEntry {
+            id: id.into(),
+            backend: HostBackendKind::Remote,
+            url: Some(url.into()),
+            credential_ref: None,
+            labels: Default::default(),
+        };
+        let user = vec![
+            host("farm", "https://user-farm:8443"),
+            host("gpu", "https://gpu:8443"),
+        ];
+        let project = vec![host("farm", "https://project-farm:8443")];
+        let merged = merge_hosts(user, project);
+        // `farm` retargeted to the project url in place; `gpu` retained; order preserved.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "farm");
+        assert_eq!(merged[0].url.as_deref(), Some("https://project-farm:8443"));
+        assert_eq!(merged[1].id, "gpu");
     }
 
     #[test]

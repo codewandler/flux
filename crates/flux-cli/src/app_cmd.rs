@@ -153,6 +153,14 @@ pub(super) async fn assemble_integrations(
         ambient_signals: Vec::new(),
         live_plugins: LivePluginCatalog::default(),
     };
+
+    // Host bindings are session substrate state, not a plugin integration — they register even
+    // when no plugins directory exists (C-648).
+    let host_registry = session_host_registry(cfg);
+    if !host_registry.is_empty() {
+        assembly.ambient_signals.push(HOST_SIGNAL.to_string());
+    }
+
     let Some(dir) = plugins_dir() else {
         return Ok(assembly);
     };
@@ -168,7 +176,9 @@ pub(super) async fn assemble_integrations(
         );
     }
     merge_static_endpoints(&endpoint_registry, cfg);
-    assembly.ambient_signals = session_ambient_signals(&endpoint_registry);
+    assembly
+        .ambient_signals
+        .extend(session_ambient_signals(&endpoint_registry));
 
     // The session redactor, not a fresh one (C-403): the broker's `endpoint.discover` fan-out is a
     // credential-boundary ingest surface, and the registered-value pass — the only thing that can

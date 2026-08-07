@@ -2,7 +2,7 @@
 id: C-648
 title: "A host config table, HostRef and session registry"
 pillar: "Core"
-status: backlog
+status: in-progress
 epic: first-class-hosts
 areas: [flux-config, flux-capabilities]
 design: first-class-hosts
@@ -23,12 +23,12 @@ location — never a value.
 
 ## Acceptance
 
-- [ ] `[[host]]` entries parse with `id`, `backend` (`local` | `sandboxed` | `container` |
+- [x] `[[host]]` entries parse with `id`, `backend` (`local` | `sandboxed` | `container` |
       `kubernetes` | `remote`), optional `url`, `credential_ref` and `labels`; an unknown backend
       kind is a hard config error, proven by a failing-first test.
-- [ ] `HostRef` resolves credentials through the existing reference schemes; no configuration path
+- [x] `HostRef` resolves credentials through the existing reference schemes; no configuration path
       accepts an inline secret value, proven by a refusal test.
-- [ ] A `HostRegistry` registers config-declared hosts at session start and answers list/get by id,
+- [x] A `HostRegistry` registers config-declared hosts at session start and answers list/get by id,
       following the `EndpointRegistry` persistence pattern.
-- [ ] Registry entries expose backend kind and address for display without ever holding a resolved
+- [x] Registry entries expose backend kind and address for display without ever holding a resolved
       credential value.

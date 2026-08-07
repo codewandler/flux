@@ -28,6 +28,7 @@ mod doctor;
 mod execution;
 mod export_cmd;
 mod flow_cmd;
+mod host_cmd;
 mod insights_cmd;
 mod integration_projection;
 mod lab_cmd;
@@ -56,6 +57,7 @@ use doctor::*;
 use execution::*;
 use export_cmd::*;
 use flow_cmd::*;
+use host_cmd::*;
 use insights_cmd::*;
 use lab_cmd::*;
 use plugin_cmd::*;
@@ -118,13 +120,14 @@ mod tests {
     use super::{
         build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
         credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, fleet_status_line,
-        format_evidence, implicit_plugin_group, integration_plugin_caps, loop_machinery_label,
-        merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
-        plugin_status_one, redact_plugin_echo, render_endpoint_row, render_review_markdown,
-        resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
-        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill,
-        EndpointAction, EventStore, EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness,
-        PluginAction, RedactorSecretSink, ReviewSeverity,
+        format_evidence, host_ref_from_parts, implicit_plugin_group, integration_plugin_caps,
+        loop_machinery_label, merge_config_hosts, merge_static_endpoints, new_render_suffix,
+        parse_labels, plugin_binaries_in, plugin_status_one, redact_plugin_echo,
+        render_endpoint_row, render_review_markdown, resolve_plugin_operation_name,
+        run_endpoint_in, run_plugin_in, run_usage_with, should_fail, tool_preview, truncate,
+        url_has_userinfo, usage_annotation, write_generated_skill, EndpointAction, EventStore,
+        EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness, PluginAction,
+        RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
@@ -1265,6 +1268,115 @@ mod tests {
         );
         assert!(!bindings.contains_key("bad"), "invalid entry skipped");
         assert_eq!(bindings["pg-prod"].url, "postgres://db.example:5432/app");
+    }
+
+    /// C-648: no configuration path accepts an inline secret value — a credential-bearing URL and
+    /// an unparseable credential ref are refused with a remediation pointer, and a backend/address
+    /// mismatch is named. A refused part never becomes a `HostRef`, so nothing can register it.
+    #[test]
+    fn host_parts_reject_inline_secrets_and_misplaced_addresses() {
+        use flux_secret::host::HostBackend;
+        let labels = std::collections::BTreeMap::new;
+
+        let err = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://user:secret@farm.example:8443"),
+            None,
+            labels(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not embed credentials"), "got: {msg}");
+        assert!(msg.contains("credential_ref"), "points at the fix: {msg}");
+
+        // The credential field takes a *location* in the existing reference vocabulary — a raw
+        // value does not parse as one.
+        let err = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://farm.example:8443"),
+            Some("hunter2-not-a-ref"),
+            labels(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid credential ref"), "{err}");
+
+        // A remote binding without an address is unusable; a local one with an address is a lie.
+        let err =
+            host_ref_from_parts("farm", HostBackend::Remote, None, None, labels()).unwrap_err();
+        assert!(err.to_string().contains("needs a `url`"), "{err}");
+        let err = host_ref_from_parts(
+            "here",
+            HostBackend::Local,
+            Some("https://somewhere.example"),
+            None,
+            labels(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no address"), "{err}");
+
+        // All three reference schemes are accepted — the existing vocabulary, nothing new.
+        for scheme in [
+            "env/FLUX_FARM_TOKEN",
+            "plugin/k8s/main/token",
+            "kubernetes/ns/name/key",
+        ] {
+            host_ref_from_parts(
+                "farm",
+                HostBackend::Remote,
+                Some("https://farm.example:8443"),
+                Some(scheme),
+                labels(),
+            )
+            .unwrap_or_else(|e| panic!("`{scheme}` is a valid location: {e}"));
+        }
+    }
+
+    /// C-648: `[[host]]` declarations register in the session `HostRegistry` at startup — list/get
+    /// answer by binding name, entries expose backend kind and address for display, and an invalid
+    /// entry is skipped without sinking the rest.
+    #[test]
+    fn host_config_merges_into_the_session_registry() {
+        use flux_secret::host::HostBackend;
+        let cfg = flux_config::Config {
+            hosts: vec![
+                flux_config::HostEntry {
+                    id: "build-farm".into(),
+                    backend: flux_config::HostBackendKind::Remote,
+                    url: Some("https://farm.example:8443".into()),
+                    credential_ref: Some("env/FLUX_FARM_TOKEN".into()),
+                    labels: Default::default(),
+                },
+                flux_config::HostEntry {
+                    id: "here".into(),
+                    backend: flux_config::HostBackendKind::Local,
+                    url: None,
+                    credential_ref: None,
+                    labels: Default::default(),
+                },
+                // Invalid (credential-bearing URL) — must be skipped, not abort the merge.
+                flux_config::HostEntry {
+                    id: "bad".into(),
+                    backend: flux_config::HostBackendKind::Remote,
+                    url: Some("https://u:p@farm.example".into()),
+                    credential_ref: None,
+                    labels: Default::default(),
+                },
+            ],
+            ..Default::default()
+        };
+        let reg = flux_capabilities::HostRegistry::new();
+        merge_config_hosts(&reg, &cfg);
+        let farm = reg.get("build-farm").expect("valid binding registered");
+        assert_eq!(farm.host.backend, HostBackend::Remote);
+        assert_eq!(farm.host.display_address(), "https://farm.example:8443");
+        assert_eq!(
+            farm.host.credential_ref.as_ref().map(ToString::to_string),
+            Some("env/FLUX_FARM_TOKEN".into())
+        );
+        assert!(reg.get("bad").is_none(), "invalid entry skipped");
+        assert_eq!(reg.known_names(), ["build-farm", "here"]);
     }
 
     /// D-116 e2e (gated on `TEST_POSTGRES_URL`, like the pg backend tests): an operator-added
