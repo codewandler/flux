@@ -10,11 +10,27 @@ unschedulable at width — not because they collide, but because nobody said wha
 records which other repositories an item reaches, what kind of work it is, or who should do it: there
 are exactly two agent templates and every story goes to the same one.
 
-The measured consequence: `flux board next --limit 8 --independent` returns **3**.
-
 An item's write set can also only be declared once. `flux board create` takes `--area`; `flux board
 update` does not. So the 711 cannot be fixed by any existing verb, which is why this needs a
 mechanism rather than an afternoon of editing.
+
+### What this does **not** fix, measured
+
+The two boards give different answers and it matters which one is quoted:
+
+| board | width at `--limit 8 --independent` | pool | why held back |
+|---|---|---|---|
+| workspace (what the fleet schedules from) | **3** | 13 | `shared area flux-cli` ×7 — **none** undeclared |
+| repository | **8** | 101 | — |
+
+So the binding constraint on scheduling *today* is **`C-657`**, not scouting: seven of the ten
+held-back items collide on one 17k-line file, and every item in the active program already declares
+its areas. Scouting will not move the width from 3.
+
+Scouting is for the **long tail** — the 711 undeclared stories that are not yet in an active program
+lane and would each be held back the moment they entered one. It is a precondition for widening later,
+not the fix for the width today. Anyone reading this design as "the scout unblocks the fleet" has read
+it wrong, and the table above is here so that misreading is hard.
 
 ## Approach
 
@@ -50,10 +66,10 @@ the loop, the persona selects the agent. A `discipline → task_kind` map in `fl
 the existing `[loop_policy]`, joins them without fusing them — which is what lets a new persona be
 requested without touching a loop.
 
-**The whole design reduces to one number.** If scouting the backlog does not move the achievable
-independent width above 3, the diagnosis was wrong and this should be reconsidered rather than
-extended. The likely competing explanation is `C-657`: crate-level areas are too coarse when one
-17k-line file is written by half the backlog.
+**The number to hold this to** is the width available on the *repository* board's undeclared tail —
+how many of the 711 become batchable once scouted — not the workspace board's current 3, which is
+`C-657`'s to move. Measuring the wrong one would let this epic take credit for a fix it did not make,
+or be judged a failure for not making one it never claimed.
 
 ## Stories
 
