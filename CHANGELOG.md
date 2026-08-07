@@ -162,6 +162,18 @@ All notable changes to this project are documented in this file. The format is b
   A container integration test proves mount → connect → write/read → mismatch-refusal → restart →
   persistence against real Docker, dispositioned plainly where Docker is absent.
 
+- **A microvm binding resolves to a served guest substrate (Decision 0018 rule 3, C-677).**
+  `microvm` joins the closed `HostBackend` vocabulary and reuses `RemoteSystem` through merged
+  `Remote | Microvm` arms in selection, probe and metrics — one wire implementation, so drift is
+  impossible, and the story adds no port implementation and therefore no census entry. A binding
+  may omit its `url`: it lists as unwired and refuses selection naming the missing endpoint,
+  distinct from an unwired *backend*. The guest's own `SubstrateIdentity` passes through rather
+  than being stamped, which is safe because `remotely_reported` is set unconditionally by every
+  `RemoteSystem` constructor and never rides the wire — that flag, not the kind string, is what
+  keeps `browser.*`/`web.crawl` hidden under the selection. A new `binding_availability` answers
+  at binding granularity where `static_availability` could only answer per kind. Nothing in the
+  change creates, starts, stops or destroys a guest.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

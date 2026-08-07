@@ -2,8 +2,7 @@
 id: C-569
 title: "Every agent start resolves and snapshots an explicit loop binding"
 pillar: Core
-status: ready
-priority: 0
+status: done
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-agent, flux-flow, flux-runtime, flux-orchestrate, flux-cli]
@@ -86,3 +85,8 @@ sub-agent, Fleet and served start says exactly which behavior harness it is runn
 ## Comments
 
 - Rescued from wave-299's dead worker and committed on its story branch as 5edcb8ed (940 new lines plus 204 changed). The repository gate then refused the candidate: role::tests::a_role_resolves_its_own_loop_binding_and_never_the_parents panics with `role 'triage' has an invalid agent loop: invalid explicit agent loop: parse error: line 1`. The test's inline authored loop is `return "done"`, which is not a parseable Flux-Lang program on its own — it has no flow declaration. Either the fixture is wrong or an authored role loop is meant to accept a bare expression; deciding that by inference would produce a green test asserting the wrong thing, so the story stays open. The work is preserved on fleet/wave-299/flux/story/C-569 and is NOT in 0.57.0. Note also that the handoff gate accepted this commit because the cited test (loop_binding_census) passes — a handoff verifies the argv it is given, so a commit can break a different test in the same story and only the repository gate will say so.
+
+
+## Evidence
+
+- Closed against work already in main, not a new implementation. crates/flux-flow/src/engine.rs carries the resolved binding on the engine (`pub agent_loop_binding: AgentLoopBinding`, :559), assembles from it (`assemble_with_binding`, :780), refuses unsupported runtime features before the first model call (`validate_runtime`, :836) and reconstructs the admitted binding per turn (`turn.loop_binding` / `equivalent_to`, :1004-1011). crates/flux-core/src/agent_loop.rs defines `AgentLoopBindingMetadata` carrying profile, revision, runner, source_ref, source_sha256, entry_point, required_operations and required_runtime_features. crates/flux-agent/src/role.rs gives roles their own binding via `AgentLoopBinding::native_flux`. Landed by a9bfb475. wave-299 independently re-implemented the same contract as crates/flux-flow/src/loop_binding.rs and was never merged; that branch is retained, not deleted.
