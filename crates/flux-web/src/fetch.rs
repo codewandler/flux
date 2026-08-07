@@ -211,6 +211,13 @@ impl Tool for WebFetchTool {
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
+        // Read off before the body is moved. `web.fetch` has one surface rather than the
+        // record/view split `http.request` has, so a rate-limit note lands in the read itself —
+        // which is where the unexplained latency would otherwise have been (C-701).
+        let retried = match response.retries.note() {
+            Some(note) => format!("{note}\n"),
+            None => String::new(),
+        };
         let capped = egress::CappedBody {
             bytes: response.body,
             truncated: response.truncated,
@@ -268,7 +275,7 @@ impl Tool for WebFetchTool {
         }
 
         Ok(ToolResult {
-            content: format!("[{status}]\n{rendered}"),
+            content: format!("[{status}]\n{retried}{rendered}"),
             view: None,
             is_error: !status.is_success(),
         })
@@ -431,6 +438,57 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// C-701, acceptance 4 — a read that rode out a rate limit says so.
+    ///
+    /// `web.fetch` has one surface rather than `http.request`'s record/view split, so the note lands
+    /// in the read itself — which is where the unexplained latency would otherwise have been. It
+    /// appears only when there was a wait: the second half of this test is a plain read, rendered
+    /// byte-for-byte as it always was.
+    #[tokio::test]
+    async fn a_read_that_rode_out_a_rate_limit_says_so_and_a_plain_one_is_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let script = [
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 4\r\nconnection: close\r\n\r\nwait",
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 6\r\nconnection: close\r\n\r\nserved",
+            ];
+            let mut turn = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let answer = script.get(turn).copied().unwrap_or(script[1]);
+                turn += 1;
+                let _ = sock.write_all(answer.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+        let retried = tool
+            .execute(&ctx(), json!({ "url": format!("http://{addr}/") }))
+            .await
+            .expect("a rate-limited read that succeeds on the retry is a successful op");
+        assert!(
+            retried
+                .content
+                .starts_with("[200 OK]\nrate-limited, retried 1 time over "),
+            "the wait is explained right under the status line: {}",
+            retried.content
+        );
+        assert!(retried.content.ends_with("served"), "{}", retried.content);
+
+        let plain = one_shot("200 OK", "text/plain", "served").await;
+        let read = tool.execute(&ctx(), json!({ "url": plain })).await.unwrap();
+        assert_eq!(
+            read.content, "[200 OK]\nserved",
+            "a read that was not retried renders exactly as it always did"
+        );
     }
 
     /// C-652, unchanged in substance by C-674 — `web.fetch` is `SelectedExecutionSystem`, so the

@@ -481,6 +481,14 @@ field, one meaning, one set of paths it can name.
 Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
 user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
 
+**The vocabulary is ahead of the wiring, deliberately, and says so.** `local`, `sandboxed`,
+`microvm`, `ssh` and `remote` resolve to a substrate today. `container` and `kubernetes` are
+declarable and will validate, list and render — but nothing wires them yet, so `flux host ls`
+reports them as `unwired (selection fails closed)` and selecting one refuses by name instead of
+falling back to your own machine. Declaring one ahead of its implementation is legal and useful
+for recording intent; just do not expect it to run anything. The same is true of a `microvm`
+binding that names no served endpoint yet.
+
 Selecting a binding (`flux --host <name> …`) is granted, never ambient: `grant` lists the surface
 classes allowed to select it — `operator` (attended sessions) and/or `unattended` (serving and
 `--yes` surfaces) — and the default is deny. The classes are exact: an unattended surface never

@@ -370,6 +370,52 @@ pub struct PrivateAdmit {
     pub substrate: Option<String>,
 }
 
+/// What one guarded HTTP request spent recovering from rate limiting before it answered (C-701).
+///
+/// It rides on the answer rather than only reaching a log because a retry is *latency the operator
+/// paid*, and unexplained latency is the failure mode the whole feature would otherwise introduce: a
+/// turn that sat for eleven seconds has to be able to say why. It matters more once the substrate
+/// that waited is on another machine — the waiting happened there, so only the answer can carry it
+/// back — which is the same argument [`PrivateAdmit`] is reported for.
+///
+/// A request answered first time reports [`RetryReport::default`]: no retries, no wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetryReport {
+    /// Retries made **after** the first attempt. Zero for a request answered first time.
+    pub retries: u32,
+    /// Total time spent waiting between this request's attempts.
+    pub waited: Duration,
+}
+
+impl RetryReport {
+    /// Attempts made in total — the retries plus the first attempt, which always happened.
+    pub fn attempts(&self) -> u32 {
+        self.retries.saturating_add(1)
+    }
+
+    /// A one-line note for an operator-facing surface, or `None` when there is nothing to explain.
+    ///
+    /// Returning `None` rather than an empty string is the whole point: a caller renders this only
+    /// when it says something, so an ordinary request's output is byte-for-byte what it was.
+    pub fn note(&self) -> Option<String> {
+        if self.retries == 0 {
+            return None;
+        }
+        Some(format!(
+            "rate-limited, retried {} time{} over {:.1}s",
+            self.retries,
+            if self.retries == 1 { "" } else { "s" },
+            self.waited.as_secs_f64()
+        ))
+    }
+}
+
+/// Cap on the retries one answer may claim to have made — [`bounded_response`] clamps to it, because
+/// a far side's count is a claim about how long *this* caller waited.
+pub const MAX_REPORTED_RETRIES: u32 = 16;
+/// Cap on the total wait one answer may claim, for the same reason.
+pub const MAX_REPORTED_WAIT: Duration = Duration::from_secs(600);
+
 /// Cap on the response headers a substrate's answer may carry across a hop.
 pub const MAX_RESPONSE_HEADERS: usize = 128;
 /// Cap on one response header's name or value, in bytes.
@@ -411,6 +457,8 @@ pub fn bounded_response(mut response: HttpResponse, max_response_bytes: usize) -
         name.truncate(floor_char_boundary(name, MAX_HEADER_TEXT_BYTES));
         value.truncate(floor_char_boundary(value, MAX_HEADER_TEXT_BYTES));
     }
+    response.retries.retries = response.retries.retries.min(MAX_REPORTED_RETRIES);
+    response.retries.waited = response.retries.waited.min(MAX_REPORTED_WAIT);
     response.admits.truncate(MAX_PRIVATE_ADMITS);
     for admit in &mut response.admits {
         admit.host = bounded_admit_label(&admit.host);
@@ -526,6 +574,9 @@ pub struct HttpResponse {
     /// *and* reports them here; a caller across a hop records what it is told, stamped with the
     /// substrate it came from. Empty for a request that reached nothing private.
     pub admits: Vec<PrivateAdmit>,
+    /// What this request spent riding out a rate limit before it answered (C-701). Default — no
+    /// retries, no wait — for a request answered first time, which is nearly all of them.
+    pub retries: RetryReport,
 }
 
 /// Make HTTP requests through the one guarded egress policy — the *application*-level counterpart to
@@ -1544,6 +1595,38 @@ mod tests {
         }
     }
 
+    /// C-701, acceptance 4 — the one sentence an operator surface prints, pinned exactly.
+    ///
+    /// It is deliberately `Option`: a request answered first time returns `None`, so every existing
+    /// rendering is byte-for-byte unchanged and only a request that actually waited says anything.
+    #[test]
+    fn a_retry_report_explains_itself_only_when_there_is_something_to_explain() {
+        assert_eq!(
+            RetryReport::default().attempts(),
+            1,
+            "the first attempt happened"
+        );
+        assert_eq!(RetryReport::default().note(), None);
+        assert_eq!(
+            RetryReport {
+                retries: 1,
+                waited: Duration::from_millis(1_500),
+            }
+            .note()
+            .as_deref(),
+            Some("rate-limited, retried 1 time over 1.5s")
+        );
+        let three = RetryReport {
+            retries: 3,
+            waited: Duration::from_secs(11),
+        };
+        assert_eq!(three.attempts(), 4);
+        assert_eq!(
+            three.note().as_deref(),
+            Some("rate-limited, retried 3 times over 11.0s")
+        );
+    }
+
     /// C-674, acceptance 2 — no plaintext credential is `Debug`-printable, from any angle.
     ///
     /// C-652's review found the exposure while it was still harmless: the request derived `Debug`
@@ -1721,6 +1804,7 @@ mod tests {
                     body: Vec::new(),
                     truncated: false,
                     admits: Vec::new(),
+                    retries: Default::default(),
                 })
             })
         }

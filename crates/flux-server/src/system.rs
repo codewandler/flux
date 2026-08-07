@@ -1575,6 +1575,16 @@ struct WireHttpResponse {
     truncated: bool,
     #[serde(default)]
     admits: Vec<WirePrivateAdmit>,
+    /// Rate-limit retries the **serving** substrate made, and what they cost (C-701).
+    ///
+    /// The retry happens where the request is made, so on this route it happens on the far side and
+    /// this frame is the only way the operator's own surface can learn about the latency it paid
+    /// for. `#[serde(default)]` keeps a pre-C-701 peer readable: an answer with no counters is an
+    /// answer that reports none.
+    #[serde(default)]
+    retries: u32,
+    #[serde(default)]
+    waited_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1643,6 +1653,9 @@ async fn serve_http(
                         headers: response.headers,
                         body: encode_bytes(&response.body),
                         truncated: response.truncated,
+                        retries: response.retries.retries,
+                        waited_ms: u64::try_from(response.retries.waited.as_millis())
+                            .unwrap_or(u64::MAX),
                         admits: response
                             .admits
                             .into_iter()
@@ -2171,6 +2184,13 @@ fn decode_http_response(
         body,
         truncated: value.truncated,
         admits,
+        // A claim about how long the far side waited, so it is bounded like every other claim in
+        // this frame. `RemoteSystem` re-imposes the port's own caps on top; this is depth.
+        retries: flux_system::port::RetryReport {
+            retries: value.retries.min(flux_system::port::MAX_REPORTED_RETRIES),
+            waited: Duration::from_millis(value.waited_ms)
+                .min(flux_system::port::MAX_REPORTED_WAIT),
+        },
     })
 }
 
@@ -4368,6 +4388,114 @@ mod tests {
         (root, server, remote, handshake)
     }
 
+    /// A loopback origin that answers a scripted sequence and counts the requests it received, so a
+    /// test can tell *where* a retry happened from how many times the origin was actually contacted.
+    async fn scripted_origin(script: Vec<String>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let turn = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let answer = script.get(turn).or_else(|| script.last()).cloned();
+                let _ = socket
+                    .write_all(answer.unwrap_or_default().as_bytes())
+                    .await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// C-701 — a **selected remote substrate retries on the serving machine**, and the wire learns
+    /// nothing new.
+    ///
+    /// This is the claim the story's design rests on, so it is checked rather than assumed. The
+    /// origin is a listener only the daemon connects to, and it is contacted **twice**: the 429 and
+    /// the wait that followed it both happened over there, next to the service being called. The
+    /// coordinator made one framed request and got one answer — no per-attempt round trip, no
+    /// coordinator sitting on an open link per retry — and the answer carries the counters, which is
+    /// the only way latency paid on another machine can reach the operator's own surface.
+    #[tokio::test]
+    async fn a_remote_substrate_retries_a_429_on_its_own_side_and_reports_what_it_cost() {
+        let (origin, hits) = scripted_origin(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 1\r\ncontent-length: 4\r\nconnection: close\r\n\r\nwait".into(),
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nserved".into(),
+        ])
+        .await;
+
+        let (root, system) = workspace_system_serving_http("remote-http-429");
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+        let (delegate, handshake) = HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .expect("the fixture daemon speaks this build's protocol version");
+        let remote = RemoteSystem::identified(delegate, handshake.identity());
+
+        let allow = PrivateNetAllow::Any;
+        let request = flux_system::port::HttpRequest {
+            operation: "http.request".into(),
+            method: "GET".into(),
+            target: flux_system::net::guard_url_scoped_for_secret(&format!("{origin}/v1"), &allow)
+                .unwrap(),
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(20),
+            max_response_bytes: 64 * 1024,
+            secrets: flux_system::port::HttpSecretScope::default(),
+        };
+
+        let response = flux_system::port::GuardedHttp::http_request(&remote, &request, &allow)
+            .await
+            .map_err(|error| error.to_string())
+            .expect("the peer rides out the rate limit and answers with the retry's response");
+
+        assert_eq!(response.status, 200, "the caller gets the retry's answer");
+        assert_eq!(String::from_utf8_lossy(&response.body), "served");
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            // Both listeners are in-process loopback, so reachability is not what isolates this:
+            // the coordinator makes ONE framed call, HttpDelegate has no retry loop, and
+            // RemoteSystem never falls back to sending locally. Two accepted connections at the
+            // origin can therefore only have come from the daemon's own retry.
+            "the origin was contacted twice by the daemon's own retry loop — so the retry \
+             happened on the substrate that sends, not on the coordinator"
+        );
+        assert_eq!(
+            response.retries.retries, 1,
+            "what the far side waited has to reach the operator's own surface"
+        );
+        assert!(
+            response.retries.waited >= Duration::from_secs(1),
+            "the wire carries the wait, not just the count: {:?}",
+            response.retries.waited
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
     /// C-674, acceptance 1 — the delegating request, end to end over the loopback TLS fixture.
     ///
     /// A `RemoteSystem` whose delegate is the shipped HTTPS transport asks a serving daemon to make
@@ -4844,6 +4972,8 @@ mod tests {
                     grant_source: long.clone(),
                 })
                 .collect(),
+            retries: u32::MAX,
+            waited_ms: u64::MAX,
         })
         .expect("an oversized but well-formed frame decodes, bounded");
 
@@ -4865,12 +4995,20 @@ mod tests {
                 "the transport does not get to assert provenance; the hop does"
             );
         }
+        assert_eq!(
+            decoded.retries.retries,
+            flux_system::port::MAX_REPORTED_RETRIES,
+            "a far side's retry count is a claim about this caller's latency, and is bounded (C-701)"
+        );
+        assert_eq!(decoded.retries.waited, flux_system::port::MAX_REPORTED_WAIT);
         assert!(decode_http_response(WireHttpResponse {
             status: 200,
             headers: Vec::new(),
             body: "not base64 at all!!".into(),
             truncated: false,
             admits: Vec::new(),
+            retries: 0,
+            waited_ms: 0,
         })
         .is_err());
     }

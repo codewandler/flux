@@ -78,3 +78,33 @@ provider-round ceiling that has no relationship to the work.
 - Together these three close the loop the operator actually wants: the worker decides when it is
   done, says so at each checkpoint, and the coordinator can answer "how is it going?" without
   interrogating anything.
+
+## Evidence — wave-602
+
+The checkpoint loop is in place in the roadmap's `story-implementation.flux` and it works: all three
+surviving workers hit the ceiling and none of them lost work.
+
+    adaptive model-call budget exhausted before `explore` (60/60 calls used in this logical run)
+    ai_segment exhausted its 60 model-round budget before completion
+
+`wave-602-worker-1` hit it twice, `wave-602-worker-2` and `wave-472-worker-9` once each. Both
+wave-602 workers went on to commit cleanly, which is precisely the outcome this story exists to
+produce and did not happen before checkpointing.
+
+What the measurement adds is the **cost of the restart**, which the current design does not address.
+The segment is stateless by construction and the carry is prose, so a resumed segment re-derives its
+bearings by re-reading the tree. `wave-602-worker-1`'s phase split across its whole assignment:
+
+| phase | steps |
+|---|---|
+| `gather` | 166 |
+| `execute` | 62 |
+
+2.7 gather steps per execute step, with 88 `read` and 63 `grep` calls, for a change of 946 lines
+across 7 files. The two exhausted segments consumed 994 s and 790 s of wall clock before being cut —
+about 73% of that worker's 40-minute run spent in segments that ended without returning.
+
+The work survives; the *context* does not. That suggests the checkpoint's typed decision (acceptance
+item 2) should carry enough structure for the next segment to resume from what was already
+established — the files that matter, the design read, the failing test — rather than a prose summary
+that leaves rediscovery as the next segment's first job.

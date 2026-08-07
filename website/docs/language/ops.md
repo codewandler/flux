@@ -54,6 +54,17 @@ policy.
 | `sqlite_query` | `db, sql[, limit]` | low | Read-only SQLite query (`limit` caps rows, default 200) |
 | `now` / `cwd` / `home_dir` / `sys_info` | | low | Clock, workspace/home paths, and host metadata — no shell needed |
 
+`http.request` and `web.fetch` ride out a rate limit rather than handing it straight back. A `429 Too
+Many Requests` is retried up to three times, honouring `Retry-After` in either of its forms
+(delta-seconds or an HTTP-date) and otherwise backing off exponentially from 500 ms with a little
+jitter. Retrying is safe for any method, a `POST` included, because a 429 says the far side received
+the request and declined to act on it — which is why a `503` is *not* retried: it makes no such
+promise. Every wait stays inside the request's own `timeout`, so a retry that would overrun the
+budget returns the 429 instead of blocking past it, and cancelling the turn ends the wait
+immediately. When a request did wait, the rendered result says so — `rate-limited, retried 2 times
+over 3.4s` — so the latency is never unexplained. The retry happens wherever the request is made, so
+a selected remote substrate waits next to the service it is calling rather than across the link.
+
 All native web operations share the `[private_net] web` scope. Public destinations are allowed by
 default; private/internal destinations require an explicit grant. Browser operations register in
 every host but are advertised only when a Chromium binary is discoverable. `web.search` is the

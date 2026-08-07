@@ -310,6 +310,22 @@ All notable changes to this project are documented in this file. The format is b
   embedded credentials is refused without echoing it. Capability lines state what the protocol does
   not carry — tool calls and results, pending C-705 — rather than leaving an unexplained empty pane.
 
+- **Guarded HTTP honors 429 and `Retry-After` (C-701).** The retry wraps the whole attempt in
+  `NativeHttp::send` rather than the redirect chain inside it, because the first hop's secret
+  re-authorization sits above that chain — a loop placed inside would leave every retry riding
+  attempt one's authorization decision. Each retry re-mints the guarded target and re-authorizes
+  every carried secret against the destination that admission produced, proven by a test whose
+  refusal could only be produced on the second attempt. Bounds: 3 retries, 30s per wait, 60s
+  total, and the request's own budget with headroom — a `Retry-After` asking for longer returns
+  the 429 with its header intact rather than waiting less and retrying anyway. `503` is
+  deliberately excluded: a 429 is a definite negative acknowledgement, while a 503 describes the
+  server's state and is often a gateway's, emitted after forwarding. Retries are visible in the
+  result rather than appearing as unexplained latency. **Protocol note:** the response frame gains
+  two `#[serde(default)]` counters without a version bump. That is sanctioned rather than an
+  implicit extension of the C-674 rule: the retry code and the fields ship in the same binary, so
+  a v4 peer lacking them never retried, and the zero default is the truthful reading rather than a
+  fabricated one.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

@@ -129,6 +129,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   is shown as unavailable with the reason, and the conversation lives in the server's session
   store, so it deliberately does not appear in your local `flux sessions`.
 
+- **Web requests ride out rate limits.** When an API answers `429 Too Many Requests`, fetches and
+  HTTP requests now wait and try again — honouring `Retry-After` in either of its forms, or backing
+  off gently when the server names no delay — instead of handing the error straight to your
+  program. Every wait stays inside the timeout you set, cancelling a turn ends it immediately, and
+  the result says what happened: `rate-limited, retried 2 times over 3.4s`. On a remote host the
+  waiting happens next to the service being called, not on your machine. A `503` is deliberately
+  *not* retried: a 429 tells you the server received your request and declined to act on it, which
+  is what makes retrying safe even for a POST, while a 503 makes no such promise.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

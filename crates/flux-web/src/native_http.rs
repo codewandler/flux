@@ -38,6 +38,7 @@
 //! turn's registered secrets anyway.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use flux_core::{Error, Result};
 use flux_system::net::PrivateNetAllow;
@@ -46,7 +47,7 @@ use flux_system::secret_scope::SecretUse;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
 
-use crate::{egress, WebOptions};
+use crate::{egress, retry, WebOptions};
 
 /// The native guarded-HTTP backend: the shared egress client, plus the audit wiring a private-range
 /// admit is recorded through.
@@ -170,7 +171,97 @@ impl NativeHttp {
         Ok(())
     }
 
+    /// Send one guarded request, riding out a rate limit if the far side asks for one (C-701).
+    ///
+    /// The loop is here rather than inside [`egress::send_guarded`] for one structural reason: the
+    /// first hop's secret re-authorization happens in [`Self::attempt`], *above* the redirect chain.
+    /// A retry loop wrapped around `send_guarded` would leave that check outside itself, so every
+    /// retry would be riding on the decision the first attempt made — exactly what a retry may not
+    /// do. Wrapping the whole attempt instead means a retry re-mints the guarded target, re-admits
+    /// it, re-authorizes every carried secret against the destination that admission produced, and
+    /// only then re-enters the redirect chain, which re-admits and re-authorizes each hop as it
+    /// always has.
+    ///
+    /// It is also why the retry sits in the *egress client* rather than in an op: the substrate that
+    /// sends is the substrate that waits. A selected remote substrate runs this loop next to the
+    /// service it is calling, and the wire sees one request and one answer — no new frame, no round
+    /// trip per attempt, and no coordinator holding a link open per retry.
     async fn send(&self, request: &HttpRequest, allow: &PrivateNetAllow) -> Result<HttpResponse> {
+        let deadline = tokio::time::Instant::now() + request.timeout;
+        // Collected across attempts, not just the last one: an admission made on a retried attempt
+        // is exactly as real a security event as one made on the first, and for a caller across a
+        // hop this report is the only place it can appear.
+        let mut admits: Vec<PrivateAdmit> = Vec::new();
+        let mut report = flux_system::port::RetryReport::default();
+
+        loop {
+            // Every attempt after the first re-runs the egress guard on the URL the caller named,
+            // rather than re-using the addresses an earlier attempt was vetted for. It costs one
+            // resolve on a path that is already waiting seconds, and it is what "exactly as a first
+            // attempt" has to mean for admission: if the host now resolves somewhere the operator's
+            // grant does not cover, the retry refuses instead of connecting there.
+            let readmitted = match report.retries {
+                0 => None,
+                _ => Some(flux_system::net::guard_url_scoped_for_secret(
+                    request.target.url().as_str(),
+                    allow,
+                )?),
+            };
+            let target = readmitted.as_ref().unwrap_or(&request.target);
+
+            let budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let mut response = self
+                .attempt(request, target, allow, budget, &mut admits)
+                .await?;
+
+            let retry_after = response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+                .map(|(_, value)| value.as_str());
+            let wait = retry::wait_after(&retry::Attempt {
+                status: response.status,
+                retry_after,
+                retries: report.retries,
+                waited: report.waited,
+                // Measured *after* the attempt: what the wait has to fit inside is what is left.
+                remaining: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                now: std::time::SystemTime::now(),
+                jitter: retry::jitter(),
+            });
+
+            let Some(wait) = wait else {
+                response.admits = admits;
+                response.retries = report;
+                return Ok(response);
+            };
+
+            // An `await`, never a blocking sleep. Cancellation in this codebase is the caller
+            // dropping the operation future, so the wait has to be a suspension point: a cancelled
+            // turn returns here instead of holding a thread until the far side's clock runs out.
+            tokio::time::sleep(wait).await;
+            report.waited = report.waited.saturating_add(wait);
+            report.retries += 1;
+        }
+    }
+
+    /// One attempt against `target`: authorize every carried secret against the destination that
+    /// admission produced, send, and follow the bounded redirect chain.
+    ///
+    /// `target` rather than `request.target` is the whole reason this is a separate function. On the
+    /// first attempt they are the same value; on a retry `target` is a freshly minted admission, and
+    /// authorizing against *it* is what stops a retry inheriting a decision made for an earlier one.
+    ///
+    /// `budget` is what is left of the request's wall-clock allowance, not the request's own
+    /// `timeout` — the chain, its redirects and the waits between attempts stay inside one deadline.
+    async fn attempt(
+        &self,
+        request: &HttpRequest,
+        target: &flux_system::secret_scope::GuardedSecretTarget,
+        allow: &PrivateNetAllow,
+        budget: Duration,
+        admits: &mut Vec<PrivateAdmit>,
+    ) -> Result<HttpResponse> {
         let operation = request.operation.as_str();
         let method = Method::from_bytes(request.method.as_bytes()).map_err(|_| {
             Error::Other(format!("{operation}: invalid method {:?}", request.method))
@@ -200,23 +291,20 @@ impl NativeHttp {
         // the same allowlist measured against the same guard-vetted destination.
         Self::authorize_hop(
             request,
-            request.target.url(),
-            request.target.destination(),
+            target.url(),
+            target.destination(),
             "the request to",
         )?;
 
-        // Collected in hop order alongside the audit sink, so the answer can carry what happened
-        // rather than leaving a caller across a link to reconstruct it from a list of hosts.
-        let mut admits: Vec<PrivateAdmit> = Vec::new();
         let response = egress::send_guarded(
             &self.http,
             egress::GuardedRequest {
-                url: request.target.url().clone(),
-                pinned: request.target.pinned().to_vec(),
+                url: target.url().clone(),
+                pinned: target.pinned().to_vec(),
                 method,
                 headers,
                 body: request.body.clone(),
-                timeout: request.timeout,
+                timeout: budget,
             },
             operation,
             |raw| {
@@ -242,7 +330,8 @@ impl NativeHttp {
                     return;
                 };
                 // The sink above always hears about it; the *reported* list is bounded, because a
-                // redirect chain is bounded but a caller's allocation should not depend on that.
+                // redirect chain and a retry budget are both bounded but a caller's allocation
+                // should not depend on that.
                 if admits.len() < flux_system::port::MAX_PRIVATE_ADMITS {
                     admits.push(admit);
                 }
@@ -272,7 +361,10 @@ impl NativeHttp {
             headers,
             body: capped.bytes,
             truncated: capped.truncated,
-            admits,
+            // Filled in by [`Self::send`], which is the only place that knows whether this attempt
+            // was the last one and what the ones before it cost.
+            admits: Vec::new(),
+            retries: flux_system::port::RetryReport::default(),
         })
     }
 }
@@ -478,6 +570,491 @@ mod tests {
                 .expect("an admitted loopback target is served")
                 .status,
             200
+        );
+    }
+}
+
+/// C-701 — the rate-limit recovery this backend performs, driven end to end against a live server.
+///
+/// Every test here scripts a real loopback server and drives [`NativeHttp`] through the port, because
+/// the properties under test are all joints: the wait comes from a header the far side chose, the
+/// budget comes from the request, the guard and the secret scope re-run per attempt, and the
+/// cancellation is the caller dropping the future. A unit test over the schedule alone (there is one,
+/// in [`crate::retry`]) could not see any of them.
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use flux_system::port::{HeaderValue as PortHeaderValue, HttpSecretScope};
+    use flux_system::secret_scope::SecretAllowlist;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// One raw HTTP response, ready to be written to a socket.
+    fn reply(status_line: &str, extra: &[&str], body: &str) -> String {
+        let extra: String = extra.iter().map(|header| format!("{header}\r\n")).collect();
+        format!(
+            "HTTP/1.1 {status_line}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A loopback server that answers a **scripted sequence** of responses — one per accepted
+    /// connection — and remembers the raw bytes of every request it was sent.
+    ///
+    /// The script is what makes a retry observable: `[429, 200]` answers the rate limit first and
+    /// succeeds second, so "the caller got a 200" *is* "the request was retried". Once the script
+    /// runs out the last entry repeats, so a test that expected two attempts and got three fails on
+    /// its count rather than hanging on an unanswered connection.
+    struct Scripted {
+        base: String,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Scripted {
+        fn attempts(&self) -> usize {
+            self.seen.lock().unwrap().len()
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    async fn scripted(script: Vec<String>) -> Scripted {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        tokio::spawn(async move {
+            let mut turn = 0usize;
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&buf[..read]).into_owned());
+                let answer = script
+                    .get(turn)
+                    .or_else(|| script.last())
+                    .cloned()
+                    .unwrap_or_default();
+                turn += 1;
+                let _ = socket.write_all(answer.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        Scripted {
+            base: format!("http://{addr}"),
+            seen,
+        }
+    }
+
+    /// A GET through the guard, with an explicit wall-clock budget — the field the retry chain has
+    /// to stay inside.
+    fn get(url: &str, allow: &PrivateNetAllow, budget: Duration) -> HttpRequest {
+        HttpRequest {
+            operation: "http.request".to_string(),
+            method: "GET".into(),
+            target: flux_system::net::guard_url_scoped_for_secret(url, allow)
+                .expect("the loopback fixture is admitted under its grant"),
+            headers: Vec::new(),
+            body: None,
+            timeout: budget,
+            max_response_bytes: 64 * 1024,
+            secrets: HttpSecretScope::default(),
+        }
+    }
+
+    /// An [`flux_plugin::EgressAudit`] that counts the private-destination admissions it is told
+    /// about — the seam that shows whether the egress guard ran once or once per attempt.
+    #[derive(Default)]
+    struct CountingAudit(Mutex<Vec<String>>);
+
+    impl flux_plugin::EgressAudit for CountingAudit {
+        fn record_private_admit(&self, operation: &str, host: &str, _grant_source: &str) {
+            self.0.lock().unwrap().push(format!("{operation} {host}"));
+        }
+    }
+
+    /// C-701 acceptance 1 — `Retry-After` in its **delta-seconds** form is honored: the wait is at
+    /// least what the server asked for, and the answer the caller gets is the retry's.
+    ///
+    /// A 429 is a definite answer — the far side received the request and declined to act on it —
+    /// which is what makes waiting and asking again sound rather than a duplicate effect.
+    #[tokio::test]
+    async fn a_429_with_retry_after_delta_seconds_waits_that_long_and_retries() {
+        let server = scripted(vec![
+            reply("429 Too Many Requests", &["retry-after: 1"], "slow down"),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions::default());
+
+        let started = Instant::now();
+        let response = native
+            .http_request(
+                &get(
+                    &format!("{}/v1", server.base),
+                    &allow,
+                    Duration::from_secs(20),
+                ),
+                &allow,
+            )
+            .await
+            .expect("a rate-limited request that succeeds on the retry is served");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            response.status, 200,
+            "the caller gets the retry's answer, not the 429"
+        );
+        assert_eq!(String::from_utf8_lossy(&response.body), "served");
+        assert_eq!(server.attempts(), 2, "exactly one retry was made");
+        assert!(
+            elapsed >= Duration::from_secs(1),
+            "the server's delta-seconds must be waited out, not ignored: {elapsed:?}"
+        );
+        // C-701 acceptance 4 — the wait is reported, not silent.
+        assert_eq!(response.retries.retries, 1);
+        assert_eq!(response.retries.attempts(), 2);
+        assert!(
+            response.retries.waited >= Duration::from_secs(1),
+            "the report accounts for the wait it took: {:?}",
+            response.retries.waited
+        );
+        // The exact wording is pinned in `flux-system`'s own tests, where the wait is a fixed number
+        // rather than one jitter widened; here the point is only that a surface has a sentence to
+        // print instead of unexplained latency.
+        let note = response
+            .retries
+            .note()
+            .expect("a retried request has a note");
+        assert!(
+            note.starts_with("rate-limited, retried 1 time over 1."),
+            "the note names the retries and the wait: {note}"
+        );
+    }
+
+    /// C-701 acceptance 1 — `Retry-After` in its **HTTP-date** form is honored too.
+    ///
+    /// A date already in the past means "come back now", so the retry is immediate. That is what
+    /// separates a parsed date from an unparsed one: an unusable header falls back to the
+    /// exponential backoff, whose first step is half a second, so a sub-500ms wait can only mean the
+    /// date was read.
+    #[tokio::test]
+    async fn a_429_with_retry_after_as_an_http_date_is_honored() {
+        let server = scripted(vec![
+            reply(
+                "429 Too Many Requests",
+                &["retry-after: Wed, 21 Oct 2015 07:28:00 GMT"],
+                "slow down",
+            ),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions::default());
+
+        let started = Instant::now();
+        let response = native
+            .http_request(
+                &get(
+                    &format!("{}/v1", server.base),
+                    &allow,
+                    Duration::from_secs(20),
+                ),
+                &allow,
+            )
+            .await
+            .expect("a rate-limited request that succeeds on the retry is served");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(server.attempts(), 2, "exactly one retry was made");
+        assert_eq!(response.retries.retries, 1);
+        assert!(
+            response.retries.waited < Duration::from_millis(500)
+                && elapsed < Duration::from_secs(2),
+            "an HTTP-date already past means retry now — a 500ms+ wait means the date was not \
+             parsed and the backoff was used instead: waited {:?}, elapsed {elapsed:?}",
+            response.retries.waited
+        );
+    }
+
+    /// C-701 acceptance 1 — with **no** `Retry-After` the wait is a bounded exponential backoff with
+    /// jitter: at least the first backoff step, and never more than that step plus the jitter span.
+    #[tokio::test]
+    async fn a_429_with_no_retry_after_backs_off_with_bounded_jitter() {
+        let server = scripted(vec![
+            reply("429 Too Many Requests", &[], "slow down"),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions::default());
+
+        let started = Instant::now();
+        let response = native
+            .http_request(
+                &get(
+                    &format!("{}/v1", server.base),
+                    &allow,
+                    Duration::from_secs(20),
+                ),
+                &allow,
+            )
+            .await
+            .expect("a rate-limited request that succeeds on the retry is served");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(server.attempts(), 2, "exactly one retry was made");
+        // The schedule is stated here rather than read off the implementation's constants: a test
+        // that imports the number it is checking cannot catch that number being wrong.
+        assert!(
+            elapsed >= Duration::from_millis(500),
+            "a headerless 429 still waits the first backoff step (500ms): {elapsed:?}"
+        );
+        let waited = response.retries.waited;
+        assert!(
+            waited >= Duration::from_millis(500)
+                && waited <= Duration::from_millis(500) + Duration::from_millis(250),
+            "the backoff is bounded — jitter widens it by at most 250ms, it does not unbound it: \
+             {waited:?}"
+        );
+    }
+
+    /// C-701 acceptance 2 — the request's wall-clock budget bounds the **whole chain including the
+    /// waits**, and a retry that would overrun it returns the 429 instead of blocking past it.
+    ///
+    /// Both arms, in one test, because either alone proves nothing: with room in the budget the wait
+    /// is taken and the retry answers, and with less budget than the wait needs the same 429 comes
+    /// straight back. A backend that simply never retried would pass the second arm.
+    #[tokio::test]
+    async fn the_request_budget_bounds_the_wait_rather_than_being_overrun() {
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions::default());
+
+        let roomy = scripted(vec![
+            reply("429 Too Many Requests", &["retry-after: 1"], "slow down"),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let served = native
+            .http_request(
+                &get(
+                    &format!("{}/v1", roomy.base),
+                    &allow,
+                    Duration::from_secs(20),
+                ),
+                &allow,
+            )
+            .await
+            .expect("a budget with room for the wait is served by the retry");
+        assert_eq!(served.status, 200, "the wait fits, so the retry happens");
+        assert_eq!(roomy.attempts(), 2);
+
+        let tight = scripted(vec![
+            reply("429 Too Many Requests", &["retry-after: 30"], "slow down"),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let started = Instant::now();
+        let refused = native
+            .http_request(
+                &get(
+                    &format!("{}/v1", tight.base),
+                    &allow,
+                    Duration::from_secs(3),
+                ),
+                &allow,
+            )
+            .await
+            .expect("a 429 is data, so an unretryable one is still a successful request");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            refused.status, 429,
+            "a wait that does not fit the budget returns the 429"
+        );
+        assert_eq!(
+            tight.attempts(),
+            1,
+            "and nothing is sent a second time: {:?}",
+            tight.requests()
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "the budget must not be blocked past — the answer comes back at once: {elapsed:?}"
+        );
+        assert_eq!(refused.retries, Default::default());
+        assert!(
+            refused.retries.note().is_none(),
+            "nothing was retried, so there is nothing for a surface to explain"
+        );
+    }
+
+    /// C-701 acceptance 2 — the wait is **cancellable**: a cancelled turn does not sit in a sleep.
+    ///
+    /// Cancellation in this codebase is the caller dropping the operation future, so that is what
+    /// this does. The wait must therefore be an `await`, never a blocking sleep: dropping mid-wait
+    /// has to return the thread at once *and* leave the retry unsent.
+    #[tokio::test]
+    async fn a_cancelled_turn_does_not_sit_in_the_retry_wait() {
+        let server = scripted(vec![
+            reply("429 Too Many Requests", &["retry-after: 20"], "slow down"),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions::default());
+        let request = get(
+            &format!("{}/v1", server.base),
+            &allow,
+            Duration::from_secs(120),
+        );
+
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(400),
+            native.http_request(&request, &allow),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "the request must still be waiting when the caller drops it — it returned instead"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "dropping the future must return immediately, not after the wait: {elapsed:?}"
+        );
+        // Give a stray retry every chance to reach the server before the count is read.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.attempts(),
+            1,
+            "a cancelled wait must never go on to send the retry: {:?}",
+            server.requests()
+        );
+    }
+
+    /// C-701 acceptance 3 — a retry re-runs the **per-hop secret re-authorization**, and does not
+    /// reuse the decision the previous attempt made.
+    ///
+    /// The proof is a decision that could not have been made on the first attempt: the retry's
+    /// response is a redirect to a host outside the carried secret's `to=` scope. Re-running the
+    /// chain refuses it by name. A backend that authorized once before its retry loop — or that
+    /// replayed the first attempt's admitted target — would follow that redirect and carry the
+    /// credential to a host the operator never named.
+    #[tokio::test]
+    async fn a_retry_re_authorizes_the_secret_it_carries_on_every_hop_it_reaches() {
+        let elsewhere = scripted(vec![reply("200 OK", &[], "should never be reached")]).await;
+        let elsewhere_port = elsewhere
+            .base
+            .rsplit(':')
+            .next()
+            .expect("the fixture base URL ends in a port")
+            .to_string();
+        let server = scripted(vec![
+            reply("429 Too Many Requests", &["retry-after: 0"], "slow down"),
+            reply(
+                "302 Found",
+                &[&format!("location: http://localhost:{elsewhere_port}/next")],
+                "",
+            ),
+        ])
+        .await;
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions::default());
+
+        let mut request = get(
+            &format!("{}/v1", server.base),
+            &allow,
+            Duration::from_secs(20),
+        );
+        request.headers = vec![(
+            "authorization".to_string(),
+            PortHeaderValue::secret("FLUX_TEST_C701_TOKEN", "scoped-secret-42"),
+        )];
+        request.secrets = HttpSecretScope {
+            allowlist: SecretAllowlist::parse(["FLUX_TEST_C701_TOKEN;to=127.0.0.1"]),
+            carried: Vec::new(),
+            principal: None,
+        };
+
+        let error = native
+            .http_request(&request, &allow)
+            .await
+            .expect_err("the retry's redirect leaves the secret's scope and must be refused");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("refusing the redirect to localhost"),
+            "the refusal is the per-hop scope check, re-run on the retry: {message}"
+        );
+        assert!(
+            !message.contains("scoped-secret-42"),
+            "a refusal never quotes the credential: {message}"
+        );
+        assert_eq!(
+            server.attempts(),
+            2,
+            "the retry did happen — otherwise the refusal proves nothing: {:?}",
+            server.requests()
+        );
+        assert_eq!(
+            elsewhere.attempts(),
+            0,
+            "and nothing reached the out-of-scope host"
+        );
+    }
+
+    /// C-701 acceptance 3 — and a retry re-runs the **egress guard**, rather than reusing the
+    /// addresses the first attempt was vetted for.
+    ///
+    /// Loopback is a private range, so every admission is a real audit event. Two attempts must
+    /// produce two admissions on the sink; a backend that re-sent to the previously vetted pins
+    /// would produce one.
+    #[tokio::test]
+    async fn a_retry_re_admits_its_target_through_the_egress_guard() {
+        let server = scripted(vec![
+            reply("429 Too Many Requests", &["retry-after: 0"], "slow down"),
+            reply("200 OK", &[], "served"),
+        ])
+        .await;
+        let audit = Arc::new(CountingAudit::default());
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions {
+            audit: Some(audit.clone()),
+            grant_source: Some("test:grant".into()),
+            ..Default::default()
+        });
+
+        let response = native
+            .http_request(
+                &get(
+                    &format!("{}/v1", server.base),
+                    &allow,
+                    Duration::from_secs(20),
+                ),
+                &allow,
+            )
+            .await
+            .expect("a rate-limited request that succeeds on the retry is served");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            audit.0.lock().unwrap().as_slice(),
+            [
+                "web:http.request 127.0.0.1".to_string(),
+                "web:http.request 127.0.0.1".to_string()
+            ],
+            "each attempt is admitted on its own, and each admission is audited"
         );
     }
 }
