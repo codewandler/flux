@@ -149,6 +149,13 @@
   refuses and tells you which file. It never quietly falls back to public trust, and there is no
   flag to skip the check.
 
+- **See and switch the loop your agent runs, without leaving the terminal UI.** The loop driving
+  the current agent is now always shown, a hotkey opens a selector listing the `*.flux` loops
+  available to you, and choosing one raises a short overlay that visualizes the outer loop's
+  structure and renders its description — so "what is this agent actually doing, and can I run it
+  differently" is answerable in place. A loop authored while the UI is running appears without a
+  restart.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

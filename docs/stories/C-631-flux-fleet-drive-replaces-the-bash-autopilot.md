@@ -58,3 +58,8 @@ accumulation, dispatch width.
   these native verbs.
 - User-facing documentation: `website/docs/coding/fleet.md` — "Unattended driving" and "Parking a
   wave".
+
+
+## Comments
+
+- Code shipped in 0.59.0 through wave-602; story stays open. The remaining acceptance item is operational and lives in the roadmap repository: delete the bash autopilot once drive reaches parity and point AUTOPILOT.md at the native command. Both drivers exist in this release, which is recorded in the CHANGELOG entry rather than left for a reader to discover.
