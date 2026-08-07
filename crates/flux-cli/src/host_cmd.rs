@@ -348,14 +348,39 @@ fn missing_endpoint_failure(backend: HostBackend) -> flux_capabilities::HostProb
     }
 }
 
+/// A CA bundle is a handful of certificates; anything larger is a misdeclaration, not a bundle.
+pub(super) const MAX_CA_PEM_BYTES: usize = 256 * 1024;
+
+/// Read a declared CA certificate — the single reachability envelope for every surface that names
+/// one (`[[host]] ca_cert`, `[host.ssh] ca`, and `--remote-ca`).
+///
+/// A CA is *public* material that legitimately lives at a system path — `/etc/flux/ca.pem`,
+/// `~/.kube/…`, wherever the deployment put it — so it is read through the scoped host-file port
+/// rather than the workspace jail, which is exactly what that port exists for. Confining it to the
+/// workspace would mean the flagship case this story was filed to fix ("reach my own cluster")
+/// required copying the cluster CA into the project, and it would have left the ssh bootstrap
+/// (which has always used this port) able to name paths the other kinds could not.
+///
+/// The scope is the declared path *itself*, so the grant is exactly the one file the operator
+/// wrote in their own configuration — nothing broader. Both the request and the scope are reduced
+/// to physical identities first, so an in-scope symlink cannot name an out-of-scope target, and the
+/// read is capped: a path that is not a CA bundle is refused for its size rather than slurped.
+pub(super) async fn read_ca_pem(system: &System, path: &str) -> Result<Vec<u8>> {
+    flux_system::port::GuardedHostFiles::read_file_scoped(system, path, path, MAX_CA_PEM_BYTES)
+        .await
+        .map(|read| read.bytes)
+        .map_err(|error| anyhow::anyhow!("{error}"))
+}
+
 /// Read and validate the private CA a binding declares (C-684), or `Ok(None)` when it declares
 /// none and the ordinary public trust store applies.
 ///
 /// One helper, three callers — selection, `probe` and the metrics read — because a binding that
 /// probes green against one trust decision and then executes against another is exactly the
-/// inconsistency a named binding is supposed to remove. It reads through the guarded `System`, the
-/// same jailed read `--remote-ca` has always used, so the CA is subject to the workspace's read
-/// roots like any other file flux opens.
+/// inconsistency a named binding is supposed to remove.
+///
+/// It reads through [`read_ca_pem`], which is also what the ssh bootstrap uses, so one declared
+/// field has one reachability envelope on every backend kind that dials TLS.
 ///
 /// Both failures are fail-closed and both name the binding and the file, because those are the two
 /// things an operator needs to act: nothing here ever falls back to the default trust store, since
@@ -369,7 +394,7 @@ async fn declared_ca_pem(
     let Some(path) = host.ca_cert.as_deref() else {
         return Ok(None);
     };
-    let pem = system.read_file_bytes(path).await.map_err(|error| {
+    let pem = read_ca_pem(system, path).await.map_err(|error| {
         format!(
             "host `{}` declares the private CA `{path}`, which cannot be read: {error}. The \
              binding refuses rather than falling back to the default trust store",

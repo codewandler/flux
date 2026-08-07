@@ -1681,8 +1681,11 @@ async fn resolve_selected_execution_system(
         })?;
     let private_net = fleet_private_net();
     let remote = if let Some(path) = flags.remote_ca.as_deref() {
-        let pem = local
-            .read_file_bytes(path.to_string_lossy().as_ref())
+        // C-684: the same reachability envelope the named bindings use. A CA lives where the
+        // deployment put it (`/etc/flux`, `~/.kube`), so the flag and the binding must not disagree
+        // about which paths are nameable — that asymmetry is the bug this story was filed against,
+        // and reintroducing it in the other direction would be no better.
+        let pem = read_ca_pem(local, path.to_string_lossy().as_ref())
             .await
             .with_context(|| format!("read remote-system CA `{}`", path.display()))?;
         flux_server::system::connect_remote_system_with_ca_pem(endpoint, token, &private_net, &pem)

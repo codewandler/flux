@@ -59,13 +59,14 @@ id = "cluster"
 backend = "kubernetes"
 url = "https://127.0.0.1:8790"
 credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
-ca_cert = "ca.pem"
+ca_cert = "/etc/flux/cluster-ca.pem"
 grant = ["operator"]
 ```
 
 Then `flux host probe cluster` verifies the endpoint against that CA, and `flux --host cluster …`
-executes on it. An unreadable or malformed `ca_cert` refuses the binding by name; it never falls
-back to the public trust store. See [Host bindings](../../website/docs/reference/config.md#host-bindings-host).
+executes on it. The path is read as you wrote it and may live outside the project — a cluster CA
+usually does. An unreadable or malformed `ca_cert` refuses the binding by name; it never falls back
+to the public trust store. See [Host bindings](../../website/docs/reference/config.md#host-bindings-host).
 
 ## What each file is for
 

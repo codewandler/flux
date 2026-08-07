@@ -59,7 +59,8 @@ grant = ["operator"]
 ```
 
 `ca_cert` is the path to the CA certificate **on the client machine** — a location, not the
-certificate itself, and not a secret. `flux host probe vm-guest` verifies the guest against it and
+certificate itself, and not a secret. It may be absolute and outside your project, as above; flux
+reads exactly that file. `flux host probe vm-guest` verifies the guest against it and
 reports the negotiated protocol version. An unreadable or malformed certificate refuses the binding
 and names it; nothing falls back to the public trust store, and no flag relaxes that. See
 [Host bindings](../../website/docs/reference/config.md#host-bindings-host).

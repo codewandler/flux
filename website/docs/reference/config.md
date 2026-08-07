@@ -472,6 +472,12 @@ and resolution validates it — an unreadable or malformed certificate refuses t
 the binding and the file, and **never** falls back to the default trust store. There is no flag
 that relaxes this; an endpoint whose certificate does not chain to the declared CA is refused with
 the TLS failure named.
+
+The path may be absolute and outside the workspace — `/etc/flux/ca.pem`, a path under `~`, wherever
+your deployment put it — because a CA belongs to the machine or the cluster, not to the project you
+happen to be working in. Flux reads exactly the file you named and nothing else, so naming one does
+not open a directory. This is the same rule for `ca_cert`, `[host.ssh] ca` and `--remote-ca`: one
+field, one meaning, one set of paths it can name.
 Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
 user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
 

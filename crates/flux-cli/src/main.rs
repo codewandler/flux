@@ -2199,6 +2199,73 @@ sqR3JAysdJBljWp4mVhFw3iPuGfa6RI5keoUH/fk23Lbsgs=
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-684 review: one declared field, one reachability envelope.
+    ///
+    /// A CA certificate is public material that lives where the deployment put it — `/etc/flux`,
+    /// `~/.kube`, a path chosen by the cluster, never inside the project being worked on. Reading
+    /// it through the workspace jail would mean the documented `ca_cert = "/etc/flux/guest-ca.pem"`
+    /// refuses on a `microvm` binding while the identical declaration works on an `ssh` one, which
+    /// has always used the scoped host-file port. That split is the same class of defect this story
+    /// was filed to remove, so it is pinned here rather than left to the docs to apologise for.
+    ///
+    /// The grant stays exactly one file: the scope is the declared path itself, so this widens
+    /// *which* path an operator may name, never how many.
+    #[tokio::test]
+    async fn a_declared_ca_outside_the_workspace_is_readable_on_every_kind() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+
+        let base = std::env::temp_dir().join(format!("flux-host-ca-out-{}", std::process::id()));
+        let workspace = base.join("project");
+        let elsewhere = base.join("etc-flux");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // Deliberately a sibling of the workspace, never under it: this is the whole point.
+        let ca = elsewhere.join("guest-ca.pem");
+        std::fs::write(&ca, TEST_CA_PEM).unwrap();
+
+        std::env::set_var("C684_OUT_TOKEN", "guest-token");
+        let host = HostRef {
+            url: Some("https://127.0.0.1:1".into()),
+            credential_ref: Some(flux_secret::Ref::env("C684_OUT_TOKEN")),
+            ca_cert: Some(ca.to_string_lossy().into_owned()),
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("vm-guest", HostBackend::Microvm)
+        };
+
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&workspace).unwrap(),
+            )),
+        };
+        // The anchor is accepted, so the only thing left to fail is the transport. A jailed read
+        // would refuse here with "cannot be read" and never reach the wire at all.
+        match prober.probe(&host).await.unwrap_err() {
+            HostProbeFailure::Connect { .. } => {}
+            other => panic!("a CA outside the workspace must still be readable, got {other:?}"),
+        }
+
+        let local = flux_system::System::new(flux_system::Workspace::new(&workspace).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(host));
+        let text = resolve_named_host("vm-guest", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("connect host `vm-guest`"),
+            "selection reads the same anchor and reaches the client: {text}"
+        );
+        assert!(
+            !text.contains("cannot be read"),
+            "the workspace jail must not be what decides where a CA may live: {text}"
+        );
+
+        std::env::remove_var("C684_OUT_TOKEN");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     /// C-677, acceptance 4 — the pin C-651 made for the confinement peer, made here for the guest.
     ///
     /// C-652's `Executor::non_native_target` reads `kind != "native" || remotely_reported` as "a
