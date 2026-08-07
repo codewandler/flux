@@ -98,6 +98,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   bind that reaches beyond loopback without a token fails the shipped checks, and the running
   daemon refuses it too.
 
+- **Use the dev box you already have.** Declare an `ssh` host binding and flux reaches a machine
+  that has nothing on it but sshd: it opens a port-forward, makes sure flux is serving on the other
+  side, and runs your work there over the same secure protocol a `remote` host uses — same
+  authentication, same version check, same approval gates. ssh only gets you there; it never
+  becomes the way your work runs, so the far machine keeps enforcing its own permissions. Nothing
+  prompts: host-key checking is strict, a changed key is a refusal you can read rather than a
+  question in an unattended run, and your key stays a reference to a file flux never opens. Every
+  failure names the piece that is missing — no sshd, an unrecognised host key, a key that was
+  declined, no flux binary over there — and none of them quietly falls back to your own machine.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

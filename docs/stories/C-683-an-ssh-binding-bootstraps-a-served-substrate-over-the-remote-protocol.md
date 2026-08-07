@@ -2,7 +2,7 @@
 id: C-683
 title: "An ssh binding bootstraps a served substrate over the remote protocol"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system, flux-cli]
 design: first-class-hosts
@@ -29,24 +29,24 @@ known-hosts bypass); the key is a credential *reference*, never a value in confi
 
 ## Acceptance
 
-- [ ] `ssh` joins the closed `HostBackend` vocabulary: declarable in `[[host]]` with
+- [x] `ssh` joins the closed `HostBackend` vocabulary: declarable in `[[host]]` with
       `user@host[:port]`, an optional remote binary path, and a credential reference for the key;
       rendered by `flux host ls`/`show`; the unknown-key hard error unchanged; absent sshd, a
       usable key, or a startable far-side binary, resolution fails closed naming the missing
       piece — nothing ever falls back to running effects locally or to raw command execution.
-- [ ] Resolution establishes the served endpoint over an ssh port-forward through the guarded
+- [x] Resolution establishes the served endpoint over an ssh port-forward through the guarded
       spawn path (pinned argv, strict host-key checking, key by reference) and admits it with the
       standard remote-protocol handshake; the bearer token still authenticates over the tunnel —
       the tunnel never substitutes for protocol auth.
-- [ ] `flux host probe` on an ssh binding performs the side-effect-free identity check through
+- [x] `flux host probe` on an ssh binding performs the side-effect-free identity check through
       the tunnel and reports the negotiated protocol version and the far side's
       `SubstrateIdentity` with `remotely_reported` provenance; `browser.*`/`web.crawl` stay
       hidden under the selection (non-native kind, pinned like the sibling backends).
-- [ ] A loopback-sshd integration test proves the full chain (bootstrap → forward → handshake →
+- [x] A loopback-sshd integration test proves the full chain (bootstrap → forward → handshake →
       a guarded read on the far side) and the refusal faces (no sshd; host-key mismatch refuses
       rather than prompts; far-side version mismatch surfaces the protocol's own refusal),
       explicitly dispositioned where no sshd is available in CI.
-- [ ] The config reference documents the binding, its bootstrap contract (what must exist on the
+- [x] The config reference documents the binding, its bootstrap contract (what must exist on the
       far machine: the flux binary at a declared path or on PATH — installing it stays the
       operator's step, per the C-480 boundary), and the failure faces; the codegate censuses stay
       clean.

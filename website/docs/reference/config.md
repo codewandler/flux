@@ -592,7 +592,14 @@ Four more things worth knowing before you declare one.
   changed host key is a named refusal rather than a question — an unattended run has nobody to
   answer one. Password and keyboard-interactive authentication are off, agent forwarding and
   connection multiplexing are off, and `-F none` means neither your `~/.ssh/config` nor the
-  system-wide one is consulted. The `[[host]]` entry is the whole declaration.
+  system-wide one is consulted. The `[[host]]` entry is the whole declaration — which also means
+  **`ProxyJump` is not supported**: a machine reachable only through a jump host cannot be reached
+  by an ssh binding today, because no binding field declares one. Point the binding at a directly
+  reachable target, or serve that machine and use a `remote` binding.
+- **Nothing reaps a far-side serve.** If flux started `flux system serve` on the far machine, it
+  keeps running after your session ends — that is deliberate, because the next session attaches to
+  it instead of starting another, and because killing a process on someone else's build machine is
+  not a thing a client should do implicitly. Stop it the way you stop any other service there.
 - **The key is a reference, and it stays a file.** `credential_ref` resolves to the private key's
   *path*; openssh opens it and flux never reads the material. An `ssh://user:pass@host` url is
   refused — an ssh binding authenticates by key.

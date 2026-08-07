@@ -252,14 +252,19 @@ impl SshPlan {
         Ok(())
     }
 
-    /// The pinned options every ssh invocation of this binding carries. Order matters:
-    /// `ClearAllForwardings` comes before any `-L` so it clears what a config file contributed
-    /// without clearing what this binding declared.
+    /// The pinned options every ssh invocation of this binding carries.
+    ///
+    /// `ClearAllForwardings` is deliberately **absent**, and its absence is pinned by test: OpenSSH
+    /// applies it after the entire command line, not in argument order, so pinning it silently
+    /// cancelled this binding's own `-L` — a live client that bound nothing and said nothing.
+    /// `-F none` covers what it was reached for, by making no config file contribute at all.
     fn pinned_options(&self) -> Vec<String> {
         // The binding is the whole declaration: `-F none` skips both the per-user and the
         // system-wide ssh config, so what the tunnel does is what the `[[host]]` entry says and
-        // nothing an unrelated file contributes. A jump host or a cipher preference has to be
-        // declared, not inherited.
+        // nothing an unrelated file contributes. The consequence is real and worth naming: a
+        // machine reachable only through `ProxyJump` is not reachable by an ssh binding, because
+        // no binding field declares one. Reach it through a target that is directly reachable, or
+        // serve it and use a `remote` binding.
         let mut argv: Vec<String> = vec!["-F".to_string(), "none".to_string()];
         let mut option = |value: &str| {
             argv.push("-o".to_string());
