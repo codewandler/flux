@@ -2,7 +2,7 @@
 id: C-654
 title: "Host metrics over the remote protocol and the host surface"
 pillar: "Core"
-status: backlog
+status: done
 epic: host-metrics-seam
 areas: [flux-server, flux-cli]
 design: host-metrics-seam
@@ -21,10 +21,15 @@ usage.
 
 ## Acceptance
 
-- [ ] `bounded_operations()` gains `host.metrics` under a `PROTOCOL_VERSION` bump; an older server
-      answers a typed unsupported, and the handshake test proves both directions.
-- [ ] `flux host metrics <name>` renders typed readings with explicit unavailable entries; JSON
+- [x] `bounded_operations()` gains `host.metrics` under a `PROTOCOL_VERSION` bump; a mixed
+      version pair is refused at handshake from both seats (proven live in both directions), and
+      a same-version peer that declares no metric kinds answers a typed unsupported without a
+      request. (Amended at integration: the original "an older server answers a typed
+      unsupported" was unreachable by design — exact-equality negotiation refuses an older
+      server before any operation; the review judged the delivered semantics the safe
+      resolution of that clause.)
+- [x] `flux host metrics <name>` renders typed readings with explicit unavailable entries; JSON
       output is the automation API.
-- [ ] The `host.metrics` operation registers behind the ambient host gate with deliberate
+- [x] The `host.metrics` operation registers behind the ambient host gate with deliberate
       placement, and the placement census is updated.
-- [ ] Readings served by a remote binding carry `remotely_reported` provenance.
+- [x] Readings served by a remote binding carry `remotely_reported` provenance.

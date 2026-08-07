@@ -129,6 +129,17 @@ All notable changes to this project are documented in this file. The format is b
   system (same machine, same narrowable roots); GuardedHttp inherits the port's `Unserved` until
   a selected native substrate gains an HTTP backend.
 
+- **Host metrics ride the remote protocol and surface as `flux host metrics` (Decision 0018
+  rule 6, C-654).** `PROTOCOL_VERSION` 2→3: the handshake declares served `metric_kinds` as a
+  capability beside `operations`, negotiation stays exact-equality and refuses a mixed pair from
+  both seats, and a same-version peer declaring no kinds is answered with a typed `Unserved`
+  without a round trip. `RemoteSystem`'s `GuardedMetrics` delegates over the wire; every decoded
+  reading is re-bounded twice (decoder and hop, both routed through `bounded_reading`), and
+  `remotely_reported` provenance is stamped by the hop — the wire cannot forge it. The surface is
+  `flux host metrics <name>` plus the ambient-gated `host.metrics` operation at the host pack's
+  `LocalControlPlane` placement, carrying probe's exact authority pair (`network_fetch` +
+  `host_read` on the binding subject).
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
