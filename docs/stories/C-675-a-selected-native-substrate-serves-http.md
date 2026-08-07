@@ -2,7 +2,7 @@
 id: C-675
 title: "A selected native substrate serves HTTP"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system, flux-web]
 design: first-class-hosts
@@ -22,14 +22,14 @@ second client, without an ambient seam, and without the routing branch learning 
 
 ## Acceptance
 
-- [ ] A sandboxed selection serves `http.request`/`web.fetch` through the one reviewed egress
+- [x] A sandboxed selection serves `http.request`/`web.fetch` through the one reviewed egress
       client with its own audit sink; the codegate `Http` census still counts exactly the existing
       client construction points.
-- [ ] The selection branch stays kind-blind and nothing can fall back to a local send while a
+- [x] The selection branch stays kind-blind and nothing can fall back to a local send while a
       selection is in force; the placement census is unchanged.
-- [ ] A spawned sub-agent's context carries the parent's selected substrate, pinned by the test
+- [x] A spawned sub-agent's context carries the parent's selected substrate, pinned by the test
       C-652's review named as the open question.
-- [ ] `SandboxedSystem`'s `GuardedHttp` census entry moves from empty to its new truth with a
+- [x] `SandboxedSystem`'s `GuardedHttp` census entry moves from empty to its new truth with a
       review note stating which call is made and why it adds no IO path.
 
 ## Design
@@ -90,3 +90,8 @@ there is not.
 
 Selection now resolves after the session opens, because the substrate's audit sink is a
 session-scoped value (event store + session id). Every binding refusal is still a startup refusal.
+
+
+## Comments
+
+- Review minor: pub System::with_http is un-censused — the codegate families cover who implements and who constructs a client, not who attaches one; a second attachment site would land without review. Candidate codegate lint. Also noted: a refused binding now leaves session bookkeeping behind (cleanup, not authority).
