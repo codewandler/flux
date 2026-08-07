@@ -497,7 +497,6 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 ### Host metrics seam
 _A host exposes nothing about itself. Dispatch-layer telemetry, substrate provenance and the usage_
 - [C-655 — A Kubernetes host serves node metrics](C-655-a-kubernetes-host-serves-node-metrics.md) · Core · Decision 0018 rule 6: node/pod metrics mapped into the same closed vocabulary; follows the container/Kubernetes backend (C-397, C-480)
-- [C-673 — Harden the native metrics reader against hostile mounts and pinned roots](C-673-harden-the-native-metrics-reader-against-hostile-mounts-and-pinned-roots.md) · Core · C-653 review findings: the reading is bounded at the answer, not at every seam edge; caps truncate silently and one parse path can panic
 
 ### Hosted Single Org
 - [C-656 — SSO member login to a hosted Exchange](C-656-sso-member-login-to-a-hosted-exchange.md) · Core · Decision 0019 rule 5: browser OIDC sign-in, member token mint, token stored under the named binding credential reference; replaces the transitional env pair
@@ -1197,6 +1196,7 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
 - [C-654 — Host metrics over the remote protocol and the host surface](C-654-host-metrics-over-the-remote-protocol-and-the-host-surface.md) · Core · Decision 0018 rule 6: host.metrics bounded wire operation under a protocol version bump; flux host metrics CLI and usage-observatory projection
 - [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
+- [C-673 — Harden the native metrics reader against hostile mounts and pinned roots](C-673-harden-the-native-metrics-reader-against-hostile-mounts-and-pinned-roots.md) · Core · C-653 review findings: the reading is bounded at the answer, not at every seam edge; caps truncate silently and one parse path can panic
 - [C-675 — A selected native substrate serves HTTP](C-675-a-selected-native-substrate-serves-http.md) · Core · C-651/C-652 interplay: a sandboxed selection answers Unserved for web effects — fail-closed, and a capability gap both implementors flagged
 - [C-677 — A microvm binding resolves to a served guest substrate](C-677-a-microvm-binding-resolves-to-a-served-guest-substrate.md) · Core · Decision 0018 rule 3 within C-480's boundary: flux never provisions a VM; a microvm host is the remote protocol served from the C-480 guest profile
 - [C-685 — A Kubernetes profile for the agent surface](C-685-a-kubernetes-profile-for-the-agent-surface.md) · Core · C-480 shipped deployment profiles for `flux system serve` (the substrate); the agent surface `flux app run --serve` has none, and its non-loopback bind has auth requirements the manifests must encode

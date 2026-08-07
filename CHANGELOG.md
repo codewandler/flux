@@ -242,6 +242,21 @@ All notable changes to this project are documented in this file. The format is b
   protected route. `--yes` ships as the declared posture with `--remote-approval` one commented
   line away and the C-687 caveat stated in all three places an operator reads.
 
+- **The native metrics reader is hardened against hostile mounts and pinned roots (C-673).**
+  Every arithmetic path reachable from parsed `/proc` content is checked: a counter that overflows
+  answers `ReadFailed` rather than panicking under debug or wrapping to a fabricated zero ratio
+  under release. Mount points longer than the label bound keep distinct identities through a
+  content digest instead of colliding on a shared prefix, cap truncation is visible in the answer
+  as `omitted_mounts` (counting distinct points, so an overmount stack counts once), and the
+  non-disk exclusion covers `fuse.*` generically plus 9p, ceph, glusterfs and davfs. The
+  metrics-roots census guard was rebuilt on the attribute-scoped visitor the credential-boundary
+  census already uses — the previous text heuristic skipped everything after a file's first
+  `#[cfg(test)]`, including the setter's own definition — and its review note now claims only the
+  half it mechanically checks. **Note for consumers:** the disk reading in `flux host metrics
+  --output json` and the `host.metrics` operation is now an object (`mounts` plus
+  `omitted_mounts`) rather than a bare array, under an unchanged `flux.host-metrics/v1` token;
+  the remote wire payload is byte-identical and the protocol version is unchanged.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
