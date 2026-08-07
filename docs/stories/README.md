@@ -600,6 +600,13 @@ _Fleet membership and task execution are separate concerns. The V1 fleet can adm
 - [C-552 — One TaskAgentBackend separates agent execution from fleet membership](C-552-task-agent-backend-contract.md) · Core · follow-up after native loop/report contracts — lifecycle stays generic and advertises which harness and budget semantics a backend can uphold
 - [C-553 — Codex, Claude, Hermes and Pi run through typed local task-agent adapters](C-553-cli-agent-harness-adapters.md) · Core · local harness CLIs are task backends; each maps only loop/report/yield/budget behavior it can prove and refuses the rest
 
+### The substrate seam: what crosses it, and who may compose it
+- [C-689 — DNS resolution follows the selected substrate](C-689-dns-resolution-follows-the-selected-substrate.md) · Core · HostResolver exists as a test seam inside net.rs but never reaches the port, so the coordinator resolves names the substrate will dial — a cluster name resolves to the wrong answer or none
+- [C-690 — Clock offset joins the host metric vocabulary](C-690-clock-offset-joins-the-host-metric-vocabulary.md) · Core · time is not an authorization boundary — it is substrate condition; sampled_at is stamped by the reader's clock and no field expresses the skew a consumer compares across
+- [C-691 — WebSocket rides the remote protocol](C-691-websocket-rides-the-remote-protocol.md) · Core · GuardedNetwork::open_websocket_scoped is on the port and native-only; RemoteSystem answers Unserved and websocket is absent from the wire's bounded operations — HTTP's position before C-674
+- [C-692 — An accepted WebSocket session is a guarded resource](C-692-an-accepted-websocket-session-is-a-guarded-resource.md) · Core · ingress is guarded at bind_tcp and the TCP framing layer; the upgrade happens above the seam, so an accepted WS session has no per-message ceiling the way an outbound one does
+- [C-693 — A shared substrate distinguishes the callers using it](C-693-a-shared-substrate-distinguishes-the-callers-using-it.md) · Core · the agent surface has ServerAuth::Principal with realm-scoped sessions and per-request (Caller, Trust); the remote-system wire has one bearer token and no principal at all
+
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
