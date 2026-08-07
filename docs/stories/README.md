@@ -424,6 +424,7 @@ _The substrate abstraction already exists — `flux-system` owns the guarded por
 - [C-678 — End users see only host bindings granted to them](C-678-end-users-see-only-host-bindings-granted-to-them.md) · Core · Decision 0018 rule 4's second sentence is unimplemented across the flux host surface; C-654's review measured the gap
 - [C-679 — The remote client bounds every response it decodes](C-679-the-remote-client-bounds-every-response-it-decodes.md) · Core · the server caps requests (MAX_REQUEST_BYTES); the client caps nothing — response.json() on the wire answer and the handshake are unbounded
 - [C-680 — flux system serve accepts a file-shaped token](C-680-flux-system-serve-accepts-a-file-shaped-token.md) · Core · C-480 review: the k8s manifest carries the bearer token as a pod env var only because serve offers nothing but --token-env; file-shaped is the decision 0007/0008 direction
+- [C-683 — An ssh binding bootstraps a served substrate over the remote protocol](C-683-an-ssh-binding-bootstraps-a-served-substrate-over-the-remote-protocol.md) · Core · Decision 0018 rule 3 composition: ssh is the bootstrap, never the substrate — the far side is still the flux binary serving the remote protocol, and verification-before-acceptance is unchanged
 
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
@@ -441,6 +442,8 @@ _Wave 1 closed the confidentiality holes. This wave is about the thing the opera
 - [C-630 — fleet integrate --only salvages the non-conflicting subset of a wave](C-630-fleet-integrate-only-salvages-the-non-conflicting-subset-of-a-wave.md) · Core · wave-346 parked whole while two of three stories were independently integrable
 - [C-632 — Every worker turn records usage, including failed turns](C-632-every-worker-turn-records-usage-including-failed-turns.md) · Core · no recent worker turn carries rounds or tokens; you cannot see how close a worker was to its round budget before it died; activity.ndjson has no timestamps, no turn id, and a proven torn write at line 556
 - [C-659 — Fleet state.json stops carrying every agent's last turn](C-659-fleet-state-json-stops-carrying-every-agent-s-last-turn.md) · Core · every fleet verb fully parses state.json; last_turn blobs accumulate per agent and nothing prunes them
+- [C-681 — fleet promote accumulates, gates and merges every member in dependency order](C-681-fleet-promote-accumulates-gates-and-merges-every-member-in-dependency-order.md) · Core · decision 0017 point 6; the bash driver's snapshot_and_merge is flux-only and carries one machine's absolute paths
+- [C-682 — Handoff evidence anchors are declared per repository, not derived by cargo-specific code](C-682-handoff-evidence-anchors-are-declared-per-repository-not-derived-by-cargo-specific-code.md) · Core · decision 0017 point 6; handoff_evidence.py is 170 lines of cargo-specific derivation and silently skips a story that adds tests to an existing file
 
 ### `fleet:init` interviews an operator and writes a working fleet
 _Standing up the fleet in this workspace took many hours across several sessions, and almost none of_
