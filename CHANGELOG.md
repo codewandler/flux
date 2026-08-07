@@ -91,6 +91,22 @@ All notable changes to this project are documented in this file. The format is b
   approximating; `browser.*` and `web.crawl` stay `NativeSystemOnly`, pinned by a new
   placement-census test.
 
+- **Sandboxed is a selectable peer backend (Decision 0018 rules 3 and 8, C-651).**
+  `SandboxedSystem` in `flux-system` composes the native `System` with the OS sandbox and
+  implements all seven guarded port families by delegation — no added or removed permission, no
+  second spawn path; seven reviewed single-use codegate allowances plus a completeness test pin
+  it. Admission is evidence-gated: `resolve` admits only an active sandbox, and an
+  outer-confinement conclusion is inherited only from the ambient posture that already trusted
+  and audit-disclosed the `FLUX_SANDBOXED` marker — a bare marker fails closed with a refusal
+  naming it. A `Require` posture floor raises a named local binding to the sandboxed peer;
+  `--no-sandbox` never lowers an explicitly selected binding (tightest-wins);
+  `SubstrateIdentity` reports `kind = "sandboxed"` on every admission path, which keeps
+  `browser.*`/`web.crawl` hidden under a sandboxed selection. The `--sandbox`/`--no-sandbox`
+  modifier path is byte-for-byte unchanged, and an admitted peer is a workspace snapshot that
+  does not follow a later re-root (pinned by test). GuardedMetrics delegates to the composed
+  system (same machine, same narrowable roots); GuardedHttp inherits the port's `Unserved` until
+  a selected native substrate gains an HTTP backend.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

@@ -477,7 +477,7 @@ this machine can serve it, and which backend it would use. An autonomy posture t
 unconfined (`bounded-autonomy`, `exploratory`) selects this backend for a named `local` binding —
 a posture may tighten a selection, never loosen one.
 
-Three consequences are worth stating plainly before you declare one.
+Four consequences are worth stating plainly before you declare one.
 
 - **A bare `FLUX_SANDBOXED` marker does not satisfy it.** A flux running inside a flux sandbox is
   confined by that outer sandbox and a `sandboxed` binding inherits it — but only where the run's
