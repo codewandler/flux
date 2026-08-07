@@ -2,8 +2,7 @@
 id: C-701
 title: "Guarded HTTP honors 429 and Retry-After"
 pillar: "Core"
-status: backlog
-priority: 2
+status: in-progress
 epic: first-class-hosts
 areas: [flux-web]
 design: docs/designs/the-substrate-seam.md
@@ -50,3 +49,8 @@ local and remote behave identically without the wire learning anything new.
 - [ ] Tests drive: a 429 with delta-seconds, a 429 with an HTTP-date, a 429 with no header, budget
       exhaustion mid-wait, cancellation mid-wait, and a retry that must re-authorize a scoped
       secret.
+
+
+## Comments
+
+- In progress: dispatched to an implementor in worktree flux-c701 off base f1c1bf09. Retry lives in the egress client behind GuardedHttp so a selected remote substrate retries next to the target and the wire learns nothing new. Safety argument to preserve: a 429 is a definite answer, so retry is sound for any method including POST — which is why C-674's framed route carrying no at-most-once guarantee does not block it.

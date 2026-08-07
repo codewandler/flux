@@ -2,7 +2,7 @@
 id: C-686
 title: "The TUI attaches to an agent that lives on a host"
 pillar: "Core"
-status: backlog
+status: in-progress
 epic: remote-agents
 areas: [flux-tui]
 design: docs/designs/operating-a-deployed-host.md
@@ -37,3 +37,8 @@ line-buffered conversation.
       replays enough history to make the pane truthful about what happened while detached.
 - [ ] The docs state precisely which session artifacts live on which machine, so nobody expects
       `flux sessions`/`replay` locally to hold a remote agent's history unless it was exported.
+
+
+## Comments
+
+- In progress: dispatched to an implementor in worktree flux-c686 off base a3f62d66. Design-first — the seam question is how a remote agent's turns reach the TUI's view model without masquerading as local session events, and what is authoritative for history on reattach. NOT a release blocker: this is the agent axis, not host/system, so the cut proceeds without it if it is not green in time.

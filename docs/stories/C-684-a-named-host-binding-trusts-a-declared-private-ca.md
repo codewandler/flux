@@ -2,8 +2,7 @@
 id: C-684
 title: "A named host binding trusts a declared private CA"
 pillar: "Core"
-status: backlog
-priority: 1
+status: in-progress
 epic: first-class-hosts
 areas: [flux-cli]
 design: first-class-hosts
@@ -40,3 +39,8 @@ and route every binding-resolution path through the CA-aware client.
 - [ ] A test proves both faces against a loopback TLS server with a generated private CA, and
       C-480's VM/Kubernetes reference docs point at the new field where they describe their
       generated certificates.
+
+
+## Comments
+
+- In progress: dispatched to an implementor in worktree flux-c684 off base 4e972fea. Adds an optional CA reference to [[host]] and routes resolve_named_host, CliHostProber::probe and the metrics read through connect_remote_system_with_ca_pem. Must merge forward over C-683 (ssh backend arms) and C-674 (PROTOCOL_VERSION 4), both now landed. Release-relevant: without it no named binding reaches a pod, guest or container with a cluster-issued cert.
