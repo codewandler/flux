@@ -2,7 +2,7 @@
 id: C-651
 title: "Sandboxed is a selectable peer backend"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system]
 design: first-class-hosts

@@ -416,11 +416,6 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 - [A-115 — JiraBoard through Exchange-governed operations, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · re-pointed by Decision 0006: the vendor mapping is a connector board member and every write an admitted Exchange operation — the plugin path this was written over is deleted by Milestone 5; the status↔State mapping stays config, not code
 - [A-118 — GitlabBoard — a second Exchange-governed tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · re-pointed by Decision 0006 away from plugins/gitlab (Milestone 5 deletes the plugin path); deferrable — its value is the proof that WorkBoard is not 'Jira with a trait on top'
 
-### First-class hosts
-_The substrate abstraction already exists — `flux-system` owns the guarded port, `flux-codegate`_
-- [C-651 — Sandboxed is a selectable peer backend](C-651-sandboxed-is-a-selectable-peer-backend.md) · Core · Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a spawn-time modifier; codegate census entry under review
-- [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
-
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
 - [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
@@ -492,7 +487,6 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 
 ### Host metrics seam
 _A host exposes nothing about itself. Dispatch-layer telemetry, substrate provenance and the usage_
-- [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
 - [C-654 — Host metrics over the remote protocol and the host surface](C-654-host-metrics-over-the-remote-protocol-and-the-host-surface.md) · Core · Decision 0018 rule 6: host.metrics bounded wire operation under a protocol version bump; flux host metrics CLI and usage-observatory projection
 - [C-655 — A Kubernetes host serves node metrics](C-655-a-kubernetes-host-serves-node-metrics.md) · Core · Decision 0018 rule 6: node/pod metrics mapped into the same closed vocabulary; follows the container/Kubernetes backend (C-397, C-480)
 
@@ -1179,6 +1173,9 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-648 — A host config table, HostRef and session registry](C-648-a-host-config-table-hostref-and-session-registry.md) · Core · Decision 0018 rules 1-2: declare named hosts the way endpoints are declared; credential references, never values
 - [C-649 — flux host CLI family and host.* operations](C-649-flux-host-cli-family-and-host-operations.md) · Core · Decision 0018 rule 1: ls/add/show/rm/probe plus an ambient-gated host.* op group, mirroring the endpoint surface
 - [C-650 — A named host binding selects the execution substrate](C-650-a-named-host-binding-selects-the-execution-substrate.md) · Core · Decision 0018 rules 2 and 4: --host NAME resolves a registered binding to the selected ExecutionSystem; --remote stays as ephemeral sugar
+- [C-651 — Sandboxed is a selectable peer backend](C-651-sandboxed-is-a-selectable-peer-backend.md) · Core · Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a spawn-time modifier; codegate census entry under review
+- [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
+- [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

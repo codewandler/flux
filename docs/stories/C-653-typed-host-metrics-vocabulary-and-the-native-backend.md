@@ -2,7 +2,7 @@
 id: C-653
 title: "Typed host metrics vocabulary and the native backend"
 pillar: "Core"
-status: backlog
+status: done
 epic: host-metrics-seam
 areas: [flux-system]
 design: host-metrics-seam

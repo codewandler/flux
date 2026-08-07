@@ -2,7 +2,7 @@
 id: C-652
 title: "HTTP joins the guarded port"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system, flux-web]
 design: first-class-hosts
