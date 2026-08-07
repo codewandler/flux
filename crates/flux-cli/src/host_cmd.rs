@@ -19,6 +19,7 @@ pub(super) fn backend_from_config(kind: flux_config::HostBackendKind) -> HostBac
         flux_config::HostBackendKind::Sandboxed => HostBackend::Sandboxed,
         flux_config::HostBackendKind::Container => HostBackend::Container,
         flux_config::HostBackendKind::Kubernetes => HostBackend::Kubernetes,
+        flux_config::HostBackendKind::Microvm => HostBackend::Microvm,
         flux_config::HostBackendKind::Remote => HostBackend::Remote,
     }
 }
@@ -142,6 +143,7 @@ pub(super) fn config_kind_from_backend(backend: HostBackend) -> flux_config::Hos
         HostBackend::Sandboxed => flux_config::HostBackendKind::Sandboxed,
         HostBackend::Container => flux_config::HostBackendKind::Container,
         HostBackend::Kubernetes => flux_config::HostBackendKind::Kubernetes,
+        HostBackend::Microvm => flux_config::HostBackendKind::Microvm,
         HostBackend::Remote => flux_config::HostBackendKind::Remote,
     }
 }
@@ -167,7 +169,7 @@ pub(super) fn render_host_row(record: &HostRecord) -> String {
         id = host.id,
         backend = host.backend,
         address = host.display_address(),
-        availability = flux_capabilities::static_availability(host.backend),
+        availability = flux_capabilities::binding_availability(host),
         owner = record.owner,
         cred = host_credential_location(record),
     );
@@ -189,7 +191,7 @@ fn host_view(record: &HostRecord) -> serde_json::Value {
         "id": host.id,
         "backend": host.backend.as_str(),
         "url": host.url,
-        "availability": flux_capabilities::static_availability(host.backend),
+        "availability": flux_capabilities::binding_availability(host),
         "owner": record.owner,
         "credential_ref": host.credential_ref.as_ref().map(ToString::to_string),
         "grant": host.grant.iter().map(|g| g.as_str()).collect::<Vec<_>>(),
@@ -219,8 +221,8 @@ impl std::fmt::Debug for SelectedSubstrate {
 /// raises a `local` binding to the `sandboxed` peer, exactly as `SandboxFloor::raise_mode` raises
 /// the spawn-time sandbox mode — a floor may tighten a selection, never loosen one.
 ///
-/// Only `local` is raised, and only from a `Require` floor. A `remote`, `container` or
-/// `kubernetes` binding carries its own physical boundary, so silently re-pointing it at this
+/// Only `local` is raised, and only from a `Require` floor. A `remote`, `container`, `kubernetes`
+/// or `microvm` binding carries its own physical boundary, so silently re-pointing it at this
 /// machine's sandbox would answer a different question than the operator asked; and an `On` floor
 /// tolerates an unconfined run by construction, so forcing a fail-closed backend under it would
 /// turn a tolerated degradation into a startup refusal.
@@ -240,6 +242,45 @@ pub(super) fn backend_under_floor(
             HostBackend::Sandboxed
         }
         other => other,
+    }
+}
+
+/// What a remote-shaped binding (`remote`, `microvm`) that names no address must tell an operator.
+///
+/// The two absences are not the same thing, so they do not get the same words. A `remote` binding
+/// cannot be constructed without a url, so reaching this at all means the operator-editable store
+/// was hand-edited. A `microvm` binding legitimately exists before its guest does — flux never
+/// provisions a VM (C-677 / C-480's boundary), so the endpoint comes to exist when a deployment
+/// serves one, and the refusal has to name that gap instead of implying a retry would close it.
+fn missing_endpoint_error(name: &str, backend: HostBackend) -> String {
+    match backend {
+        HostBackend::Microvm => format!(
+            "host `{name}` binds the `microvm` backend but names no served guest endpoint; flux \
+             never provisions a VM — deploy the guest's `flux system serve` (see the VM/microVM \
+             deployment profile) and declare its `url`. Selection fails closed until then"
+        ),
+        other => format!("host `{name}` has no url; a {other} binding needs one"),
+    }
+}
+
+/// The same absence as a typed probe failure.
+///
+/// A urlless `microvm` binding is [`BackendUnavailable`](flux_capabilities::HostProbeFailure), not
+/// [`BackendUnwired`](flux_capabilities::HostProbeFailure): the backend *is* wired — flux knows
+/// exactly how to reach a guest — and what is missing is the guest, which is the distinction an
+/// operator acts on.
+fn missing_endpoint_failure(backend: HostBackend) -> flux_capabilities::HostProbeFailure {
+    match backend {
+        HostBackend::Microvm => flux_capabilities::HostProbeFailure::BackendUnavailable {
+            backend: HostBackend::Microvm.as_str().to_string(),
+            detail: "the binding names no served guest endpoint; flux never provisions a VM — \
+                     deploy the guest's `flux system serve` and declare its `url`"
+                .to_string(),
+        },
+        // Unreachable through validated construction, but the store is operator-editable.
+        _ => flux_capabilities::HostProbeFailure::Connect {
+            detail: "binding has no url".to_string(),
+        },
     }
 }
 
@@ -297,10 +338,14 @@ pub(super) async fn resolve_named_host(
             "host `{name}` binds the `{backend}` backend, which has no selectable implementation \
              wired yet; selection fails closed"
         ),
-        HostBackend::Remote => {
+        // C-677: `microvm` shares this arm because Decision 0018 rule 3 composes rather than
+        // invents — a microVM host is the delivered remote protocol served from inside a guest, so
+        // the same authenticated client, the same handshake admission and the same credential
+        // *reference* scheme apply. Sharing the arm is the guarantee: there is no second
+        // implementation that could drift, and no wire code belongs to the VM at all.
+        backend @ (HostBackend::Remote | HostBackend::Microvm) => {
             let Some(url) = host.url.as_deref() else {
-                // Unreachable through validated construction, but the store is operator-editable.
-                bail!("host `{name}` has no url; a remote binding needs one");
+                bail!("{}", missing_endpoint_error(name, backend));
             };
             let token = match &host.credential_ref {
                 Some(reference) if reference.scheme == flux_secret::Scheme::Env => local
@@ -404,8 +449,9 @@ fn unknown_binding_error(id: &str, registry: &flux_capabilities::HostRegistry) -
 /// The CLI's [`HostProber`]: local identity through the running guarded `System`, remote identity
 /// through the protocol handshake (a GET of the identity route — nothing executes), and (C-651)
 /// `sandboxed` identity by resolving the confinement peer, which reports whether this platform can
-/// confine at all. The remaining peer backends report [`HostProbeFailure::BackendUnwired`] until
-/// their selection stories wire them.
+/// confine at all. A `microvm` binding (C-677) takes the remote path: its guest serves the same
+/// protocol, so the same handshake is what admits it. The remaining peer backends report
+/// [`HostProbeFailure::BackendUnwired`] until their selection stories wire them.
 pub(super) struct CliHostProber {
     pub(super) system: Arc<System>,
 }
@@ -457,12 +503,13 @@ impl flux_capabilities::HostProber for CliHostProber {
                     backend: host.backend.as_str().to_string(),
                 })
             }
-            HostBackend::Remote => {
+            // C-677: one arm, because a microvm host *is* the remote protocol served from inside a
+            // guest. The handshake is what admits either of them, and the report is the far side's
+            // own `SubstrateIdentity` passed through — the guest's truth, stamped
+            // `remotely_reported` here because nothing on this machine observed it.
+            HostBackend::Remote | HostBackend::Microvm => {
                 let Some(url) = host.url.as_deref() else {
-                    // Unreachable through validated construction paths, but fail typed anyway.
-                    return Err(HostProbeFailure::Connect {
-                        detail: "binding has no url".to_string(),
-                    });
+                    return Err(missing_endpoint_failure(host.backend));
                 };
                 let token = match &host.credential_ref {
                     Some(reference) if reference.scheme == flux_secret::Scheme::Env => self
@@ -544,7 +591,7 @@ impl flux_capabilities::HostProber for CliHostProber {
                     backend: host.backend.as_str().to_string(),
                 })
             }
-            HostBackend::Remote => Arc::new(self.connect_remote(host).await?),
+            HostBackend::Remote | HostBackend::Microvm => Arc::new(self.connect_remote(host).await?),
         };
 
         match GuardedMetrics::read_metrics(&*substrate).await {
@@ -571,9 +618,9 @@ impl flux_capabilities::HostProber for CliHostProber {
 }
 
 impl CliHostProber {
-    /// The remote binding's connected substrate, with the credential resolved from its *location*.
-    /// Shares `probe`'s credential rules, including that only an env-scheme reference resolves on
-    /// this path today.
+    /// A remote-shaped binding's connected substrate (`remote` or `microvm`), with the credential
+    /// resolved from its *location*. Shares `probe`'s credential rules, including that only an
+    /// env-scheme reference resolves on this path today.
     async fn connect_remote(
         &self,
         host: &HostRef,
@@ -582,9 +629,7 @@ impl CliHostProber {
         use flux_capabilities::HostProbeFailure;
 
         let Some(url) = host.url.as_deref() else {
-            return Err(HostProbeFailure::Connect {
-                detail: "binding has no url".to_string(),
-            });
+            return Err(missing_endpoint_failure(host.backend));
         };
         let token = match &host.credential_ref {
             Some(reference) if reference.scheme == flux_secret::Scheme::Env => self

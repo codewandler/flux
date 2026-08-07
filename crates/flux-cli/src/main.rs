@@ -1748,6 +1748,7 @@ mod tests {
                 HostBackend::Remote,
                 HostBackend::Container,
                 HostBackend::Kubernetes,
+                HostBackend::Microvm,
             ] {
                 assert_eq!(backend_under_floor(elsewhere, floor), elsewhere);
             }
@@ -1824,6 +1825,236 @@ mod tests {
                     "the `sandboxed` backend is wired now — this is the merge-base refusal: {text}"
                 );
             }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `microvm` binding with no served endpoint yet (C-677, acceptance 1).
+    ///
+    /// This is the honest half of the story's boundary: flux never provisions a VM, so a microvm
+    /// binding declared before C-480's guest profile has served one names a *gap*, not a substrate.
+    /// It must list as unwired and refuse selection saying why — the same honesty the `container`
+    /// and `kubernetes` arms already keep — rather than resolving to this machine or to nothing.
+    #[tokio::test]
+    async fn a_microvm_binding_without_an_endpoint_lists_unwired_and_fails_closed() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let backend: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+
+        let dir = std::env::temp_dir().join(format!("flux-host-microvm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("vm-planned", backend)
+        });
+
+        // `ls`/`show` render it, and the availability column says unwired rather than implying a
+        // probe would settle it.
+        let row = render_host_row(&record);
+        assert!(row.contains("[microvm]"), "the kind renders: {row}");
+        assert!(
+            row.contains("unwired"),
+            "with no endpoint the static answer is unwired: {row}"
+        );
+
+        // Selection fails closed, and the refusal names the gap — an operator must learn that the
+        // endpoint is theirs to bring into existence, not flux's to create.
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(record);
+        let err = resolve_named_host("vm-planned", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("endpoint") && text.contains("microvm"),
+            "the refusal must name the missing endpoint: {text}"
+        );
+
+        // The probe distinguishes "this binding has no endpoint" from "flux cannot do microvm at
+        // all": the backend *is* wired, so it is not `BackendUnwired`.
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+        match prober
+            .probe(&HostRef::declared("vm-planned", backend))
+            .await
+            .unwrap_err()
+        {
+            HostProbeFailure::BackendUnavailable { backend, detail } => {
+                assert_eq!(backend, "microvm");
+                assert!(detail.contains("endpoint"), "{detail}");
+            }
+            other => panic!("expected BackendUnavailable naming the endpoint gap, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `microvm` binding *with* an endpoint is the delivered remote protocol (C-677,
+    /// acceptance 2).
+    ///
+    /// Decision 0018 rule 3 composes rather than invents, so this asserts sameness rather than
+    /// new behaviour: for identical inputs a microvm binding and a remote one must produce the
+    /// identical typed outcome, because they are one code path. The failure classes are the
+    /// observable proof that admission runs the protocol handshake with the declared credential
+    /// *reference* — a missing credential never reaches the wire, and a present one gets no
+    /// further than the transport when no guest is listening.
+    #[tokio::test]
+    async fn a_microvm_binding_with_an_endpoint_admits_through_the_remote_protocol() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let microvm: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+
+        let dir = std::env::temp_dir().join(format!("flux-host-microvm-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+        // A loopback address the private-network guard refuses by default: the handshake is
+        // attempted and cannot complete, with no egress off this machine.
+        let endpoint = "https://127.0.0.1:1";
+        let served = |backend, credential| HostRef {
+            url: Some(endpoint.into()),
+            credential_ref: credential,
+            ..HostRef::declared("vm-guest", backend)
+        };
+
+        // The credential is a *reference*; a binding that names none is refused before the wire,
+        // exactly as the remote backend is.
+        for backend in [microvm, HostBackend::Remote] {
+            match prober.probe(&served(backend, None)).await.unwrap_err() {
+                HostProbeFailure::CredentialUnavailable { .. } => {}
+                other => panic!("{backend}: expected CredentialUnavailable, got {other:?}"),
+            }
+        }
+
+        // With a credential, admission gets as far as the protocol handshake and no further —
+        // the identity check is what admits, so an unreachable guest is a `Connect` class and
+        // never a report.
+        std::env::set_var("FLUX_C677_GUEST_TOKEN", "guest-token");
+        let credential = Some(flux_secret::Ref::env("FLUX_C677_GUEST_TOKEN"));
+        for backend in [microvm, HostBackend::Remote] {
+            match prober
+                .probe(&served(backend, credential.clone()))
+                .await
+                .unwrap_err()
+            {
+                HostProbeFailure::Connect { .. } => {}
+                other => panic!("{backend}: expected Connect, got {other:?}"),
+            }
+        }
+
+        // And selection composes the same client: the refusal is a connection failure, never
+        // "this backend has no selectable implementation".
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..served(microvm, credential)
+        }));
+        let text = resolve_named_host("vm-guest", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("connect host `vm-guest`"),
+            "an endpoint-bearing microvm binding resolves through the remote client: {text}"
+        );
+        assert!(
+            !text.contains("no selectable implementation"),
+            "the merge-base refusal must be gone: {text}"
+        );
+        std::env::remove_var("FLUX_C677_GUEST_TOKEN");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-677, acceptance 4 — the pin C-651 made for the confinement peer, made here for the guest.
+    ///
+    /// C-652's `Executor::non_native_target` reads `kind != "native" || remotely_reported` as "a
+    /// substrate selection is in force" and hides `browser.*` / `web.crawl` on that basis. A
+    /// microvm binding passes the *guest's own* `SubstrateIdentity` through (acceptance 2 asks for
+    /// the guest's identity, not a stamped one), and a guest is an ordinary machine: it will
+    /// commonly report `kind = "native"`. So the guarantee cannot rest on the kind string — it
+    /// rests on provenance, and the client must assert that provenance itself rather than accept
+    /// the far side's word for it. A guest claiming to be this machine would otherwise silently
+    /// re-expose a local browser under a selection that asked for a VM.
+    #[test]
+    fn a_microvm_selection_can_never_report_a_native_target() {
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+        use flux_system::port::{ExecutionIdentity, SubstrateIdentity};
+        use flux_system::remote::RemoteSystem;
+        let microvm: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+
+        // First, that a served microvm binding really is remote-shaped — if it were not, the
+        // client below would be the wrong thing to pin. Same id, same address, same everything
+        // but the word: the two must be indistinguishable to `ls`/`show`.
+        let served = |backend| {
+            HostRecord::config(HostRef {
+                url: Some("https://guest.internal:8443".into()),
+                ..HostRef::declared("g", backend)
+            })
+        };
+        assert_eq!(
+            render_host_row(&served(microvm)).replace("[microvm]", "[remote]"),
+            render_host_row(&served(HostBackend::Remote)),
+            "a microvm binding that names its guest endpoint is the remote protocol under a \
+             different word; anything else means a second implementation crept in"
+        );
+
+        let dir = std::env::temp_dir().join(format!("flux-host-microvm-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = std::sync::Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+
+        for (label, system) in [
+            (
+                "an honest guest",
+                RemoteSystem::loopback(inner.clone()),
+            ),
+            (
+                "a guest reporting the ordinary native kind of its own machine",
+                RemoteSystem::identified(
+                    RemoteSystem::loopback(inner.clone()).delegate().clone(),
+                    SubstrateIdentity {
+                        kind: "native".into(),
+                        workspace: "/srv/work".into(),
+                        confinement: "off".into(),
+                        remotely_reported: true,
+                    },
+                ),
+            ),
+            (
+                "a guest claiming this machine observed it",
+                RemoteSystem::identified(
+                    RemoteSystem::loopback(inner.clone()).delegate().clone(),
+                    SubstrateIdentity {
+                        kind: "native".into(),
+                        workspace: "/srv/work".into(),
+                        confinement: "off".into(),
+                        remotely_reported: false,
+                    },
+                ),
+            ),
+        ] {
+            let identity = system.substrate_identity();
+            assert!(
+                identity.kind != "native" || identity.remotely_reported,
+                "{label}: the executor would treat this as an unselected native target and \
+                 re-expose `browser.*` / `web.crawl`: {identity:?}"
+            );
         }
         std::fs::remove_dir_all(&dir).ok();
     }
