@@ -37,3 +37,45 @@ line-buffered conversation.
       replays enough history to make the pane truthful about what happened while detached.
 - [ ] The docs state precisely which session artifacts live on which machine, so nobody expects
       `flux sessions`/`replay` locally to hold a remote agent's history unless it was exported.
+
+## Design
+
+[docs/designs/tui-attach.md](../designs/tui-attach.md) — the attach seam, the where-does-history-live
+decision, and the three protocol gaps found while building against the shipped served surface.
+
+Summary of the two decisions the story turns on:
+
+- **The seam.** A remote turn never becomes a local session event. `flux-tui` declares a
+  protocol-free `attach::AttachedAgent` and a deliberately narrow `AttachUpdate` vocabulary
+  (text · lifecycle state · artifact · notice — exactly what `message/stream` carries);
+  `flux-a2a::attach` implements it over the existing `flux a2a` client; `flux-cli` translates
+  between the two. Updates arrive as one new `UiEvent::Attached` arm and reach the *same*
+  transcript mutators a local turn uses, through one crossing point that never touches the local
+  event store. Tool calls and results are absent because the wire does not carry them, and the
+  surface says so rather than leaving the tool pane silently empty.
+- **History.** The remote is authoritative. Reattach replays `tasks/get`'s `Task.history`, which is
+  projected from the served agent's own store. Attach mode mints no local session, writes nothing
+  locally, and leaves `session_id` empty — so an attached conversation cannot appear in
+  `flux sessions` or be `flux replay`ed here. Stated per artifact in
+  `website/docs/agent/a2a.md#which-session-artifacts-live-on-which-machine`.
+
+## Progress
+
+Implemented on `impl/C-686`.
+
+- `--attach <URL|NAME>` on `flux tui`, mutually exclusive with `--remote`/`--host`/`--fleet` at
+  parse time; `--attach-token-env` (default `FLUX_A2A_TOKEN`) and `--attach-context`. A named target
+  resolves an `[[endpoint.static]]` binding declaring `protocol = "a2a"` — deliberately not
+  `[[host]]`, which is the substrate axis. Credential is always by reference; no flag accepts a
+  token value and a `user:pass@` URL is refused.
+- Streaming turns, `tasks/cancel`, `tasks/resubscribe` and `tasks/get` history are driven through
+  `flux_a2a::attach::AttachedA2aAgent`; capabilities are probed at connect and rendered
+  disabled-with-reason when absent.
+- Remote approvals are raised in the TUI's existing approval sheet and answered with the request's
+  own `fingerprint`; all four `/approvals` postures render as themselves, including the
+  shared-operator-token caveat that stands until C-687.
+
+Not done, and filed as candidate work in the design doc: tool activity does not cross the A2A wire
+(the served `StreamSink` implements `text_delta` only); a `contextId` has no read-only route to its
+task id, so a fresh process replays history only after its first turn; `GET /sessions/{id}` carries
+no history.

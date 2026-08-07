@@ -325,11 +325,25 @@ flux a2a http://127.0.0.1:8787 "summarize the open bugs"
 
 With no prompt it opens an interactive session against the remote agent instead.
 
+For a full-screen client — panes, the approval sheet, an interrupt that reaches the remote turn —
+attach the TUI instead:
+
+```sh
+flux tui --attach http://127.0.0.1:8787
+```
+
+⚠ `--attach` is this row; `--remote` is the row above it. The TUI refuses them together, and the
+attached header says which machine you are on. Note the consequence that surprises people most:
+**an attached conversation lives in the server's session store, so it is not in your `flux
+sessions` and cannot be `flux replay`ed locally.** The full artifact-by-artifact split, and the
+affordances the A2A wire does not carry (tool calls and results do not cross it), are in
+[A2A](./agent/a2a.md#which-session-artifacts-live-on-which-machine).
+
 - **Where your files are:** the server's. The agent edits the tree *it* was started in; your local
   files are not in the picture at all.
 - **Where the approval prompt appears:** wherever your client puts it. Under `--remote-approval`
-  the server parks each effect at `/approvals` and it is your client's job to show it to a human;
-  under `--yes` nobody is asked.
+  the server parks each effect at `/approvals` and it is your client's job to show it to a human
+  (`flux tui --attach` raises them in its ordinary approval sheet); under `--yes` nobody is asked.
 - **Good for:** giving a team or another agent access to one configured agent; agent-to-agent work.
 - **What it costs:** the model choice and the credentials live on the server, and under
   `--remote-approval` every guarded effect costs a network round trip and a human. If what you
