@@ -71,7 +71,7 @@ back to the public trust store. See [Host bindings](../../website/docs/reference
 
 | File | Why it exists |
 |---|---|
-| `kustomization.yaml` | The base itself: which manifests are applied, the shared labels, and the image tag that names the release this profile runs. |
+| `kustomization.yaml` | The base itself: which manifests are applied, the shared labels, and the published image and tag that name the release this profile runs. `newName` is `ghcr.io/codewandler/flux-system`, which every release publishes; `newTag` is restamped by the cut. Neither is hand-maintained — see [deploy/README.md](../README.md) for how to verify the image's provenance or build it yourself. |
 | `namespace.yaml` | A boundary the default-deny NetworkPolicy can own; enforces the restricted Pod Security Standard. |
 | `workspace-pvc.yaml` | The canonical workspace and its delivery ledger. Losing it loses both. |
 | `deployment.yaml` | One replica, `Recreate`, non-root, seccomp `RuntimeDefault`, read-only rootfs, all capabilities dropped, TCP probes. |

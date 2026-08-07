@@ -36,3 +36,8 @@ session multiplexed over it whose caps and closure are enforced on both sides.
 - [ ] The URL guard's scoped-destination judgment applies to the substrate's resolution of the
       target (composes with C-689), and the census entry for the remote implementation states the
       delegating truth.
+
+
+## Comments
+
+- C-674's review, for whoever implements this: the handshake advertises framed operations through a blanket predicate — .filter(|_| GuardedHttp::serves_http(&system)) applied to all of framed_operations() at flux-server/src/system.rs:408-413. Correct for a one-element list; a WebSocket family added as a second token will silently inherit HTTP's availability unless that becomes per-operation first.

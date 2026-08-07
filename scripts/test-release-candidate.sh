@@ -10,6 +10,7 @@ CI_WORKFLOW="$ROOT/.github/workflows/ci.yml"
 FLOW_WORKFLOW="$ROOT/.github/workflows/release-flow.yml"
 PROMOTER="$ROOT/scripts/promote-release-flow.sh"
 FULL_GATE="$ROOT/scripts/release-full-gate.sh"
+STAMPER="$ROOT/scripts/stamp-deployment-images.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
@@ -331,8 +332,11 @@ release_commit_line=$(grep -nF 'git commit --only "${COMMIT_PATHS[@]}"' "$ROOT/s
   && [ "$embedded_build_line" -lt "$embedded_check_line" ] \
   && [ "$embedded_check_line" -lt "$release_commit_line" ] \
   || fail "cut-release must regenerate and verify embedded docs before the release commit"
-grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip)' "$ROOT/scripts/cut-release.sh" \
-  || fail "public-docs.zip is not a path-limited member of the release commit"
+# C-696 extended this list rather than routing around it: the cut now restamps both deployment
+# profiles, so they are release files and must ride the SAME path-limited commit. The exact string
+# is the point — a restamp that is not committed here leaves the tag carrying a stale manifest.
+grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip deploy/kubernetes/kustomization.yaml deploy/agent/kustomization.yaml)' "$ROOT/scripts/cut-release.sh" \
+  || fail "public-docs.zip and the restamped deployment profiles are not path-limited members of the release commit"
 grep -Fq 'promotes those artifacts without recompiling' "$ROOT/crates/flux-sdk/PUBLISHING.md" \
   || fail "publishing runbook does not document build-once promotion"
 
@@ -356,5 +360,63 @@ receipt_line=$(grep -nF 'scripts/release-candidate.sh write release-candidate.tx
   || fail "candidate receipt can be written before exact cut CI is verified"
 grep -Fq 'FLUX_RELEASE_CANDIDATE_OWNS_GATE' "$FLOW_WORKFLOW" \
   || fail "automatic flow does not delegate release-gate ownership"
+
+# C-696 — the cut restamps the deployment profiles, and proves it left nothing behind.
+#
+# Both kustomizations pin the image tag that names the release the profile runs. Before this, the
+# cut bumped Cargo.toml and the changelogs but never touched them, so every release shipped
+# manifests advertising the PREVIOUS version's image — the binary and the manifests disagreed the
+# moment the tag was pushed. The restamp is extracted into its own script precisely so it can be
+# driven over a fixture here rather than only by running a real cut.
+[ -x "$STAMPER" ] || fail "missing executable deployment image stamper: $STAMPER"
+
+stamp_fixture() {
+  local root=$1 tag=$2
+  rm -rf "$root"
+  mkdir -p "$root/deploy/kubernetes" "$root/deploy/agent"
+  for profile in kubernetes agent; do
+    cat >"$root/deploy/$profile/kustomization.yaml" <<FIXTURE
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+images:
+  - name: flux-system
+    newName: ghcr.io/codewandler/flux-system
+    newTag: $tag
+FIXTURE
+  done
+}
+
+STAMP_ROOT="$TMP/stamp"
+stamp_fixture "$STAMP_ROOT" 1.2.2
+"$STAMPER" 1.2.2 1.2.3 "$STAMP_ROOT" >/dev/null \
+  || fail "the deployment image stamper refused a well-formed cut"
+for profile in kubernetes agent; do
+  grep -Fqx '    newTag: 1.2.3' "$STAMP_ROOT/deploy/$profile/kustomization.yaml" \
+    || fail "deploy/$profile/kustomization.yaml was not restamped to the cut version"
+done
+# The postcondition the acceptance names: after a cut, NO shipped manifest still names the version
+# the release just left behind.
+if grep -rlF '1.2.2' "$STAMP_ROOT/deploy" >/dev/null 2>&1; then
+  fail "a manifest still references the previous version after the stamp"
+fi
+
+# ...and the stamper is the thing that notices. A manifest it does not know how to move must make
+# the cut FAIL, not pass silently while shipping a stale reference.
+stamp_fixture "$STAMP_ROOT" 1.2.2
+printf 'image: flux-system:1.2.2\n' >"$STAMP_ROOT/deploy/kubernetes/deployment.yaml"
+expect_fail "$STAMPER" 1.2.2 1.2.3 "$STAMP_ROOT"
+grep -Fq '1.2.2' "$TMP/stderr" \
+  || fail "the stamper does not name the manifest still referencing the previous version"
+
+# A version that is not there at all is a cut that would silently ship the old tag.
+stamp_fixture "$STAMP_ROOT" 9.9.9
+expect_fail "$STAMPER" 1.2.2 1.2.3 "$STAMP_ROOT"
+
+# And the cut actually calls it, inside the transaction, before the release commit.
+stamp_line=$(grep -nF 'scripts/stamp-deployment-images.sh' "$ROOT/scripts/cut-release.sh" | head -1 | cut -d: -f1)
+[ -n "$stamp_line" ] && [ "$stamp_line" -lt "$release_commit_line" ] \
+  || fail "cut-release does not restamp the deployment profiles before the release commit"
+grep -Fq 'RELEASE_FILES=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip docs/roadmap.md deploy/kubernetes/kustomization.yaml deploy/agent/kustomization.yaml)' "$ROOT/scripts/cut-release.sh" \
+  || fail "the cut transaction does not snapshot the deployment profiles it restamps"
 
 echo "release-candidate receipt and workflow tests passed"

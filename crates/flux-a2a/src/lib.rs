@@ -14,7 +14,10 @@
 //! - [`server`] — the reusable, transport-agnostic server side ([`server::dispatch`],
 //!   [`server::agent_card`], the [`server::A2aTurn`] seam, and the message/event shaping). A surface
 //!   (axum in `flux-server` or another downstream HTTP host) provides the route + state and calls these.
+//! - [`attach`] — a long-lived [`attach::AttachedA2aAgent`] over the same client, for a rich
+//!   surface that watches and steers a served agent rather than chatting line-by-line (C-686).
 
+pub mod attach;
 mod client;
 pub mod error;
 pub mod server;

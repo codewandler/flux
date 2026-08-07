@@ -16,9 +16,20 @@ flux tui -m opus               # pick a model for the session
 flux tui --yes                 # auto-approve every admitted tool call (no approval sheet)
 flux tui -c                    # continue the most recent session
 flux tui --remote https://worker.example:8790  # approve here; effects land there
+flux tui --attach https://agent.internal:8787  # the whole agent lives there; watch and steer it
 flux tui --fleet               # attach to the Fleet rooted in the current directory
 flux tui --fleet=../roadmap    # attach to an explicit Fleet root
 ```
+
+:::warning `--remote` and `--attach` are opposite
+`--remote` (and `--host`) keep the agent **here** and land its effects there, so you still approve
+on this machine and the session is stored in your local event store. `--attach` moves the **whole**
+agent — planning, model calls, tools, approvals and the session — to a served host, and this
+terminal becomes a window onto it. flux refuses the two together. See
+[attaching the TUI to a served agent](./a2a.md#client--flux-tui---attach-urlname) for what an
+attached surface can do, which affordances the protocol does not carry, and — importantly — which
+session artifacts live on which machine.
+:::
 
 `flux tui` takes the same turn-control flags as `flux run` — see [CLI](./cli.md#turn-controls) for
 `-m`, `--effort`, `--max-tokens`, `--turn-budget`, `--loop`, `--skill`, and the rest, and

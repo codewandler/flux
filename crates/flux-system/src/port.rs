@@ -284,6 +284,158 @@ pub struct HttpSecretScope {
     pub principal: Option<String>,
 }
 
+/// One resolved request-header value, carried so that its plaintext **cannot** reach a log, a
+/// `Debug` line or a serializer by accident (C-674).
+///
+/// C-652's review found the gap this closes: [`HttpRequest`] derived `Debug` while `headers` held
+/// already-resolved `$secret` values, and nothing structurally tied those values to
+/// [`HttpSecretScope::carried`]. Neither leaked while the type stayed inside one process. Both
+/// become real the moment the request crosses a frame, so the carriage is fixed here rather than by
+/// remembering to be careful at each call site:
+///
+/// - **The value is private.** [`expose`](Self::expose) is the only way to read it, so every place
+///   that puts a header on a wire is a place a reviewer can find by searching for one name.
+/// - **`Debug` never prints a value** — not even a literal one. A wrapper that printed the values it
+///   believed were plain would leak exactly when a caller mislabelled one, which is the failure this
+///   exists to make unrepresentable.
+/// - **There is no `Serialize`.** `flux-system` holds no serialization format at all (its dependency
+///   set is `flux-core` + `tokio` + `url`), so a transport must encode this deliberately; it cannot
+///   fall into a derived one.
+/// - **A secret-bearing value names its secret**, which is the structural link `carried` lacked:
+///   [`HttpRequest::carried_secrets`] reads the headers themselves, so a header-placed credential is
+///   re-authorized at every redirect hop whether or not the caller also listed it.
+#[derive(Clone)]
+pub struct HeaderValue {
+    value: String,
+    /// The allowlisted `$secret` name this value materializes, if any. A name, never a value.
+    secret: Option<String>,
+}
+
+impl HeaderValue {
+    /// A header value the caller wrote literally — no `$secret` marker resolved into it.
+    pub fn literal(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            secret: None,
+        }
+    }
+
+    /// A header value that materializes the allowlisted secret `name`.
+    ///
+    /// Naming the secret is not bookkeeping: it is what makes the credential visible to per-hop
+    /// re-authorization without a second list that can drift out of step with this one.
+    pub fn secret(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            secret: Some(name.into()),
+        }
+    }
+
+    /// The plaintext, for the one place that actually puts it on a wire.
+    pub fn expose(&self) -> &str {
+        &self.value
+    }
+
+    /// The `$secret` name this value materializes, or `None` for a literal.
+    pub fn secret_name(&self) -> Option<&str> {
+        self.secret.as_deref()
+    }
+}
+
+impl std::fmt::Debug for HeaderValue {
+    /// Whether a value is a materialized secret and how long it is — never what it is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.secret {
+            Some(name) => write!(f, "<secret `{name}`, {} bytes>", self.value.len()),
+            None => write!(f, "<header value, {} bytes>", self.value.len()),
+        }
+    }
+}
+
+/// One private-destination admission recorded while a guarded HTTP request was served.
+///
+/// The event exists already — `flux_plugin::EgressAudit`'s `PrivateNetAdmit` — but it is emitted by
+/// whichever backend actually followed the hop, and once that backend is on another machine the
+/// caller's audit trail would otherwise fall silent about an admission that really happened
+/// (C-674). So the substrate *reports* its admits with the response and the caller records them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivateAdmit {
+    /// The private/internal host the guard admitted.
+    pub host: String,
+    /// The grant that let it through, as the admitting substrate names it.
+    pub grant_source: String,
+    /// The substrate that admitted it, when that was **not this process** — the provenance stamp,
+    /// set by the hop that crossed a trust boundary, exactly as `remotely_reported` is for a metric
+    /// reading. A far side that could set this itself could claim a local admission.
+    pub substrate: Option<String>,
+}
+
+/// Cap on the response headers a substrate's answer may carry across a hop.
+pub const MAX_RESPONSE_HEADERS: usize = 128;
+/// Cap on one response header's name or value, in bytes.
+pub const MAX_HEADER_TEXT_BYTES: usize = 8 * 1024;
+/// Cap on the private-destination admissions one answer may report.
+pub const MAX_PRIVATE_ADMITS: usize = 32;
+/// Cap on an admit's host or grant-source label, in bytes — a hostname's own maximum.
+pub const MAX_ADMIT_LABEL_BYTES: usize = 253;
+
+/// Bound one operator-facing label from a substrate's answer, mirroring
+/// [`crate::metrics::bounded_label`]: trimmed, control characters removed, length capped.
+///
+/// Control characters matter more than length here — an admit's host lands in an audit record an
+/// operator reads in a terminal, and a reporter that could embed an escape sequence could rewrite
+/// what that terminal shows.
+pub fn bounded_admit_label(raw: &str) -> String {
+    raw.trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_ADMIT_LABEL_BYTES)
+        .collect()
+}
+
+/// Re-impose every bound a guarded HTTP answer is supposed to honour, on an answer that came from
+/// somewhere this process cannot vouch for.
+///
+/// The caps on [`HttpResponse`] are the *substrate's* promise, and a promise is all they are until
+/// the answer is a local observation. A delegate is implementable by anyone, so a caller that
+/// re-caps here is not distrusting one transport — it is declining to extend trust to the answer
+/// at all. `truncated` becomes true when this side had to cut, and stays true when the substrate
+/// says it already did: both mean the caller is not holding the whole body.
+pub fn bounded_response(mut response: HttpResponse, max_response_bytes: usize) -> HttpResponse {
+    if response.body.len() > max_response_bytes {
+        response.body.truncate(max_response_bytes);
+        response.truncated = true;
+    }
+    response.headers.truncate(MAX_RESPONSE_HEADERS);
+    for (name, value) in &mut response.headers {
+        name.truncate(floor_char_boundary(name, MAX_HEADER_TEXT_BYTES));
+        value.truncate(floor_char_boundary(value, MAX_HEADER_TEXT_BYTES));
+    }
+    response.admits.truncate(MAX_PRIVATE_ADMITS);
+    for admit in &mut response.admits {
+        admit.host = bounded_admit_label(&admit.host);
+        admit.grant_source = bounded_admit_label(&admit.grant_source);
+        admit.substrate = admit
+            .substrate
+            .as_deref()
+            .map(bounded_admit_label)
+            .filter(|substrate| !substrate.is_empty());
+    }
+    response
+}
+
+/// The largest index `<= max` that `String::truncate` will accept — truncating mid-codepoint panics,
+/// and a hostile far side gets to choose where the codepoints fall.
+fn floor_char_boundary(text: &str, max: usize) -> usize {
+    if text.len() <= max {
+        return text.len();
+    }
+    (0..=max)
+        .rev()
+        .find(|at| text.is_char_boundary(*at))
+        .unwrap_or(0)
+}
+
 /// One guarded HTTP request, stated so a **non-native** substrate can serve it.
 ///
 /// The target is a [`GuardedSecretTarget`] rather than a bare string: it can only be minted by
@@ -296,6 +448,9 @@ pub struct HttpSecretScope {
 /// A substrate in *another* address space treats the pinned addresses as what they are — this
 /// process's answer, not its own — and re-admits at its own boundary, where [`Self::secrets`] gives
 /// it everything the local guard had.
+///
+/// `Debug` is safe to derive because no field can print a plaintext credential: header values are
+/// [`HeaderValue`]s, the target redacts its query, and a scope is names and grants.
 #[derive(Debug)]
 pub struct HttpRequest {
     /// The operation whose effect this is (`http.request`, `web.fetch`). Diagnostics and audit
@@ -306,8 +461,9 @@ pub struct HttpRequest {
     pub method: String,
     /// The admitted target: URL, vetted addresses, and destination token, correlated by the guard.
     pub target: GuardedSecretTarget,
-    /// Request headers, already resolved (a `$secret` marker is a value by the time it is here).
-    pub headers: Vec<(String, String)>,
+    /// Request headers, already resolved — a `$secret` marker is a value by the time it is here, so
+    /// the value travels in a [`HeaderValue`] that cannot be printed or serialized un-redacted.
+    pub headers: Vec<(String, HeaderValue)>,
     /// The request body, if any.
     pub body: Option<Vec<u8>>,
     /// Wall-clock budget for the whole request, redirect chain included.
@@ -317,6 +473,32 @@ pub struct HttpRequest {
     pub max_response_bytes: usize,
     /// The secret grants this request carries. Empty for a request that carries none.
     pub secrets: HttpSecretScope,
+}
+
+impl HttpRequest {
+    /// Every secret this request actually carries, and where each one sits — the union of what the
+    /// caller declared in [`HttpSecretScope::carried`] and what the headers themselves say.
+    ///
+    /// This is the structural link C-652's review found missing. `carried` is a caller-assembled
+    /// list; the headers are the request. Deriving the header half from the headers means a
+    /// credential that is physically present is re-authorized at every redirect hop even if the
+    /// list forgot it — and a query-placed secret, which lives in the URL and appears in no header,
+    /// still comes from `carried`, because that is the only place it can.
+    pub fn carried_secrets(&self) -> Vec<(String, InjectionSite)> {
+        let mut carried = self.secrets.carried.clone();
+        for (_, value) in &self.headers {
+            let Some(name) = value.secret_name() else {
+                continue;
+            };
+            if !carried
+                .iter()
+                .any(|(known, site)| known == name && *site == InjectionSite::Header)
+            {
+                carried.push((name.to_string(), InjectionSite::Header));
+            }
+        }
+        carried
+    }
 }
 
 /// What a guarded HTTP request answered.
@@ -336,6 +518,14 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
     /// Whether the body was cut at the cap.
     pub truncated: bool,
+    /// The private/internal destinations the guard admitted while serving this request, in hop
+    /// order (C-674).
+    ///
+    /// Reported rather than only logged, because the substrate that admits is not always the
+    /// process whose audit trail an operator reads. A native backend records these on its own sink
+    /// *and* reports them here; a caller across a hop records what it is told, stamped with the
+    /// substrate it came from. Empty for a request that reached nothing private.
+    pub admits: Vec<PrivateAdmit>,
 }
 
 /// Make HTTP requests through the one guarded egress policy — the *application*-level counterpart to
@@ -356,6 +546,22 @@ pub struct HttpResponse {
 /// operator's provenance says the effect landed on the substrate they selected. A substrate that
 /// cannot make HTTP requests says so and the operation refuses.
 pub trait GuardedHttp: Send + Sync {
+    /// Whether this substrate serves the family at all — deny-by-default, like every capability
+    /// declaration on this port.
+    ///
+    /// It exists so a caller can answer "this substrate makes no HTTP requests" **without sending a
+    /// request**, which matters once the substrate is across a link: a request sent to find out
+    /// costs a round trip and hands back a failure the caller then has to interpret, where
+    /// [`GuardedIoFailure::Unserved`] already means the one thing an operator can act on (implement
+    /// it, or stop asking). Same shape, same reason, as
+    /// [`GuardedMetrics::served_metric_kinds`].
+    ///
+    /// Answering `true` promises nothing about any individual request; it is the difference between
+    /// a substrate that will try and one that structurally cannot.
+    fn serves_http(&self) -> bool {
+        false
+    }
+
     /// Admit, pin, send and read back one HTTP request on this execution substrate, following at
     /// most a bounded redirect chain and re-admitting every hop under `allow`.
     fn http_request<'a>(
@@ -834,6 +1040,12 @@ impl GuardedMetrics for System {
 /// no HTTP" rather than a request sent through some other path — the C-652 posture, unchanged for
 /// every consumer that does not deliberately compose one.
 impl GuardedHttp for System {
+    /// Served exactly when a composition site attached a backend — the honest declaration, and the
+    /// one a serving process announces in its protocol handshake (C-674).
+    fn serves_http(&self) -> bool {
+        self.attached_http().backend().is_some()
+    }
+
     fn http_request<'a>(
         &'a self,
         request: &'a HttpRequest,
@@ -1332,6 +1544,111 @@ mod tests {
         }
     }
 
+    /// C-674, acceptance 2 — no plaintext credential is `Debug`-printable, from any angle.
+    ///
+    /// C-652's review found the exposure while it was still harmless: the request derived `Debug`
+    /// with resolved header values in it, and the target's `Debug` printed a URL that an `in=query`
+    /// secret lives inside. Both stayed inside one process. This story makes the type cross a frame,
+    /// so the test asserts what "by construction" has to mean — the value is absent from every
+    /// rendering, whether a caller formats the whole request, one header, or the target.
+    #[test]
+    fn no_resolved_secret_survives_any_debug_rendering_of_a_request() {
+        const TOKEN: &str = "ghp-super-secret-token-value";
+        const QUERY_TOKEN: &str = "query-placed-secret-value";
+
+        let target = crate::net::guard_url_scoped_for_secret(
+            &format!("http://127.0.0.1:9/probe?api_key={QUERY_TOKEN}"),
+            &PrivateNetAllow::Any,
+        )
+        .expect("a loopback literal is admitted under an `Any` grant");
+        let request = HttpRequest {
+            operation: "http.request".into(),
+            method: "GET".into(),
+            target,
+            headers: vec![
+                (
+                    "authorization".into(),
+                    HeaderValue::secret("GITHUB_TOKEN", TOKEN),
+                ),
+                (
+                    "content-type".into(),
+                    HeaderValue::literal("application/json"),
+                ),
+            ],
+            body: None,
+            timeout: Duration::from_secs(1),
+            max_response_bytes: 1024,
+            secrets: HttpSecretScope::default(),
+        };
+
+        for rendering in [
+            format!("{request:?}"),
+            format!("{:?}", request.headers),
+            format!("{:?}", request.headers[0].1),
+            format!("{:?}", request.target),
+        ] {
+            assert!(
+                !rendering.contains(TOKEN),
+                "a resolved header secret reached a Debug rendering: {rendering}"
+            );
+            assert!(
+                !rendering.contains(QUERY_TOKEN),
+                "a query-placed secret reached a Debug rendering: {rendering}"
+            );
+        }
+
+        // The name is not a secret and stays visible — an operator has to be able to tell *which*
+        // credential a refusal is about, and a rendering that hid that would be unreadable.
+        assert!(format!("{request:?}").contains("GITHUB_TOKEN"));
+        // A literal is redacted too. A wrapper that printed the values it believed were plain would
+        // leak exactly when a caller mislabelled one, which is the failure this shape forecloses.
+        assert!(!format!("{:?}", request.headers[1].1).contains("application/json"));
+        // And the value is still reachable, at exactly one named door.
+        assert_eq!(request.headers[0].1.expose(), TOKEN);
+    }
+
+    /// C-674, acceptance 2 — a header that carries a secret is re-authorized per hop because the
+    /// header says so, not because a separate list remembered to.
+    #[test]
+    fn a_header_placed_secret_is_carried_whether_or_not_the_caller_listed_it() {
+        let target =
+            crate::net::guard_url_scoped_for_secret("http://127.0.0.1:9/p", &PrivateNetAllow::Any)
+                .unwrap();
+        let mut request = HttpRequest {
+            operation: "http.request".into(),
+            method: "GET".into(),
+            target,
+            headers: vec![(
+                "authorization".into(),
+                HeaderValue::secret("GITHUB_TOKEN", "value"),
+            )],
+            body: None,
+            timeout: Duration::from_secs(1),
+            max_response_bytes: 1024,
+            // The list a caller assembles — here, empty, which is the drift the structural link
+            // closes.
+            secrets: HttpSecretScope::default(),
+        };
+        assert_eq!(
+            request.carried_secrets(),
+            vec![("GITHUB_TOKEN".to_string(), InjectionSite::Header)]
+        );
+
+        // A query-placed secret has no header to be read from, so it still comes from the list —
+        // and declaring the header one as well does not duplicate it.
+        request.secrets.carried = vec![
+            ("QUERY_KEY".to_string(), InjectionSite::Query),
+            ("GITHUB_TOKEN".to_string(), InjectionSite::Header),
+        ];
+        assert_eq!(
+            request.carried_secrets(),
+            vec![
+                ("QUERY_KEY".to_string(), InjectionSite::Query),
+                ("GITHUB_TOKEN".to_string(), InjectionSite::Header),
+            ]
+        );
+    }
+
     /// C-652 — HTTP joins the port fail-closed.
     ///
     /// A substrate that says nothing about HTTP serves nothing. That is the whole posture: bringing
@@ -1403,6 +1720,7 @@ mod tests {
                     headers: Vec::new(),
                     body: Vec::new(),
                     truncated: false,
+                    admits: Vec::new(),
                 })
             })
         }

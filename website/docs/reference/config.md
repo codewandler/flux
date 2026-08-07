@@ -456,8 +456,8 @@ when you want the equivalent imperative surface. See [Endpoints](../agent/endpoi
 ## Host bindings (`[[host]]`)
 
 Each `[[host]]` table declares a named binding to an execution substrate. `id` and a `backend`
-kind (`local`, `sandboxed`, `container`, `kubernetes`, `microvm` or `remote`) are required; an
-unknown backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused
+kind (`local`, `sandboxed`, `container`, `kubernetes`, `microvm`, `ssh` or `remote`) are required;
+an unknown backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused
 rather than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a
 location (the same reference forms as endpoints), never a secret value; non-secret `labels` are
 optional.
@@ -554,6 +554,81 @@ ls` says so and selection fails closed naming the missing endpoint, because that
 deploying the guest rather than by retrying. With one, `flux host probe <id>` reports the
 negotiated protocol version and the guest's own substrate identity, marked as remotely reported —
 the guest measured itself; this machine did not.
+
+### The `ssh` binding
+
+An `ssh` binding reaches the substrate almost every operator already has: a machine with sshd on
+it. **ssh is the bootstrap, not the substrate.** Selecting the binding forwards a local port to the
+far machine's loopback, makes sure `flux system serve` is running there, and then rides the ordinary
+remote protocol through that forward — same TLS, same bearer token, same version negotiation, same
+handshake. Guarded operations are never mapped onto remote shell commands: the far side is still the
+flux binary enforcing its own capabilities, which is the whole reason a remote substrate can be
+trusted at all.
+
+```toml
+[[host]]
+id = "devbox"
+backend = "ssh"
+url = "ssh://build@devbox.internal:22"      # where sshd is; `build` is a login name, not a secret
+credential_ref = "env/FLUX_DEVBOX_KEY"      # holds the *path* of the private key to offer
+grant = ["operator"]
+ssh = { binary = "/usr/local/bin/flux", serve_port = 8790, workspace = "/srv/flux/workspace", cert = "/run/flux-tls/tls.crt", key = "/run/flux-tls/tls.key", ca = "/etc/flux/devbox-ca.pem" }
+```
+
+| `ssh` key | Meaning |
+|---|---|
+| `binary` | The far-side flux binary. Default `flux`, resolved on the far side's `PATH`. |
+| `serve_port` | The far-side loopback port the serve binds and the forward lands on. Default `8790`. |
+| `workspace` | The far-side workspace root a started serve is given. |
+| `cert` / `key` | Far-side TLS material. **Both are required to *start* a serve**; a binding without them may only attach to one you run yourself. |
+| `ca` | A **local** PEM whose roots this binding trusts — the same pinning `--remote-ca` does, not a TLS bypass. |
+| `known_hosts` | A **local** `known_hosts` file scoping host-key verification to this binding. Verification is strict either way; this only says which record. |
+| `server_name` | The name the far side's certificate carries. Default `127.0.0.1`, the address the forward lands on. |
+| `token_ref` | Location of the serving endpoint's bearer token. Default `env/FLUX_REMOTE_SYSTEM_TOKEN`. Never a value. |
+
+**What must already exist on the far machine.** Installing flux there is your step, exactly as it is
+for a `remote` binding — see [Remote system deployment](../remote-system-deployment.md) and the
+shipped `deploy/` artifacts. This binding starts or attaches to what is there; it never installs
+anything. Concretely the far machine needs the flux binary at `binary` (or on `PATH`), the TLS
+certificate and key at `cert`/`key` if you want flux to start the serve, and a way to obtain its
+bearer token: either it already holds it (a systemd `EnvironmentFile`, as `deploy/vm` ships), or its
+sshd accepts the variable (`AcceptEnv FLUX_REMOTE_SYSTEM_TOKEN`) so the local side can hand it over
+through the ssh channel. The token is never passed as a command-line argument on either machine,
+because arguments are visible in a process table to everyone on the box.
+
+**What the tunnel does and does not do.** It carries the connection; it does not authenticate it.
+The bearer token still authenticates every request, the certificate is still verified against
+`server_name`, and a version mismatch still refuses to pair — a far side reached over ssh is admitted
+by exactly the checks a directly addressed one is. And because those answers come from another trust
+boundary, an ssh binding is a *non-native* selection like any other: it serves no local HTTP, and
+`browser.*` / `web.crawl` are withheld while it is in force.
+
+Four more things worth knowing before you declare one.
+
+- **Nothing prompts, ever.** Host-key checking is strict and `BatchMode` is on, so an unknown or
+  changed host key is a named refusal rather than a question — an unattended run has nobody to
+  answer one. Password and keyboard-interactive authentication are off, agent forwarding and
+  connection multiplexing are off, and `-F none` means neither your `~/.ssh/config` nor the
+  system-wide one is consulted. The `[[host]]` entry is the whole declaration — which also means
+  **`ProxyJump` is not supported**: a machine reachable only through a jump host cannot be reached
+  by an ssh binding today, because no binding field declares one. Point the binding at a directly
+  reachable target, or serve that machine and use a `remote` binding.
+- **Nothing reaps a far-side serve.** If flux started `flux system serve` on the far machine, it
+  keeps running after your session ends — that is deliberate, because the next session attaches to
+  it instead of starting another, and because killing a process on someone else's build machine is
+  not a thing a client should do implicitly. Stop it the way you stop any other service there.
+- **The key is a reference, and it stays a file.** `credential_ref` resolves to the private key's
+  *path*; openssh opens it and flux never reads the material. An `ssh://user:pass@host` url is
+  refused — an ssh binding authenticates by key.
+- **Every failure names its piece.** No sshd reachable, a host key that is not the one on record, a
+  key sshd declined, no flux binary at the declared path, nothing serving and no certificate to
+  start one with, a refused handshake — each is a distinct message. Nothing ever falls back to
+  running the effect on your own machine.
+- **Two sessions do not fight.** Starting a serve is idempotent because the far side's bind address
+  is the arbiter: a second session that tries loses the bind, its attempt exits, and it attaches to
+  the serve that won. `flux host probe` never starts one at all — a probe is side-effect-free, so
+  against a far side with nothing serving it reports that rather than launching a process on your
+  build machine.
 
 `[exchange] host = "<binding>"` names the `[[host]]` entry serving the Exchange catalogue — the
 declared home for what the transitional `FLUX_EXCHANGE_URL`/token environment pair configures.

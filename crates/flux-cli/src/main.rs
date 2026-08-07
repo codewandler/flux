@@ -21,6 +21,7 @@ mod usage;
 mod a2a_cmd;
 mod app_cmd;
 mod args;
+mod attach_cmd;
 mod auth_cmd;
 mod dispatch;
 mod docs_cmd;
@@ -39,6 +40,7 @@ mod review;
 mod review_progress;
 mod session;
 mod splash;
+mod ssh_host;
 mod stream_json;
 mod system_cmd;
 mod user_interaction;
@@ -47,6 +49,7 @@ mod wakeup_cmd;
 use a2a_cmd::*;
 use app_cmd::*;
 use args::*;
+use attach_cmd::*;
 use auth_cmd::*;
 use board_fleet_cmd::*;
 use catalog_cmd::*;
@@ -480,12 +483,14 @@ mod tests {
             Some(Commands::Context {
                 action:
                     ContextAction::Show {
+                        layer,
                         profile,
                         tools,
                         body,
                         json,
                     },
             }) => {
+                assert_eq!(layer, None, "no positional layer was given");
                 assert_eq!(profile, ContextProfile::General);
                 assert_eq!(tools, ["read", "edit"]);
                 assert!(body);
@@ -1402,6 +1407,7 @@ mod tests {
                     ca_cert: None,
                     grant: vec!["operator".into()],
                     labels: Default::default(),
+                    ssh: None,
                 },
                 flux_config::HostEntry {
                     id: "here".into(),
@@ -1411,6 +1417,7 @@ mod tests {
                     ca_cert: None,
                     grant: Vec::new(),
                     labels: Default::default(),
+                    ssh: None,
                 },
                 // Invalid (credential-bearing URL) — must be skipped, not abort the merge.
                 flux_config::HostEntry {
@@ -1421,6 +1428,7 @@ mod tests {
                     ca_cert: None,
                     grant: Vec::new(),
                     labels: Default::default(),
+                    ssh: None,
                 },
             ],
             ..Default::default()
@@ -1616,6 +1624,7 @@ mod tests {
             ca_cert: None,
             grant: vec!["operator".into()],
             labels: Default::default(),
+            ssh: None,
         };
         flux_runtime::metadata::persist_user_host_in(entry("https://one.example:8443"), &env)
             .unwrap();

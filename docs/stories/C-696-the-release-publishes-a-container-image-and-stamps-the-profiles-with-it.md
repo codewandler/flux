@@ -2,8 +2,7 @@
 id: C-696
 title: "The release publishes a container image and stamps the profiles with it"
 pillar: "Core"
-status: backlog
-priority: 1
+status: in-progress
 epic: remote-agents
 areas: [release]
 design: docs/designs/operating-a-deployed-host.md
@@ -44,3 +43,8 @@ closed and structurally enforced.
       the documented script — with the verification command for the attestation.
 - [ ] A dry run of the cut on a scratch branch demonstrates the restamp and leaves the working tree
       clean; no registry push happens outside a real release.
+
+
+## Comments
+
+- In progress: dispatched to an implementor in worktree flux-c696 off base 4af5e8cf. Release-blocking pair: cut-release.sh does not restamp the two kustomizations' image tag (blocked by two exact-string gates that must learn the same substitution), and newName is a bare local name no workflow publishes. Must not weaken check-release-integrity.sh's scoping of attestations/id-token to the attesting job — report BLOCKED instead.

@@ -481,6 +481,41 @@ pub(super) enum Commands {
             require_equals = true
         )]
         fleet: Option<std::path::PathBuf>,
+
+        /// Attach to an agent that lives on a served host: the WHOLE agent runs there — planning,
+        /// model calls, tools, session and approvals — and this terminal is a window onto it.
+        ///
+        /// Takes a served agent's URL (`https://agent.internal:8787`) or the id of an
+        /// `[[endpoint.static]]` binding declared with `protocol = "a2a"`, whose `credential_ref`
+        /// supplies the bearer credential.
+        ///
+        /// ⚠ This is NOT `--remote`/`--host`. Those keep the agent here and land its *effects*
+        /// elsewhere, so you still approve on this machine. With `--attach` the approval stage
+        /// moved too, and the conversation lives in the remote's session store — it will not appear
+        /// in `flux sessions` or `flux replay` here. They are refused together for that reason.
+        #[arg(
+            long,
+            value_name = "URL|NAME",
+            conflicts_with_all = ["remote", "host", "fleet"]
+        )]
+        attach: Option<String>,
+
+        /// Name of the environment variable holding the attached agent's bearer token. The token is
+        /// never accepted as a command-line value. Ignored when `--attach` names a binding that
+        /// carries its own `credential_ref`.
+        #[arg(
+            long = "attach-token-env",
+            value_name = "ENV",
+            default_value = "FLUX_A2A_TOKEN",
+            requires = "attach"
+        )]
+        attach_token_env: String,
+
+        /// Continue an existing conversation on the attached agent instead of starting a new one.
+        /// A served flux agent maps one context id to one session, so the same value reaches the
+        /// same remote session — including from a different machine.
+        #[arg(long = "attach-context", value_name = "ID", requires = "attach")]
+        attach_context: Option<String>,
     },
     /// Fork a recorded session at a decision point (A-46): the prefix replays hermetically from
     /// the cassette (no side effects), then the tail DIVERGES live through the real approval
@@ -987,6 +1022,11 @@ pub(super) enum IntegrationAction {
 pub(super) enum ContextAction {
     /// Show the ordered context manifest. Bodies are omitted unless explicitly requested.
     Show {
+        /// Show one layer instead of all of them: its manifest row and its body, without needing
+        /// `--body`. Accepts the layer id (`git`) or an unambiguous prefix of one. `--json` carries
+        /// every manifest field.
+        #[arg(value_name = "LAYER")]
+        layer: Option<String>,
         /// Agent behavior profile to include after the universal harness protocol.
         #[arg(long, value_enum, default_value_t)]
         profile: ContextProfile,
@@ -1507,7 +1547,9 @@ pub(super) enum HostAction {
     Add {
         /// The binding name (a bare name, e.g. `build-farm`).
         id: String,
-        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes`, `microvm` or `remote`.
+        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes`, `microvm`, `ssh` or
+        /// `remote`. An `ssh` binding's far-side contract (`[[host]].ssh`) is declarative only —
+        /// declare the binding here, then add the sub-table if it needs more than the defaults.
         #[arg(long)]
         backend: String,
         /// Bare `scheme://host[:port]` for backends with an address — no embedded credentials.

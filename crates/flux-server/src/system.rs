@@ -30,8 +30,11 @@ use flux_system::net::{
     DuplexStream as GuardedDuplex, DuplexWriteHalf, InboundLimits, NetworkListener, NetworkStream,
     PrivateNetAllow, StreamListener,
 };
-use flux_system::port::{ExecutionIdentity, GuardedMetrics, GuardedNetwork, SubstrateIdentity};
+use flux_system::port::{
+    ExecutionIdentity, GuardedHttp, GuardedMetrics, GuardedNetwork, SubstrateIdentity,
+};
 use flux_system::remote::{Answer, Answered, Delegate, Delivered, RemoteSystem, Unreachable};
+use flux_system::secret_scope::{InjectionSite, SecretAllowlist};
 use flux_system::{
     ChildStatus, ManagedChild, ManagedProcess, ProcessOutput, ScopedFileRead, System,
 };
@@ -46,10 +49,11 @@ use crate::{guard_open_bind, require_auth, ServerAuth};
 /// Version of the remote execution-system wire contract.
 ///
 /// v3 (C-654) added the bounded `host.metrics` operation and the handshake's `metric_kinds`
-/// declaration. Decision 0018 rule 5 fixes the rule this follows: wire support for a new port
-/// family is a *versioned* protocol change, never an implicit extension — so the version moves and
-/// a mixed pair refuses to pair at all, rather than discovering the gap one operation at a time.
-pub const PROTOCOL_VERSION: u32 = 3;
+/// declaration. v4 (C-674) added the guarded HTTP frame and its route. Decision 0018 rule 5 fixes
+/// the rule this follows: wire support for a new port family is a *versioned* protocol change,
+/// never an implicit extension — so the version moves and a mixed pair refuses to pair at all,
+/// rather than discovering the gap one operation at a time.
+pub const PROTOCOL_VERSION: u32 = 4;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 static CLIENT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -74,7 +78,10 @@ pub struct SystemHandshake {
 }
 
 impl SystemHandshake {
-    fn identity(&self) -> SubstrateIdentity {
+    /// The substrate identity this handshake establishes. Public because the ssh binding (C-683)
+    /// composes the same client from one layer out and must install the same identity a directly
+    /// addressed `remote` binding would — `remotely_reported` included.
+    pub fn identity(&self) -> SubstrateIdentity {
         SubstrateIdentity {
             kind: self.substrate_kind.clone(),
             workspace: self.workspace.clone(),
@@ -95,6 +102,34 @@ impl SystemHandshake {
             .collect();
         kinds.dedup();
         kinds
+    }
+
+    /// The peer's declared operations, resolved against the **closed** local vocabulary.
+    ///
+    /// C-654 left a question open in its notes: a second per-family handshake field would be the
+    /// moment to consider a generalized declared-capability set rather than one field per family.
+    /// C-674 answers it by **not adding a field**. The generalized set already exists and is called
+    /// `operations`: "does this peer serve the HTTP family" is a question about an operation, which
+    /// is the axis `operations` is on. `metric_kinds` is not a counter-example — it declares a
+    /// vocabulary *within* a family (which instruments), which no operation list can express.
+    ///
+    /// What `operations` was missing was `metric_kinds`'s discipline, so it gains it here: the
+    /// declaration is resolved against this build's own vocabulary, deduplicated, and therefore
+    /// bounded by it. A peer cannot enlarge what a caller iterates over, and a token this build does
+    /// not know is dropped rather than guessed at — the set can only degrade closed.
+    fn declared_operations(&self) -> Vec<&'static str> {
+        let mut declared: Vec<&'static str> = protocol_operations()
+            .iter()
+            .copied()
+            .filter(|known| self.operations.iter().any(|token| token == known))
+            .collect();
+        declared.dedup();
+        declared
+    }
+
+    /// Whether the peer declared the guarded HTTP frame (C-674).
+    fn declares_http(&self) -> bool {
+        self.declared_operations().contains(&HTTP_REQUEST_OPERATION)
     }
 }
 
@@ -366,6 +401,21 @@ fn remote_system_router(
         .into_iter()
         .map(|kind| kind.as_str().to_string())
         .collect();
+    // The HTTP family is declared only when this process can actually serve it — i.e. when a
+    // composition site attached a backend (C-675). Announcing it unconditionally would make a
+    // same-version peer discover the gap mid-effect instead of at pairing, which is precisely what
+    // the declaration exists to prevent.
+    let operations: Vec<String> = bounded_operations()
+        .iter()
+        .copied()
+        .chain(
+            framed_operations()
+                .iter()
+                .copied()
+                .filter(|_| GuardedHttp::serves_http(&*system)),
+        )
+        .map(str::to_string)
+        .collect();
     let state = SystemState {
         delivery: Arc::new(DeliveryLedger::new(system.clone())),
         network: Arc::new(NetworkResources::default()),
@@ -375,10 +425,7 @@ fn remote_system_router(
             substrate_kind: identity.kind,
             workspace: identity.workspace,
             confinement: identity.confinement,
-            operations: bounded_operations()
-                .iter()
-                .map(|operation| (*operation).to_string())
-                .collect(),
+            operations,
             metric_kinds,
         },
     };
@@ -386,6 +433,7 @@ fn remote_system_router(
     Ok(Router::new()
         .route("/system/v1/handshake", get(handshake))
         .route("/system/v1/execute", post(execute))
+        .route("/system/v1/http", post(serve_http))
         .route(
             "/system/v1/operations/{operation_id}",
             get(operation_status),
@@ -424,7 +472,11 @@ pub async fn serve_tls(
 /// The complete product graph enables both Rustls providers (Slack brings `ring`; reqwest brings
 /// AWS-LC), so Rustls cannot choose one automatically. Installing the workspace's intended provider
 /// is idempotent: an embedder that selected a provider first keeps its selection.
-fn ensure_crypto_provider() {
+///
+/// Public because anything that stands up TLS in this workspace has to make the same choice — a
+/// test's stand-in far side included, and a process that reaches one without ever calling `serve`
+/// would otherwise panic inside Rustls rather than fail a check it can see.
+pub fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
@@ -1330,6 +1382,407 @@ async fn dispatch(system: &System, operation: &str, arguments: Value) -> WireAns
     answer
 }
 
+// ---------------------------------------------------------------------------
+// http.request — the guarded HTTP frame (C-674)
+// ---------------------------------------------------------------------------
+//
+// Two rules shape everything below, and both are about the frame being a **trust boundary** rather
+// than a pipe.
+//
+// **Nothing plaintext is printable or incidentally serializable.** A header value that has had a
+// `$secret` resolved into it travels in a newtype whose `Debug` refuses it and whose `Serialize` is
+// hand-written, so the one place the value becomes bytes is the one place it has to. The URL is
+// redacted wherever a diagnostic names it, because an `in=query` credential lives there.
+//
+// **The serving side enforces, it does not verify a promise.** It re-runs the egress guard on the
+// URL it was handed — the requester's vetted addresses are that process's answer, not this one's —
+// re-caps `max_response_bytes` against its own ceiling, and hands the whole thing to the same
+// `GuardedHttp` backend its own web ops use, which owns the per-hop admission, the connection pin,
+// the redirect bound and the per-hop secret re-authorization. A requester that lied about any of it
+// gets the guard's answer, not its own.
+
+/// The guarded HTTP operation, as it is named in the handshake and on its own route (C-674).
+const HTTP_REQUEST_OPERATION: &str = "http.request";
+
+/// The serving side's own ceiling on retained response bytes, applied to whatever the requester
+/// asked for. A caller's cap is a caller's business; this one is the daemon's memory.
+const MAX_SERVED_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Cap on the request headers one frame may carry.
+const MAX_REQUEST_HEADERS: usize = 128;
+/// Cap on one header name or value, in bytes.
+const MAX_HEADER_TEXT_BYTES: usize = 8 * 1024;
+/// Cap on the allowlist entries and carried-secret names one frame may declare.
+const MAX_SCOPE_ENTRIES: usize = 256;
+
+/// A header value on the wire.
+///
+/// A newtype rather than a `String` for one reason, and it is the whole of C-652's review finding:
+/// a `String` field makes the surrounding frame `Debug`-derivable with a resolved credential in it.
+/// This refuses to print itself and serializes only as the deliberate act of encoding a frame.
+#[derive(Clone)]
+struct WireSecretText(String);
+
+impl Serialize for WireSecretText {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for WireSecretText {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+impl std::fmt::Debug for WireSecretText {
+    /// How long, never what. Deliberately identical in shape to
+    /// [`flux_system::port::HeaderValue`]'s, so the two ends of the frame redact the same way.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<header value, {} bytes>", self.0.len())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireHeader {
+    name: String,
+    /// The allowlisted `$secret` this value materializes, if any — a name, never a value. Carried
+    /// so the serving side can re-authorize it at every redirect hop from the headers themselves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    value: WireSecretText,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireInjectionSite {
+    Header,
+    Query,
+}
+
+impl From<InjectionSite> for WireInjectionSite {
+    fn from(site: InjectionSite) -> Self {
+        match site {
+            InjectionSite::Header => Self::Header,
+            InjectionSite::Query => Self::Query,
+        }
+    }
+}
+
+impl From<WireInjectionSite> for InjectionSite {
+    fn from(site: WireInjectionSite) -> Self {
+        match site {
+            WireInjectionSite::Header => Self::Header,
+            WireInjectionSite::Query => Self::Query,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireCarriedSecret {
+    name: String,
+    site: WireInjectionSite,
+}
+
+/// The `$secret` scope, on the wire: names, sites and grants. **Never a value** — the port says so
+/// and the shape enforces it, because a grant has nowhere to put one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WireSecretScope {
+    /// The operator's allowlist entries as written, so the far side re-parses the identical grants
+    /// rather than a re-rendering that could turn an unusable entry back into a bare name.
+    #[serde(default)]
+    allowlist: Vec<String>,
+    #[serde(default)]
+    carried: Vec<WireCarriedSecret>,
+    #[serde(default)]
+    principal: Option<String>,
+}
+
+/// One guarded HTTP request, framed.
+///
+/// `Debug` is written by hand and **redacts** — which also means a later `#[derive(Debug)]` added
+/// out of habit is a compile error rather than a silent leak.
+#[derive(Serialize, Deserialize)]
+struct WireHttpRequest {
+    protocol_version: u32,
+    /// The op whose effect this is, so a refusal on the far side reads the way that op's refusals
+    /// read.
+    operation: String,
+    method: String,
+    /// The URL to send to. Re-guarded on arrival; the requester's vetted addresses are deliberately
+    /// **not** on the wire, because they are that process's answer about its own network.
+    url: String,
+    #[serde(default)]
+    headers: Vec<WireHeader>,
+    /// The request body, base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+    timeout_ms: u64,
+    max_response_bytes: u64,
+    #[serde(default)]
+    secrets: WireSecretScope,
+    allow: WirePrivateAllow,
+}
+
+impl std::fmt::Debug for WireHttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WireHttpRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("operation", &self.operation)
+            .field("method", &self.method)
+            .field("url", &redacted_wire_url(&self.url))
+            .field("headers", &self.headers)
+            .field("body_bytes", &self.body.as_ref().map(String::len))
+            .field("timeout_ms", &self.timeout_ms)
+            .field("max_response_bytes", &self.max_response_bytes)
+            .field("secrets", &self.secrets)
+            .field("allow", &self.allow)
+            .finish()
+    }
+}
+
+/// A URL with its query and fragment replaced by a marker, for anywhere a diagnostic names one.
+///
+/// An unparseable URL renders as its own scheme-and-nothing rather than verbatim: a string this
+/// build could not parse is exactly the one whose credential-bearing parts it cannot locate.
+fn redacted_wire_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(url) => flux_system::secret_scope::redacted_url(&url),
+        Err(_) => "<unparseable url>".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WirePrivateAdmit {
+    host: String,
+    grant_source: String,
+}
+
+/// What a served request answered. `substrate` is deliberately absent: provenance describes *the
+/// hop*, so `RemoteSystem` stamps it — a peer that could put it in a frame could claim an admission
+/// happened on the caller's own machine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireHttpResponse {
+    status: u16,
+    #[serde(default)]
+    headers: Vec<(String, String)>,
+    /// The capped body, base64.
+    body: String,
+    truncated: bool,
+    #[serde(default)]
+    admits: Vec<WirePrivateAdmit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WireHttpAnswer {
+    status: WireStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    value: Option<WireHttpResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+fn http_refused(detail: impl Into<String>) -> WireHttpAnswer {
+    WireHttpAnswer {
+        status: WireStatus::Refused,
+        value: None,
+        detail: Some(detail.into()),
+    }
+}
+
+fn http_unserved(detail: impl Into<String>) -> WireHttpAnswer {
+    WireHttpAnswer {
+        status: WireStatus::Unserved,
+        value: None,
+        detail: Some(detail.into()),
+    }
+}
+
+/// Serve one guarded HTTP request on **this** substrate.
+///
+/// Deliberately **not** on the generic `execute` route. The delivery ledger there keys on a
+/// `serde_json::Value` argument bag, which is the shape a resolved credential must not enter; and an
+/// HTTP request is not a workspace mutation whose terminal receipt a ledger can usefully replay. The
+/// consequence is stated rather than hidden: this frame has no at-most-once guarantee, so a broken
+/// link leaves an unanswered request in the same "unknown" position the port's `Unreachable` already
+/// describes, and the caller decides. Wiring at-most-once through it is a separate change.
+async fn serve_http(
+    State(state): State<SystemState>,
+    Json(request): Json<WireHttpRequest>,
+) -> Response {
+    if request.protocol_version != PROTOCOL_VERSION {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(http_refused(format!(
+                "unsupported remote-system protocol version {}",
+                request.protocol_version
+            ))),
+        )
+            .into_response();
+    }
+    // The declaration and the route agree, or the declaration was a lie. A substrate nobody
+    // attached a backend to answers the port's own `Unserved` rather than improvising a client.
+    if !GuardedHttp::serves_http(&*state.system) {
+        return Json(http_unserved(
+            "perform a guarded HTTP request — no HTTP backend is composed onto this substrate",
+        ))
+        .into_response();
+    }
+    match build_served_request(&request) {
+        Ok((port_request, allow)) => {
+            let answer = GuardedHttp::http_request(&*state.system, &port_request, &allow).await;
+            Json(match answer {
+                Ok(response) => WireHttpAnswer {
+                    status: WireStatus::Served,
+                    value: Some(WireHttpResponse {
+                        status: response.status,
+                        headers: response.headers,
+                        body: encode_bytes(&response.body),
+                        truncated: response.truncated,
+                        admits: response
+                            .admits
+                            .into_iter()
+                            .map(|admit| WirePrivateAdmit {
+                                host: admit.host,
+                                grant_source: admit.grant_source,
+                            })
+                            .collect(),
+                    }),
+                    detail: None,
+                },
+                Err(error) => match flux_system::remote::failure_mode(&error) {
+                    Some(flux_system::remote::FailureMode::Unserved) => {
+                        http_unserved(error.to_string())
+                    }
+                    _ => http_refused(error.to_string()),
+                },
+            })
+            .into_response()
+        }
+        Err(detail) => Json(http_refused(detail)).into_response(),
+    }
+}
+
+/// Turn a frame into the request this substrate will actually make — running **this** machine's
+/// egress guard and **this** machine's caps over it.
+///
+/// Every bound here is re-derived rather than accepted. The requester's `max_response_bytes` can
+/// only lower the ceiling, never raise it; the header, allowlist and carried-secret lists are capped
+/// before anything is built from them; and the target comes from
+/// [`flux_system::net::guard_url_scoped_for_secret`] run here, so the addresses the connection pins
+/// to are the ones this substrate vetted.
+fn build_served_request(
+    request: &WireHttpRequest,
+) -> std::result::Result<(flux_system::port::HttpRequest, PrivateNetAllow), String> {
+    if request.headers.len() > MAX_REQUEST_HEADERS {
+        return Err(format!(
+            "{}: a guarded request may carry at most {MAX_REQUEST_HEADERS} headers",
+            request.operation
+        ));
+    }
+    for header in &request.headers {
+        if header.name.len() > MAX_HEADER_TEXT_BYTES || header.value.0.len() > MAX_HEADER_TEXT_BYTES
+        {
+            // The offending value is never quoted, and neither is the name it was placed under when
+            // the value is a secret: a refusal is not a place to spend a credential.
+            return Err(format!(
+                "{}: a header name or value exceeds {MAX_HEADER_TEXT_BYTES} bytes",
+                request.operation
+            ));
+        }
+    }
+    if request.secrets.allowlist.len() > MAX_SCOPE_ENTRIES
+        || request.secrets.carried.len() > MAX_SCOPE_ENTRIES
+    {
+        return Err(format!(
+            "{}: a secret scope may declare at most {MAX_SCOPE_ENTRIES} entries",
+            request.operation
+        ));
+    }
+
+    let allow: PrivateNetAllow = request.allow.clone().into();
+    // This substrate's own admission. The requester's vetted addresses are not on the wire at all,
+    // so there is nothing here to be tempted into trusting.
+    let target = flux_system::net::guard_url_scoped_for_secret(&request.url, &allow)
+        .map_err(|error| format!("{}: {error}", request.operation))?;
+
+    let body = match &request.body {
+        Some(encoded) => Some(
+            decode_bytes(Some(&Value::String(encoded.clone())))
+                .map_err(|error| format!("{}: {error}", request.operation))?,
+        ),
+        None => None,
+    };
+    let max_response_bytes = usize::try_from(request.max_response_bytes)
+        .unwrap_or(MAX_SERVED_RESPONSE_BYTES)
+        .min(MAX_SERVED_RESPONSE_BYTES);
+
+    Ok((
+        flux_system::port::HttpRequest {
+            operation: request.operation.clone(),
+            method: request.method.clone(),
+            target,
+            headers: request
+                .headers
+                .iter()
+                .map(|header| {
+                    let value = match &header.secret {
+                        Some(name) => {
+                            flux_system::port::HeaderValue::secret(name, header.value.0.clone())
+                        }
+                        None => flux_system::port::HeaderValue::literal(header.value.0.clone()),
+                    };
+                    (header.name.clone(), value)
+                })
+                .collect(),
+            body,
+            timeout: Duration::from_millis(request.timeout_ms),
+            max_response_bytes,
+            secrets: flux_system::port::HttpSecretScope {
+                allowlist: SecretAllowlist::parse(&request.secrets.allowlist),
+                carried: request
+                    .secrets
+                    .carried
+                    .iter()
+                    .map(|carried| (carried.name.clone(), carried.site.into()))
+                    .collect(),
+                principal: request.secrets.principal.clone(),
+            },
+        },
+        allow,
+    ))
+}
+
+/// Operations that ride a **frame of their own** rather than the generic `execute` envelope.
+///
+/// `execute` carries its arguments as a `serde_json::Value`, which is a `Debug`-printable,
+/// freely-serializable bag. That is exactly right for a path, a byte count or a metric token, and
+/// exactly wrong for a request header that has already had a `$secret` resolved into it: the
+/// plaintext would be one `{:?}` away from a log line and one derive away from an unintended
+/// serializer, which is the shape C-652's review refused to let cross a frame. So `http.request`
+/// gets its own route and its own frame, whose header carriage redacts itself
+/// ([`flux_system::port::HeaderValue`]).
+///
+/// It is still an operation for capability purposes: it is declared in `operations` like every
+/// other, so a caller learns whether a peer serves it from the handshake it already reads.
+fn framed_operations() -> &'static [&'static str] {
+    &[HTTP_REQUEST_OPERATION]
+}
+
+/// Every operation name this protocol version knows — the closed vocabulary a peer's declaration is
+/// resolved against. See [`SystemHandshake::declared_operations`].
+fn protocol_operations() -> Vec<&'static str> {
+    bounded_operations()
+        .iter()
+        .chain(framed_operations())
+        .copied()
+        .collect()
+}
+
 fn bounded_operations() -> &'static [&'static str] {
     &[
         "process.run",
@@ -1686,6 +2139,41 @@ fn decode_metric_answers(value: Value) -> std::result::Result<Vec<MetricAnswer>,
     Ok(answers)
 }
 
+/// Decode a served HTTP answer, re-imposing every bound the port declares (C-674).
+///
+/// The list caps come first, before the entries are built, so an oversized frame costs a truncation
+/// rather than the allocation it was asking for. Labels route through
+/// [`flux_system::port::bounded_admit_label`] on the way in — an admit's host lands in an audit
+/// record an operator reads in a terminal, and a reporter that could embed a control sequence there
+/// could rewrite what that terminal shows.
+fn decode_http_response(
+    value: WireHttpResponse,
+) -> std::result::Result<flux_system::port::HttpResponse, Unreachable> {
+    let body = base64::engine::general_purpose::STANDARD
+        .decode(&value.body)
+        .map_err(|error| Unreachable::new(format!("invalid response body payload: {error}")))?;
+    let mut headers = value.headers;
+    headers.truncate(flux_system::port::MAX_RESPONSE_HEADERS);
+    let admits = value
+        .admits
+        .into_iter()
+        .take(flux_system::port::MAX_PRIVATE_ADMITS)
+        .map(|admit| flux_system::port::PrivateAdmit {
+            host: flux_system::port::bounded_admit_label(&admit.host),
+            grant_source: flux_system::port::bounded_admit_label(&admit.grant_source),
+            // Provenance is the hop's to assert, and this is not the hop. `RemoteSystem` stamps it.
+            substrate: None,
+        })
+        .collect();
+    Ok(flux_system::port::HttpResponse {
+        status: value.status,
+        headers,
+        body,
+        truncated: value.truncated,
+        admits,
+    })
+}
+
 fn process_value(output: ProcessOutput) -> Value {
     json!({"stdout": output.stdout, "stderr": output.stderr, "exit_code": output.exit_code})
 }
@@ -1771,6 +2259,7 @@ fn fingerprint(operation: &str, arguments: &Value) -> String {
 pub struct HttpDelegate {
     http: reqwest::Client,
     execute_url: reqwest::Url,
+    http_url: reqwest::Url,
     process_ws_url: reqwest::Url,
     network_ws_url: reqwest::Url,
     ws: WsTransport,
@@ -1780,6 +2269,9 @@ pub struct HttpDelegate {
     /// The metric kinds the peer declared at handshake, resolved against the closed vocabulary
     /// (C-654). Empty means the peer serves no metrics — see [`HttpDelegate::metrics_gap`].
     metric_kinds: Vec<MetricKind>,
+    /// Whether the peer declared the guarded HTTP frame, resolved against the closed operation
+    /// vocabulary (C-674). `false` means it serves none — see [`HttpDelegate::http_gap`].
+    serves_http: bool,
 }
 
 impl HttpDelegate {
@@ -1852,6 +2344,9 @@ impl HttpDelegate {
         let execute_url = base
             .join("system/v1/execute")
             .map_err(|error| Error::Config(format!("remote-system endpoint: {error}")))?;
+        let http_url = base
+            .join("system/v1/http")
+            .map_err(|error| Error::Config(format!("remote-system endpoint: {error}")))?;
         let mut process_ws_url = base
             .join("system/v1/process")
             .map_err(|error| Error::Config(format!("remote-system endpoint: {error}")))?;
@@ -1890,10 +2385,12 @@ impl HttpDelegate {
             )));
         }
         let metric_kinds = handshake.declared_metric_kinds();
+        let serves_http = handshake.declares_http();
         Ok((
             Arc::new(Self {
                 http,
                 execute_url,
+                http_url,
                 process_ws_url,
                 network_ws_url,
                 ws: WsTransport {
@@ -1903,6 +2400,7 @@ impl HttpDelegate {
                 },
                 token,
                 metric_kinds,
+                serves_http,
                 client_id: format!(
                     "{}-{}-{}",
                     std::process::id(),
@@ -1978,6 +2476,7 @@ impl HttpDelegate {
         Self {
             http: self.http.clone(),
             execute_url: self.execute_url.clone(),
+            http_url: self.http_url.clone(),
             process_ws_url: self.process_ws_url.clone(),
             network_ws_url: self.network_ws_url.clone(),
             ws: self.ws.clone(),
@@ -1985,6 +2484,7 @@ impl HttpDelegate {
             client_id: self.client_id.clone(),
             next_id: AtomicU64::new(self.next_id.fetch_add(1, Ordering::Relaxed)),
             metric_kinds: self.metric_kinds.clone(),
+            serves_http: self.serves_http,
         }
     }
 
@@ -2004,6 +2504,117 @@ impl HttpDelegate {
                     .to_string(),
             ))
         })
+    }
+
+    /// The typed answer for a peer that declared no guarded HTTP frame, or `None` when it did.
+    ///
+    /// C-654's shape, for the same reason (C-674). A same-version peer can perfectly well serve no
+    /// HTTP — a daemon nobody composed a backend onto is exactly that — and it says so in its
+    /// handshake, so the gap is answered here **without a request**. Sending one to find out would
+    /// turn a known capability gap into a round trip whose failure a caller must interpret, and the
+    /// mode is the part that matters: `Unserved` means *implement it or stop asking*, so a retry
+    /// loop must never be told to try again.
+    fn http_gap<T>(&self) -> Option<Delivered<T>> {
+        (!self.serves_http).then(|| {
+            Ok(Answer::Unserved(
+                "perform a guarded HTTP request — the remote peer declared no HTTP frame in its \
+                 handshake"
+                    .to_string(),
+            ))
+        })
+    }
+
+    /// Send one guarded HTTP frame and decode what comes back, re-imposing every bound on the way.
+    ///
+    /// The decode is where a *hostile* far side is stopped: the header list, each header's text,
+    /// the admit list and its labels are all bounded before anything is built from them, so an
+    /// oversized frame costs a truncation rather than an allocation. `RemoteSystem` re-caps the
+    /// body against the request's own `max_response_bytes` afterwards — this is depth, not a
+    /// substitute, because [`Delegate`](flux_system::remote::Delegate) is implementable by anyone.
+    async fn http_request_framed(
+        &self,
+        request: &flux_system::port::HttpRequest,
+        allow: &PrivateNetAllow,
+    ) -> Delivered<flux_system::port::HttpResponse> {
+        let frame = WireHttpRequest {
+            protocol_version: PROTOCOL_VERSION,
+            operation: request.operation.clone(),
+            method: request.method.clone(),
+            url: request.target.url().to_string(),
+            headers: request
+                .headers
+                .iter()
+                .map(|(name, value)| WireHeader {
+                    name: name.clone(),
+                    secret: value.secret_name().map(str::to_string),
+                    value: WireSecretText(value.expose().to_string()),
+                })
+                .collect(),
+            body: request.body.as_deref().map(encode_bytes),
+            timeout_ms: u64::try_from(request.timeout.as_millis()).unwrap_or(u64::MAX),
+            max_response_bytes: request.max_response_bytes as u64,
+            secrets: WireSecretScope {
+                allowlist: request
+                    .secrets
+                    .allowlist
+                    .entries()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                // The union, not the caller's list: a header that carries a secret says so, and the
+                // far side has to re-authorize it at every hop it follows.
+                carried: request
+                    .carried_secrets()
+                    .into_iter()
+                    .map(|(name, site)| WireCarriedSecret {
+                        name,
+                        site: site.into(),
+                    })
+                    .collect(),
+                principal: request.secrets.principal.clone(),
+            },
+            allow: WirePrivateAllow::from(allow),
+        };
+
+        let response = self
+            .http
+            .post(self.http_url.clone())
+            .bearer_auth(&self.token)
+            .json(&frame)
+            .send()
+            .await
+            .map_err(|error| Unreachable::new(error.to_string()))?;
+        if !response.status().is_success() && response.status() != StatusCode::BAD_REQUEST {
+            return Ok(Answer::Refused(format!(
+                "remote-system HTTP status {}",
+                response.status()
+            )));
+        }
+        let answer = response
+            .json::<WireHttpAnswer>()
+            .await
+            .map_err(|error| Unreachable::new(format!("invalid response frame: {error}")))?;
+        match answer.status {
+            WireStatus::Served => match answer.value {
+                Some(value) => Ok(Answer::Served(decode_http_response(value)?)),
+                None => Err(Unreachable::new(
+                    "a served HTTP answer carried no response frame",
+                )),
+            },
+            WireStatus::Refused => Ok(Answer::Refused(
+                answer.detail.unwrap_or_else(|| "remote refused".into()),
+            )),
+            WireStatus::Unserved => Ok(Answer::Unserved(
+                answer
+                    .detail
+                    .unwrap_or_else(|| HTTP_REQUEST_OPERATION.to_string()),
+            )),
+            WireStatus::Unknown => Ok(Answer::Unknown(
+                answer
+                    .detail
+                    .unwrap_or_else(|| "remote outcome is unknown".into()),
+            )),
+        }
     }
 
     async fn open_process_socket(&self, start: &ProcessStart) -> Delivered<ProcessSocket> {
@@ -2976,6 +3587,23 @@ impl Delegate for HttpDelegate {
         )
     }
 
+    fn serves_http(&self) -> bool {
+        self.serves_http
+    }
+
+    fn http_request<'a>(
+        &'a self,
+        request: &'a flux_system::port::HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, flux_system::port::HttpResponse> {
+        Box::pin(async move {
+            if let Some(gap) = self.http_gap() {
+                return gap;
+            }
+            self.http_request_framed(request, allow).await
+        })
+    }
+
     fn served_metric_kinds(&self) -> Vec<MetricKind> {
         self.metric_kinds.clone()
     }
@@ -3634,6 +4262,655 @@ mod tests {
         }
 
         peer.abort();
+    }
+
+    /// A one-shot loopback origin that answers every connection with `response` and reports its
+    /// base URL. Loopback is a private range, so a request to it is only admitted under an explicit
+    /// grant — which is what makes "the serving side ran the guard" observable rather than assumed.
+    async fn one_shot_origin(response: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A daemon workspace whose `System` carries the one reviewed native HTTP backend — the
+    /// composition `flux system serve` performs, assembled here so the serving seam under test is
+    /// the shipped one rather than a stand-in. The grant-source label is distinctive so a reported
+    /// admit can be traced back to *this* backend rather than to anything on the caller's side.
+    fn workspace_system_serving_http(tag: &str) -> (std::path::PathBuf, Arc<System>) {
+        let (root, system) = workspace_system(tag);
+        let system = Arc::try_unwrap(system).expect("the fixture holds the only reference");
+        let backend: Arc<dyn flux_system::port::GuardedHttp> =
+            Arc::new(flux_web::NativeHttp::new(&flux_web::WebOptions {
+                grant_source: Some("wire:remote-system-request".into()),
+                ..Default::default()
+            }));
+        (root, Arc::new(system.with_http(backend)))
+    }
+
+    /// A loopback origin that keeps the bytes of the first request it is sent, so a test can ask
+    /// what the *daemon* actually put on the wire — the only way to tell a header that crossed the
+    /// frame intact from one that was dropped or mangled.
+    async fn recording_origin(response: &'static str) -> (String, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 8192];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                sink.lock().unwrap().extend_from_slice(&buf[..read]);
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// One guarded request at `url`, admitted here under `Any` and carrying nothing.
+    fn wire_http_fixture(url: &str) -> flux_system::port::HttpRequest {
+        flux_system::port::HttpRequest {
+            operation: "http.request".into(),
+            method: "GET".into(),
+            target: flux_system::net::guard_url_scoped_for_secret(url, &PrivateNetAllow::Any)
+                .expect("a loopback literal is admitted under an `Any` grant"),
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(10),
+            max_response_bytes: 64 * 1024,
+            secrets: flux_system::port::HttpSecretScope::default(),
+        }
+    }
+
+    /// The shipped daemon, serving HTTP over TLS on loopback, plus a client paired with it.
+    async fn paired_http_daemon(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+        RemoteSystem,
+        SystemHandshake,
+    ) {
+        let (root, system) = workspace_system_serving_http(tag);
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+        let (delegate, handshake) = HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .expect("the fixture daemon speaks this build's protocol version");
+        let remote = RemoteSystem::identified(delegate, handshake.identity());
+        (root, server, remote, handshake)
+    }
+
+    /// C-674, acceptance 1 — the delegating request, end to end over the loopback TLS fixture.
+    ///
+    /// A `RemoteSystem` whose delegate is the shipped HTTPS transport asks a serving daemon to make
+    /// one guarded HTTP request, and the answer comes back through `port::HttpResponse`. Nothing
+    /// here is simulated locally: the origin is a separate loopback listener the *daemon* connects
+    /// to, so a response that arrives is proof the effect landed on the substrate the operator
+    /// selected rather than on the coordinator.
+    #[tokio::test]
+    async fn a_remote_substrate_serves_a_guarded_http_request_over_the_wire() {
+        let origin = one_shot_origin(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}",
+        )
+        .await;
+
+        let (root, system) = workspace_system_serving_http("remote-http");
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+
+        let (delegate, handshake) = HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .expect("the fixture daemon speaks this build's protocol version");
+        assert!(
+            handshake.operations.iter().any(|op| op == "http.request"),
+            "a peer that serves the HTTP family advertises the frame that carries it: {:?}",
+            handshake.operations
+        );
+        let remote = RemoteSystem::identified(delegate, handshake.identity());
+
+        let allow = PrivateNetAllow::Any;
+        let target =
+            flux_system::net::guard_url_scoped_for_secret(&format!("{origin}/v1"), &allow).unwrap();
+        let request = flux_system::port::HttpRequest {
+            operation: "http.request".into(),
+            method: "GET".into(),
+            target,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(10),
+            max_response_bytes: 64 * 1024,
+            secrets: flux_system::port::HttpSecretScope::default(),
+        };
+
+        let response = flux_system::port::GuardedHttp::http_request(&remote, &request, &allow)
+            .await
+            .map_err(|error| error.to_string())
+            .expect("a same-version peer that serves the family answers the request");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(String::from_utf8_lossy(&response.body), "{\"ok\":true}");
+        assert!(
+            !response.truncated,
+            "an uncut body must not claim it was cut"
+        );
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name == "content-type" && value == "application/json"),
+            "the response headers survive the frame: {:?}",
+            response.headers
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-674, acceptance 1 — the HTTP frame joins the wire under a version bump, and the frame's
+    /// own route refuses a mismatched caller before it does anything.
+    ///
+    /// The client seat is covered by the pairing refusal
+    /// ([`the_protocol_refuses_a_mixed_version_pair_from_both_seats`]) — a mixed pair never gets as
+    /// far as a request. This is the server seat for the *new* route: a caller that reached it
+    /// speaking an older version is refused where an operator can see it, not one operation later.
+    #[tokio::test]
+    async fn the_http_frame_refuses_an_older_caller_before_it_sends_anything() {
+        // A compile-time pin: the frame is a versioned protocol change (Decision 0018 rule 5), and
+        // v3 is the version that shipped without one.
+        const { assert!(PROTOCOL_VERSION > 3) };
+        assert!(
+            framed_operations().contains(&HTTP_REQUEST_OPERATION),
+            "the operation vocabulary must name the framed HTTP request: {:?}",
+            framed_operations()
+        );
+
+        let origin =
+            one_shot_origin("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        let (root, system) = workspace_system_serving_http("remote-http-version");
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
+            .resolve("localhost", address)
+            .build()
+            .unwrap();
+
+        let response = client
+            .post(format!(
+                "https://localhost:{}/system/v1/http",
+                address.port()
+            ))
+            .bearer_auth("test-token")
+            .json(&json!({
+                "protocol_version": PROTOCOL_VERSION - 1,
+                "operation": "http.request",
+                "method": "GET",
+                "url": format!("{origin}/v1"),
+                "timeout_ms": 5000,
+                "max_response_bytes": 1024,
+                "allow": {"kind": "any"},
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an older caller is refused before the request is made"
+        );
+        let answer = response.json::<WireHttpAnswer>().await.unwrap();
+        assert!(matches!(answer.status, WireStatus::Refused));
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported remote-system protocol version"),
+            "{answer:?}"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-674, acceptance 1 — a same-version peer that serves no HTTP answers the port's **typed**
+    /// `Unserved`, from its handshake, without a request.
+    ///
+    /// This is C-654's shape applied to a second family, and the fixture is what makes it a real
+    /// claim: the peer router has no `/system/v1/http` route at all, so a request sent to find out
+    /// would come back a 404 and classify as `Refused`. Getting `Unserved` therefore proves nothing
+    /// was sent — and the mode is what a caller acts on, because it means retrying never helps.
+    #[tokio::test]
+    async fn a_peer_that_serves_no_http_answers_a_typed_unserved_without_asking() {
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, peer) = serve_on_loopback(
+            |_| {
+                peer_announcing(json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "substrate_kind": "native",
+                    "workspace": "/srv/work",
+                    "confinement": "none",
+                    // A same-version daemon nobody composed an HTTP backend onto: it serves the
+                    // families it has and declares exactly those.
+                    "operations": ["workspace.read_bytes", "process.run", "host.metrics"],
+                    "metric_kinds": ["cpu"],
+                }))
+            },
+            tls,
+        );
+
+        let (delegate, handshake) = HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .expect("a same-version peer pairs even when it serves fewer families");
+        let remote = RemoteSystem::identified(delegate, handshake.identity());
+
+        assert!(
+            !flux_system::port::GuardedHttp::serves_http(&remote),
+            "a peer that declared no HTTP frame must not be credited with the family"
+        );
+        let error = flux_system::port::GuardedHttp::http_request(
+            &remote,
+            &wire_http_fixture("http://127.0.0.1:9/probe"),
+            &PrivateNetAllow::Any,
+        )
+        .await
+        .expect_err("the family fails closed");
+        assert_eq!(
+            flux_system::remote::failure_mode(&error),
+            Some(flux_system::remote::FailureMode::Unserved),
+            "retrying never helps, so the mode must be unserved rather than refused: {error}"
+        );
+
+        peer.abort();
+    }
+
+    /// C-674, acceptances 3 and 4 — the serving side runs **its own** egress guard and byte cap,
+    /// and the private admission it made reaches the caller stamped with the substrate.
+    ///
+    /// The two halves are one fixture on purpose. The same loopback origin is admitted under one
+    /// grant and refused under another *while the requesting process admitted it both times*: the
+    /// target was minted here under `Any`, so a refusal can only have come from the guard the
+    /// daemon re-ran on the URL it was handed. And an admitted request comes back reporting the
+    /// admit with the daemon's own grant-source label, which is what makes the audit event visible
+    /// to an operator who is not on that machine.
+    #[tokio::test]
+    async fn the_serving_side_guards_caps_and_reports_its_own_private_admission() {
+        let origin = one_shot_origin(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 26\r\nconnection: close\r\n\r\nabcdefghijklmnopqrstuvwxyz",
+        )
+        .await;
+        let (root, server, remote, handshake) = paired_http_daemon("remote-http-guard").await;
+
+        // Refused *there*: the requester admitted this URL under `Any` when it minted the target,
+        // and the grant that travels with the request does not admit loopback.
+        let error = flux_system::port::GuardedHttp::http_request(
+            &remote,
+            &wire_http_fixture(&format!("{origin}/blocked")),
+            &PrivateNetAllow::None,
+        )
+        .await
+        .expect_err("the serving substrate re-runs admission under the grant it was given");
+        assert_eq!(
+            flux_system::remote::failure_mode(&error),
+            Some(flux_system::remote::FailureMode::Refused),
+            "a guard that answered is a refusal, not a missing capability: {error}"
+        );
+
+        // Admitted, and capped by the substrate: the body stops at the cap rather than arriving
+        // whole and being cut here.
+        let mut request = wire_http_fixture(&format!("{origin}/ok"));
+        request.max_response_bytes = 4;
+        let response =
+            flux_system::port::GuardedHttp::http_request(&remote, &request, &PrivateNetAllow::Any)
+                .await
+                .map_err(|error| error.to_string())
+                .expect("an admitted loopback target is served");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"abcd".to_vec());
+        assert!(response.truncated, "a cut body must report itself cut");
+
+        assert_eq!(
+            response
+                .admits
+                .iter()
+                .map(|admit| (
+                    admit.host.as_str(),
+                    admit.grant_source.as_str(),
+                    admit.substrate.as_deref()
+                ))
+                .collect::<Vec<_>>(),
+            vec![(
+                "127.0.0.1",
+                "wire:remote-system-request",
+                Some(handshake.identity().kind.as_str())
+            )],
+            "the admission happened on the substrate and must reach the caller stamped with it: \
+             {:?}",
+            response.admits
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-674, acceptance 2 — a secret-bearing request crosses the frame, and the frame cannot print
+    /// it.
+    ///
+    /// Three things at once, because they are only meaningful together: the resolved value reaches
+    /// the origin (so the carriage did not quietly drop it), no rendering of the frame or the port
+    /// request contains it, and the far side re-authorizes the scope it was sent — a grant naming
+    /// another host refuses the request *there*, which is the whole reason the scope travels.
+    #[tokio::test]
+    async fn a_secret_bearing_request_crosses_the_frame_without_a_printable_plaintext() {
+        const TOKEN: &str = "ghp-frame-crossing-secret-value";
+
+        let (origin, seen) =
+            recording_origin("HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+        let (root, server, remote, _) = paired_http_daemon("remote-http-secret").await;
+
+        let mut request = wire_http_fixture(&format!("{origin}/v1"));
+        request.headers = vec![(
+            "authorization".into(),
+            flux_system::port::HeaderValue::secret("API_TOKEN", TOKEN),
+        )];
+        request.secrets = flux_system::port::HttpSecretScope {
+            allowlist: SecretAllowlist::parse(["API_TOKEN;to=127.0.0.1;in=header"]),
+            carried: Vec::new(),
+            principal: None,
+        };
+
+        let response =
+            flux_system::port::GuardedHttp::http_request(&remote, &request, &PrivateNetAllow::Any)
+                .await
+                .map_err(|error| error.to_string())
+                .expect("a scoped secret bound for its own destination is authorized");
+        assert_eq!(response.status, 200);
+
+        // It really travelled: the daemon put the resolved value on the origin's socket.
+        let received = String::from_utf8_lossy(&seen.lock().unwrap().clone()).to_string();
+        assert!(
+            received.contains(TOKEN),
+            "the resolved header never reached the origin: {received}"
+        );
+
+        // And no rendering of anything on the way there can print it.
+        let frame = WireHttpRequest {
+            protocol_version: PROTOCOL_VERSION,
+            operation: "http.request".into(),
+            method: "GET".into(),
+            url: format!("{origin}/v1?api_key={TOKEN}"),
+            headers: vec![WireHeader {
+                name: "authorization".into(),
+                secret: Some("API_TOKEN".into()),
+                value: WireSecretText(TOKEN.to_string()),
+            }],
+            body: None,
+            timeout_ms: 5_000,
+            max_response_bytes: 1024,
+            secrets: WireSecretScope::default(),
+            allow: WirePrivateAllow::Any,
+        };
+        for rendering in [
+            format!("{frame:?}"),
+            format!("{:?}", frame.headers),
+            format!("{:?}", frame.headers[0].value),
+            format!("{request:?}"),
+        ] {
+            assert!(
+                !rendering.contains(TOKEN),
+                "a resolved secret reached a Debug rendering of the wire frame: {rendering}"
+            );
+        }
+        assert!(
+            format!("{frame:?}").contains("<redacted>"),
+            "a query-placed credential must not survive the frame's own rendering: {frame:?}"
+        );
+
+        // The scope travels, and the far side enforces it: a grant for another host refuses there.
+        request.secrets.allowlist = SecretAllowlist::parse(["API_TOKEN;to=api.example.com"]);
+        let error =
+            flux_system::port::GuardedHttp::http_request(&remote, &request, &PrivateNetAllow::Any)
+                .await
+                .expect_err(
+                    "a secret out of scope for the destination is refused on the substrate",
+                );
+        assert!(
+            !error.to_string().contains(TOKEN),
+            "a refusal is not a place to spend a credential: {error}"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-674, acceptance 3 — the **redirect-scope** rule is enforced where the redirect is
+    /// followed, which is the substrate, and the refusal names the host and nothing else.
+    ///
+    /// This is the half of the secret scope that only the far side can do. The caller authorized the
+    /// destination it named; the `Location` is chosen by a server, so the only process that can
+    /// measure it against the grant is the one that follows it. The same chain completes when the
+    /// grant covers both hosts, so the refusal is the scope's decision rather than an unreachable
+    /// second origin.
+    #[tokio::test]
+    async fn the_substrate_enforces_the_redirect_scope_where_the_redirect_is_followed() {
+        const TOKEN: &str = "ghp-redirect-scope-secret-value";
+
+        let second = one_shot_origin(
+            "HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\nsecond",
+        )
+        .await;
+        let second_port = second.rsplit(':').next().unwrap().to_string();
+        // A `Location` on a *different* host spelling, so the grant's `to=` axis can tell the two
+        // hops apart even though both resolve into loopback.
+        let redirect: &'static str = Box::leak(
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://localhost:{second_port}/next\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+            .into_boxed_str(),
+        );
+        let first = one_shot_origin(redirect).await;
+        let (root, server, remote, _) = paired_http_daemon("remote-http-redirect").await;
+
+        let request_with = |entries: &[&str]| {
+            let mut request = wire_http_fixture(&format!("{first}/v1"));
+            request.headers = vec![(
+                "authorization".into(),
+                flux_system::port::HeaderValue::secret("API_TOKEN", TOKEN),
+            )];
+            request.secrets = flux_system::port::HttpSecretScope {
+                allowlist: SecretAllowlist::parse(entries),
+                carried: Vec::new(),
+                principal: None,
+            };
+            request
+        };
+
+        let served = flux_system::port::GuardedHttp::http_request(
+            &remote,
+            &request_with(&["API_TOKEN;to=127.0.0.1", "API_TOKEN;to=localhost"]),
+            &PrivateNetAllow::Any,
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .expect("a grant covering both hops follows the chain");
+        assert_eq!(served.status, 200);
+        assert_eq!(String::from_utf8_lossy(&served.body), "second");
+
+        let error = flux_system::port::GuardedHttp::http_request(
+            &remote,
+            &request_with(&["API_TOKEN;to=127.0.0.1"]),
+            &PrivateNetAllow::Any,
+        )
+        .await
+        .expect_err("a redirect outside the grant is refused on the substrate that follows it");
+        let message = error.to_string();
+        assert!(
+            message.contains("refusing the redirect to localhost"),
+            "the refusal must name the hop host an operator has to widen the grant for: {message}"
+        );
+        assert!(
+            !message.contains(TOKEN) && !message.contains(&second_port),
+            "only the host is quoted, never the hop URL a query-placed secret could ride: {message}"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-674, acceptance 3 — the decoder bounds what a hostile far side claims, before the values
+    /// are built.
+    ///
+    /// `RemoteSystem` re-caps too, and that is the layer a caller ultimately relies on; this is the
+    /// transport doing it as well, which is depth rather than a substitute. An oversized frame costs
+    /// a truncation instead of the allocation it was asking for, and a label that carries a control
+    /// sequence is cleaned before it can reach a terminal.
+    #[test]
+    fn the_http_decoder_rebounds_everything_the_wire_claims() {
+        let long = "q".repeat(9000);
+        let decoded = decode_http_response(WireHttpResponse {
+            status: 200,
+            headers: (0..(flux_system::port::MAX_RESPONSE_HEADERS + 64))
+                .map(|index| (format!("x-{index}"), long.clone()))
+                .collect(),
+            body: encode_bytes(b"body"),
+            truncated: false,
+            admits: (0..(flux_system::port::MAX_PRIVATE_ADMITS + 64))
+                .map(|_| WirePrivateAdmit {
+                    host: format!("10.0.0.1\u{1b}[2J{long}"),
+                    grant_source: long.clone(),
+                })
+                .collect(),
+        })
+        .expect("an oversized but well-formed frame decodes, bounded");
+
+        assert_eq!(
+            decoded.headers.len(),
+            flux_system::port::MAX_RESPONSE_HEADERS
+        );
+        assert_eq!(decoded.admits.len(), flux_system::port::MAX_PRIVATE_ADMITS);
+        for admit in &decoded.admits {
+            assert!(admit.host.len() <= flux_system::port::MAX_ADMIT_LABEL_BYTES);
+            assert!(admit.grant_source.len() <= flux_system::port::MAX_ADMIT_LABEL_BYTES);
+            assert!(
+                !admit.host.chars().any(char::is_control),
+                "a control sequence reached an operator's audit record: {:?}",
+                admit.host
+            );
+            assert!(
+                admit.substrate.is_none(),
+                "the transport does not get to assert provenance; the hop does"
+            );
+        }
+        assert!(decode_http_response(WireHttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: "not base64 at all!!".into(),
+            truncated: false,
+            admits: Vec::new(),
+        })
+        .is_err());
+    }
+
+    /// C-674 — the handshake's `operations` is the generalized declared-capability set, and it is
+    /// resolved against a closed vocabulary so it can only degrade closed.
+    ///
+    /// C-654 asked whether a second per-family field should become a general capability set. The
+    /// answer here is that `operations` already *is* one; what it lacked was `metric_kinds`'s
+    /// discipline, which is what this pins. A peer cannot enlarge what a caller iterates over by
+    /// inventing or repeating tokens, and a token this build does not know is dropped rather than
+    /// guessed at.
+    #[test]
+    fn a_declared_operation_set_resolves_closed_against_this_builds_vocabulary() {
+        let handshake = SystemHandshake {
+            protocol_version: PROTOCOL_VERSION,
+            substrate_kind: "native".into(),
+            workspace: "/srv/work".into(),
+            confinement: "none".into(),
+            operations: vec![
+                "http.request".into(),
+                "http.request".into(),
+                "workspace.read_bytes".into(),
+                // Neither of these exists in this build.
+                "http.websocket".into(),
+                "process.exec_anything".into(),
+            ],
+            metric_kinds: Vec::new(),
+        };
+        assert_eq!(
+            handshake.declared_operations(),
+            vec!["workspace.read_bytes", "http.request"],
+            "an unknown token is dropped and a repeat cannot enlarge the set"
+        );
+        assert!(handshake.declares_http());
+        assert!(!SystemHandshake {
+            operations: vec!["workspace.read_bytes".into()],
+            ..handshake
+        }
+        .declares_http());
     }
 
     /// C-654: the decoder re-imposes the vocabulary's bounds on what the wire claims.
