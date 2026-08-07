@@ -1,0 +1,32 @@
+# The Flux remote execution system as an ordinary Kubernetes workload.
+#
+# Render it:            kubectl kustomize deploy/kubernetes
+# Apply it:             kubectl apply -k deploy/kubernetes
+#
+# Two Secrets are deliberately absent from this base, because a checked-in manifest is exactly where
+# a bearer token and a TLS private key must never be. Create them first — see deploy/kubernetes/README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: flux-system
+
+resources:
+  - namespace.yaml
+  - workspace-pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: flux-system
+      app.kubernetes.io/component: remote-execution-system
+
+# The image tag is the release identity. It is pinned here rather than in the Deployment so one edit
+# moves the whole profile, and so the artifact contract test can check this single place against
+# [workspace.package].version.
+images:
+  - name: flux-system
+    newName: flux-system
+    newTag: 0.58.0

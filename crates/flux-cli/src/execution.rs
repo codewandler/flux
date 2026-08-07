@@ -1649,6 +1649,12 @@ pub(super) fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
 /// stays meaningful and the native workspace-following path is preserved, exactly as C-650
 /// shipped it. The spawn-time modifier still confines that path through `apply_sandbox_env`,
 /// which this touches in no way.
+///
+/// C-675: `local` is the session system **with the native HTTP backend attached** (see the call
+/// site). Only a substrate composed from it inherits that backend — a `local` binding installs no
+/// override at all, and a `remote` one is a different address space that answers the family for
+/// itself — so the attachment reaches exactly the substrates that run in this process and were
+/// deliberately selected.
 async fn resolve_selected_execution_system(
     flags: &AgentFlags,
     local: &System,
@@ -2280,14 +2286,6 @@ pub(super) async fn build_agent_with(
     } else {
         flux_secret::host::HostGrant::Operator
     };
-    let selected_substrate = resolve_selected_execution_system(
-        flags,
-        &system,
-        &host_registry,
-        host_surface,
-        posture.sandbox_floor(),
-    )
-    .await?;
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
@@ -2491,27 +2489,52 @@ pub(super) async fn build_agent_with(
     // (tier 2), all under the family-wide `[private_net] web` egress scope. Registered here — after
     // the session is resolved — because the `PrivateNetAdmit` audit sink needs the event store +
     // session id, and `web.fetch` contributes `web.page` records to the datasource backend.
-    {
+    let web_options = {
         let web_audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
             store: events.clone(),
             stream: session_id.clone(),
         });
-        flux_web::try_register_web(
-            &mut registry,
-            &flux_web::WebOptions {
-                private_net: flux_system::net::PrivateNetAllow::from_hosts(
-                    effective_web_private_hosts(&cfg),
-                ),
-                audit: Some(web_audit),
-                grant_source: Some(web_grant_source()),
-                records: Some(Arc::new(BackendRecordSink {
-                    backend: backend.clone(),
-                })),
-                browser_bin: cfg.browser_bin.clone(),
-                allowed_secrets: cfg.web.allowed_secrets.clone(),
-            },
-        )?;
-    }
+        flux_web::WebOptions {
+            private_net: flux_system::net::PrivateNetAllow::from_hosts(
+                effective_web_private_hosts(&cfg),
+            ),
+            audit: Some(web_audit),
+            grant_source: Some(web_grant_source()),
+            records: Some(Arc::new(BackendRecordSink {
+                backend: backend.clone(),
+            })),
+            browser_bin: cfg.browser_bin.clone(),
+            allowed_secrets: cfg.web.allowed_secrets.clone(),
+        }
+    };
+    flux_web::try_register_web(&mut registry, &web_options)?;
+
+    // C-675: **the composition site.** This layer holds both halves — the one reviewed egress
+    // client (`flux_web::NativeHttp`, built from the very wiring the ops just registered with) and
+    // the substrate a selection installs — so it is the only place that can join them without a
+    // lower layer reaching up for a client it may not depend on. A native-composed substrate
+    // (the confinement peer today, a container backend next) then serves web effects through the
+    // same client, the same egress guard and the same audit sink an unselected run uses.
+    //
+    // The attachment rides on a *clone* of the session system handed to selection, never on the
+    // session's own: an unselected run, and a named `local` binding that installs no override, stay
+    // on the bare native path where the family is fail-closed exactly as C-652 shipped it.
+    //
+    // Selection therefore resolves here rather than beside the other startup refusals: the audit
+    // sink is a session-scoped value (event store + session id) and the private-net scope is the
+    // resolved `[private_net] web` one, neither of which exists earlier. A refusal from an unknown,
+    // ungranted or unconfinable binding is still a startup refusal, just after the session opens.
+    let selection_local = (*system)
+        .clone()
+        .with_http(Arc::new(flux_web::NativeHttp::new(&web_options)));
+    let selected_substrate = resolve_selected_execution_system(
+        flags,
+        &selection_local,
+        &host_registry,
+        host_surface,
+        posture.sandbox_floor(),
+    )
+    .await?;
 
     let integrations = assemble_integrations(
         system.clone(),

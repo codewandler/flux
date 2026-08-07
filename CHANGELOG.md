@@ -140,6 +140,28 @@ All notable changes to this project are documented in this file. The format is b
   `LocalControlPlane` placement, carrying probe's exact authority pair (`network_fetch` +
   `host_read` on the binding subject).
 
+- **A selected native substrate serves HTTP (C-675).** `System` carries an optional
+  `AttachedHttp` backend set at exactly one production site: the CLI attaches
+  `flux_web::NativeHttp` (the workspace's one egress client) to a clone handed to substrate
+  selection, so a sandboxed selection serves `http.request`/`web.fetch` through the same guard,
+  redactor and session-scoped audit sink an unselected run uses. The session's own system stays
+  bare — C-652's fail-closed path is byte-identical for unselected runs and named `local`
+  bindings — the routing branch stays kind-blind, and no census entry changed because nothing new
+  constructs a client. Sub-agent spawns now snapshot the parent's *selection* rather than its
+  resolved system, so a child of an unselected parent carries no selection.
+
+- **First-class remote-system deployment profiles (C-480).** `deploy/` gains three checked
+  profiles for `flux system serve`: a single-COPY non-root OCI image (entrypoint pinned, no ENV,
+  no secret or workspace in any layer — pinned by test), a Kubernetes Kustomize base (replicas 1
+  + Recreate, PVC, file-shaped TLS Secret at 0400, TCP probes, caps-drop-ALL, seccomp,
+  read-only rootfs, and a real default-deny NetworkPolicy), and a VM/microVM guest profile whose
+  hardened unit keeps the sandbox floor and installs bubblewrap — `--no-sandbox` never appears in
+  its ExecStart, pinned by test. Container and pod profiles take the documented `--no-sandbox`
+  escape with the UNCONFINED disclosure surviving into deployment logs; the review ruled an
+  image-level `FLUX_SANDBOXED=1` would have shipped C-651's forged-posture shape as a default.
+  A container integration test proves mount → connect → write/read → mismatch-refusal → restart →
+  persistence against real Docker, dispositioned plainly where Docker is absent.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

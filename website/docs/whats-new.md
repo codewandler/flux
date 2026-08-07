@@ -51,6 +51,20 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   zero, and readings that came from a remote machine are marked as reported by it rather than
   observed locally.
 
+- **Choosing a confined host no longer costs you the web.** Fetches and HTTP requests made under
+  a selected host now go out through the same reviewed, guarded egress path an ordinary run uses,
+  with the same private-network audit trail — and a host that genuinely cannot make requests
+  still refuses plainly instead of quietly sending them from somewhere else. Sub-agents now
+  inherit exactly the host their parent was running on, and nothing else.
+
+- **Deploy the remote execution system from shipped artifacts.** Flux now ships an OCI image
+  that runs only the serving daemon as a non-root user with no secrets in any layer, a Kubernetes
+  Kustomize base (one replica per workspace, persistent volume, TLS and bearer Secrets, and a
+  default-deny network policy), and a hardened VM/microVM guest unit with a cloud-init install
+  contract. Upgrade, rollback and version-mismatch behavior are documented per profile. Flux
+  still never provisions your Docker hosts, clusters or VMs — the artifacts run where you already
+  have somewhere to run them.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

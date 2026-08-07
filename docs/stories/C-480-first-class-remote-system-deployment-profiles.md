@@ -2,8 +2,7 @@
 id: C-480
 title: "First-class remote-system deployment profiles — OCI image, Kubernetes manifests and a microVM guest unit"
 pillar: Core
-status: ready
-priority: 7
+status: done
 epic: remote-agents
 design: docs/designs/remote-agents.md
 areas: [release, website, flux-server]
@@ -19,25 +18,27 @@ containers, Kubernetes and VM/microVM guests, without coupling the protocol to o
 
 ## Acceptance
 
-- [ ] A release-versioned OCI image runs only `flux system serve`, uses a non-root identity, carries
-      no token/key/workspace in a layer, and has a documented SBOM/provenance path consistent with
-      the binary release.
-- [ ] Failing-first container integration test: mount a workspace/TLS/token, start the image, connect
+- [x] A release-versioned OCI image runs only `flux system serve`, uses a non-root identity, carries
+      no token/key/workspace in a layer, and has a documented provenance path consistent with
+      the binary release. (Amended at integration: the binary release ships attestation and no
+      SBOM, so the image documents `gh attestation verify` over the repacked attested archive —
+      the review judged this consistent; an SBOM for the release pipeline is a separate decision.)
+- [x] Failing-first container integration test: mount a workspace/TLS/token, start the image, connect
       with a released client, write/read through the remote system, restart the container, and prove
       the workspace plus delivery ledger persist. The test is explicitly dispositioned when Docker
       is unavailable in ordinary workspace CI.
-- [ ] A checked Kubernetes profile (raw manifests or Kustomize first; Helm only if it adds a real
+- [x] A checked Kubernetes profile (raw manifests or Kustomize first; Helm only if it adds a real
       need) includes one replica per workspace, PVC, TLS Secret, bearer Secret, ClusterIP Service,
       TCP readiness/liveness probes, non-root/seccomp settings, and a default-deny NetworkPolicy.
-- [ ] A VM/microVM guest profile includes a hardened service unit and cloud-init or equivalent
+- [x] A VM/microVM guest profile includes a hardened service unit and cloud-init or equivalent
       install contract for the same release artifact, durable workspace disk, TLS/token file modes,
       and firewall expectations.
-- [ ] None of the artifacts claims Flux provisions Docker hosts, clusters or microVMs. Firecracker,
+- [x] None of the artifacts claims Flux provisions Docker hosts, clusters or microVMs. Firecracker,
       Kata, Cloud Hypervisor and cloud-specific lifecycle belong behind a future generic isolation
       provisioner contract, not the remote wire.
-- [ ] Upgrade/rollback and protocol-version mismatch behavior are documented and tested.
-- [ ] Public deployment docs use the shipped artifacts rather than placeholder images once released.
-- [ ] Release, codegate, root workspace, and artifact-specific checks are green.
+- [x] Upgrade/rollback and protocol-version mismatch behavior are documented and tested.
+- [x] Public deployment docs use the shipped artifacts rather than placeholder images once released.
+- [x] Release, codegate, root workspace, and artifact-specific checks are green.
 
 ## Progress
 

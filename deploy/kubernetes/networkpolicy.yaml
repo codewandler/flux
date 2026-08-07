@@ -1,0 +1,74 @@
+# Default deny, then admit exactly what the profile needs.
+#
+# NetworkPolicy is enforced by the CNI plugin. On a cluster whose CNI ignores it, these objects
+# apply cleanly and restrict nothing — check your CNI before treating this as a boundary.
+---
+# Nothing in or out of this namespace unless a later policy admits it. An empty podSelector selects
+# every pod; naming both policy types is what makes the egress half deny rather than stay unset.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# The one ingress the daemon exists to serve: a control plane that runs the agent locally and lands
+# its effects here. Label the client pod `flux-remote-client: "true"` and its namespace
+# `flux-remote-client: "true"`, or replace this selector with the one your cluster actually uses.
+#
+# Widening this to an empty `from:` admits the whole cluster and is not a shortcut worth taking:
+# a bearer token is the daemon's only remaining barrier at that point.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flux-system-allow-remote-client
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: flux-system
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              flux-remote-client: "true"
+          podSelector:
+            matchLabels:
+              flux-remote-client: "true"
+      ports:
+        - port: 8790
+          protocol: TCP
+---
+# Egress is denied by default above, which also denies DNS. This restores name resolution only.
+#
+# Guarded network effects executed on this substrate — an approved `network.dial`, a package
+# fetch inside an approved process — need egress of their own, and there is no honest generic
+# answer for what that should be: it is the blast radius you chose when you placed effects here.
+# Add the destinations your approved operations genuinely need, and no more.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flux-system-allow-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: flux-system
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
