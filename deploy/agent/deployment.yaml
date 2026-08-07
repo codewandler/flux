@@ -1,0 +1,176 @@
+# One replica per session store. See state-pvc.yaml for why that is the topology rather than a
+# starting point to scale out of.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flux-agent
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two pods must never hold the same SQLite session store.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flux-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flux-agent
+    spec:
+      # An agent that plans its own actions must not be handed a cluster API credential it never
+      # asked for. Nothing in this profile talks to the API server.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # Without fsGroup a freshly provisioned volume is root-owned and the non-root agent cannot
+        # create its own store.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: flux-agent
+          # The SAME image the substrate profile runs, tag pinned by kustomization.yaml. The image's
+          # ENTRYPOINT is `flux system serve`; `command:` below replaces it with the agent surface.
+          # There is no second image and no second build recipe.
+          image: flux-system
+          # The whole reason one image serves both axes: a command override selects the program.
+          command:
+            - /usr/local/bin/flux
+            - app
+            - run
+          # The agent's working directory. Everything it reads and writes is under here, because the
+          # container filesystem is read-only.
+          workingDir: /srv/flux/workspace
+          # ── Arguments ────────────────────────────────────────────────────────────────────────
+          #
+          # `--no-sandbox` is required and deliberate, exactly as in the substrate profile: an
+          # HTTP/A2A serving surface is pinned to the fail-closed sandbox floor
+          # (`unattended_sandbox_surface`, flux-cli), and bubblewrap cannot satisfy that floor
+          # inside an ordinary container — creating a user namespace there is refused under the
+          # default seccomp profile. `--no-sandbox` is that floor's documented outer-container
+          # escape, and the pod is the isolation boundary that replaces it, which is why this
+          # profile runs read-only, non-root, with all capabilities dropped and both directions of
+          # traffic denied by default. Removing this flag does not harden the pod; it stops the
+          # agent from starting. Flux prints the resolved UNCONFINED posture at startup.
+          #
+          # `--store` puts the session store on the volume. Without it the store would default to
+          # `$HOME/.flux` and, on a read-only rootfs, the agent would fail to open it.
+          #
+          # `--serve=0.0.0.0:8787` uses the `=` spelling on purpose: `--serve <addr>` is an
+          # optional-value flag, and the separated form swallows a following positional as the
+          # address.
+          #
+          # ── Approval posture: choose one, and only one ───────────────────────────────────────
+          #
+          # `flux app run --serve` with no program REFUSES TO START unless a posture is chosen —
+          # an HTTP request has no terminal to prompt at, so the choice cannot be defaulted
+          # (`ServedApprovalPosture::select`, crates/flux-cli/src/app_cmd.rs).
+          #
+          #   --yes              Never ask. Authorization policy, the sandbox floor and the
+          #                      resource budgets are what constrain this agent. This is the
+          #                      posture shipped here, because a pod has nobody attached to it:
+          #                      an unanswered effect under the other posture is a DENIED effect,
+          #                      so a deployment that nobody is watching would slowly refuse
+          #                      everything while looking healthy.
+          #
+          #   --remote-approval  A human answers each guarded effect over the network
+          #                      (GET /approvals, POST /approvals/{id}); silence for
+          #                      FLUX_APPROVAL_TIMEOUT_SECS (default 120) DENIES. Swap it in below
+          #                      when somebody really is watching.
+          #
+          #                      ⚠ Until C-687 lands, this posture supports only the shared
+          #                      operator token (or an open loopback bind): whoever holds the token
+          #                      in flux-agent-token may answer approvals, so it does not give you
+          #                      per-operator accountability, and principal auth
+          #                      (`[server] introspect_url`) is refused outright alongside it.
+          args:
+            - --no-sandbox
+            - --store
+            - /srv/flux/state
+            - --serve=0.0.0.0:8787
+            - --yes
+          # Swap the posture by replacing `--yes` above with:
+          # - --remote-approval
+          env:
+            # The bearer token reaches the agent through the environment and never through argv, so
+            # it cannot be read out of a process listing. The Secret is created out of band, and it
+            # is REQUIRED, never `optional`: without it the kubelet refuses to start the container,
+            # and flux itself refuses a non-loopback bind with nothing to authenticate
+            # (`guard_open_bind`, flux-server). Two independent refusals, neither relying on the
+            # other, and no way to express an open public listener in this file.
+            - name: FLUX_SERVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: flux-agent-token
+                  key: token
+            # The model call happens HERE, unlike the substrate profile — that is what the agent
+            # axis means. Name the credential your `--model` spec actually resolves; this is the
+            # Anthropic API key that flux's default `sonnet` alias uses. See deploy/agent/README.md
+            # for the other providers.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: flux-agent-model-credentials
+                  key: api-key
+            # `~` has to resolve somewhere writable: installed plugins and `endpoints.toml` live
+            # under `$HOME/.flux`, and the container filesystem is read-only.
+            - name: HOME
+              value: /srv/flux/state
+          ports:
+            - name: http
+              containerPort: 8787
+              protocol: TCP
+          # HTTP probes, and this is a real difference from the substrate profile rather than a
+          # style choice. `flux system serve` authenticates every route, so its probe can only be
+          # TCP. The agent surface registers `/health` and the agent card OUTSIDE its authentication
+          # layer (`let exempt = Router::new()`, crates/flux-server/src/lib.rs) — the documented
+          # health/discovery exemption in AGENTS.md — so a probe proves the router answers without
+          # any manifest ever carrying the bearer token.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              # An agent turn holds a conversation, its tool output and its event writes in memory.
+              # This is a starting point; raise it against your own turns rather than guessing.
+              memory: 4Gi
+          volumeMounts:
+            - name: state
+              mountPath: /srv/flux/state
+              subPath: state
+            - name: state
+              mountPath: /srv/flux/workspace
+              subPath: workspace
+            - name: tmp
+              mountPath: /tmp
+      # A turn in flight owns a model call, tool effects and pending event writes. Give it room to
+      # finalize rather than tearing the store out from under a half-written turn.
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: flux-agent-state
+        - name: tmp
+          emptyDir: {}

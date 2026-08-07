@@ -1,0 +1,25 @@
+# ClusterIP, deliberately. The agent listener speaks plain HTTP — `flux app run --serve` terminates
+# no TLS of its own — and its bearer token is the only thing standing between a caller and an agent
+# that plans and executes. Putting a LoadBalancer or a bare Ingress in front of that would send the
+# token across whatever the cluster's edge happens to be.
+#
+# If you do front it, terminate TLS at the ingress and keep the connection to this Service inside a
+# boundary you trust (a mesh with mTLS, or a node-local path). The bearer token authenticates the
+# CALLER to the agent; it does nothing to authenticate the agent to the caller, and it is replayable
+# by anyone who reads it off the wire.
+apiVersion: v1
+kind: Service
+metadata:
+  name: flux-agent
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: flux-agent
+  ports:
+    # Only the agent endpoint. A program's declared channels (webhook, Slack, cron) bind their OWN
+    # addresses from their own declarations and are deliberately not published here — see
+    # deploy/agent/README.md.
+    - name: http
+      port: 8787
+      targetPort: http
+      protocol: TCP
