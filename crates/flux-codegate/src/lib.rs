@@ -1236,6 +1236,7 @@ const GUARDED_PORT_TRAITS: &[&str] = &[
     "GuardedHostFiles",
     "GuardedWorkspaceFiles",
     "GuardedNetwork",
+    "GuardedHttp",
 ];
 
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
@@ -3980,6 +3981,34 @@ impl Exec for Double {}
                 "crates/flux-system/src/remote.rs",
                 "GuardedNetwork",
                 "RemoteSystem",
+            ),
+            // C-652 — the HTTP family. Two of these three are refusals and the third is the
+            // workspace's one HTTP client, which is why the family adds no new IO path.
+            //
+            // `System`'s impl is empty: `flux-system` holds no HTTP client by design, so the native
+            // backend inherits the port's fail-closed default rather than growing a second one.
+            // `RemoteSystem`'s impl is a typed `Unserved` naming the missing wire support — it
+            // cannot send anything.
+            ("crates/flux-system/src/port.rs", "GuardedHttp", "System"),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedHttp",
+                "RemoteSystem",
+            ),
+            // The one that actually performs HTTP, and the reason the family exists. `NativeHttp`
+            // adds no client: it wraps the redirect-disabled, proxy-free `reqwest::Client` that
+            // `flux-web`'s reviewed egress broker already owned, and every request still goes
+            // through `flux_system::net`'s admission, C-77's connection pin, the bounded redirect
+            // chain and the response-byte cap. What is new is only *who may ask* — so this reads as
+            // one reviewed backend on the existing egress path rather than a second path.
+            //
+            // It lives in `flux-web` (L5) rather than beside the port (L2) because that is where the
+            // client is, and `flux-codegate`'s `Http` census keeps the count of clients at one. The
+            // layer map forbids the alternative outright.
+            (
+                "crates/flux-web/src/native_http.rs",
+                "GuardedHttp",
+                "NativeHttp",
             ),
         ];
         let mut allowance_use = vec![0usize; ALLOW.len()];

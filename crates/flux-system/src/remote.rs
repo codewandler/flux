@@ -108,8 +108,8 @@ use crate::net::{
     PrivateNetAllow,
 };
 use crate::port::{
-    ExecutionIdentity, Guarded, GuardedEnv, GuardedHostFiles, GuardedNetwork, GuardedProcess,
-    GuardedWorkspaceFiles, SubstrateIdentity,
+    ExecutionIdentity, Guarded, GuardedEnv, GuardedHostFiles, GuardedHttp, GuardedNetwork,
+    GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
 };
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead};
 
@@ -630,6 +630,42 @@ impl GuardedNetwork for RemoteSystem {
     }
 }
 
+/// HTTP is on the port (C-652), but the protocol behind [`RemoteSystem`] has no frame that carries
+/// an HTTP request yet — Decision 0018 rule 5 keeps that a separate, versioned protocol change
+/// rather than an implicit extension.
+///
+/// So this answers with the port's typed [`FailureMode::Unserved`] and *names what is missing*,
+/// which is the one thing an operator can act on: this mode means "implement it, or stop asking",
+/// and retrying never helps.
+///
+/// The alternative — sending the request from this process because the delegate cannot — is the
+/// approximation the whole backend refuses to make. It would leave the effect, the source address
+/// the far end sees, and any credential the request carries on the coordinator, while dispatch
+/// provenance recorded the selected substrate. A missing capability is reported, never simulated.
+///
+/// There is deliberately no `Delegate::http_request` to override: adding one would invent the wire
+/// this decision defers.
+impl GuardedHttp for RemoteSystem {
+    fn http_request<'a>(
+        &'a self,
+        request: &'a crate::port::HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, crate::port::HttpResponse> {
+        let _ = allow;
+        let operation = request.operation.clone();
+        Box::pin(async move {
+            Err(Error::GuardedIo(GuardedIoError::new(
+                FailureMode::Unserved,
+                format!(
+                    "carry `{operation}` to a delegated substrate — the remote protocol has no HTTP \
+                     wire support yet, and this backend reports the gap rather than sending the \
+                     request from the coordinator's own process"
+                ),
+            )))
+        })
+    }
+}
+
 impl GuardedHostFiles for RemoteSystem {
     fn host_path_identity(&self, path: &str) -> Result<String> {
         settle(self.delegate.host_path_identity(path))
@@ -959,5 +995,60 @@ mod tests {
     #[test]
     fn an_unrelated_error_has_no_failure_mode() {
         assert_eq!(failure_mode(&Error::Other("something else".into())), None);
+    }
+
+    /// C-652 — a delegated substrate answers HTTP by *naming what is missing*, never by sending the
+    /// request from this process.
+    ///
+    /// Decision 0018 rule 5 puts HTTP on the port and leaves wire support for it a separate,
+    /// versioned protocol change. Until that lands there is no frame to carry an HTTP request to the
+    /// far side, and the only two honest answers are "unserved" or a lie. Approximating — running
+    /// the request locally because the delegate cannot — would place the effect, its source address
+    /// and its credentials on the coordinator while the operator's provenance says otherwise, which
+    /// is exactly the substitution the port exists to prevent.
+    ///
+    /// The refusal is checked structurally *and* for the phrase an operator has to act on: this is
+    /// the one failure mode where retrying never helps and the fix is "implement the wire".
+    #[tokio::test]
+    async fn remote_http_is_unserved_and_names_the_missing_wire_support() {
+        struct ServesNothing;
+        impl Delegate for ServesNothing {}
+
+        let target = crate::net::guard_url_scoped_for_secret(
+            "http://127.0.0.1:9/probe",
+            &crate::net::PrivateNetAllow::Any,
+        )
+        .expect("a loopback literal is admitted under an `Any` grant");
+        let request = crate::port::HttpRequest {
+            operation: "http.request".into(),
+            method: "GET".into(),
+            target,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(1),
+            max_response_bytes: 1024,
+            secrets: crate::port::HttpSecretScope::default(),
+        };
+
+        let remote = RemoteSystem::new(Arc::new(ServesNothing));
+        let error = crate::port::GuardedHttp::http_request(
+            &remote,
+            &request,
+            &crate::net::PrivateNetAllow::Any,
+        )
+        .await
+        .expect_err("a delegated substrate cannot serve HTTP until the wire carries it");
+
+        assert_eq!(
+            failure_mode(&error),
+            Some(FailureMode::Unserved),
+            "retrying never helps, so the mode must be unserved rather than refused: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("wire support"),
+            "the refusal must name the missing wire support so an operator knows what to build: \
+             {message}"
+        );
     }
 }
