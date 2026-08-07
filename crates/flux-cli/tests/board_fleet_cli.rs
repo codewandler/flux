@@ -1852,6 +1852,103 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
     assert_eq!(repository["stories"][0]["wave"], "wave-2");
 }
 
+/// Failing first: `fleet repair` rebuilds the structure a wave's topology names and disk lacks.
+///
+/// Reclamation removed an integration worktree an unfinished wave still needed, and putting it back
+/// took a hand-written `git worktree add` against a base read out of `state.json` — the same class of
+/// hand repair as the `git reset --hard <base>` an integration worktree needed before handoffs would
+/// verify. Both facts are recorded; neither had a verb.
+///
+/// The three assertions below are the whole contract. A missing checkout returns **on its own
+/// branch**, so a worker's delivered commit survives the repair. A worktree holding an uncommitted
+/// change is refused rather than reset, because the only place that change exists is the one this
+/// verb would overwrite. And once nothing would be discarded, a derived worktree goes back to the
+/// base it is pinned to, leaving every story commit alone.
+#[test]
+fn fleet_repair_rebuilds_missing_structure_without_discarding_work() {
+    fn head_of(worktree: &PathBuf) -> String {
+        String::from_utf8(git(worktree, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+    fn entry_for(repaired: &serde_json::Value, worktree: &PathBuf) -> serde_json::Value {
+        repaired["data"]["worktrees"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .find(|entry| entry["worktree"] == worktree.display().to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("{} is missing from {repaired}", worktree.display()))
+    }
+
+    let (root, story) = one_story_wave("wave-repair");
+    let base = head_of(&root);
+    let delivered = commit_result(&story, "delivered");
+    let integration = story
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("integration");
+    assert!(integration.is_dir());
+
+    fs::remove_dir_all(&story).unwrap();
+    let repaired = flux(&root, &["fleet", "repair", "wave-2", "--output", "json"]);
+    assert!(
+        repaired.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&repaired.stdout),
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let repaired: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(repaired["data"]["wave"], "wave-2");
+    assert_eq!(
+        entry_for(&repaired, &story)["repair"]["action"],
+        "recreated"
+    );
+    assert!(story.is_dir(), "the checkout the topology names is back");
+    assert_eq!(
+        head_of(&story),
+        delivered,
+        "rebuilt on its recorded branch, so the delivered commit came back with it"
+    );
+
+    assert!(git(
+        &integration,
+        &["commit", "--allow-empty", "-qm", "assembly"]
+    )
+    .status
+    .success());
+    let assembled = head_of(&integration);
+    fs::write(integration.join("scratch.txt"), "unsaved\n").unwrap();
+    let refused = flux(&root, &["fleet", "repair", "wave-2", "--output", "json"]);
+    assert!(refused.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        entry_for(&refused, &integration)["repair"]["action"],
+        "refused"
+    );
+    assert_eq!(
+        head_of(&integration),
+        assembled,
+        "a refusal leaves the worktree exactly as it was"
+    );
+    assert!(integration.join("scratch.txt").is_file());
+
+    fs::remove_file(integration.join("scratch.txt")).unwrap();
+    let reset = flux(&root, &["fleet", "repair", "wave-2", "--output", "json"]);
+    assert!(reset.status.success());
+    let reset: serde_json::Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(entry_for(&reset, &integration)["repair"]["action"], "reset");
+    assert_eq!(head_of(&integration), base, "back on its pinned base");
+    assert_eq!(
+        head_of(&story),
+        delivered,
+        "repairing the assembly never touches a story's commits"
+    );
+}
+
 #[test]
 fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     let root = fixture("wave-integration");

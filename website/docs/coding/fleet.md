@@ -479,6 +479,29 @@ retained with the reason, and a branch is deleted only when git agrees it holds 
 A wave that can still advance is refused rather than reclaimed: deleting a build it is about to use
 would cost work rather than space.
 
+## Repairing a wave's structure
+
+Reclamation, a hand-deleted directory or an interrupted assembly can leave a wave whose topology names
+a worktree disk no longer has, or whose integration checkout sits somewhere other than the base it is
+pinned to. Both are mechanical to fix from records the fleet already holds — the source checkout, the
+branch, the pinned base — and both were previously hand-written `git` under pressure.
+
+```sh
+flux fleet repair wave-7 --dry-run --output json   # what it would rebuild
+flux fleet repair wave-7 --output json
+```
+
+A missing checkout is recreated on its **recorded branch**, so a worker's committed work comes back
+with it; only a branch that is gone too is created afresh at the pinned base. A derived worktree — the
+integration assembly and the pinned verification checkout — is put back on its base when it has
+drifted off. A story worktree is never rewound: its commits are the deliverable, and being ahead of the
+base is its correct state.
+
+Repair refuses anything that would discard work and reports the reason instead of acting: a worktree
+holding an uncommitted change, one git cannot inspect, and one sitting on the commit its gate recorded
+as the candidate. An applied or cancelled wave is refused outright, because its worktrees are gone on
+purpose.
+
 ## Restart and resume
 
 The durable state/event log pins board revisions, source commits, write sets, worktrees, sessions,

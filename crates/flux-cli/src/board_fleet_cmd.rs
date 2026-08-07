@@ -803,6 +803,15 @@ pub(super) enum FleetAction {
         /// Wave to reclaim. Omit to reclaim every wave that is not in flight.
         target: Option<String>,
     },
+    /// Rebuild the structure a wave's topology names and disk lacks, discarding nothing.
+    ///
+    /// A worktree removed out from under an unfinished wave, or one left off the base it is pinned
+    /// to, currently takes a hand-written `git worktree add` or `git reset --hard` against values
+    /// read out of `state.json`. Every input is already recorded, so this is a verb.
+    Repair {
+        /// Wave whose recorded structure should be rebuilt.
+        wave: String,
+    },
     Validate,
     Start,
     Stop,
@@ -4734,6 +4743,7 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Reclaim { target } => {
             reclaim_finished_waves(command, root, state, target.as_deref())
         }
+        FleetAction::Repair { wave } => repair_wave_structure(command, root, state, wave),
         FleetAction::Start => {
             state.running = true;
             state.main_agent.status = "running".into();
@@ -5790,6 +5800,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Apply { .. }
             | FleetAction::Note { .. }
             | FleetAction::Reclaim { .. }
+            | FleetAction::Repair { .. }
     ) || matches!(action, FleetAction::Call { operation } if !matches!(operation.as_str(), "status" | "schedule" | "schema"))
 }
 
@@ -5933,8 +5944,10 @@ fn fleet_operations() -> &'static [&'static str] {
         "doctor",
         "refresh",
         // Reclaim MUTATES (it deletes build output and journals what it freed), so it is deliberately
-        // absent from the read-only list below.
+        // absent from the read-only list below. Repair writes checkouts, so it belongs on the same
+        // side.
         "reclaim",
+        "repair",
         "validate",
         "start",
         "stop",
@@ -11414,6 +11427,258 @@ fn worktree_holds_work(worktree: &Path, source: &Path, canonical_ref: &str) -> R
     Ok(true)
 }
 
+/// What a worktree a topology names is FOR, which is what decides how it may be repaired.
+///
+/// The two roles are asymmetric and must stay that way. A story worktree's commits ARE the
+/// deliverable, so "ahead of the pinned base" is its correct state and never something to fix. The
+/// integration and verification checkouts are structure the fleet derives for itself — an assembly
+/// that integration rebuilds from the story branches, and a checkout whose entire purpose is to sit
+/// at the base — so putting one back on its base costs nothing that cannot be regenerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorktreeRole {
+    Story,
+    Derived,
+}
+
+/// Everything repair needs to know about one worktree, gathered before any decision is taken.
+struct WorktreeFacts<'a> {
+    role: WorktreeRole,
+    present: bool,
+    dirty: bool,
+    /// `None` when the checkout exists but git could not be asked — an uninspectable tree.
+    head: Option<&'a str>,
+    base: &'a str,
+    /// The commit this repository's gate recorded, when it has one.
+    candidate: Option<&'a str>,
+}
+
+/// The one repair a single worktree needs, or the reason it must not be repaired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorktreeRepair {
+    Intact,
+    /// The topology names it and disk lacks it.
+    Recreate,
+    /// A derived checkout that drifted off the base it is pinned to.
+    ResetToBase,
+    /// Repairing it would destroy something that exists nowhere else.
+    Refused(&'static str),
+}
+
+/// Decide one worktree's repair from recorded facts alone.
+///
+/// Kept pure and separate from the git that carries it out, because the whole risk of this verb lives
+/// in the decision. `fleet repair` writes checkouts an operator reaches for precisely when a wave is
+/// already damaged, and the failure mode is silent: a reset that discards the only copy of a change
+/// looks exactly like a successful repair.
+///
+/// So the refusals are the contract. An uncommitted change is refused because a worktree is the only
+/// place a worker's unfinished work exists — wave-299 held a complete six-file implementation its turn
+/// never committed. A checkout that cannot be inspected is refused for the same reason reclamation
+/// retains one: an unanswerable question is not a licence to act. And a derived worktree sitting on
+/// the commit its gate recorded is refused because that commit is the candidate `apply` pins, not a
+/// stray assembly to be rewound.
+fn plan_worktree_repair(facts: &WorktreeFacts<'_>) -> WorktreeRepair {
+    if !facts.present {
+        return WorktreeRepair::Recreate;
+    }
+    if facts.role == WorktreeRole::Story {
+        // Present is the entire test for a story checkout. Its commits are the deliverable and its
+        // uncommitted changes are a worker's live work, so there is nothing here repair may touch.
+        return WorktreeRepair::Intact;
+    }
+    if facts.dirty {
+        return WorktreeRepair::Refused(
+            "holds uncommitted changes, which resetting it to the pinned base would discard",
+        );
+    }
+    let Some(head) = facts.head else {
+        return WorktreeRepair::Refused("could not be inspected, so it was left alone");
+    };
+    if head == facts.base {
+        return WorktreeRepair::Intact;
+    }
+    if facts.candidate == Some(head) {
+        return WorktreeRepair::Refused(
+            "holds the candidate commit its gate recorded; only integration may move it",
+        );
+    }
+    WorktreeRepair::ResetToBase
+}
+
+/// Carry out one planned repair, reporting a git failure rather than abandoning the rest of the wave.
+///
+/// Partial repair beats no repair: a wave with five worktrees and one unfixable checkout should come
+/// back with four rebuilt and one explained, which is exactly how reclamation reports its own
+/// per-worktree outcomes.
+fn apply_worktree_repair(
+    plan: &WorktreeRepair,
+    source: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Value {
+    match plan {
+        WorktreeRepair::Intact => json!({"action": "intact"}),
+        WorktreeRepair::Refused(reason) => json!({"action": "refused", "reason": reason}),
+        WorktreeRepair::Recreate => {
+            // Administrative records of a checkout that was DELETED rather than removed keep the
+            // branch "already checked out", so `git worktree add` refuses until they are pruned.
+            // Pruning only ever forgets worktrees whose directory is already gone.
+            let _ = guarded_git(source, &["worktree", "prune"]);
+            let reference = format!("refs/heads/{branch}");
+            // Reuse the recorded branch when it survived. This is what makes recreation
+            // non-destructive: the checkout comes back holding whatever the worker committed, and only
+            // a branch that is gone too is created afresh at the pinned base.
+            let restored = git_output(source, &["show-ref", "--verify", &reference]).is_some();
+            let path = worktree.display().to_string();
+            let argv = if restored {
+                vec!["worktree", "add", path.as_str(), branch]
+            } else {
+                vec!["worktree", "add", "-b", branch, path.as_str(), base]
+            };
+            match guarded_git(source, &argv) {
+                Ok(output) if output.exit_code == 0 => json!({
+                    "action": "recreated",
+                    "branch": if restored {"restored"} else {"recreated at the pinned base"},
+                    "head": git_output(worktree, &["rev-parse", "HEAD"]),
+                }),
+                Ok(output) => json!({
+                    "action": "failed",
+                    "reason": clipped_redacted(output.stderr.as_bytes()),
+                }),
+                Err(error) => json!({"action": "failed", "reason": format!("{error:#}")}),
+            }
+        }
+        WorktreeRepair::ResetToBase => {
+            // Record where it was. The discarded assembly stays in the reflog, and the report names
+            // the commit, so an unexpected reset is answerable rather than merely regrettable.
+            let from = git_output(worktree, &["rev-parse", "HEAD"]);
+            match guarded_git(worktree, &["reset", "--hard", base]) {
+                Ok(output) if output.exit_code == 0 => {
+                    json!({"action": "reset", "from": from, "head": base})
+                }
+                Ok(output) => json!({
+                    "action": "failed",
+                    "reason": clipped_redacted(output.stderr.as_bytes()),
+                }),
+                Err(error) => json!({"action": "failed", "reason": format!("{error:#}")}),
+            }
+        }
+    }
+}
+
+/// Rebuild the structure one wave's topology names and disk lacks.
+///
+/// Recovery is the half of the fleet that has no verbs: harvesting six delivered stories in one
+/// evening took a hand-written `git worktree add` to replace an integration worktree reclamation had
+/// removed, and repeated `git reset --hard <base>` before handoffs would verify. Every input to both
+/// is recorded — the source checkout, the branch, the pinned base — so the repair is mechanical and
+/// the only thing missing was somewhere to ask for it.
+fn repair_wave_structure(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let record = state
+        .waves
+        .get(wave_id)
+        .cloned()
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let status = record["status"].as_str().unwrap_or("unknown");
+    // A finished wave's worktrees are absent on purpose. Rebuilding them would resurrect structure
+    // nothing needs and re-fill the disk reclamation just freed.
+    if wave_worktrees_are_removable(status) {
+        bail!(
+            "conflict/precondition: wave {wave_id} is {status}; its worktrees are gone on purpose and \
+             rebuilding them would restore structure the wave no longer needs"
+        )
+    }
+    if !record["topology"].is_object() {
+        bail!("not-found: wave {wave_id} has no recorded topology to rebuild")
+    }
+    let mut outcomes = Vec::new();
+    for repository in record["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let source = PathBuf::from(repository["source_root"].as_str().unwrap_or_default());
+        let base = repository["base_commit"].as_str().unwrap_or_default();
+        let candidate = repository["candidate"].as_str();
+        let mut targets = vec![
+            (
+                "integration",
+                WorktreeRole::Derived,
+                &repository["integration"],
+            ),
+            ("verify", WorktreeRole::Derived, &repository["verify"]),
+        ];
+        targets.extend(
+            repository["stories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|story| ("story", WorktreeRole::Story, story)),
+        );
+        for (label, role, entry) in targets {
+            let (Some(path), Some(branch)) = (entry["worktree"].as_str(), entry["branch"].as_str())
+            else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            let present = path.is_dir();
+            let porcelain = present
+                .then(|| git_output(&path, &["status", "--porcelain"]))
+                .flatten();
+            let head = present
+                .then(|| git_output(&path, &["rev-parse", "HEAD"]))
+                .flatten();
+            let plan = plan_worktree_repair(&WorktreeFacts {
+                role,
+                present,
+                dirty: porcelain
+                    .as_deref()
+                    .is_some_and(|status| !worker_dirt(status).is_empty()),
+                head: head.as_deref(),
+                base,
+                candidate,
+            });
+            let repair = if command.dry_run {
+                json!({"action": "preview", "planned": format!("{plan:?}")})
+            } else {
+                apply_worktree_repair(&plan, &source, &path, branch, base)
+            };
+            outcomes.push(json!({
+                "repository": repository["id"],
+                "role": label,
+                "worktree": display_path(&path),
+                "branch": branch,
+                "repair": repair,
+            }));
+        }
+    }
+    let counted = |action: &str| {
+        outcomes
+            .iter()
+            .filter(|outcome| outcome["repair"]["action"] == action)
+            .count()
+    };
+    let summary = format!(
+        "wave {wave_id}: {} recreated, {} reset to base, {} refused, {} intact",
+        counted("recreated"),
+        counted("reset"),
+        counted("refused"),
+        counted("intact")
+    );
+    // Journal it for the same reason reclamation is journalled: the effect lands on disk rather than
+    // in the state being written, so an unrecorded run is indistinguishable from a no-op.
+    state.revision += 1;
+    let data = json!({"wave": wave_id, "dry_run": command.dry_run, "worktrees": outcomes});
+    persist_fleet_mutation(command, root, &state, "wave.repaired", data.clone())?;
+    Ok((summary, data, vec![], state.revision))
+}
+
 /// Per repository, the operations `binding` requires that the repository will not surface.
 ///
 /// Reported per repository rather than collapsed: a Fleet spans several checkouts, and an operation
@@ -16651,6 +16916,108 @@ mod tests {
             "green",
         ] {
             assert!(wave_is_reclaimable(status), "{status} has finished");
+        }
+    }
+
+    fn repair_facts<'a>(
+        role: WorktreeRole,
+        present: bool,
+        dirty: bool,
+        head: Option<&'a str>,
+        candidate: Option<&'a str>,
+    ) -> WorktreeFacts<'a> {
+        WorktreeFacts {
+            role,
+            present,
+            dirty,
+            head,
+            base: "base",
+            candidate,
+        }
+    }
+
+    /// Failing first: the structure a topology names and disk lacks is exactly what repair rebuilds.
+    ///
+    /// Reclaiming an `agent-turn-failed` wave removed its integration worktree and no operation could
+    /// rebuild it, so the wave held deliverable work with nowhere to assemble a candidate. Absence is
+    /// unambiguous — nothing on disk can be lost by putting a recorded checkout back — so it is the one
+    /// case repair acts on regardless of role.
+    #[test]
+    fn a_worktree_the_topology_names_and_disk_lacks_is_rebuilt() {
+        for role in [WorktreeRole::Story, WorktreeRole::Derived] {
+            assert_eq!(
+                plan_worktree_repair(&repair_facts(role, false, false, None, None)),
+                WorktreeRepair::Recreate,
+                "{role:?} structure that disk lacks is rebuilt"
+            );
+        }
+    }
+
+    /// A story worktree is a worker's own checkout, so repair never rewinds it.
+    ///
+    /// Being ahead of the pinned base is the CORRECT state for a story worktree — those commits are
+    /// the deliverable — and its uncommitted changes may be the only copy of a live turn's work. A
+    /// verb that "repaired" either would destroy exactly what the wave exists to produce.
+    #[test]
+    fn a_present_story_worktree_is_never_rewound() {
+        for dirty in [false, true] {
+            assert_eq!(
+                plan_worktree_repair(&repair_facts(
+                    WorktreeRole::Story,
+                    true,
+                    dirty,
+                    Some("delivered"),
+                    None
+                )),
+                WorktreeRepair::Intact,
+                "a story worktree ahead of its base is finished work, not damage"
+            );
+        }
+    }
+
+    /// A derived worktree returns to its pinned base only when that discards nothing.
+    ///
+    /// `git reset --hard <base>` on an integration worktree was a hand step before handoffs would
+    /// verify, which is why it earns a verb — but the same command applied to a dirty tree, an
+    /// uninspectable one, or the commit a gate already recorded as its candidate spends work instead
+    /// of restoring shape. Each refusal is asserted rather than left to the caller's judgement.
+    #[test]
+    fn a_derived_worktree_is_reset_only_when_nothing_would_be_lost() {
+        assert_eq!(
+            plan_worktree_repair(&repair_facts(
+                WorktreeRole::Derived,
+                true,
+                false,
+                Some("assembly"),
+                None
+            )),
+            WorktreeRepair::ResetToBase
+        );
+        assert_eq!(
+            plan_worktree_repair(&repair_facts(
+                WorktreeRole::Derived,
+                true,
+                false,
+                Some("base"),
+                None
+            )),
+            WorktreeRepair::Intact
+        );
+        for facts in [
+            repair_facts(WorktreeRole::Derived, true, true, Some("assembly"), None),
+            repair_facts(WorktreeRole::Derived, true, false, None, None),
+            repair_facts(
+                WorktreeRole::Derived,
+                true,
+                false,
+                Some("assembly"),
+                Some("assembly"),
+            ),
+        ] {
+            assert!(
+                matches!(plan_worktree_repair(&facts), WorktreeRepair::Refused(_)),
+                "repair must refuse anything that would discard work"
+            );
         }
     }
 
