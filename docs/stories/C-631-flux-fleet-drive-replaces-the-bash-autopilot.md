@@ -2,10 +2,11 @@
 id: C-631
 title: "flux fleet drive replaces the bash autopilot"
 pillar: "Core"
-status: backlog
+status: ready
 epic: fleet-harness-throughput
 areas: [flux-cli]
 note: "the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged"
+priority: 0
 ---
 
 # flux fleet drive replaces the bash autopilot
