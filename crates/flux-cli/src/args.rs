@@ -1507,7 +1507,7 @@ pub(super) enum HostAction {
     Add {
         /// The binding name (a bare name, e.g. `build-farm`).
         id: String,
-        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes` or `remote`.
+        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes`, `microvm` or `remote`.
         #[arg(long)]
         backend: String,
         /// Bare `scheme://host[:port]` for backends with an address — no embedded credentials.
@@ -1534,8 +1534,8 @@ pub(super) enum HostAction {
         id: String,
     },
     /// Verify one binding by its backend's side-effect-free identity check: substrate identity
-    /// (kind, workspace, confinement, remotely_reported) and, for a remote backend, the
-    /// negotiated protocol version. Executes nothing on the substrate.
+    /// (kind, workspace, confinement, remotely_reported) and, for a remote-shaped backend
+    /// (`remote`, `microvm`), the negotiated protocol version. Executes nothing on the substrate.
     Probe {
         /// Binding name to probe.
         id: String,

@@ -175,6 +175,10 @@ pub enum HostBackendKind {
     Sandboxed,
     Container,
     Kubernetes,
+    /// A VM/microVM guest serving the remote protocol (C-677). Declarable with the endpoint its
+    /// guest serves, or without one yet — flux never provisions the guest, so a binding written
+    /// before the endpoint exists is honestly unwired rather than a config error.
+    Microvm,
     Remote,
 }
 
@@ -186,6 +190,7 @@ impl HostBackendKind {
             Self::Sandboxed => "sandboxed",
             Self::Container => "container",
             Self::Kubernetes => "kubernetes",
+            Self::Microvm => "microvm",
             Self::Remote => "remote",
         }
     }
@@ -2323,6 +2328,51 @@ backend = "local"
         assert_eq!(cfg.hosts[1].id, "here");
         assert_eq!(cfg.hosts[1].backend, HostBackendKind::Local);
         assert!(cfg.hosts[1].url.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-677: a `microvm` binding is declarable in `[[host]]` — with the endpoint its guest serves,
+    /// or without one yet. Both are legal declarations because flux never provisions the guest: the
+    /// endpoint comes to exist through C-480's VM/microVM profile, and until it does the binding is
+    /// honestly unwired rather than a config error. The entry's own hard errors are unchanged.
+    #[test]
+    fn a_microvm_host_binding_parses_with_or_without_a_served_endpoint() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[host]]
+id = "vm-guest"
+backend = "microvm"
+url = "https://guest.internal:8443"
+credential_ref = "env/GUEST_TOKEN"
+grant = ["operator"]
+
+[[host]]
+id = "vm-planned"
+backend = "microvm"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.hosts.len(), 2);
+        let served = &cfg.hosts[0];
+        assert_eq!(served.backend.as_str(), "microvm");
+        assert_eq!(served.url.as_deref(), Some("https://guest.internal:8443"));
+        assert_eq!(served.credential_ref.as_deref(), Some("env/GUEST_TOKEN"));
+        // Declared before the guest exists: no address, and that is not a parse error.
+        assert_eq!(cfg.hosts[1].backend.as_str(), "microvm");
+        assert!(cfg.hosts[1].url.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The unknown-key hard error is unchanged for the new kind — a dropped typo in a substrate
+        // binding stays a safety problem, not a formatting one.
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            "[[host]]\nid = \"vm\"\nbackend = \"microvm\"\ncredentialref = \"env/X\"\n",
+        );
+        let err = load(&dir).unwrap_err();
+        assert!(err.to_string().contains("credentialref"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -1,0 +1,91 @@
+#cloud-config
+# Bootstrap contract for a VM or microVM guest that serves the Flux remote execution system.
+#
+# This configures a guest that something else created. Flux does not create, pool, snapshot, attest,
+# resume or destroy Firecracker, Cloud Hypervisor, Kata or cloud instances; those lifecycle verbs
+# belong behind a generic isolation-provisioner contract, not on the remote wire. Once the guest has
+# an address and runs this daemon, it is a remote execution system like any other.
+#
+# Replace every REPLACE_ME. The two secrets are delivered out of band on purpose: a token or a
+# private key written into a cloud-init user-data blob is stored, logged and often readable from the
+# instance metadata service for the life of the guest.
+#
+# Usage differs by platform (`--user-data`, `user_data`, a metadata service). The contract does not.
+
+hostname: flux-remote-system
+
+# ── Durable workspace disk ───────────────────────────────────────────────────────────────────────
+# The canonical workspace and its delivery ledger live here. A guest whose root disk is ephemeral
+# still keeps both across a restart, which is the property the container profile gets from a volume.
+disk_setup:
+  /dev/REPLACE_ME_WORKSPACE_DISK:
+    table_type: gpt
+    layout: true
+    overwrite: false
+
+fs_setup:
+  - device: /dev/REPLACE_ME_WORKSPACE_DISK
+    partition: 1
+    filesystem: ext4
+    label: flux-workspace
+    overwrite: false
+
+mounts:
+  - [LABEL=flux-workspace, /srv/flux/workspace, ext4, "defaults,nofail,nodev,nosuid", "0", "2"]
+
+packages:
+  - ca-certificates
+  # The guest keeps the fail-closed sandbox floor rather than waiving it, which is the reason to run
+  # a VM guest instead of a container in the first place.
+  - bubblewrap
+  - nftables
+package_update: true
+
+write_files:
+  # The hardened unit and the install contract, both copied verbatim from deploy/vm/.
+  - path: /opt/flux/flux-system.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      REPLACE_ME_WITH_deploy/vm/flux-system.service
+
+  - path: /opt/flux/install-flux-system.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      REPLACE_ME_WITH_deploy/vm/install-flux-system.sh
+
+  # Admit the daemon's port only from intended clients. A remote execution system on an open port is
+  # one stolen bearer token away from being someone else's execution system.
+  - path: /etc/nftables.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      #!/usr/sbin/nft -f
+      flush ruleset
+      table inet filter {
+        chain input {
+          type filter hook input priority filter; policy drop;
+          ct state established,related accept
+          iif lo accept
+          ip saddr REPLACE_ME_CLIENT_CIDR tcp dport 8790 accept
+          ip saddr REPLACE_ME_ADMIN_CIDR tcp dport 22 accept
+        }
+        chain forward {
+          type filter hook forward priority filter; policy drop;
+        }
+        chain output {
+          type filter hook output priority filter; policy accept;
+        }
+      }
+
+runcmd:
+  - [systemctl, enable, --now, nftables]
+  - [/opt/flux/install-flux-system.sh, --version, "REPLACE_ME_FLUX_VERSION", "--unit", /opt/flux/flux-system.service]
+  # Deliver the bearer token and the TLS keypair out of band, then:
+  #   systemctl start flux-system
+  # The daemon refuses to start on an empty token, so a guest that never received one fails closed
+  # rather than serving unauthenticated.
+
+# The service identity is created by the install contract. No login user is added here: a guest that
+# executes approved effects does not also need an interactive account for convenience.

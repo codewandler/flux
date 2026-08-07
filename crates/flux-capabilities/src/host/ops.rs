@@ -23,7 +23,7 @@ use flux_runtime::{
 use flux_secret::host::HostRecord;
 use flux_spec::{AccessKind, ToolSpec};
 
-use super::{render_metric_answer, static_availability, HostMetrics, HostProber, HostRegistry};
+use super::{binding_availability, render_metric_answer, HostMetrics, HostProber, HostRegistry};
 
 /// The group every host op belongs to (surfaced by the session-ambient `host` signal the CLI
 /// injects when bindings are declared). Shared so the op specs and the group manifest can't drift.
@@ -93,7 +93,7 @@ fn render_record(r: &HostRecord) -> String {
         host.id,
         host.backend,
         host.display_address(),
-        static_availability(host.backend)
+        binding_availability(host)
     );
     out.push_str(&format!(" owner={}", r.owner));
     if host.credential_ref.is_some() {

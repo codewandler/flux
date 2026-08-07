@@ -1,0 +1,80 @@
+# The Flux remote execution system as a supervised guest service.
+#
+# Installed to /etc/systemd/system/flux-system.service by deploy/vm/install-flux-system.sh.
+#
+# Unlike the container and pod profiles, this one does NOT pass --no-sandbox. A VM or microVM guest
+# owns its kernel, so bubblewrap can create the user namespace the fail-closed sandbox floor needs,
+# and the daemon keeps that floor. If a stripped guest kernel has no unprivileged user namespaces,
+# the daemon refuses to start and says so — add --no-sandbox to ExecStart as a deliberate, recorded
+# decision, and treat the guest boundary as the isolation instead.
+
+[Unit]
+Description=Flux remote execution system
+Documentation=https://github.com/codewandler/flux/blob/main/website/docs/remote-system-deployment.md
+After=network-online.target
+Wants=network-online.target
+# The canonical workspace lives on a durable disk. Starting without it would serve an empty
+# workspace and write a delivery ledger the real volume never sees.
+RequiresMountsFor=/srv/flux/workspace
+
+[Service]
+Type=exec
+User=flux
+Group=flux
+
+# FLUX_REMOTE_SYSTEM_TOKEN=… — root-owned, mode 0600. systemd reads it before dropping privileges,
+# so the service identity never needs access to the file itself.
+EnvironmentFile=/etc/flux/remote-system.env
+
+ExecStart=/usr/local/bin/flux system serve \
+    --workspace /srv/flux/workspace \
+    --bind 0.0.0.0:8790 \
+    --cert /etc/flux/tls/tls.crt \
+    --key /etc/flux/tls/tls.key
+
+Restart=on-failure
+RestartSec=2
+# Guarded process effects land here; give them a chance to stop cleanly.
+TimeoutStopSec=30
+KillMode=mixed
+
+# ── Hardening ────────────────────────────────────────────────────────────────────────────────────
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+RemoveIPC=true
+# The workspace is the remote's canonical tree, not shared guest state.
+UMask=0027
+
+# The canonical workspace is the one writable path. Everything else on the guest is read-only to
+# this service, which is what makes "the workspace is the blast radius" true here.
+ReadWritePaths=/srv/flux/workspace
+
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Deliberately NOT set, and each omission is a decision:
+#
+#   RestrictNamespaces — bubblewrap needs user, mount, pid, net, ipc and uts namespaces to confine
+#     spawned processes. Restricting them here would disable the sandbox floor this profile keeps.
+#   SystemCallFilter — this daemon exists to run operator-approved processes whose syscall needs are
+#     unknowable from here. A filter tuned to the daemon would silently break the effects it is
+#     deployed to run, and a filter wide enough for them is not a boundary. Confinement of spawned
+#     work is bubblewrap's job, above.
+#   MemoryDenyWriteExecute — breaks any approved workload with a JIT (node, a JVM, several Python
+#     extensions).
+
+[Install]
+WantedBy=multi-user.target
