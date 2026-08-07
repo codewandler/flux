@@ -98,3 +98,8 @@ thin.
 probe as side-effect-free, and launching a process on someone's build machine is an effect; and
 `-F none` means neither ssh config file is read, so the `[[host]]` entry is the whole declaration
 rather than something a file the binding never named can change.
+
+
+## Comments
+
+- Review open question settled empirically: two_local_sessions_do_not_fight_over_one_far_side_serve ran 6/6 green at a consistent ~1.1s in the primary checkout. That refutes the ~50% raciness hypothesis and settles which OpenSSH behaviour applies — a flux-started far-side serve OUTLIVES the tunnel rather than taking SIGHUP, so the winner's daemon survives for the losing session to attach to. This is the benign reading and matches the documented no-reaping behaviour now in config.md.
