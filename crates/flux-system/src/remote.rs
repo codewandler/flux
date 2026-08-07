@@ -4,9 +4,10 @@
 //! is that substrate: [`RemoteSystem`] implements the delegable port families by handing each
 //! operation to a [`Delegate`] and turning what comes back into a `flux_core::Result`. A caller
 //! therefore runs operations somewhere other than its own process while the guarantees stay stated
-//! in exactly one place — `port.rs` — because nothing here re-states them. Host metrics are the one
-//! family it does not delegate: that needs a wire operation under a protocol version bump (C-654),
-//! so until then it serves the port's own `Unserved` answer.
+//! in exactly one place — `port.rs` — because nothing here re-states them. Host metrics delegate
+//! too since C-654, with two things added on the way back: the reading is re-bounded and stamped
+//! `remotely_reported`, because a measurement of another machine is a claim rather than an
+//! observation.
 //!
 //! **This is not a second IO path**, for the same reason the port is not: `RemoteSystem` cannot open
 //! a file or start a process. It can only ask something else to, and that something else is
@@ -105,6 +106,7 @@ use std::time::Duration;
 
 pub use flux_core::{Error, GuardedIoError, GuardedIoFailure as FailureMode, Result};
 
+use crate::metrics::{bounded_reading, MetricAnswer, MetricKind};
 use crate::net::{
     BindExposure, DatagramEndpoint, DialTarget, InboundLimits, NetworkListener, NetworkStream,
     PrivateNetAllow,
@@ -338,6 +340,40 @@ pub trait Delegate: Send + Sync {
     fn env(&self, key: &str) -> Delivered<Option<String>> {
         let _ = key;
         Ok(unserved_now("read the guarded environment"))
+    }
+
+    // -- host metrics -----------------------------------------------------------------------------
+
+    /// Which metric kinds the far side declares it can measure about **its own** substrate.
+    ///
+    /// A *declaration*, not a delivery: it has no [`Delivered`] wrapper because a transport that
+    /// cannot answer it has nothing to report, and an empty vocabulary already means exactly that.
+    /// The kinds come from whatever the transport negotiated (the remote protocol carries them in
+    /// its handshake), so this costs no round trip and stays honest about a far side that measures
+    /// nothing — which is a *different* answer from a machine whose instruments are missing.
+    fn served_metric_kinds(&self) -> Vec<crate::metrics::MetricKind> {
+        Vec::new()
+    }
+
+    /// One metric kind, measured on the far side.
+    ///
+    /// Not reducible to anything: there is no local substitute for a measurement of another
+    /// machine, so a transport that cannot carry this must leave it denying rather than answer
+    /// about the coordinator's own hardware.
+    fn read_metric(&self, kind: crate::metrics::MetricKind) -> Answered<'_, MetricAnswer> {
+        let _ = kind;
+        unserved("read a host metric")
+    }
+
+    /// Every kind the far side serves, in one delegated call.
+    ///
+    /// Deliberately *not* reduced to a loop over [`read_metric`](Self::read_metric): a snapshot is
+    /// meant to describe one moment, and eight separately-timed round trips to a remote machine
+    /// would compose readings taken seconds apart into something that never existed. A transport
+    /// that can only answer one kind at a time should override this by looping itself, and own
+    /// that skew knowingly.
+    fn read_metrics(&self) -> Answered<'_, Vec<MetricAnswer>> {
+        unserved("read host metrics")
     }
 
     // -- workspace files --------------------------------------------------------------------------
@@ -632,13 +668,59 @@ impl GuardedNetwork for RemoteSystem {
     }
 }
 
-/// Deliberately empty, so every operation inherits `port.rs`'s fail-closed `Unserved` answer.
+/// Host metrics, delegated (C-654) — a remote host reports what **its** serving process measured.
 ///
-/// [`Delegate`] carries no metrics operation yet: putting host metrics on the wire is a versioned
-/// protocol change (C-654), not something a delegating backend may improvise. Until then a remote
-/// host reports that it does not serve metrics — which is the honest answer, and the one Decision
-/// 0018 rule 3 requires of a backend that cannot satisfy a guarded trait.
-impl GuardedMetrics for RemoteSystem {}
+/// Two things happen to every answer on the way through, and both are about not trusting the far
+/// side with an invariant this side is responsible for:
+///
+/// - **Re-bounding.** [`crate::metrics`]'s caps on labels, mounts and sensors are a convention over
+///   public fields, not a type invariant, so a delegate could hand back a reading no local reader
+///   would ever produce. Everything served here goes through
+///   [`bounded_reading`](crate::metrics::bounded_reading) regardless of transport — a wire decoder
+///   that also bounds is defence in depth, not a substitute, because [`Delegate`] is implementable
+///   by anyone.
+/// - **Provenance.** The snapshot is stamped `remotely_reported` here rather than accepted from the
+///   answer. A far side that claimed `false` would be asserting that *this* process observed the
+///   number, which is exactly the substitution [`SubstrateIdentity`] exists to prevent; the flag
+///   describes the hop, so the hop sets it.
+///
+/// What is *not* re-interpreted is the measurement itself, or the difference between the two
+/// negatives: an `Unserved` from the far side stays `Unserved` (this substrate does not serve
+/// metrics at all) and a [`MetricAnswer::Unavailable`] stays unavailable (it serves the family and
+/// has no such instrument). Neither ever becomes a zero.
+impl GuardedMetrics for RemoteSystem {
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        self.delegate.served_metric_kinds()
+    }
+
+    fn read_metric(&self, kind: MetricKind) -> Guarded<'_, MetricAnswer> {
+        Box::pin(
+            async move { settle(self.delegate.read_metric(kind).await).map(reported_remotely) },
+        )
+    }
+
+    fn read_metrics(&self) -> Guarded<'_, Vec<MetricAnswer>> {
+        Box::pin(async move {
+            settle(self.delegate.read_metrics().await)
+                .map(|answers| answers.into_iter().map(reported_remotely).collect())
+        })
+    }
+}
+
+/// Re-bound a delegated answer and stamp it as reported by another process. See
+/// [`GuardedMetrics for RemoteSystem`](RemoteSystem#impl-GuardedMetrics-for-RemoteSystem).
+fn reported_remotely(answer: MetricAnswer) -> MetricAnswer {
+    match answer {
+        MetricAnswer::Served(mut snapshot) => {
+            snapshot.reading = bounded_reading(snapshot.reading);
+            snapshot.remotely_reported = true;
+            MetricAnswer::Served(snapshot)
+        }
+        // An explicitly-unavailable answer carries a kind and a reason and no measurement, so
+        // there is nothing to bound and nothing whose provenance could mislead.
+        unavailable @ MetricAnswer::Unavailable { .. } => unavailable,
+    }
+}
 
 /// HTTP is on the port (C-652), but the protocol behind [`RemoteSystem`] has no frame that carries
 /// an HTTP request yet — Decision 0018 rule 5 keeps that a separate, versioned protocol change
@@ -894,6 +976,18 @@ impl<T: GuardedSubstrate + ?Sized> Delegate for Loopback<T> {
         Ok(Answer::Served(self.substrate.env(key)))
     }
 
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        GuardedMetrics::served_metric_kinds(&*self.substrate)
+    }
+
+    fn read_metric(&self, kind: MetricKind) -> Answered<'_, MetricAnswer> {
+        Box::pin(async move { relay(GuardedMetrics::read_metric(&*self.substrate, kind).await) })
+    }
+
+    fn read_metrics(&self) -> Answered<'_, Vec<MetricAnswer>> {
+        Box::pin(async move { relay(GuardedMetrics::read_metrics(&*self.substrate).await) })
+    }
+
     fn read_file_bytes<'a>(&'a self, path: &'a str) -> Answered<'a, Vec<u8>> {
         Box::pin(async move { relay(self.substrate.read_file_bytes(path).await) })
     }
@@ -1005,6 +1099,132 @@ mod tests {
     #[test]
     fn an_unrelated_error_has_no_failure_mode() {
         assert_eq!(failure_mode(&Error::Other("something else".into())), None);
+    }
+
+    /// C-654, acceptance 4: a delegated substrate serves the metrics seam by *asking the far side*,
+    /// and what comes back is stamped as remotely reported.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_delegated_substrate_serves_metrics_and_stamps_them_remotely_reported() {
+        let root = crate::sandbox::fixture_dir("remote-metrics-delegated");
+        let native = Arc::new(crate::System::new(crate::Workspace::new(&root).unwrap()));
+        let remote = RemoteSystem::loopback(native);
+
+        assert!(
+            !GuardedMetrics::served_metric_kinds(&remote).is_empty(),
+            "a delegate whose far side measures must not report an empty vocabulary"
+        );
+        let answers = GuardedMetrics::read_metrics(&remote)
+            .await
+            .expect("a delegating backend serves what its far side measures");
+        assert!(!answers.is_empty(), "the snapshot must carry answers");
+
+        let mut served = 0;
+        for answer in &answers {
+            match answer {
+                crate::metrics::MetricAnswer::Served(snapshot) => {
+                    served += 1;
+                    assert!(
+                        snapshot.remotely_reported,
+                        "{} crossed a delegation hop and must say so",
+                        snapshot.kind()
+                    );
+                }
+                // The other negative: the far side serves the family and has no such instrument.
+                // It stays unavailable rather than becoming a zero, exactly as it would locally.
+                crate::metrics::MetricAnswer::Unavailable { .. } => {}
+            }
+        }
+        assert!(served > 0, "nothing was actually measured: {answers:?}");
+
+        // The single-kind face carries the same provenance as the snapshot face.
+        let uptime = GuardedMetrics::read_metric(&remote, crate::metrics::MetricKind::Uptime)
+            .await
+            .expect("uptime is served through the delegation");
+        match uptime {
+            crate::metrics::MetricAnswer::Served(snapshot) => {
+                assert!(snapshot.remotely_reported);
+                assert_eq!(snapshot.kind(), crate::metrics::MetricKind::Uptime);
+            }
+            other => panic!("uptime answered {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-654: the port-level guarantee that no [`Delegate`] — not just the shipped HTTPS one — can
+    /// walk an unbounded reading through the seam. The caps are a convention over public fields, so
+    /// the hop re-bounds rather than trusting what the far side handed it.
+    #[tokio::test]
+    async fn a_delegate_cannot_walk_an_unbounded_reading_through_the_hop() {
+        use crate::metrics::{
+            MetricReading, MetricSnapshot, TemperatureSensor, MAX_LABEL_BYTES, MAX_SENSORS,
+        };
+
+        struct Hostile;
+        impl Delegate for Hostile {
+            fn served_metric_kinds(&self) -> Vec<MetricKind> {
+                vec![MetricKind::Temperature]
+            }
+
+            fn read_metric(&self, _kind: MetricKind) -> Answered<'_, MetricAnswer> {
+                Box::pin(async {
+                    Ok(Answer::Served(MetricAnswer::Served(MetricSnapshot {
+                        sampled_at: std::time::SystemTime::now(),
+                        reading: MetricReading::Temperature(
+                            (0..(MAX_SENSORS * 4))
+                                .map(|_| TemperatureSensor {
+                                    label: "w".repeat(8192),
+                                    celsius: 41.0,
+                                })
+                                .collect(),
+                        ),
+                        // The far side claims the coordinator observed this itself.
+                        remotely_reported: false,
+                    })))
+                })
+            }
+        }
+
+        let remote = RemoteSystem::new(Arc::new(Hostile));
+        let answer = GuardedMetrics::read_metric(&remote, MetricKind::Temperature)
+            .await
+            .expect("the delegate served an answer");
+        match answer {
+            MetricAnswer::Served(snapshot) => {
+                assert!(
+                    snapshot.remotely_reported,
+                    "the hop sets provenance; the far side does not get to deny it"
+                );
+                match snapshot.reading {
+                    MetricReading::Temperature(sensors) => {
+                        assert_eq!(
+                            sensors.len(),
+                            MAX_SENSORS,
+                            "the sensor list must be re-capped"
+                        );
+                        assert!(sensors.iter().all(|s| s.label.len() <= MAX_LABEL_BYTES));
+                    }
+                    other => panic!("temperature answered {other:?}"),
+                }
+            }
+            other => panic!("expected a served answer, got {other:?}"),
+        }
+    }
+
+    /// C-654, acceptance 1 at the delegation seam: a far side that does not serve the metrics
+    /// family answers the port's typed `Unserved` — never a decode error and never a zero.
+    #[tokio::test]
+    async fn a_delegate_without_the_metrics_family_answers_a_typed_unserved() {
+        struct ServesNothing;
+        impl Delegate for ServesNothing {}
+
+        let remote = RemoteSystem::new(Arc::new(ServesNothing));
+        let error = GuardedMetrics::read_metrics(&remote)
+            .await
+            .expect_err("a delegate that serves no metrics must fail closed");
+        assert_eq!(failure_mode(&error), Some(FailureMode::Unserved));
+        assert!(GuardedMetrics::served_metric_kinds(&remote).is_empty());
     }
 
     /// C-652 — a delegated substrate answers HTTP by *naming what is missing*, never by sending the

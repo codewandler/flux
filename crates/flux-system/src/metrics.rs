@@ -104,6 +104,18 @@ impl MetricKind {
             MetricKind::FanSpeed => "fan",
         }
     }
+
+    /// The kind a token names, or `None` where nothing does.
+    ///
+    /// The inverse of [`as_str`](Self::as_str), and the *only* way a token from outside this
+    /// process becomes a kind: the vocabulary is closed, so an unrecognized token is not a metric
+    /// this build has never heard of — it is a token to refuse. A wire decoder that mapped it onto
+    /// a neighbouring kind would report one instrument's measurement under another's name.
+    pub fn from_token(token: &str) -> Option<MetricKind> {
+        MetricKind::ALL
+            .into_iter()
+            .find(|kind| kind.as_str() == token)
+    }
 }
 
 impl std::fmt::Display for MetricKind {
@@ -233,6 +245,18 @@ pub struct MetricSnapshot {
     pub sampled_at: SystemTime,
     /// The measurement.
     pub reading: MetricReading,
+    /// Whether some *other* process measured this and reported it here (C-654).
+    ///
+    /// The same provenance bit [`SubstrateIdentity`](crate::port::SubstrateIdentity) carries, and
+    /// it means the same thing: nothing in this reading was observed locally. A locally-read
+    /// number is evidence; a remotely-reported one is a claim from a substrate that may be
+    /// measuring a different machine, a different kernel, or nothing at all. Collapsing the two
+    /// would let an operator act on "this host is at 95 % memory" without knowing which host.
+    ///
+    /// Stamped by the backend that crossed the boundary, never by the reader: the native reader
+    /// records `false` because it just read `/proc`, and a delegating backend rewrites it to `true`
+    /// on the way out regardless of what the far side claimed.
+    pub remotely_reported: bool,
 }
 
 impl MetricSnapshot {
@@ -254,6 +278,40 @@ pub enum MetricUnavailable {
     UnsupportedPlatform,
     /// The instrument exists and answering it failed at sample time.
     ReadFailed,
+}
+
+impl MetricUnavailable {
+    /// The stable operator- and wire-facing token for this reason.
+    ///
+    /// Lives beside [`MetricKind::as_str`] and for the same reason: a wire frame, a CLI's JSON and
+    /// a monitoring projection all have to agree on the spelling, and three copies of a match arm
+    /// would eventually disagree about one of them.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MetricUnavailable::NoInstrument => "no_instrument",
+            MetricUnavailable::UnsupportedPlatform => "unsupported_platform",
+            MetricUnavailable::ReadFailed => "read_failed",
+        }
+    }
+
+    /// The reason a token names, or `None` where nothing does.
+    pub fn from_token(token: &str) -> Option<MetricUnavailable> {
+        match token {
+            "no_instrument" => Some(MetricUnavailable::NoInstrument),
+            "unsupported_platform" => Some(MetricUnavailable::UnsupportedPlatform),
+            "read_failed" => Some(MetricUnavailable::ReadFailed),
+            _ => None,
+        }
+    }
+
+    /// One sentence an operator can act on, completing "…, so nothing was measured".
+    pub const fn explain(self) -> &'static str {
+        match self {
+            MetricUnavailable::NoInstrument => "this substrate has no such instrument",
+            MetricUnavailable::UnsupportedPlatform => "this platform has no reader for the kind",
+            MetricUnavailable::ReadFailed => "the instrument failed at sample time",
+        }
+    }
 }
 
 /// What a substrate answers for one requested metric kind.
@@ -388,6 +446,54 @@ pub(crate) async fn read_native(roots: &MetricsRoots, kind: MetricKind) -> Resul
     }
 }
 
+/// Re-apply every bound in this module to a reading that was **built somewhere else** — decoded
+/// from a remote host's report, mapped out of a Kubernetes node listing, replayed from a fixture.
+///
+/// This exists because the caps are a *construction-site convention over public `String` and `Vec`
+/// fields*, not a type invariant: nothing in [`MountUsage`] or [`TemperatureSensor`] prevents a
+/// caller from writing a megabyte label, and a decoder that trusted its input would carry an
+/// unbounded allocation straight through the seam while every local reader stayed honest. So a
+/// backend that did not do the measuring re-bounds rather than re-derives, through this one
+/// function — the same reason [`bounded_label`] is public.
+///
+/// Truncation is deliberately silent. A reading is a measurement, not a message: refusing the whole
+/// snapshot because a machine has 40 mounts would turn a cosmetic excess into an outage, and the
+/// caps are already the documented contract every consumer renders against.
+pub fn bounded_reading(reading: MetricReading) -> MetricReading {
+    match reading {
+        MetricReading::Disk(mut mounts) => {
+            mounts.truncate(MAX_MOUNTS);
+            for mount in &mut mounts {
+                mount.mount_point = bounded_label(&mount.mount_point);
+                mount.filesystem = bounded_label(&mount.filesystem);
+            }
+            MetricReading::Disk(mounts)
+        }
+        MetricReading::Temperature(mut sensors) => {
+            sensors.truncate(MAX_SENSORS);
+            for sensor in &mut sensors {
+                sensor.label = bounded_label(&sensor.label);
+            }
+            MetricReading::Temperature(sensors)
+        }
+        MetricReading::FanSpeed(mut sensors) => {
+            sensors.truncate(MAX_SENSORS);
+            for sensor in &mut sensors {
+                sensor.label = bounded_label(&sensor.label);
+            }
+            MetricReading::FanSpeed(sensors)
+        }
+        // Every other reading is a fixed number of numbers, so there is nothing to bound: the
+        // arms are spelled out rather than caught by `other =>` so a future variant carrying a
+        // list has to come here and decide.
+        reading @ (MetricReading::CpuUsage(_)
+        | MetricReading::LoadAverage(_)
+        | MetricReading::Memory(_)
+        | MetricReading::Swap(_)
+        | MetricReading::Uptime(_)) => reading,
+    }
+}
+
 /// Reduce an instrument label to a bounded, control-character-free identity.
 ///
 /// Public because [`MAX_LABEL_BYTES`] is part of the contract, not an implementation detail of the
@@ -482,6 +588,9 @@ mod linux {
             Ok(reading) => MetricAnswer::Served(MetricSnapshot {
                 sampled_at: SystemTime::now(),
                 reading,
+                // This process just read this machine's own `/proc` and `/sys`. Nothing was
+                // reported to it, so nothing is remotely reported.
+                remotely_reported: false,
             }),
             Err(reason) => MetricAnswer::unavailable_for(kind, reason),
         })
@@ -1043,6 +1152,13 @@ SwapFree:        1024000 kB
                 "{} carried a sampled-at outside the call: {snapshot:?}",
                 snapshot.kind()
             );
+            // C-654: this process read this machine. Anything claiming otherwise would let a
+            // consumer attribute a local measurement to some other host.
+            assert!(
+                !snapshot.remotely_reported,
+                "{} was read locally and must not claim remote provenance",
+                snapshot.kind()
+            );
         }
 
         std::fs::remove_dir_all(&root).ok();
@@ -1309,6 +1425,98 @@ SwapFree:        1024000 kB
         tokens.sort_unstable();
         tokens.dedup();
         assert_eq!(tokens.len(), MetricKind::ALL.len(), "tokens must be unique");
+    }
+
+    /// C-654: every kind survives a round trip through the token a wire frame carries, and a token
+    /// nothing names is refused rather than mapped onto a neighbour.
+    #[test]
+    fn every_kind_round_trips_through_its_wire_token() {
+        for kind in MetricKind::ALL {
+            assert_eq!(
+                MetricKind::from_token(kind.as_str()),
+                Some(kind),
+                "{kind} does not survive its own token"
+            );
+        }
+        for unknown in ["", "cpu ", "CPU", "gpu", "temperature_c"] {
+            assert_eq!(
+                MetricKind::from_token(unknown),
+                None,
+                "`{unknown}` is not in the closed vocabulary and must not resolve"
+            );
+        }
+    }
+
+    /// C-654: the caps are a construction-site convention over public fields, so a reading built
+    /// **off this machine** — a decoded wire frame, a mapped node listing — has to be re-bounded
+    /// rather than trusted. This is the seam a hostile far side would otherwise walk through.
+    #[test]
+    fn a_reading_built_elsewhere_is_rebounded_rather_than_trusted() {
+        let long = "z".repeat(4096);
+
+        let mounts: Vec<MountUsage> = (0..(MAX_MOUNTS + 40))
+            .map(|index| MountUsage {
+                mount_point: format!("/mnt/{long}{index}"),
+                filesystem: long.clone(),
+                total_bytes: 1,
+                available_bytes: 1,
+                used_bytes: 0,
+            })
+            .collect();
+        match bounded_reading(MetricReading::Disk(mounts)) {
+            MetricReading::Disk(mounts) => {
+                assert_eq!(
+                    mounts.len(),
+                    MAX_MOUNTS,
+                    "the mount table must be re-capped"
+                );
+                for mount in &mounts {
+                    assert!(mount.mount_point.len() <= MAX_LABEL_BYTES, "{mount:?}");
+                    assert!(mount.filesystem.len() <= MAX_LABEL_BYTES, "{mount:?}");
+                }
+            }
+            other => panic!("disk re-bounded into {other:?}"),
+        }
+
+        let temperature: Vec<TemperatureSensor> = (0..(MAX_SENSORS + 40))
+            .map(|_| TemperatureSensor {
+                label: long.clone(),
+                celsius: 40.0,
+            })
+            .collect();
+        match bounded_reading(MetricReading::Temperature(temperature)) {
+            MetricReading::Temperature(sensors) => {
+                assert_eq!(sensors.len(), MAX_SENSORS);
+                assert!(sensors.iter().all(|s| s.label.len() <= MAX_LABEL_BYTES));
+            }
+            other => panic!("temperature re-bounded into {other:?}"),
+        }
+
+        let fans: Vec<FanSensor> = (0..(MAX_SENSORS + 40))
+            .map(|_| FanSensor {
+                // A control character is an injection into an operator's terminal, not a label.
+                label: format!("chip\u{1b}[2J/{long}"),
+                rpm: 900,
+            })
+            .collect();
+        match bounded_reading(MetricReading::FanSpeed(fans)) {
+            MetricReading::FanSpeed(sensors) => {
+                assert_eq!(sensors.len(), MAX_SENSORS);
+                for sensor in &sensors {
+                    assert!(sensor.label.len() <= MAX_LABEL_BYTES);
+                    assert!(
+                        !sensor.label.chars().any(char::is_control),
+                        "a control character survived re-bounding: {:?}",
+                        sensor.label
+                    );
+                }
+            }
+            other => panic!("fan re-bounded into {other:?}"),
+        }
+
+        // A reading that is a fixed set of numbers has nothing to bound and must come back intact.
+        let uptime = MetricReading::Uptime(Duration::from_secs(9));
+        assert_eq!(bounded_reading(uptime.clone()), uptime);
     }
 
     /// Instrument labels are bounded identities: trimmed, control-character free, and cut on a

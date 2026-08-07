@@ -510,6 +510,117 @@ impl flux_capabilities::HostProber for CliHostProber {
             }
         }
     }
+
+    /// C-654: resolve the binding to a live substrate and ask **it** to measure itself.
+    ///
+    /// Read-only, and gated exactly as `probe` is rather than as a *selection* is: measuring a
+    /// binding does not install it, run anything on it, or change where this turn's effects land,
+    /// so it does not ask for the `HostGrant` that selecting one requires. What it does share with
+    /// `probe` is the credential path — a remote binding is reached with its declared credential —
+    /// which is why both live behind the same operator surface.
+    async fn read_metrics(
+        &self,
+        host: &HostRef,
+    ) -> std::result::Result<flux_capabilities::HostMetrics, flux_capabilities::HostProbeFailure>
+    {
+        use flux_capabilities::{HostMetrics, HostProbeFailure};
+        use flux_system::port::GuardedMetrics;
+
+        let substrate: Arc<dyn flux_system::port::ExecutionSystem> = match host.backend {
+            HostBackend::Local => self.system.clone(),
+            HostBackend::Sandboxed => {
+                match flux_system::sandboxed::SandboxedSystem::from_env((*self.system).clone()) {
+                    Ok(peer) => Arc::new(peer),
+                    Err(error) => {
+                        return Err(HostProbeFailure::BackendUnavailable {
+                            backend: host.backend.as_str().to_string(),
+                            detail: error.to_string(),
+                        })
+                    }
+                }
+            }
+            HostBackend::Container | HostBackend::Kubernetes => {
+                return Err(HostProbeFailure::BackendUnwired {
+                    backend: host.backend.as_str().to_string(),
+                })
+            }
+            HostBackend::Remote => Arc::new(self.connect_remote(host).await?),
+        };
+
+        match GuardedMetrics::read_metrics(&*substrate).await {
+            Ok(answers) => Ok(HostMetrics::Served {
+                remotely_reported: flux_system::port::ExecutionIdentity::substrate_identity(
+                    &*substrate,
+                )
+                .remotely_reported,
+                answers,
+            }),
+            // The port's two negatives stay apart here, where they are last distinguishable: an
+            // `Unserved` means this substrate measures nothing at all, which is not a transport
+            // failure and not an empty snapshot. Anything else really did fail to reach it.
+            Err(error) => match flux_system::remote::failure_mode(&error) {
+                Some(flux_system::remote::FailureMode::Unserved) => Ok(HostMetrics::Unserved {
+                    detail: error.to_string(),
+                }),
+                _ => Err(HostProbeFailure::Connect {
+                    detail: error.to_string(),
+                }),
+            },
+        }
+    }
+}
+
+impl CliHostProber {
+    /// The remote binding's connected substrate, with the credential resolved from its *location*.
+    /// Shares `probe`'s credential rules, including that only an env-scheme reference resolves on
+    /// this path today.
+    async fn connect_remote(
+        &self,
+        host: &HostRef,
+    ) -> std::result::Result<flux_system::remote::RemoteSystem, flux_capabilities::HostProbeFailure>
+    {
+        use flux_capabilities::HostProbeFailure;
+
+        let Some(url) = host.url.as_deref() else {
+            return Err(HostProbeFailure::Connect {
+                detail: "binding has no url".to_string(),
+            });
+        };
+        let token = match &host.credential_ref {
+            Some(reference) if reference.scheme == flux_secret::Scheme::Env => self
+                .system
+                .env(&reference.slot)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| HostProbeFailure::CredentialUnavailable {
+                    reference: reference.to_string(),
+                    detail: format!(
+                        "environment variable `{}` is unset or empty",
+                        reference.slot
+                    ),
+                })?,
+            Some(reference) => {
+                return Err(HostProbeFailure::CredentialUnavailable {
+                    reference: reference.to_string(),
+                    detail: "only an env-scheme credential resolves here (store-scheme resolution \
+                             needs the discovery broker)"
+                        .to_string(),
+                })
+            }
+            None => {
+                return Err(HostProbeFailure::CredentialUnavailable {
+                    reference: "none".to_string(),
+                    detail: "a remote binding needs a credential reference (the serving endpoint \
+                             refuses an empty token)"
+                        .to_string(),
+                })
+            }
+        };
+        flux_server::system::connect_remote_system(url, token, &fleet_private_net())
+            .await
+            .map_err(|error| HostProbeFailure::Connect {
+                detail: error.to_string(),
+            })
+    }
 }
 
 /// `flux host …` — see [`HostAction`]. Reads resolve through the same session registry the agent
@@ -660,6 +771,97 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
                         bail!("probe `{id}` failed — {failure}");
                     }
                 }
+            }
+        }
+        HostAction::Metrics { id, output } => {
+            let registry = session_host_registry(&cfg);
+            let record = registry
+                .get(&id)
+                .ok_or_else(|| unknown_binding_error(&id, &registry))?;
+            let system =
+                Arc::new(System::new(Workspace::new(&cwd)?).with_sandbox(resolved_sandbox()));
+            let prober = CliHostProber { system };
+            let outcome = flux_capabilities::HostProber::read_metrics(&prober, &record.host).await;
+            render_host_metrics(&id, outcome, output)?;
+        }
+    }
+    Ok(())
+}
+
+/// `flux host metrics` output, both faces (C-654).
+///
+/// The two negatives the port keeps apart stay apart here, because this is the surface an operator
+/// reads: a substrate that serves no metrics says so once, and an instrument this machine does not
+/// have is a per-kind `unavailable` entry with a reason. Neither is ever rendered as a number.
+fn render_host_metrics(
+    id: &str,
+    outcome: std::result::Result<
+        flux_capabilities::HostMetrics,
+        flux_capabilities::HostProbeFailure,
+    >,
+    output: AgentOutput,
+) -> Result<()> {
+    use flux_capabilities::HostMetrics;
+
+    match output {
+        AgentOutput::Human => match outcome {
+            Ok(HostMetrics::Served {
+                remotely_reported,
+                answers,
+            }) => {
+                println!(
+                    "{id}: {}",
+                    if remotely_reported {
+                        "remotely reported by the serving substrate"
+                    } else {
+                        "observed locally"
+                    }
+                );
+                for answer in &answers {
+                    println!("  {}", flux_capabilities::render_metric_answer(answer));
+                }
+            }
+            Ok(HostMetrics::Unserved { detail }) => {
+                println!("{id}: this substrate does not serve host metrics — {detail}");
+            }
+            Err(failure) => bail!("metrics `{id}` failed — {failure}"),
+        },
+        // JSON, not the human prose above, is the automation API: every value stays a raw number
+        // in its declared unit, and `status` is what a consumer branches on.
+        AgentOutput::Json | AgentOutput::Ndjson => {
+            let doc = match &outcome {
+                Ok(HostMetrics::Served {
+                    remotely_reported,
+                    answers,
+                }) => serde_json::json!({
+                    "schema": "flux.host-metrics/v1",
+                    "id": id,
+                    "ok": true,
+                    "served": true,
+                    "remotely_reported": remotely_reported,
+                    "metrics": answers
+                        .iter()
+                        .map(flux_capabilities::metric_answer_json)
+                        .collect::<Vec<_>>(),
+                }),
+                Ok(HostMetrics::Unserved { detail }) => serde_json::json!({
+                    "schema": "flux.host-metrics/v1",
+                    "id": id,
+                    "ok": true,
+                    // Served-nothing is a *reported* state, not a failure: the binding answered.
+                    "served": false,
+                    "detail": detail,
+                }),
+                Err(failure) => serde_json::json!({
+                    "schema": "flux.host-metrics/v1",
+                    "id": id,
+                    "ok": false,
+                    "failure": failure,
+                }),
+            };
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+            if let Err(failure) = outcome {
+                bail!("metrics `{id}` failed — {failure}");
             }
         }
     }

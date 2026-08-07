@@ -10,6 +10,8 @@ mod ops;
 
 pub use ops::{host_tools, register_host_ops, try_register_host_ops, HOST_GROUP};
 
+use flux_system::metrics::{MetricAnswer, MetricReading};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
@@ -223,13 +225,224 @@ impl fmt::Display for HostProbeFailure {
 
 impl std::error::Error for HostProbeFailure {}
 
-/// Performs a backend's side-effect-free identity check (C-649 `probe`). Implemented in the
-/// surface crate — the remote handshake client lives above this layer — and shared by the
-/// `host.probe` op and the `flux host probe` command so the two cannot drift.
+/// What a binding answered when asked to measure itself (Decision 0018 rule 6, C-654).
+///
+/// The two negatives the metrics port keeps apart survive all the way to the surface, because an
+/// operator responds to them differently and a projection has to branch on them:
+///
+/// - [`Unserved`](Self::Unserved) — this substrate does not serve the metrics seam at all. Nothing
+///   was attempted. Retrying never helps.
+/// - [`Served`](Self::Served) with a [`MetricAnswer::Unavailable`] inside — it serves the seam and
+///   this machine has no such instrument.
+///
+/// Neither is ever an empty list or a zero reading. An empty `Vec` here would say "this machine
+/// measured nothing", which is a claim rather than an absence, so the unserved case is a variant
+/// instead of a length check.
+#[derive(Debug, Clone)]
+pub enum HostMetrics {
+    /// The substrate measured itself. Answers come in [`MetricKind::ALL`] order and are bounded by
+    /// that closed vocabulary.
+    Served {
+        /// Whether another process took these measurements and reported them here — the same
+        /// provenance bit [`HostProbeReport::remotely_reported`] carries.
+        remotely_reported: bool,
+        /// One answer per served kind: a measurement, or an explicit unavailability.
+        answers: Vec<MetricAnswer>,
+    },
+    /// The binding resolved and its substrate serves no metrics. `detail` names what is missing.
+    Unserved {
+        /// The substrate's own words for what it cannot do.
+        detail: String,
+    },
+}
+
+/// Performs a backend's side-effect-free identity check (C-649 `probe`) and its bounded metrics
+/// read (C-654). Implemented in the surface crate — the remote handshake client lives above this
+/// layer — and shared by the `host.*` ops and the `flux host` commands so the two cannot drift.
 #[async_trait]
 pub trait HostProber: Send + Sync {
     async fn probe(&self, host: &HostRef)
         -> std::result::Result<HostProbeReport, HostProbeFailure>;
+
+    /// The binding's bounded metrics snapshot.
+    ///
+    /// Defaulted, and the default is the port's own fail-closed answer: a prober that has not
+    /// wired the seam serves no metrics. That keeps this a non-breaking addition for an out-of-tree
+    /// implementor *and* keeps deny-by-default the posture — an implementor who forgets is honest
+    /// rather than silently reporting zeros for a substrate nobody asked.
+    async fn read_metrics(
+        &self,
+        host: &HostRef,
+    ) -> std::result::Result<HostMetrics, HostProbeFailure> {
+        let _ = host;
+        Ok(HostMetrics::Unserved {
+            detail: "this prober does not read host metrics".to_string(),
+        })
+    }
+}
+
+/// One typed answer as a line an operator reads. Shared by the `host.metrics` op and
+/// `flux host metrics` so the two renderings cannot drift.
+///
+/// An unavailable answer says so in words and never renders as `0` — the board statistics
+/// contract's `absent` convention, one layer down.
+pub fn render_metric_answer(answer: &MetricAnswer) -> String {
+    let kind = answer.kind();
+    let snapshot = match answer {
+        MetricAnswer::Served(snapshot) => snapshot,
+        MetricAnswer::Unavailable { reason, .. } => {
+            return format!("{kind}: unavailable — {}", reason.explain())
+        }
+    };
+    let body = match &snapshot.reading {
+        MetricReading::CpuUsage(usage) => format!(
+            "{:.1}% busy over {}ms across {} logical core(s)",
+            usage.busy_ratio * 100.0,
+            usage.window.as_millis(),
+            usage.logical_cores
+        ),
+        MetricReading::LoadAverage(load) => format!(
+            "{:.2} / {:.2} / {:.2} runnable (1/5/15 min)",
+            load.one_minute, load.five_minute, load.fifteen_minute
+        ),
+        MetricReading::Memory(pool) | MetricReading::Swap(pool) => format!(
+            "{} used of {} ({} available)",
+            bytes(pool.used_bytes),
+            bytes(pool.total_bytes),
+            bytes(pool.available_bytes)
+        ),
+        MetricReading::Disk(mounts) => mounts
+            .iter()
+            .map(|mount| {
+                format!(
+                    "{} [{}] {} used of {} ({} available)",
+                    mount.mount_point,
+                    mount.filesystem,
+                    bytes(mount.used_bytes),
+                    bytes(mount.total_bytes),
+                    bytes(mount.available_bytes)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        MetricReading::Uptime(uptime) => {
+            let seconds = uptime.as_secs();
+            format!(
+                "{}d {}h {}m",
+                seconds / 86_400,
+                (seconds % 86_400) / 3_600,
+                (seconds % 3_600) / 60
+            )
+        }
+        MetricReading::Temperature(sensors) => sensors
+            .iter()
+            .map(|sensor| format!("{} {:.1} °C", sensor.label, sensor.celsius))
+            .collect::<Vec<_>>()
+            .join("; "),
+        MetricReading::FanSpeed(sensors) => sensors
+            .iter()
+            .map(|sensor| format!("{} {} rpm", sensor.label, sensor.rpm))
+            .collect::<Vec<_>>()
+            .join("; "),
+    };
+    format!("{kind}: {body}")
+}
+
+/// Binary-prefixed bytes. Metrics report raw byte counts; only the rendering rounds.
+fn bytes(value: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let mut size = value as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{value} B")
+    } else {
+        format!("{size:.1} {}", UNITS[unit])
+    }
+}
+
+/// One typed answer as the automation shape — the JSON `flux host metrics --output json` and the
+/// `host.metrics` op both emit.
+///
+/// Every value stays a raw number in its declared unit (bytes, milliseconds, degrees, rpm): the
+/// rounding in [`render_metric_answer`] is for a human reader, and a consumer that had to parse it
+/// back would be reading a display string as data.
+pub fn metric_answer_json(answer: &MetricAnswer) -> serde_json::Value {
+    let kind = answer.kind().as_str();
+    let snapshot = match answer {
+        MetricAnswer::Served(snapshot) => snapshot,
+        MetricAnswer::Unavailable { reason, .. } => {
+            return serde_json::json!({
+                "kind": kind,
+                // Explicitly unavailable, never a zero reading: a consumer branches on `status`.
+                "status": "unavailable",
+                "reason": reason.as_str(),
+                "detail": reason.explain(),
+            });
+        }
+    };
+    let reading = match &snapshot.reading {
+        MetricReading::CpuUsage(usage) => serde_json::json!({
+            "logical_cores": usage.logical_cores,
+            "busy_ratio": usage.busy_ratio,
+            "window_ms": usage.window.as_millis() as u64,
+        }),
+        MetricReading::LoadAverage(load) => serde_json::json!({
+            "one_minute": load.one_minute,
+            "five_minute": load.five_minute,
+            "fifteen_minute": load.fifteen_minute,
+        }),
+        MetricReading::Memory(pool) | MetricReading::Swap(pool) => serde_json::json!({
+            "total_bytes": pool.total_bytes,
+            "available_bytes": pool.available_bytes,
+            "used_bytes": pool.used_bytes,
+        }),
+        MetricReading::Disk(mounts) => serde_json::Value::Array(
+            mounts
+                .iter()
+                .map(|mount| {
+                    serde_json::json!({
+                        "mount_point": mount.mount_point,
+                        "filesystem": mount.filesystem,
+                        "total_bytes": mount.total_bytes,
+                        "available_bytes": mount.available_bytes,
+                        "used_bytes": mount.used_bytes,
+                    })
+                })
+                .collect(),
+        ),
+        MetricReading::Uptime(uptime) => serde_json::json!({
+            "uptime_ms": uptime.as_millis() as u64,
+        }),
+        MetricReading::Temperature(sensors) => serde_json::Value::Array(
+            sensors
+                .iter()
+                .map(|sensor| serde_json::json!({"label": sensor.label, "celsius": sensor.celsius}))
+                .collect(),
+        ),
+        MetricReading::FanSpeed(sensors) => serde_json::Value::Array(
+            sensors
+                .iter()
+                .map(|sensor| serde_json::json!({"label": sensor.label, "rpm": sensor.rpm}))
+                .collect(),
+        ),
+    };
+    serde_json::json!({
+        "kind": kind,
+        "status": "served",
+        "sampled_at_ms": snapshot
+            .sampled_at
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_millis() as u64)
+            .unwrap_or_default(),
+        // Provenance travels with the reading, not only with the binding: a snapshot detached from
+        // its host still has to say whether anyone here observed it (Decision 0018 rule 6).
+        "remotely_reported": snapshot.remotely_reported,
+        "reading": reading,
+    })
 }
 
 #[cfg(test)]

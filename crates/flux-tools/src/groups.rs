@@ -159,11 +159,14 @@ pub fn builtin_groups() -> Vec<ToolGroup> {
             name: "host".into(),
             description: "Named execution-substrate bindings (Decision 0018): list and inspect \
                           the session's declared hosts — backend kind, address, availability, a \
-                          credential presence marker, never a value — and verify one with its \
-                          backend's side-effect-free identity probe. Surfaced when host bindings \
-                          are declared ([[host]] config or the hosts store)."
+                          credential presence marker, never a value — verify one with its \
+                          backend's side-effect-free identity probe, and read one's own condition \
+                          (CPU, memory, disk, uptime, temperature, fans) as typed readings where \
+                          an unmeasurable metric is explicitly unavailable rather than zero. \
+                          Surfaced when host bindings are declared ([[host]] config or the hosts \
+                          store)."
                 .into(),
-            tools: names(&["host.list", "host.info", "host.probe"]),
+            tools: names(&["host.list", "host.info", "host.probe", "host.metrics"]),
             // Surfaced by the session-ambient `host` signal the CLI injects when the startup
             // registry holds any binding (C-648).
             surface_when: when("host"),

@@ -20,12 +20,17 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
+use flux_system::metrics::{
+    bounded_label, CpuUsage, FanSensor, LoadAverage, MemoryUsage, MetricAnswer, MetricKind,
+    MetricReading, MetricSnapshot, MetricUnavailable, MountUsage, TemperatureSensor, MAX_MOUNTS,
+    MAX_SENSORS,
+};
 use flux_system::net::{
     BindExposure, DatagramEndpoint, DatagramHandle, DialTarget, DuplexReadHalf,
     DuplexStream as GuardedDuplex, DuplexWriteHalf, InboundLimits, NetworkListener, NetworkStream,
     PrivateNetAllow, StreamListener,
 };
-use flux_system::port::{ExecutionIdentity, GuardedNetwork, SubstrateIdentity};
+use flux_system::port::{ExecutionIdentity, GuardedMetrics, GuardedNetwork, SubstrateIdentity};
 use flux_system::remote::{Answer, Answered, Delegate, Delivered, RemoteSystem, Unreachable};
 use flux_system::{
     ChildStatus, ManagedChild, ManagedProcess, ProcessOutput, ScopedFileRead, System,
@@ -39,7 +44,12 @@ use tower_http::timeout::TimeoutLayer;
 use crate::{guard_open_bind, require_auth, ServerAuth};
 
 /// Version of the remote execution-system wire contract.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 (C-654) added the bounded `host.metrics` operation and the handshake's `metric_kinds`
+/// declaration. Decision 0018 rule 5 fixes the rule this follows: wire support for a new port
+/// family is a *versioned* protocol change, never an implicit extension — so the version moves and
+/// a mixed pair refuses to pair at all, rather than discovering the gap one operation at a time.
+pub const PROTOCOL_VERSION: u32 = 3;
 const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 static CLIENT_INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -52,6 +62,15 @@ pub struct SystemHandshake {
     pub workspace: String,
     pub confinement: String,
     pub operations: Vec<String>,
+    /// Which [`MetricKind`](flux_system::metrics::MetricKind) tokens the serving substrate declares
+    /// it can measure about itself (C-654).
+    ///
+    /// A *capability declaration*, alongside `operations` and for the same reason: it makes
+    /// `served_metric_kinds` free and honest instead of a round trip that a caller would be tempted
+    /// to cache. Defaulted because a peer that declares nothing measures nothing — which is the
+    /// port's `Unserved`, and a different answer from a machine whose instruments are missing.
+    #[serde(default)]
+    pub metric_kinds: Vec<String>,
 }
 
 impl SystemHandshake {
@@ -62,6 +81,20 @@ impl SystemHandshake {
             confinement: self.confinement.clone(),
             remotely_reported: true,
         }
+    }
+
+    /// The declared kinds, resolved against the **closed** local vocabulary.
+    ///
+    /// Never trust the wire: a token this build does not know is dropped rather than guessed at,
+    /// and the result is capped by the vocabulary itself, so a peer cannot enlarge what a caller
+    /// will iterate over by repeating or inventing tokens.
+    fn declared_metric_kinds(&self) -> Vec<MetricKind> {
+        let mut kinds: Vec<MetricKind> = MetricKind::ALL
+            .into_iter()
+            .filter(|kind| self.metric_kinds.iter().any(|token| token == kind.as_str()))
+            .collect();
+        kinds.dedup();
+        kinds
     }
 }
 
@@ -326,6 +359,13 @@ fn remote_system_router(
 ) -> anyhow::Result<Router> {
     guard_open_bind(&auth, bind)?;
     let identity = system.substrate_identity();
+    // Declared once, at bind time: which kinds this substrate can measure is a property of the
+    // machine and its build, not of a request, so a caller learns it from the handshake instead of
+    // paying a round trip for it.
+    let metric_kinds: Vec<String> = GuardedMetrics::served_metric_kinds(&*system)
+        .into_iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect();
     let state = SystemState {
         delivery: Arc::new(DeliveryLedger::new(system.clone())),
         network: Arc::new(NetworkResources::default()),
@@ -339,6 +379,7 @@ fn remote_system_router(
                 .iter()
                 .map(|operation| (*operation).to_string())
                 .collect(),
+            metric_kinds,
         },
     };
     let auth = Arc::new(auth);
@@ -1154,6 +1195,34 @@ async fn dispatch(system: &System, operation: &str, arguments: Value) -> WireAns
             )
         }
         "env.read" => served(json!(system.env(arg!("key", as_str)))),
+        // C-654. `kind` is optional and that is the whole shape: with it, one measurement; without
+        // it, the substrate's snapshot in one round trip, because eight separately-timed requests
+        // would compose readings from different moments into a picture of none of them. Either way
+        // the answer is bounded by the closed vocabulary, so there is no size argument to police.
+        "host.metrics" => {
+            let requested = match arguments.get("kind") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(token)) => match MetricKind::from_token(token) {
+                    Some(kind) => Some(kind),
+                    // A token this build does not know is refused rather than approximated: the
+                    // vocabulary is closed, so the nearest kind is still the wrong instrument.
+                    None => {
+                        return refused(format!(
+                            "host.metrics: `{token}` is not a metric kind (known: {})",
+                            metric_kind_tokens()
+                        ))
+                    }
+                },
+                Some(_) => return refused("host.metrics: `kind` must be a string"),
+            };
+            let read = match requested {
+                Some(kind) => GuardedMetrics::read_metric(system, kind)
+                    .await
+                    .map(|answer| vec![answer]),
+                None => GuardedMetrics::read_metrics(system).await,
+            };
+            served_result(read.and_then(|answers| metric_answers_value(&answers)))
+        }
         "host.identity" => served_result(
             system
                 .host_path_identity(arg!("path", as_str))
@@ -1271,6 +1340,7 @@ fn bounded_operations() -> &'static [&'static str] {
         "network.bind_udp",
         "env.read",
         "host.identity",
+        "host.metrics",
         "host.read",
         "workspace.read_bytes",
         "workspace.write_bytes",
@@ -1313,6 +1383,259 @@ fn served_result(result: Result<Value>) -> WireAnswer {
             _ => refused(error.to_string()),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// host.metrics — the wire form of the closed metric vocabulary (C-654)
+// ---------------------------------------------------------------------------
+//
+// Hand-written rather than derived, for two reasons that are really one. The typed vocabulary lives
+// in `flux-system` and stays free of a serialization format — the port is a Rust trait, not a
+// protocol — so the encoding belongs here beside the other wire shapes (`process_value`,
+// `WireDialTarget`). And a derived `Deserialize` would be a decoder that *accepts whatever the
+// bytes say*, which is exactly wrong for this family: the caps on labels, mounts and sensors are a
+// construction-site convention over public fields, so the only place they can be re-imposed on a
+// reading measured by another machine is at the point of decode.
+//
+// `remotely_reported` is deliberately absent from the wire. It describes *the hop*, and
+// `RemoteSystem` sets it; a peer that could put it in a frame could claim its numbers were read
+// locally.
+
+/// Every token the closed vocabulary answers to, for a refusal that tells an operator what to ask.
+fn metric_kind_tokens() -> String {
+    MetricKind::ALL
+        .iter()
+        .map(|kind| kind.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn metric_reading_value(reading: &MetricReading) -> Value {
+    match reading {
+        MetricReading::CpuUsage(usage) => json!({
+            "logical_cores": usage.logical_cores,
+            "busy_ratio": usage.busy_ratio,
+            "window_ms": u64::try_from(usage.window.as_millis()).unwrap_or(u64::MAX),
+        }),
+        MetricReading::LoadAverage(load) => json!({
+            "one_minute": load.one_minute,
+            "five_minute": load.five_minute,
+            "fifteen_minute": load.fifteen_minute,
+        }),
+        MetricReading::Memory(pool) | MetricReading::Swap(pool) => json!({
+            "total_bytes": pool.total_bytes,
+            "available_bytes": pool.available_bytes,
+            "used_bytes": pool.used_bytes,
+        }),
+        MetricReading::Disk(mounts) => Value::Array(
+            mounts
+                .iter()
+                .map(|mount| {
+                    json!({
+                        "mount_point": mount.mount_point,
+                        "filesystem": mount.filesystem,
+                        "total_bytes": mount.total_bytes,
+                        "available_bytes": mount.available_bytes,
+                        "used_bytes": mount.used_bytes,
+                    })
+                })
+                .collect(),
+        ),
+        MetricReading::Uptime(uptime) => json!({
+            "uptime_ms": u64::try_from(uptime.as_millis()).unwrap_or(u64::MAX),
+        }),
+        MetricReading::Temperature(sensors) => Value::Array(
+            sensors
+                .iter()
+                .map(|sensor| json!({"label": sensor.label, "celsius": sensor.celsius}))
+                .collect(),
+        ),
+        MetricReading::FanSpeed(sensors) => Value::Array(
+            sensors
+                .iter()
+                .map(|sensor| json!({"label": sensor.label, "rpm": sensor.rpm}))
+                .collect(),
+        ),
+    }
+}
+
+/// One bounded snapshot as the wire carries it. Fails only where a sample time cannot be expressed
+/// — never by dropping an answer, since a missing answer and an unavailable one read differently.
+fn metric_answers_value(answers: &[MetricAnswer]) -> Result<Value> {
+    let mut encoded = Vec::with_capacity(answers.len());
+    for answer in answers {
+        encoded.push(match answer {
+            MetricAnswer::Served(snapshot) => json!({
+                "kind": snapshot.kind().as_str(),
+                "status": "served",
+                "sampled_at_ms": system_time_millis(snapshot.sampled_at)?,
+                "reading": metric_reading_value(&snapshot.reading),
+            }),
+            MetricAnswer::Unavailable { kind, reason } => json!({
+                "kind": kind.as_str(),
+                "status": "unavailable",
+                "reason": reason.as_str(),
+            }),
+        });
+    }
+    Ok(json!({"answers": encoded}))
+}
+
+fn number(value: &Value, key: &str) -> std::result::Result<f64, String> {
+    value
+        .get(key)
+        .and_then(Value::as_f64)
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("metric reading is missing a finite `{key}`"))
+}
+
+fn count(value: &Value, key: &str) -> std::result::Result<u64, String> {
+    value
+        .get(key)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("metric reading is missing `{key}`"))
+}
+
+fn label(value: &Value, key: &str) -> std::result::Result<String, String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(bounded_label)
+        .ok_or_else(|| format!("metric reading is missing `{key}`"))
+}
+
+/// The entries of an encoded list reading, truncated to `max` **before** anything is built.
+///
+/// The cap is applied to the iterator rather than to the finished `Vec` on purpose: truncating
+/// afterwards would already have allocated whatever the far side sent.
+fn capped_entries(value: &Value, max: usize) -> std::result::Result<Vec<&Value>, String> {
+    Ok(value
+        .as_array()
+        .ok_or_else(|| "metric reading is not a list".to_string())?
+        .iter()
+        .take(max)
+        .collect())
+}
+
+fn decode_metric_reading(
+    kind: MetricKind,
+    value: &Value,
+) -> std::result::Result<MetricReading, String> {
+    let pool = |value: &Value| -> std::result::Result<MemoryUsage, String> {
+        Ok(MemoryUsage {
+            total_bytes: count(value, "total_bytes")?,
+            available_bytes: count(value, "available_bytes")?,
+            used_bytes: count(value, "used_bytes")?,
+        })
+    };
+    Ok(match kind {
+        MetricKind::CpuUsage => MetricReading::CpuUsage(CpuUsage {
+            logical_cores: u32::try_from(count(value, "logical_cores")?)
+                .map_err(|_| "cpu reports an implausible core count".to_string())?,
+            // A ratio outside `0.0..=1.0` is not a fraction of a window; clamping keeps a
+            // projection's arithmetic sane without discarding an otherwise usable reading.
+            busy_ratio: number(value, "busy_ratio")?.clamp(0.0, 1.0),
+            window: Duration::from_millis(count(value, "window_ms")?),
+        }),
+        MetricKind::LoadAverage => MetricReading::LoadAverage(LoadAverage {
+            one_minute: number(value, "one_minute")?,
+            five_minute: number(value, "five_minute")?,
+            fifteen_minute: number(value, "fifteen_minute")?,
+        }),
+        MetricKind::Memory => MetricReading::Memory(pool(value)?),
+        MetricKind::Swap => MetricReading::Swap(pool(value)?),
+        MetricKind::Disk => MetricReading::Disk(
+            capped_entries(value, MAX_MOUNTS)?
+                .into_iter()
+                .map(|mount| {
+                    Ok(MountUsage {
+                        mount_point: label(mount, "mount_point")?,
+                        filesystem: label(mount, "filesystem")?,
+                        total_bytes: count(mount, "total_bytes")?,
+                        available_bytes: count(mount, "available_bytes")?,
+                        used_bytes: count(mount, "used_bytes")?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?,
+        ),
+        MetricKind::Uptime => {
+            MetricReading::Uptime(Duration::from_millis(count(value, "uptime_ms")?))
+        }
+        MetricKind::Temperature => MetricReading::Temperature(
+            capped_entries(value, MAX_SENSORS)?
+                .into_iter()
+                .map(|sensor| {
+                    Ok(TemperatureSensor {
+                        label: label(sensor, "label")?,
+                        celsius: number(sensor, "celsius")?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?,
+        ),
+        MetricKind::FanSpeed => MetricReading::FanSpeed(
+            capped_entries(value, MAX_SENSORS)?
+                .into_iter()
+                .map(|sensor| {
+                    Ok(FanSensor {
+                        label: label(sensor, "label")?,
+                        rpm: u32::try_from(count(sensor, "rpm")?)
+                            .map_err(|_| "a fan reports an implausible rpm".to_string())?,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, String>>()?,
+        ),
+    })
+}
+
+/// Decode a `host.metrics` answer list, re-imposing every bound the vocabulary declares.
+///
+/// The list itself is capped by the closed vocabulary — a peer cannot make a caller iterate over
+/// more answers than there are kinds — and each answer's `remotely_reported` is left `false` here
+/// because setting it is `RemoteSystem`'s job, not the transport's.
+fn decode_metric_answers(value: Value) -> std::result::Result<Vec<MetricAnswer>, String> {
+    let encoded = value
+        .get("answers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "host.metrics response is missing `answers`".to_string())?;
+    let mut answers = Vec::with_capacity(encoded.len().min(MetricKind::ALL.len()));
+    for answer in encoded.iter().take(MetricKind::ALL.len()) {
+        let token = answer
+            .get("kind")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "a metric answer is missing `kind`".to_string())?;
+        let kind = MetricKind::from_token(token)
+            .ok_or_else(|| format!("`{token}` is not a metric kind this build knows"))?;
+        match answer.get("status").and_then(Value::as_str) {
+            Some("served") => {
+                let sampled_at =
+                    UNIX_EPOCH + Duration::from_millis(count(answer, "sampled_at_ms")?);
+                let reading = answer
+                    .get("reading")
+                    .ok_or_else(|| format!("`{token}` is served with no reading"))?;
+                answers.push(MetricAnswer::Served(MetricSnapshot {
+                    sampled_at,
+                    reading: decode_metric_reading(kind, reading)?,
+                    remotely_reported: false,
+                }));
+            }
+            Some("unavailable") => {
+                let reason = answer
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .and_then(MetricUnavailable::from_token)
+                    .ok_or_else(|| format!("`{token}` is unavailable for no stated reason"))?;
+                answers.push(MetricAnswer::unavailable_for(kind, reason));
+            }
+            // Never a fabricated zero and never a silent drop: a status this build cannot read is
+            // an answer it must not pretend to have understood.
+            other => {
+                return Err(format!(
+                    "`{token}` carries an unreadable metric status {other:?}"
+                ))
+            }
+        }
+    }
+    Ok(answers)
 }
 
 fn process_value(output: ProcessOutput) -> Value {
@@ -1406,6 +1729,9 @@ pub struct HttpDelegate {
     token: String,
     client_id: String,
     next_id: AtomicU64,
+    /// The metric kinds the peer declared at handshake, resolved against the closed vocabulary
+    /// (C-654). Empty means the peer serves no metrics — see [`HttpDelegate::metrics_gap`].
+    metric_kinds: Vec<MetricKind>,
 }
 
 impl HttpDelegate {
@@ -1504,12 +1830,18 @@ impl HttpDelegate {
             .json::<SystemHandshake>()
             .await
             .map_err(|error| Error::Other(format!("remote-system handshake frame: {error}")))?;
+        // A mixed pair is refused outright rather than degraded to the operations both sides
+        // happen to share. The two versions disagree about what a frame *means*, not only about
+        // which frames exist, so a partial pairing would put the disagreement inside individual
+        // operations — where it surfaces mid-effect — instead of at the one place an operator can
+        // act on it.
         if handshake.protocol_version != PROTOCOL_VERSION {
             return Err(Error::Config(format!(
                 "remote-system protocol mismatch: local {PROTOCOL_VERSION}, remote {}",
                 handshake.protocol_version
             )));
         }
+        let metric_kinds = handshake.declared_metric_kinds();
         Ok((
             Arc::new(Self {
                 http,
@@ -1522,6 +1854,7 @@ impl HttpDelegate {
                     connector: ws_connector,
                 },
                 token,
+                metric_kinds,
                 client_id: format!(
                     "{}-{}-{}",
                     std::process::id(),
@@ -1603,7 +1936,26 @@ impl HttpDelegate {
             token: self.token.clone(),
             client_id: self.client_id.clone(),
             next_id: AtomicU64::new(self.next_id.fetch_add(1, Ordering::Relaxed)),
+            metric_kinds: self.metric_kinds.clone(),
         }
+    }
+
+    /// The typed answer for a peer that declared no metric vocabulary, or `None` when it did.
+    ///
+    /// This is where "an older server answers a typed unsupported" actually happens. A peer that
+    /// does not serve the family declares no kinds — an older build has no `metric_kinds` field at
+    /// all, and a same-version peer on a platform with no reader declares an empty one — and both
+    /// are answered here, without a request. Sending one anyway would turn a known capability gap
+    /// into a round trip whose failure a caller has to interpret, and the mode matters: `Unserved`
+    /// means *implement it or stop asking*, so a retry loop must never be told to try again.
+    fn metrics_gap<T>(&self) -> Option<Delivered<T>> {
+        self.metric_kinds.is_empty().then(|| {
+            Ok(Answer::Unserved(
+                "measure its own substrate — the remote peer declared no metric kinds in its \
+                 handshake"
+                    .to_string(),
+            ))
+        })
     }
 
     async fn open_process_socket(&self, start: &ProcessStart) -> Delivered<ProcessSocket> {
@@ -2525,6 +2877,53 @@ impl Delegate for HttpDelegate {
         )
     }
 
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        self.metric_kinds.clone()
+    }
+
+    fn read_metric(&self, kind: MetricKind) -> Answered<'_, MetricAnswer> {
+        Box::pin(async move {
+            if let Some(gap) = self.metrics_gap() {
+                return gap;
+            }
+            settle_value(
+                self.request("host.metrics", json!({"kind": kind.as_str()}))
+                    .await,
+                |value| {
+                    let answers = decode_metric_answers(value)?;
+                    // Exactly one answer, and about the kind that was asked for. A peer that
+                    // answered a *different* kind would have a caller render one instrument's
+                    // measurement under another's name, which is worse than no reading at all.
+                    match <[MetricAnswer; 1]>::try_from(answers) {
+                        Ok([answer]) if answer.kind() == kind => Ok(answer),
+                        Ok([answer]) => Err(format!(
+                            "asked the remote substrate for `{kind}` and it answered about `{}`",
+                            answer.kind()
+                        )),
+                        Err(answers) => Err(format!(
+                            "asked the remote substrate for `{kind}` and it answered {} times",
+                            answers.len()
+                        )),
+                    }
+                },
+            )
+        })
+    }
+
+    fn read_metrics(&self) -> Answered<'_, Vec<MetricAnswer>> {
+        Box::pin(async move {
+            if let Some(gap) = self.metrics_gap() {
+                return gap;
+            }
+            // No `kind`: one round trip for the whole snapshot, so every reading in it describes
+            // the same moment.
+            settle_value(
+                self.request("host.metrics", json!({})).await,
+                decode_metric_answers,
+            )
+        })
+    }
+
     fn read_file_scoped<'a>(
         &'a self,
         path: &'a str,
@@ -2682,6 +3081,427 @@ mod tests {
     use flux_system::port::{GuardedNetwork, GuardedProcess, GuardedWorkspaceFiles};
     use flux_system::Workspace;
     use rcgen::{generate_simple_self_signed, CertifiedKey};
+
+    /// C-654, acceptance 1: `host.metrics` joins the bounded wire vocabulary, and it arrives under
+    /// a protocol version bump rather than as an implicit extension of the shipped one.
+    #[test]
+    fn host_metrics_joins_the_bounded_vocabulary_under_a_protocol_version_bump() {
+        assert!(
+            bounded_operations().contains(&"host.metrics"),
+            "the bounded vocabulary must carry the metrics read: {:?}",
+            bounded_operations()
+        );
+        // A compile-time pin: adding a wire operation is a versioned protocol change (Decision
+        // 0018 rule 6), not an implicit extension, and v2 is the version that shipped without one.
+        const { assert!(PROTOCOL_VERSION > 2) };
+    }
+
+    /// A self-signed `localhost` pair: the PEM a client must trust, and the server's TLS config.
+    async fn localhost_tls() -> (String, axum_server::tls_rustls::RustlsConfig) {
+        ensure_crypto_provider();
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_pem = cert.pem();
+        let tls = axum_server::tls_rustls::RustlsConfig::from_pem(
+            cert_pem.as_bytes().to_vec(),
+            signing_key.serialize_pem().into_bytes(),
+        )
+        .await
+        .unwrap();
+        (cert_pem, tls)
+    }
+
+    /// Serve a router over TLS on a fresh loopback port; abort the handle to stop it. The router is
+    /// built *from* the bound address, because the production one validates the address it binds.
+    fn serve_on_loopback(
+        build: impl FnOnce(SocketAddr) -> Router,
+        tls: axum_server::tls_rustls::RustlsConfig,
+    ) -> (SocketAddr, tokio::task::JoinHandle<std::io::Result<()>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = build(address);
+        let handle = tokio::spawn(async move {
+            axum_server::from_tcp_rustls(listener, tls)
+                .unwrap()
+                .serve(app.into_make_service())
+                .await
+        });
+        (address, handle)
+    }
+
+    /// A peer that answers **only** the handshake, with whatever frame the test hands it. This is
+    /// how a differently-versioned or differently-capable far side is represented: the shipped
+    /// router always speaks the current version, so it cannot stand in for one that does not.
+    fn peer_announcing(handshake: Value) -> Router {
+        Router::new().route(
+            "/system/v1/handshake",
+            get(move || {
+                let handshake = handshake.clone();
+                async move { Json(handshake) }
+            }),
+        )
+    }
+
+    fn workspace_system(tag: &str) -> (std::path::PathBuf, Arc<System>) {
+        let root = std::env::temp_dir().join(format!(
+            "flux-{tag}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let system = Arc::new(System::new(Workspace::new(&root).unwrap()));
+        (root, system)
+    }
+
+    /// C-654, acceptance 1: the version bump is a *negotiation*, and it refuses a mixed pair from
+    /// both seats — the client refuses to install an older peer, and the server refuses an older
+    /// caller's frame. Neither direction degrades to a partial vocabulary: a shared operation name
+    /// is not a shared meaning, so pairing has to fail where an operator can see it rather than
+    /// inside whichever effect first hits the disagreement.
+    #[tokio::test]
+    async fn the_protocol_refuses_a_mixed_version_pair_from_both_seats() {
+        let (cert_pem, tls) = localhost_tls().await;
+
+        // Direction one: this build meets a peer one version behind.
+        let (address, older_peer) = serve_on_loopback(
+            |_| {
+                peer_announcing(json!({
+                    "protocol_version": PROTOCOL_VERSION - 1,
+                    "substrate_kind": "native",
+                    "workspace": "/srv/work",
+                    "confinement": "none",
+                    "operations": ["workspace.read_bytes"],
+                }))
+            },
+            tls,
+        );
+        let message = match HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        {
+            Ok(_) => panic!("an older peer must not pair with this build"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            message.contains("protocol mismatch")
+                && message.contains(&PROTOCOL_VERSION.to_string())
+                && message.contains(&(PROTOCOL_VERSION - 1).to_string()),
+            "the refusal must name both versions so an operator knows which side to move: {message}"
+        );
+        older_peer.abort();
+
+        // Direction two: this build serves, and an older caller's frame arrives.
+        let (root, system) = workspace_system("remote-version-server");
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+        let client = reqwest::Client::builder()
+            .add_root_certificate(reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap())
+            .resolve("localhost", address)
+            .build()
+            .unwrap();
+        let arguments = json!({});
+        let response = client
+            .post(format!(
+                "https://localhost:{}/system/v1/execute",
+                address.port()
+            ))
+            .bearer_auth("test-token")
+            .json(&json!({
+                "protocol_version": PROTOCOL_VERSION - 1,
+                "operation_id": "older-caller-1",
+                "fingerprint": fingerprint("host.metrics", &arguments),
+                "operation": "host.metrics",
+                "arguments": arguments,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "an older caller is refused before the operation is dispatched"
+        );
+        let answer = response.json::<WireAnswer>().await.unwrap();
+        assert!(matches!(answer.status, WireStatus::Refused));
+        assert!(
+            answer
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unsupported remote-system protocol version"),
+            "{answer:?}"
+        );
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-654, acceptances 1 and 4: readings travel the bounded operation and arrive as typed
+    /// answers stamped `remotely_reported` — the single-kind face and the one-round-trip snapshot
+    /// alike. An instrument the serving machine lacks stays explicitly unavailable across the hop
+    /// rather than collapsing into a zero a projection would read as a measurement.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_metrics_travel_the_bounded_wire_and_arrive_remotely_reported() {
+        use flux_system::metrics::MetricUnavailable;
+
+        let (root, system) = workspace_system("remote-metrics");
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, server) = serve_on_loopback(
+            |bind| {
+                remote_system_router(
+                    system,
+                    ServerAuth::from_token(Some("test-token".into())),
+                    bind,
+                )
+                .unwrap()
+            },
+            tls,
+        );
+
+        let (delegate, handshake) = HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            handshake.operations.iter().any(|op| op == "host.metrics"),
+            "the peer advertises the bounded metrics operation: {:?}",
+            handshake.operations
+        );
+        assert!(
+            handshake.metric_kinds.iter().any(|kind| kind == "cpu"),
+            "the handshake declares the vocabulary the peer measures: {:?}",
+            handshake.metric_kinds
+        );
+        let remote = RemoteSystem::identified(delegate, handshake.identity());
+
+        let answers = GuardedMetrics::read_metrics(&remote)
+            .await
+            .expect("a v3 peer serves the metrics family");
+        let kinds: Vec<MetricKind> = answers.iter().map(MetricAnswer::kind).collect();
+        assert_eq!(
+            kinds,
+            MetricKind::ALL.to_vec(),
+            "one round trip returns the whole snapshot in canonical order"
+        );
+        let mut served = 0;
+        for answer in &answers {
+            match answer {
+                MetricAnswer::Served(snapshot) => {
+                    served += 1;
+                    assert!(
+                        snapshot.remotely_reported,
+                        "{} crossed the wire and must not claim local observation",
+                        snapshot.kind()
+                    );
+                }
+                MetricAnswer::Unavailable { reason, .. } => {
+                    // The other negative survives the hop with its own reason rather than becoming
+                    // a served zero.
+                    assert!(matches!(
+                        reason,
+                        MetricUnavailable::NoInstrument
+                            | MetricUnavailable::ReadFailed
+                            | MetricUnavailable::UnsupportedPlatform
+                    ));
+                }
+            }
+        }
+        assert!(served > 0, "nothing was measured at all: {answers:?}");
+
+        // The single-kind face asks for, and gets, exactly the instrument named.
+        let memory = GuardedMetrics::read_metric(&remote, MetricKind::Memory)
+            .await
+            .expect("memory is served");
+        let snapshot = memory.served().expect("a machine has physical memory");
+        assert_eq!(snapshot.kind(), MetricKind::Memory);
+        assert!(snapshot.remotely_reported);
+        match &snapshot.reading {
+            MetricReading::Memory(pool) => {
+                assert!(pool.total_bytes > 0, "bytes survive the wire: {pool:?}");
+                assert!(pool.used_bytes <= pool.total_bytes);
+            }
+            other => panic!("memory answered {other:?}"),
+        }
+
+        server.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// C-654, acceptance 1: a peer that does not serve the family answers the **typed** unsupported
+    /// the port already has, never a decode error and never a fabricated zero.
+    ///
+    /// A peer declares its metric vocabulary in the handshake, so a build without the family (an
+    /// older one has no such field at all) declares nothing — and the mode matters more than the
+    /// message: `Unserved` tells a caller that retrying will never help, which is the one thing an
+    /// operator can act on.
+    #[tokio::test]
+    async fn a_peer_that_serves_no_metrics_answers_a_typed_unserved() {
+        let (cert_pem, tls) = localhost_tls().await;
+        let (address, peer) = serve_on_loopback(
+            |_| {
+                peer_announcing(json!({
+                    "protocol_version": PROTOCOL_VERSION,
+                    "substrate_kind": "native",
+                    "workspace": "/srv/work",
+                    "confinement": "none",
+                    // The vocabulary this build shipped *before* the metrics family: same version,
+                    // no metric operation, and no `metric_kinds` field to decode.
+                    "operations": ["workspace.read_bytes", "process.run"],
+                }))
+            },
+            tls,
+        );
+
+        let (delegate, handshake) = HttpDelegate::connect_with_ca_pem(
+            &format!("https://localhost:{}", address.port()),
+            "test-token".into(),
+            &PrivateNetAllow::from_hosts(["localhost".into()]),
+            cert_pem.as_bytes(),
+        )
+        .await
+        .map_err(|error| error.to_string())
+        .expect("a same-version peer pairs even when it serves fewer families");
+        assert!(handshake.metric_kinds.is_empty(), "{handshake:?}");
+        let remote = RemoteSystem::identified(delegate, handshake.identity());
+
+        assert!(
+            GuardedMetrics::served_metric_kinds(&remote).is_empty(),
+            "a peer that declared nothing must not be credited with a vocabulary"
+        );
+        for error in [
+            GuardedMetrics::read_metrics(&remote)
+                .await
+                .expect_err("the snapshot face fails closed"),
+            GuardedMetrics::read_metric(&remote, MetricKind::CpuUsage)
+                .await
+                .expect_err("the single-kind face fails closed"),
+        ] {
+            assert_eq!(
+                flux_system::remote::failure_mode(&error),
+                Some(flux_system::remote::FailureMode::Unserved),
+                "retrying never helps, so the mode must be unserved rather than refused or \
+                 unreachable: {error}"
+            );
+        }
+
+        peer.abort();
+    }
+
+    /// C-654: the decoder re-imposes the vocabulary's bounds on what the wire claims.
+    ///
+    /// The caps on labels, mounts and sensors are a construction-site convention over public
+    /// fields, not a type invariant — so a peer that reports forty mounts with megabyte names is
+    /// representable, and the only place to stop it is where its bytes become typed values. The
+    /// list is capped before the entries are built, not after, or the allocation has already
+    /// happened by the time anything is truncated.
+    #[test]
+    fn the_metric_decoder_rebounds_everything_the_wire_claims() {
+        let long = "q".repeat(9000);
+        let mounts: Vec<Value> = (0..(MAX_MOUNTS + 64))
+            .map(|index| {
+                json!({
+                    "mount_point": format!("/mnt/{long}{index}"),
+                    "filesystem": format!("ext4{long}"),
+                    "total_bytes": 4096,
+                    "available_bytes": 1024,
+                    "used_bytes": 3072,
+                })
+            })
+            .collect();
+        let sensors: Vec<Value> = (0..(MAX_SENSORS + 64))
+            .map(|_| json!({"label": format!("chip\u{1b}[2J/{long}"), "celsius": 41.5}))
+            .collect();
+        let fans: Vec<Value> = (0..(MAX_SENSORS + 64))
+            .map(|_| json!({"label": long.clone(), "rpm": 900}))
+            .collect();
+
+        let decoded = decode_metric_answers(json!({"answers": [
+            {"kind": "disk", "status": "served", "sampled_at_ms": 1, "reading": mounts},
+            {"kind": "temperature", "status": "served", "sampled_at_ms": 1, "reading": sensors},
+            {"kind": "fan", "status": "served", "sampled_at_ms": 1, "reading": fans},
+        ]}))
+        .expect("an oversized but well-formed frame decodes, bounded");
+
+        for answer in &decoded {
+            let snapshot = answer.served().expect("all three are served");
+            assert!(
+                !snapshot.remotely_reported,
+                "the transport does not get to assert provenance; the hop does"
+            );
+            match &snapshot.reading {
+                MetricReading::Disk(mounts) => {
+                    assert_eq!(mounts.len(), MAX_MOUNTS);
+                    for mount in mounts {
+                        assert!(mount.mount_point.len() <= 64, "{mount:?}");
+                        assert!(mount.filesystem.len() <= 64, "{mount:?}");
+                    }
+                }
+                MetricReading::Temperature(sensors) => {
+                    assert_eq!(sensors.len(), MAX_SENSORS);
+                    for sensor in sensors {
+                        assert!(sensor.label.len() <= 64);
+                        assert!(
+                            !sensor.label.chars().any(char::is_control),
+                            "a control sequence reached an operator's terminal: {:?}",
+                            sensor.label
+                        );
+                    }
+                }
+                MetricReading::FanSpeed(sensors) => {
+                    assert_eq!(sensors.len(), MAX_SENSORS);
+                    assert!(sensors.iter().all(|sensor| sensor.label.len() <= 64));
+                }
+                other => panic!("unexpected reading {other:?}"),
+            }
+        }
+
+        // The answer list itself is bounded by the closed vocabulary, so a peer cannot make a
+        // caller iterate over more answers than there are kinds.
+        let flood: Vec<Value> = (0..500)
+            .map(|_| json!({"kind": "uptime", "status": "unavailable", "reason": "no_instrument"}))
+            .collect();
+        assert_eq!(
+            decode_metric_answers(json!({"answers": flood}))
+                .unwrap()
+                .len(),
+            MetricKind::ALL.len()
+        );
+
+        // A kind or a status this build cannot read is refused, never guessed at.
+        for hostile in [
+            json!({"answers": [{"kind": "gpu", "status": "served", "sampled_at_ms": 1, "reading": {}}]}),
+            json!({"answers": [{"kind": "cpu", "status": "estimated"}]}),
+            json!({"answers": [{"kind": "swap", "status": "unavailable"}]}),
+        ] {
+            assert!(
+                decode_metric_answers(hostile.clone()).is_err(),
+                "decoded a frame it should have refused: {hostile}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn delivery_ids_dedupe_and_restart_as_an_honest_unknown_without_persisting_arguments() {

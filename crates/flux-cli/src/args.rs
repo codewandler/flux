@@ -1543,6 +1543,17 @@ pub(super) enum HostAction {
         #[arg(long, value_enum, default_value_t)]
         output: AgentOutput,
     },
+    /// Read one binding's own condition: CPU, load, memory, swap, disk, uptime, temperature and
+    /// fans, measured by that substrate about itself. A metric it cannot measure is reported as
+    /// explicitly unavailable with a reason — never as zero — and a remote binding's readings are
+    /// marked as remotely reported.
+    Metrics {
+        /// Binding name to measure.
+        id: String,
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
+    },
 }
 
 /// `flux eval <adapter>` — the benchmark suites flux-eval can drive. A typo'd adapter is a parse
