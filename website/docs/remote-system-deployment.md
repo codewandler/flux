@@ -186,7 +186,7 @@ check with no negotiation window, so a mixed pair does not degrade — it refuse
 A client whose release disagrees with the daemon's fails at connect, before any operation is sent:
 
 ```
-remote-system protocol mismatch: local 2, remote 3
+remote-system protocol mismatch: local 3, remote 2
 ```
 
 The daemon enforces the same rule per request, answering `400 Bad Request` with
