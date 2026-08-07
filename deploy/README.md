@@ -62,33 +62,62 @@ daemon that refuses to start. That is the intended failure.
 
 ## Release identity and provenance
 
-An image is built from a release, not alongside one:
+Every release publishes the image. Pull it — nothing needs building:
 
 ```sh
-deploy/container/build-image.sh --release 0.58.0
+docker pull ghcr.io/codewandler/flux-system:<version>
 ```
 
-This downloads the published `flux-cli-x86_64-unknown-linux-gnu.tar.xz` for that tag, checks it
-against its published `.sha256` sidecar, and repacks that exact binary into the image. The bytes in
-the layer are the bytes the release workflow's `actions/attest` step attested, so
-`gh attestation verify` against the archive covers the binary in the image:
+That is the reference both Kustomize bases pin as `newName`, so `kubectl apply -k deploy/kubernetes`
+works against any cluster that can reach `ghcr.io`.
+
+### What the published image contains
+
+The release workflow's `publish-container-image` job repacks the *released* archive: the
+`flux-cli-x86_64-unknown-linux-gnu.tar.xz` that the `attest` job already attested and the Release
+already published, re-checked against its `.sha256` sidecar before it becomes a layer. It never
+compiles anything. So one binary is described by both attestations — the archive's and the image's:
 
 ```sh
-gh release download v0.58.0 --pattern 'flux-cli-x86_64-unknown-linux-gnu.tar.xz'
+# The image, by digest, with its provenance statement stored beside it in the registry.
+gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux
+
+# The archive inside it, if you want to check the binary independently.
+gh release download v<version> --pattern 'flux-cli-x86_64-unknown-linux-gnu.tar.xz'
 gh attestation verify flux-cli-x86_64-unknown-linux-gnu.tar.xz --repo codewandler/flux
 ```
 
-The version comes from `[workspace.package].version` in the root `Cargo.toml` — the same one-liner
-`scripts/cut-release.sh`, `release.yml` and `crates-io.yml` read — so the image tag, the
-`org.opencontainers.image.version` label and the Kustomize image tag all name one release.
+### Building it yourself
+
+Locally reproducing the published image is the same script the release job runs:
+
+```sh
+deploy/container/build-image.sh --release <version>
+```
+
+This downloads the published archive for that tag, checks it against its published `.sha256`
+sidecar, and repacks that exact binary. `--staged DIR` is the same repack from a directory that
+already holds the archive — that is the mode CI uses, where the bytes arrive as the checked asset
+set rather than from a Release that does not exist yet.
+
+`deploy/container/build-image.sh --print-image` prints the registry path, which is where that path
+is written down: the publishing job checks its own `github.repository_owner` against it and refuses
+to push if they have drifted, and `crates/flux-cli/tests/deployment_artifacts.rs` checks both
+Kustomize profiles' `newName` against it.
 
 `--binary PATH` builds from a binary you already have. It is for development and for the container
 integration test, and it carries no release provenance; nothing built that way should be published.
 
-**Not yet wired:** no workflow pushes this image to a registry. The GitHub Release asset inventory is
-closed at 28 names and structurally enforced, so a published image belongs in a registry with its own
-job rather than as a release asset. Until that job exists, the image is built from a release rather
-than published with one.
+The version comes from `[workspace.package].version` in the root `Cargo.toml` — the same one-liner
+`scripts/cut-release.sh`, `release.yml` and `crates-io.yml` read — so the image tag, the
+`org.opencontainers.image.version` label and both Kustomize image tags all name one release.
+`scripts/cut-release.sh` restamps those two tags as part of the cut
+(`scripts/stamp-deployment-images.sh`), and refuses to finish while any shipped manifest still names
+the version being left behind.
+
+The image is published to a registry rather than attached to the GitHub Release on purpose: the
+release asset inventory is closed at 28 names and structurally enforced, and an image is not a
+release asset.
 
 ## Checks
 

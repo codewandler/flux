@@ -35,10 +35,17 @@ command: [/usr/local/bin/flux, app, run]
 args: [--no-sandbox, --store, /srv/flux/state, --serve=0.0.0.0:8787, --yes]
 ```
 
-Build that image from a release exactly as before — `deploy/container/build-image.sh --release
-<version>` — and push it to a registry your cluster can pull from. The provenance path
-(`gh attestation verify` against the published archive) covers this deployment unchanged, because
-it is the same bytes.
+That image is published by every release, so there is nothing to build or push:
+`ghcr.io/codewandler/flux-system:<version>`, which is what `deploy/agent/kustomization.yaml` already
+pins. Check its provenance the same way the substrate profile does — it is the same bytes:
+
+```sh
+gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux
+```
+
+To build it locally instead — an air-gapped registry, say — `deploy/container/build-image.sh
+--release <version>` produces the same image, and you then repoint `newName` at wherever you pushed
+it.
 
 ### 1. Create the two Secrets
 

@@ -28,7 +28,10 @@ labels:
 # surface is a different program inside one released binary, reached by the Deployment's `command:`
 # override. `deploy/kubernetes/kustomization.yaml` is the other place this pair is written, and
 # `deployment_artifacts.rs` derives one from the other so they cannot drift apart.
+#
+# `newTag` is restamped by the cut (`scripts/stamp-deployment-images.sh`); `newName` is the path the
+# release workflow publishes to. Neither is hand-maintained.
 images:
   - name: flux-system
-    newName: flux-system
+    newName: ghcr.io/codewandler/flux-system
     newTag: 0.58.0

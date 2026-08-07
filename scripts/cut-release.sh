@@ -9,10 +9,11 @@
 #   scripts/cut-release.sh <ver> --no-gate   # automated release-branch flow only; candidate gates
 #
 # It stages ONLY the release files (the root manifest + lock, both changelogs, the generated
-# website customer-changelog mirror, the docs archive embedded in flux-server, and the roadmap
-# status stamp) so concurrent uncommitted work from other sessions is never swept in. The plugin
-# pack is NOT part of a flux cut: its crates sit on the independent 1.x protocol line (C-143), so
-# nothing under plugins/ is edited, re-locked, or staged here.
+# website customer-changelog mirror, the docs archive embedded in flux-server, the two deployment
+# profiles' image tag, and the roadmap status stamp) so concurrent uncommitted work from other
+# sessions is never swept in. The plugin pack is NOT part of a flux cut: its crates sit on the
+# independent 1.x protocol line (C-143), so nothing under plugins/ is edited, re-locked, or staged
+# here.
 #
 # It does NOT push. It prints the build-once sequence: stage HEAD on the versioned candidate ref,
 # prepare and verify its exact-SHA binary artifacts and receipt, then advance main and push the
@@ -70,7 +71,7 @@ echo "== cutting $OLD -> $NEW =="
 # is left behind: re-running the script would roll [Unreleased] a SECOND time and mint a phantom
 # version section (this is the documented 0.14.3 gap; it recurred cutting 0.28.0). So snapshot every
 # file this script may touch and restore it on ANY non-zero exit before the commit.
-RELEASE_FILES=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip docs/roadmap.md)
+RELEASE_FILES=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip docs/roadmap.md deploy/kubernetes/kustomization.yaml deploy/agent/kustomization.yaml)
 SNAPSHOT="$(mktemp -d)"
 for f in "${RELEASE_FILES[@]}"; do
   [ -f "$f" ] || continue
@@ -118,6 +119,13 @@ if [ "$old_pin" != "$new_pin" ]; then
     echo "   bumped $pin_before publish-closure pin(s) $old_pin -> $new_pin in Cargo.toml"
   fi
 fi
+
+# 1c) restamp the shipped deployment profiles' image tag (C-696). Both Kustomize bases pin the
+#     released image, and the cut used to leave them alone: every release therefore shipped
+#     manifests advertising the PREVIOUS version's image, so the binary and the manifests disagreed
+#     the moment the tag was pushed. The helper also refuses to finish while any shipped manifest
+#     still names $OLD, which is the postcondition the transaction above can restore from.
+scripts/stamp-deployment-images.sh "$OLD" "$NEW"
 
 # 2) re-lock the root workspace so its lockfile carries $NEW. plugins/Cargo.lock is untouched:
 #    nothing a flux cut changes appears in it (C-143).
@@ -194,7 +202,7 @@ fi
 # So: commit by pathspec (`--only`, which commits exactly these paths from the working tree and
 # leaves any other staged work alone), and include the roadmap only when its sole change is the
 # stamp this script just made.
-COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip)
+COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip deploy/kubernetes/kustomization.yaml deploy/agent/kustomization.yaml)
 if git diff --quiet HEAD -- docs/roadmap.md; then
   : # unchanged (no stamp needed, or the file has no status line) — nothing to commit
 elif diff -q <(git show "HEAD:docs/roadmap.md" 2>/dev/null) "$SNAPSHOT/docs/roadmap.md" >/dev/null 2>&1; then
@@ -207,7 +215,7 @@ fi
 
 git commit --only "${COMMIT_PATHS[@]}" -m "chore(release): cut $NEW" -m "- Bump workspace + publish-closure versions $OLD -> $NEW and re-lock the root workspace.
 - Roll CHANGELOG and WHATS-NEW [Unreleased] -> [$NEW], including the generated website mirror.
-- Restamp the roadmap status line." || { echo "!! commit failed" >&2; exit 1; }
+- Restamp the deployment profiles' image tag and the roadmap status line." || { echo "!! commit failed" >&2; exit 1; }
 # Past this point the cut is in history: restoring the working tree would undo nothing useful and
 # would clobber the committed state, so disarm the snapshot.
 COMMITTED=1

@@ -26,7 +26,13 @@ labels:
 # The image tag is the release identity. It is pinned here rather than in the Deployment so one edit
 # moves the whole profile, and so the artifact contract test can check this single place against
 # [workspace.package].version.
+#
+# `newName` is the image the release workflow publishes, so `kubectl apply -k` works against a
+# cluster that can reach ghcr.io without building anything first. `scripts/cut-release.sh` restamps
+# `newTag` as part of the cut (`scripts/stamp-deployment-images.sh`) — do not hand-edit it, and do
+# not point `newName` somewhere the release does not push: `deployment_artifacts.rs` checks both
+# against `deploy/container/build-image.sh`, and the publishing job refuses to run if they disagree.
 images:
   - name: flux-system
-    newName: flux-system
+    newName: ghcr.io/codewandler/flux-system
     newTag: 0.58.0
