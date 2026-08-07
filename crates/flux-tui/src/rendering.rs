@@ -536,6 +536,110 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
         );
     }
 
+    // C-543: the loop selector and the short overlay one selection raises. Both use the shared
+    // overlay chrome, and both draw before the approval sheet at the end of this function.
+    if let Some(selector) = &state.loop_selector {
+        let t = &state.theme;
+        let visible_entries = selector.matches();
+        let (start, visible) = overlay_window(selector.sel, visible_entries.len(), 10);
+        let selected = selector.sel.min(visible_entries.len().saturating_sub(1));
+        let width = frame.area().width.min(76);
+        let header = if selector.query.is_empty() {
+            " loops · type to filter · Enter select · Esc close ".to_string()
+        } else {
+            format!(
+                " loops · filter: {} · Enter select · Esc close ",
+                selector.query
+            )
+        };
+        // The mark is the resolved binding, not a filename: the row an operator is already running
+        // and the header's `loop …@…` segment are the same identity.
+        let current = state
+            .loop_binding
+            .as_ref()
+            .map(|binding| format!("{}@{}", binding.profile, binding.revision));
+        let rows: Vec<Line> = visible_entries
+            .iter()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+            .map(|(offset, index)| {
+                let row = start + offset;
+                let entry = &selector.entries[*index];
+                let label = entry.label();
+                let marker = if current.as_deref() == Some(label.as_str()) {
+                    "●"
+                } else {
+                    " "
+                };
+                let text = format!(
+                    " {} {marker} {label}  · {}",
+                    if row == selected { "▸" } else { " " },
+                    entry.origin()
+                );
+                let style = if row == selected {
+                    Style::default()
+                        .fg(state.theme.accent)
+                        .bg(state.theme.sel_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    state.theme.panel_style()
+                };
+                Line::styled(truncate(&text, width as usize), style)
+            })
+            .collect();
+        let counter =
+            (visible_entries.len() > visible).then_some((selected + 1, visible_entries.len()));
+        render_overlay_panel(
+            frame,
+            t,
+            Line::styled(header, t.accent_style().bg(t.panel_bg)),
+            rows,
+            counter,
+            76,
+        );
+    }
+
+    if let Some(overlay) = &state.loop_overlay {
+        let t = &state.theme;
+        let width = frame.area().width.min(76) as usize;
+        let mut rows: Vec<Line> = Vec::new();
+        if let Some(refusal) = &overlay.refusal {
+            // The full reason is also pushed to the transcript as a notice, so a narrow overlay
+            // truncating it here never costs the operator the explanation.
+            rows.push(Line::styled(
+                truncate(&format!(" {refusal}"), width),
+                t.warn_style().bg(t.panel_bg),
+            ));
+        }
+        for line in &overlay.description {
+            rows.push(Line::styled(
+                truncate(&format!(" {line}"), width),
+                t.muted_style().bg(t.panel_bg),
+            ));
+        }
+        if !overlay.description.is_empty() && !overlay.structure.is_empty() {
+            rows.push(Line::styled(" ", t.panel_style()));
+        }
+        for line in &overlay.structure {
+            rows.push(Line::styled(
+                truncate(&format!(" {line}"), width),
+                t.panel_style(),
+            ));
+        }
+        render_overlay_panel(
+            frame,
+            t,
+            Line::styled(
+                format!(" loop {} · Esc close ", overlay.title),
+                t.accent_style().bg(t.panel_bg),
+            ),
+            rows,
+            None,
+            76,
+        );
+    }
+
     // C-518: the historical observatory is an explicit sibling of C-140's live `/usage` overlay.
     // Its rows are monochrome-complete text; the active theme supplies presentation only.
     if let Some(observatory) = &state.observatory {

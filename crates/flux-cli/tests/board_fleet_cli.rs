@@ -3054,6 +3054,65 @@ fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     );
 }
 
+/// C-631 (R-10, failing first): harvest before the pause. A worker that commits its deliverable and
+/// then runs out of turn leaves that work in a worktree nothing has recorded; parking on top of it
+/// buries a finished story under a decision — three separate waves once held the same completed story,
+/// were parked as failures, and a human dug the commits out days later. `park` records what the
+/// worktrees already prove, and says what it harvested.
+#[test]
+fn parking_a_wave_harvests_committed_work_before_the_pause() {
+    let (root, story) = one_story_wave("park-harvest");
+    let commit = commit_result(&story, "delivered");
+
+    let parked = flux(
+        &root,
+        &[
+            "fleet",
+            "park",
+            "wave-2",
+            "--reason",
+            "waiting on the API decision",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        parked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parked.stdout)
+    );
+    let parked: serde_json::Value = serde_json::from_slice(&parked.stdout).unwrap();
+    assert_eq!(parked["data"]["status"], "parked");
+    let harvested = parked["data"]["harvested"]
+        .as_array()
+        .expect("the park reports what it harvested");
+    let recorded = harvested
+        .iter()
+        .find(|report| report["item"] == "repo/C-1")
+        .unwrap_or_else(|| panic!("the parked wave's story is reported: {harvested:?}"));
+    assert_eq!(recorded["recorded"], true, "{recorded}");
+    assert_eq!(recorded["commit"], commit);
+
+    // The harvest is journalled, so the commit the pause could have buried survives a restart as a
+    // recorded handoff rather than as an unread worktree.
+    let events = flux(
+        &root,
+        &["fleet", "events", "--limit", "200", "--output", "json"],
+    );
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert!(
+        events["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "wave.park.harvested"),
+        "the harvest is journalled: {}",
+        events["data"]["events"]
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
 /// C-639: parking used to live in a driver-owned text file — invisible to `fleet status`, so a parked
 /// wave was re-decided every minute, and unparking meant editing text. Parking is a lifecycle state of
 /// the wave, with a reason, and returning from it is a verb.

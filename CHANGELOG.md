@@ -326,6 +326,39 @@ All notable changes to this project are documented in this file. The format is b
   a v4 peer lacking them never retried, and the zero default is the truthful reading rather than a
   fabricated one.
 
+- **A named host binding trusts the private CA it declares (C-684).** `[[host]]` gains `ca_cert`, a
+  path to a trust anchor, honoured identically by `remote`, `microvm`, `ssh` and (once wired)
+  `kubernetes` bindings across selection, `probe` and the metrics read. Before this, `--remote-ca`
+  existed and the named binding — the entity Decision 0018 built to *replace* that flag — had no
+  equivalent, so every cluster-issued or self-signed endpoint was reachable by URL and not by name.
+  The CA is read through `GuardedHostFiles::read_file_scoped` with the declared path as both
+  request and scope, so naming a file admits that file and not its directory, both sides reduced to
+  physical identities first; `--remote-ca` moved to the same reader, because leaving the flag jailed
+  would have recreated the same defect with the flag as the odd one out. The read is capped where
+  the previous unscoped read had no cap at all, and an oversized file is refused for its size
+  rather than falling through to be reported as malformed. A certificate that does not chain is
+  refused with the TLS failure named — the error now walks its source chain — and no
+  `--insecure`-style escape exists.
+
+- **A TUI loop selector with a visualizing overlay (C-543).** The resolved loop binding — profile,
+  revision and digest as the engine admitted it under C-569, never an ambient filename — renders as
+  a header segment; a hotkey opens a selector over the `*.flux` loops found by rescanning the loop
+  directories on every open, so a loop authored while the UI runs appears without a restart; and a
+  selection raises an overlay visualizing the outer loop's structure alongside its description.
+  Selecting is an explicit new-session or re-admission decision rather than a silent switch of a
+  running agent, which is why the session tracks the binding it has already admitted separately
+  from the one the next start would use.
+
+- **`flux fleet drive` — native tick mechanics for the unattended driver (C-631, partial).** The
+  driver's control loop moves out of a 582-line bash script that parsed `state.json` three ways
+  with no revision guard and could not be edited while running. The native command inherits the
+  authored planner, retro and scribe loops unchanged — the judgment was always outside the script —
+  and replaces only the mechanics: status fingerprinting, wave-state advancement, handoff
+  reconstruction, snapshot accumulation and dispatch width, plus the park and claim contracts.
+  **Shipping incomplete by design:** the story's last acceptance item is deleting the bash
+  autopilot once drive reaches parity, which has not happened, so both exist in this release and
+  the story stays open.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

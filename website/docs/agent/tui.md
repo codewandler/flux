@@ -46,6 +46,15 @@ and a crossed hard ceiling `limit`, and shows nothing at all when no budget is d
 come from the enforcing ledger, not from a second tally kept by the UI — see
 [time and token budgets](./cli.md#time-and-token-budgets).
 
+The header also names the loop the agent runs — `loop adaptive@1 8f3c…`, the resolved profile,
+revision and abbreviated source digest, never a filename. `F3` opens the loop selector: it rescans
+the workspace's `.flux/loops` directory on every open (so a loop authored while the TUI runs appears
+without a restart) and always offers the shipped `adaptive@1` preset. Type to filter, `Enter`
+selects, `Esc` closes. Selecting raises a short overlay showing the loop's description and its outer
+structure, and the choice takes effect on the next start. A session that has already run a turn has
+admitted its loop: the selector then refuses and names the new-session/re-admission path instead of
+switching a running agent.
+
 ## Board and Fleet operations
 
 Ordinary `flux tui` remains a standalone chat and says so in the header. Fleet attachment is always
@@ -118,6 +127,7 @@ runs.
 | `Ctrl-D` | Quit — only when the session is idle **and** the composer is empty. |
 | `F1` | Open the help overlay (`F1`, `Esc`, `q`, or `Enter` closes it). |
 | `F2` | Open/close the attached Board + Fleet operations view. No effect in standalone chat. |
+| `F3` | Open the loop selector: the live set of `*.flux` loops plus the built-in preset. Type to filter, `Enter` switches the agent's loop for its next start and shows the loop's structure and description, `Esc` closes. |
 | `Esc` | Dismiss the active popup, cancel a queue edit, or clear a half-typed slash command. |
 
 ### Terminal support for the newline keys

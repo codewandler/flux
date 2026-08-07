@@ -48,6 +48,26 @@ A port-forwarded endpoint resolves to a loopback address, so the client needs it
 `--allow-private-net` grant. The certificate's SAN has to match the URL you actually type — a
 certificate issued for the in-cluster Service name will not validate against `127.0.0.1`.
 
+The `flux-system-tls` Secret above almost always holds a certificate issued by a cluster or
+operator CA rather than a public one, which is what `--remote-ca ca.pem` is trusting. To reach the
+same deployment *by name* instead, declare the CA on the binding — a `[[host]]` entry takes
+`ca_cert` for exactly this:
+
+```toml
+[[host]]
+id = "cluster"
+backend = "kubernetes"
+url = "https://127.0.0.1:8790"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+ca_cert = "/etc/flux/cluster-ca.pem"
+grant = ["operator"]
+```
+
+Then `flux host probe cluster` verifies the endpoint against that CA, and `flux --host cluster …`
+executes on it. The path is read as you wrote it and may live outside the project — a cluster CA
+usually does. An unreadable or malformed `ca_cert` refuses the binding by name; it never falls back
+to the public trust store. See [Host bindings](../../website/docs/reference/config.md#host-bindings-host).
+
 ## What each file is for
 
 | File | Why it exists |
