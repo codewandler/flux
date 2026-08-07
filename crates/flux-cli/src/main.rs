@@ -481,12 +481,14 @@ mod tests {
             Some(Commands::Context {
                 action:
                     ContextAction::Show {
+                        layer,
                         profile,
                         tools,
                         body,
                         json,
                     },
             }) => {
+                assert_eq!(layer, None, "no positional layer was given");
                 assert_eq!(profile, ContextProfile::General);
                 assert_eq!(tools, ["read", "edit"]);
                 assert!(body);

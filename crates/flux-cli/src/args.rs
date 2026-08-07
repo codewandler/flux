@@ -987,6 +987,11 @@ pub(super) enum IntegrationAction {
 pub(super) enum ContextAction {
     /// Show the ordered context manifest. Bodies are omitted unless explicitly requested.
     Show {
+        /// Show one layer instead of all of them: its manifest row and its body, without needing
+        /// `--body`. Accepts the layer id (`git`) or an unambiguous prefix of one. `--json` carries
+        /// every manifest field.
+        #[arg(value_name = "LAYER")]
+        layer: Option<String>,
         /// Agent behavior profile to include after the universal harness protocol.
         #[arg(long, value_enum, default_value_t)]
         profile: ContextProfile,
