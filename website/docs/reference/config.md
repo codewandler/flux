@@ -611,6 +611,25 @@ sshd accepts the variable (`AcceptEnv FLUX_REMOTE_SYSTEM_TOKEN`) so the local si
 through the ssh channel. The token is never passed as a command-line argument on either machine,
 because arguments are visible in a process table to everyone on the box.
 
+**The far machine also needs a way to confine what it serves.** `flux system serve` is an unattended
+surface, so its confinement floor is `require`: on a machine with no usable backend (no bubblewrap
+on Linux, no `sandbox-exec` on macOS) it refuses to start rather than serving your work unconfined
+by accident. flux reports that as its own failure — *"the far side's flux … refused to start because
+that machine has no usable confinement backend"* — and it is deliberately **not** the same message
+as a missing binary, because the fix is different and it lives over there. You have two honest
+options, both on the far machine: install a confinement backend, or point `binary` at a small
+launcher of your own that accepts unconfined operation explicitly.
+
+```sh
+#!/bin/sh
+# /usr/local/bin/flux-serve — this machine has no bubblewrap; accept that deliberately.
+exec /usr/local/bin/flux --no-sandbox "$@"
+```
+
+The binding declares *which* binary to run; the far machine's startup posture stays the far
+machine's to declare. flux will not pass `--no-sandbox` on your behalf — bypassing confinement is an
+escalation, and an escalation you did not write down is one nobody can audit.
+
 **What the tunnel does and does not do.** It carries the connection; it does not authenticate it.
 The bearer token still authenticates every request, the certificate is still verified against
 `server_name`, and a version mismatch still refuses to pair — a far side reached over ssh is admitted
@@ -636,9 +655,12 @@ Four more things worth knowing before you declare one.
   *path*; openssh opens it and flux never reads the material. An `ssh://user:pass@host` url is
   refused — an ssh binding authenticates by key.
 - **Every failure names its piece.** No sshd reachable, a host key that is not the one on record, a
-  key sshd declined, no flux binary at the declared path, nothing serving and no certificate to
-  start one with, a refused handshake — each is a distinct message. Nothing ever falls back to
-  running the effect on your own machine.
+  key sshd declined, no flux binary at the declared path, a flux that is there and refused to start
+  (with its own words, and its own face when the reason is confinement), nothing serving and no
+  certificate to start one with, a refused handshake — each is a distinct message. "Not installed"
+  and "installed and would not start" are told apart by the far side's exit status rather than by
+  its wording, so they stay distinct whatever login shell that machine uses. Nothing ever falls back
+  to running the effect on your own machine.
 - **Two sessions do not fight.** Starting a serve is idempotent because the far side's bind address
   is the arbiter: a second session that tries loses the bind, its attempt exits, and it attaches to
   the serve that won. `flux host probe` never starts one at all — a probe is side-effect-free, so

@@ -293,6 +293,37 @@ fn local_system(dir: &Path) -> System {
     System::new(Workspace::new(dir).expect("a local workspace"))
 }
 
+/// A far side deliberately configured to **refuse to start**.
+///
+/// `requirements()` hands back a wrapper that has already accepted unconfined operation, which is
+/// what lets the chain run where no confinement backend exists. This is its opposite, and it is the
+/// only way to reach the refusal face from a test: a far side that requires confinement and has
+/// none. It execs the built binary rather than that wrapper, because the wrapper's `FLUX_SANDBOX=off`
+/// is set at exec time and would win over anything set around it.
+///
+/// The environment is applied on the *far* side of the link, so this reproduces the same refusal
+/// whether or not the machine running the tests has bubblewrap installed.
+fn far_side_that_refuses_to_start(dir: &Path) -> PathBuf {
+    // Same convention `requirements()` uses to find the built binary; derived rather than taken
+    // from `Requirements`, whose `flux` is the accept-unconfined wrapper.
+    let flux = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent()?.parent().map(|d| d.join("flux")))
+        .expect("the built flux binary beside this test");
+    let path = dir.join("flux-without-a-backend");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nexec env FLUX_SANDBOX=require FLUX_BWRAP_BIN=/nonexistent/bwrap \
+             FLUX_SANDBOX_EXEC_BIN=/nonexistent/sandbox-exec {} \"$@\"\n",
+            flux.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
 struct Fixture {
     _dir: TempDir,
     _sshd: Sshd,
@@ -669,6 +700,97 @@ async fn the_tunnel_never_substitutes_for_the_protocols_bearer_auth() {
         other => panic!("expected an authentication refusal from the protocol, got {other}"),
     }
     drop(started);
+}
+
+/// A far side that ran and **refused to start** is not a far side with nothing installed.
+///
+/// This is the defect that broke the release candidate. `flux system serve` is an unattended
+/// surface at a `require` confinement floor, so on a machine with no bubblewrap it refuses to
+/// start — and the first classifier read the words "bwrap not found on PATH" as "no flux binary
+/// there". An operator following that would go install a binary already sitting at the path the
+/// message names, while the actual fix — install a confinement backend on the far machine, or point
+/// `binary` at something that accepts unconfined operation explicitly — stayed buried inside a
+/// nested error string.
+///
+/// This is also the drift detector for the far side's own wording: it produces the refusal from a
+/// real `flux system serve`, so renaming it fails here rather than silently degrading the face.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_far_side_that_cannot_confine_says_so_rather_than_blaming_a_missing_binary() {
+    let Some(mut fixture) = fixture("confinement") else {
+        return;
+    };
+    fixture.bootstrap.plan.binary = far_side_that_refuses_to_start(fixture._dir.path())
+        .display()
+        .to_string();
+    fixture.bootstrap.plan.start_timeout = Duration::from_secs(45);
+
+    let started = Instant::now();
+    let refused = connect_ssh_system(
+        &fixture.local,
+        &fixture.bootstrap,
+        TOKEN.to_string(),
+        &loopback_grant(),
+    )
+    .await
+    .expect_err("a far side that cannot confine cannot serve");
+
+    match &refused {
+        SshAdmissionError::Bootstrap(SshRefusal::FarSideCannotConfine { binary, .. }) => {
+            assert!(binary.contains("flux-without-a-backend"), "{binary}");
+        }
+        other => panic!("expected a far-side confinement refusal, got {other}"),
+    }
+    let said = refused.to_string();
+    // The wrong answer, named so it cannot come back.
+    assert!(
+        !said.contains("has no flux binary"),
+        "the binary is there and ran; saying otherwise sends an operator to install it twice: \
+         {said}"
+    );
+    // The right one, with the far side's own fix carried through rather than buried.
+    assert!(
+        said.contains("confinement") && said.contains("--no-sandbox"),
+        "the refusal names confinement and the escape that resolves it: {said}"
+    );
+    // And it does not burn the whole start window first: a serve that exited for a reason other
+    // than losing the far-side bind is answered now, not at the deadline.
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "a far side that refused to start is reported promptly, not after the start deadline"
+    );
+}
+
+/// …and the genuinely missing binary keeps its own face — told apart by the shell's **exit status**
+/// rather than by a phrase some other error could also contain. 127 is "the shell could not find
+/// it" and 126 is "found, not executable"; nothing a running flux prints can forge either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_far_side_binary_is_still_its_own_face() {
+    let Some(mut fixture) = fixture("missing-binary") else {
+        return;
+    };
+    let absent = fixture._dir.path().join("no-flux-installed-here");
+    fixture.bootstrap.plan.binary = absent.display().to_string();
+    fixture.bootstrap.plan.start_timeout = Duration::from_secs(45);
+
+    let refused = connect_ssh_system(
+        &fixture.local,
+        &fixture.bootstrap,
+        TOKEN.to_string(),
+        &loopback_grant(),
+    )
+    .await
+    .expect_err("a far side with no flux cannot serve");
+
+    match &refused {
+        SshAdmissionError::Bootstrap(SshRefusal::NoFarSideBinary { binary, .. }) => {
+            assert!(binary.contains("no-flux-installed-here"), "{binary}");
+        }
+        other => panic!("expected a missing-binary refusal, got {other}"),
+    }
+    assert!(
+        refused.to_string().contains("operator's step"),
+        "installing it stays the operator's step (the C-480 boundary): {refused}"
+    );
 }
 
 /// Belt and braces for the fixture itself: the daemon really is scoped, so a green run above is not
