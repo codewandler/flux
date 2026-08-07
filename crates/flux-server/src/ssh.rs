@@ -53,6 +53,10 @@ use crate::system::{HttpDelegate, SystemHandshake};
 /// How often the far side is re-asked for admission while a started serve comes up.
 const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How long a serve child that has exited is given to flush its last words before they are read
+/// and classified.
+const SERVE_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Everything the composition needs beyond the local half's plan: the name the far side's
 /// certificate carries, and the PEM whose roots this binding trusts.
 #[derive(Debug, Clone)]
@@ -216,14 +220,29 @@ pub async fn admit_ssh_substrate(
 
     let deadline = std::time::Instant::now() + plan.start_timeout;
     let mut last = refusal;
+    let mut serve_died_at: Option<std::time::Instant> = None;
     loop {
         if !tunnel.is_alive() {
             return Err(SshAdmissionError::Bootstrap(tunnel.diagnose()));
         }
-        // A serve session that exited without the far side becoming admissible is the informative
-        // case: a missing far-side binary says so in the shell's own words. It is only consulted
-        // once the deadline has passed, because of the idempotency race — a serve that *lost* the
-        // far-side bind exits too, and a later handshake attaches to the session that won it.
+        // A serve that exited without the far side becoming admissible is the informative case, and
+        // it is answered *now* rather than at the deadline — a far side that refused to start will
+        // not change its mind, and making an operator wait out the whole start window for an answer
+        // already sitting in the transcript is a worse error than a slower one.
+        //
+        // The single exception is the idempotency race: a serve that *lost* the far-side bind also
+        // exits, and the session that won it is about to start answering. That one is waited out,
+        // which is exactly what the bind-as-mutex contract asks for.
+        if !tunnel.serve_running() {
+            // Give the child's output a moment to flush before reading it. The tolerated case is
+            // recognised *from* the transcript, and a drain that had not caught up yet would turn
+            // the idempotency race into a spurious refusal — a grace of two seconds against a start
+            // window of tens of them.
+            let died = *serve_died_at.get_or_insert_with(std::time::Instant::now);
+            if died.elapsed() >= SERVE_EXIT_GRACE && !tunnel.serve_lost_the_bind() {
+                return Err(SshAdmissionError::Bootstrap(tunnel.diagnose_serve(plan)));
+            }
+        }
         if std::time::Instant::now() >= deadline {
             return Err(SshAdmissionError::Bootstrap(if tunnel.serve_running() {
                 SshRefusal::StartTimeout {

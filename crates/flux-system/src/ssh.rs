@@ -82,8 +82,24 @@ pub enum SshRefusal {
     HostKeyMismatch { target: String, detail: String },
     /// sshd answered and declined the key. Every interactive fallback is off by construction.
     AuthRefused { target: String, detail: String },
-    /// The declared far-side flux binary is not at that path (or not on `PATH`).
+    /// The declared far-side flux binary is not at that path (or not on `PATH`), or is there and
+    /// not executable. Established by the far side's **exit status** — see [`SshTunnel::diagnose_serve`].
     NoFarSideBinary { binary: String, detail: String },
+    /// The far-side flux binary is there, ran, and refused to start the serve. Its own words are
+    /// carried verbatim; flux does not restate another process's refusal in a second vocabulary.
+    ///
+    /// Distinct from [`NoFarSideBinary`](Self::NoFarSideBinary) because the two ask for opposite
+    /// things: one says install flux over there, the other says read what the flux that *is* over
+    /// there told you.
+    FarSideRefusedToStart { binary: String, detail: String },
+    /// The far side has no confinement backend and `flux system serve` — an unattended surface —
+    /// will not start unconfined without being told to.
+    ///
+    /// Its own face rather than a sub-case of a start refusal, because it is the one an operator
+    /// meets on any far machine without bubblewrap, and because the fix is specific and lives *over
+    /// there*: install a backend on the far machine, or point the binding's `binary` at something
+    /// that accepts unconfined operation explicitly.
+    FarSideCannotConfine { binary: String, detail: String },
     /// Nothing is serving the remote protocol on the far side and this binding cannot start one.
     NotServing { target: String, detail: String },
     /// A serve was started but never became admissible within the bounded wait.
@@ -115,6 +131,20 @@ impl fmt::Display for SshRefusal {
                 f,
                 "the far side has no flux binary at `{binary}`: {detail}. Installing it is the \
                  operator's step; this binding only starts or attaches to what is already there"
+            ),
+            Self::FarSideRefusedToStart { binary, detail } => write!(
+                f,
+                "the far side's flux at `{binary}` ran and refused to start the serve. It is \
+                 installed; this is its own refusal, in its own words — {detail}"
+            ),
+            Self::FarSideCannotConfine { binary, detail } => write!(
+                f,
+                "the far side's flux at `{binary}` refused to start because that machine has no \
+                 usable confinement backend — {detail}. The binary is installed and ran; nothing \
+                 needs installing again here. `flux system serve` is an unattended surface, so it \
+                 will not run unconfined by accident: fix it **on the far machine** by installing \
+                 a confinement backend there, or by pointing this binding's `binary` at a launcher \
+                 that accepts unconfined operation explicitly with `--no-sandbox`"
             ),
             Self::NotServing { target, detail } => write!(
                 f,
@@ -369,6 +399,10 @@ impl SshPlan {
 pub struct SshChild {
     child: Mutex<ManagedChild>,
     transcript: Mutex<String>,
+    /// The exit status, remembered the first time the child is seen to have one. A status poll is
+    /// not guaranteed to keep answering after a child is reaped, and the classification below turns
+    /// on this number, so it is captured rather than re-asked for.
+    exit_code: Mutex<Option<i32>>,
     what: &'static str,
 }
 
@@ -377,6 +411,7 @@ impl SshChild {
         Self {
             child: Mutex::new(child),
             transcript: Mutex::new(String::new()),
+            exit_code: Mutex::new(None),
             what,
         }
     }
@@ -390,7 +425,22 @@ impl SshChild {
             transcript.push_str(&out);
             transcript.push_str(&err);
         }
-        child.status().running
+        let status = child.status();
+        if !status.running {
+            if let Some(code) = status.exit_code {
+                self.exit_code.lock().unwrap().get_or_insert(code);
+            }
+        }
+        status.running
+    }
+
+    /// The exit status of a child that has finished, if it reported one.
+    ///
+    /// For a session carrying a remote command this is the **far side's** status: ssh exits with
+    /// the remote command's own, reserving 255 for its own failures.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.poll();
+        *self.exit_code.lock().unwrap()
     }
 
     /// Everything the child has said, capped by the guarded spawn path's own output cap.
@@ -584,37 +634,85 @@ impl SshTunnel {
             .is_some_and(SshChild::is_alive)
     }
 
-    /// Diagnose a serve session that exited. The far side's shell reports a missing binary as
-    /// `command not found`, which is the one face worth naming exactly: installing flux there is
-    /// the operator's step, so "not installed" and "would not start" are different conversations.
+    /// Diagnose a serve session that exited, from its **exit status** first.
+    ///
+    /// The status is the structural signal and the words are only the detail, because the words are
+    /// not ours: they come from the far side's login shell (which may be `sh`, `fish`, `zsh`, …,
+    /// each with its own phrasing) and from a far-side flux that is free to reword its own errors.
+    /// An earlier version classified on phrases alone and got two things wrong at once — it read
+    /// "bwrap **not found** on PATH" as a missing flux binary, and it failed to recognise a genuinely
+    /// missing binary under a shell that says `Unknown command` rather than `command not found`.
+    ///
+    /// POSIX pins what the phrases do not: the shell exits **127** when it cannot find the command
+    /// and **126** when it finds one it cannot execute, and ssh reserves **255** for its own
+    /// failures and otherwise passes the remote command's status through. Any other status means
+    /// the far-side flux ran and decided something, so the answer is *its* refusal, not a guess
+    /// about its absence.
     pub fn diagnose_serve(&self, plan: &SshPlan) -> SshRefusal {
-        let transcript = self.serve_transcript().unwrap_or_default();
-        let said = transcript.to_ascii_lowercase();
-        if said.contains("command not found")
-            || said.contains("no such file or directory")
-            || said.contains("not found")
-        {
-            return SshRefusal::NoFarSideBinary {
-                binary: plan.binary.clone(),
-                detail: redact_empty(&transcript),
+        let guard = self.serve.lock().unwrap();
+        let Some(serve) = guard.as_ref() else {
+            return SshRefusal::NotServing {
+                target: plan.target.display(),
+                detail: "no serve session was started for this binding".to_string(),
             };
+        };
+        let transcript = serve.transcript();
+        let detail = redact_empty(&transcript);
+        match serve.exit_code() {
+            // The shell could not run what it was handed. This is the only status that means
+            // "install flux over there", and nothing a running flux prints can forge it.
+            Some(127) => SshRefusal::NoFarSideBinary {
+                binary: plan.binary.clone(),
+                detail,
+            },
+            Some(126) => SshRefusal::NoFarSideBinary {
+                binary: plan.binary.clone(),
+                detail: format!("{detail} (found, but the far side could not execute it)"),
+            },
+            // ssh's own reserved status, or a child with no status to report: the session failed
+            // rather than the command, so the ssh-level faces apply.
+            Some(255) | None => serve.diagnose(&plan.target),
+            // The binary ran. Whatever it says, it is installed — so the answer is its refusal.
+            Some(_) => classify_far_side_start(plan, &transcript, detail),
         }
-        if said.contains("host key verification failed") || said.contains("permission denied") {
-            return self
-                .serve
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|child| child.diagnose(&plan.target))
-                .unwrap_or_else(|| SshRefusal::Unreachable {
-                    target: plan.target.display(),
-                    detail: redact_empty(&transcript),
-                });
-        }
-        SshRefusal::StartTimeout {
-            target: plan.target.display(),
-            detail: redact_empty(&transcript),
-        }
+    }
+
+    /// Whether a started serve exited because it lost the far side's bind to another session.
+    ///
+    /// This is the one exit worth *waiting out* rather than reporting: it is the idempotency race
+    /// working as designed, and the session that won is about to start answering. Every other exit
+    /// is reported immediately instead of burning the whole start window first.
+    pub fn serve_lost_the_bind(&self) -> bool {
+        let guard = self.serve.lock().unwrap();
+        guard.as_ref().is_some_and(|serve| {
+            let said = serve.transcript().to_ascii_lowercase();
+            said.contains("address already in use") || said.contains("address in use")
+        })
+    }
+}
+
+/// Which refusal a far-side flux that *ran* produced.
+///
+/// The confinement case earns its own face because it is the one every far machine without a
+/// confinement backend meets, and its fix lives on that machine. It is recognised by phrases the
+/// serving surface owns — and if those are ever reworded, the fallback is
+/// [`SshRefusal::FarSideRefusedToStart`], which still carries the far side's words verbatim and
+/// still says the binary is installed. A missed phrase costs specificity here; it can never
+/// resurrect the wrong claim.
+fn classify_far_side_start(plan: &SshPlan, transcript: &str, detail: String) -> SshRefusal {
+    let said = transcript.to_ascii_lowercase();
+    if said.contains("sandbox required")
+        || said.contains("sandbox profile refused")
+        || (said.contains("sandbox") && said.contains("unavailable"))
+    {
+        return SshRefusal::FarSideCannotConfine {
+            binary: plan.binary.clone(),
+            detail,
+        };
+    }
+    SshRefusal::FarSideRefusedToStart {
+        binary: plan.binary.clone(),
+        detail,
     }
 }
 
@@ -854,13 +952,111 @@ mod tests {
                 "could not reach",
             ),
         ] {
-            let child = SshChild {
-                child: Mutex::new(ManagedChild::from_handle(Silent)),
-                transcript: Mutex::new(said.to_string()),
-                what: "forward",
-            };
+            let child = exited(said, 255);
             let refusal = child.diagnose(&target).to_string();
             assert!(refusal.contains(expect), "`{said}` → {refusal}");
+        }
+    }
+
+    /// A serve session that exited is classified by its **exit status**, not by phrases.
+    ///
+    /// This is the regression pin for the defect that broke a release candidate: the far side's
+    /// confinement refusal contains the words "bwrap **not found** on PATH", and a phrase-first
+    /// classifier read that as a missing flux binary — sending an operator to install something
+    /// already installed. The same phrase-first rule also missed a genuinely absent binary under a
+    /// login shell that says `Unknown command` instead of `command not found`. POSIX pins the two
+    /// statuses that actually mean "the shell could not run it"; everything else means the far-side
+    /// flux ran and decided something.
+    #[test]
+    fn a_far_side_that_ran_is_never_reported_as_one_that_is_not_installed() {
+        let plan = plan();
+
+        // The real refusal, verbatim from `flux system serve` on a machine with no bubblewrap.
+        let confinement = "Error: unattended sandbox profile refused to start remote \
+             execution-system serving surface: config error: sandbox required \
+             (FLUX_SANDBOX=require / [sandbox] require) but unavailable: bubblewrap (bwrap) not \
+             found on PATH — install it or set FLUX_BWRAP_BIN. To accept unconfined operation \
+             explicitly, use --no-sandbox";
+        let refusal = tunnel_whose_serve(exited(confinement, 1)).diagnose_serve(&plan);
+        assert!(
+            matches!(refusal, SshRefusal::FarSideCannotConfine { .. }),
+            "a far side that ran and refused is not a far side without flux: {refusal:?}"
+        );
+        let said = refusal.to_string();
+        assert!(!said.contains("has no flux binary"), "{said}");
+        assert!(
+            said.contains("confinement") && said.contains("--no-sandbox"),
+            "{said}"
+        );
+
+        // 127 is the only thing that means "install flux over there" — and it holds whatever the
+        // far side's login shell calls the problem.
+        for shell_said in [
+            "sh: 1: /usr/local/bin/flux: not found",
+            "bash: /usr/local/bin/flux: command not found",
+            "fish: Unknown command: /usr/local/bin/flux",
+        ] {
+            let refusal = tunnel_whose_serve(exited(shell_said, 127)).diagnose_serve(&plan);
+            assert!(
+                matches!(refusal, SshRefusal::NoFarSideBinary { .. }),
+                "`{shell_said}` → {refusal:?}"
+            );
+        }
+        // Found, but not executable.
+        let refusal = tunnel_whose_serve(exited("permission denied", 126)).diagnose_serve(&plan);
+        assert!(
+            matches!(refusal, SshRefusal::NoFarSideBinary { .. }),
+            "{refusal:?}"
+        );
+
+        // A refusal this build does not recognise still says the binary is installed and still
+        // carries the far side's words — the fallback loses specificity, never correctness.
+        let refusal = tunnel_whose_serve(exited("Error: something new and unrecognised", 1))
+            .diagnose_serve(&plan);
+        match &refusal {
+            SshRefusal::FarSideRefusedToStart { detail, .. } => {
+                assert!(detail.contains("unrecognised"), "{detail}")
+            }
+            other => {
+                panic!("an unclassified far-side refusal must not be a missing binary: {other:?}")
+            }
+        }
+        assert!(refusal.to_string().contains("It is installed"), "{refusal}");
+    }
+
+    /// The one serve exit that is waited out rather than reported: the idempotency race.
+    #[test]
+    fn a_serve_that_lost_the_far_side_bind_is_the_tolerated_exit() {
+        assert!(
+            tunnel_whose_serve(exited(
+                "error: serve remote execution system: Address already in use (os error 98)",
+                1
+            ))
+            .serve_lost_the_bind(),
+            "a lost bind is the race working as designed, not a refusal"
+        );
+        assert!(
+            !tunnel_whose_serve(exited("Error: sandbox required but unavailable", 1))
+                .serve_lost_the_bind(),
+            "every other exit is answered now rather than at the deadline"
+        );
+    }
+
+    fn exited(said: &str, code: i32) -> SshChild {
+        SshChild {
+            child: Mutex::new(ManagedChild::from_handle(Silent)),
+            transcript: Mutex::new(said.to_string()),
+            exit_code: Mutex::new(Some(code)),
+            what: "serve",
+        }
+    }
+
+    fn tunnel_whose_serve(serve: SshChild) -> SshTunnel {
+        SshTunnel {
+            forward: exited("", 0),
+            serve: Mutex::new(Some(serve)),
+            local_port: 45_678,
+            target: SshTarget::parse("build@devbox").unwrap(),
         }
     }
 
