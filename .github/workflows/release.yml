@@ -741,6 +741,140 @@ jobs:
           GH_TOKEN: "${{ github.token }}"
         run: scripts/verify-github-release.sh "${{ needs.plan.outputs.tag }}"
 
+  # C-696: the container registry identity and nothing else.
+  #
+  # Both Kustomize profiles pin `newName: ghcr.io/<owner>/flux-system`, so something has to push
+  # that path or the shipped manifests name an image nobody can pull. This job is that something,
+  # and it is deliberately a THIRD authority rather than more power on an existing one: `host` still
+  # holds nothing, `attest` still holds only the attestation identity for the release archives, and
+  # `publish-github-release` still holds only the Release credential.
+  #
+  # The bytes: this job never compiles anything. It repacks `flux-cli-x86_64-unknown-linux-gnu.tar.xz`
+  # out of the SAME checked asset set the `attest` job attested and `publish-github-release`
+  # published, and `build-image.sh --staged` re-checks that archive against its published `.sha256`
+  # before it becomes a layer. So `gh attestation verify` on the release archive and on the image
+  # describe one binary. A fresh `cargo build` here would produce a plausible image containing a
+  # binary nothing attested — that is the failure mode this shape exists to make unavailable.
+  #
+  # The ordering: it needs `publish-github-release`, so an image is never pushed for a release that
+  # did not become public. The registry is the one publication that cannot be un-published.
+  #
+  # It carries `attestations`/`id-token: write` — which `scripts/check-release-integrity.sh`
+  # otherwise confines to `attest`. That check names this job explicitly, with the reason; read it
+  # there before adding a third name.
+  publish-container-image:
+    needs:
+      - plan
+      - host
+      - attest
+      - publish-github-release
+    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Collect the checked asset set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-staged-assets
+          path: artifacts
+      # Derived from the repository this run belongs to, then checked against the two places the
+      # path is written down. A fork, a rename or a half-finished registry move produces a mismatch
+      # here — before anything is pushed — rather than manifests pointing at a path this workflow
+      # never wrote to.
+      - name: Resolve and agree the published image reference
+        id: image
+        env:
+          OWNER: ${{ github.repository_owner }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error::$RELEASE_TAG is not a plain vX.Y.Z release tag"
+            exit 1
+          }
+          derived="ghcr.io/$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')/flux-system"
+          pinned=$(deploy/container/build-image.sh --print-image)
+          if [ "$derived" != "$pinned" ]; then
+            echo "::error::this repository publishes to $derived but deploy/container/build-image.sh names $pinned"
+            exit 1
+          fi
+          for profile in deploy/kubernetes/kustomization.yaml deploy/agent/kustomization.yaml; do
+            grep -Fqx "    newName: $derived" "$profile" || {
+              echo "::error::$profile does not pin newName: $derived"
+              exit 1
+            }
+            grep -Fqx "    newTag: $version" "$profile" || {
+              echo "::error::$profile does not pin newTag: $version; the cut did not restamp it"
+              exit 1
+            }
+          done
+          echo "name=$derived" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "reference=$derived:$version" >> "$GITHUB_OUTPUT"
+      - name: Build the image from the released binary
+        env:
+          REFERENCE: ${{ steps.image.outputs.reference }}
+          VERSION: ${{ steps.image.outputs.version }}
+        run: |
+          set -euo pipefail
+          deploy/container/build-image.sh --staged artifacts --version "$VERSION" --tag "$REFERENCE"
+      # The job's own GITHUB_TOKEN, bounded by the `packages: write` above. No long-lived registry
+      # credential exists, so there is none to leak, rotate or scope wrongly.
+      - name: Sign in to the container registry
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+      - name: Publish the image
+        id: push
+        env:
+          REFERENCE: ${{ steps.image.outputs.reference }}
+        run: |
+          set -euo pipefail
+          docker push "$REFERENCE"
+          # The digest the registry accepted, read back from the local image's RepoDigests rather
+          # than scraped out of the push log. `|| true` keeps a no-match from aborting the step
+          # before the explicit check below can say what actually went wrong.
+          repo_digests=$(docker image inspect "$REFERENCE" \
+            --format '{{ range .RepoDigests }}{{ println . }}{{ end }}')
+          digest=$(printf '%s\n' "$repo_digests" \
+            | { grep -F "${REFERENCE%:*}@" || true; } | head -1 | cut -d@ -f2)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::could not read the pushed manifest digest for $REFERENCE"
+            exit 1
+          }
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # By digest, not by tag: a tag is mutable and an attestation that named one would describe
+      # whatever the tag points at later. `push-to-registry` puts the statement beside the image so
+      # `gh attestation verify oci://…` works without knowing anything about this run.
+      - name: Attest the published image
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+      - name: Record the published image
+        env:
+          REFERENCE: ${{ steps.image.outputs.reference }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Container image published"
+            echo "- Reference: \`$REFERENCE\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- Verify: \`gh attestation verify oci://$REFERENCE --repo $GITHUB_REPOSITORY\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   announce:
     needs:
       - plan

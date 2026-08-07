@@ -300,6 +300,50 @@ fn auth_exempt_routes() -> Vec<String> {
     routes
 }
 
+/// The value a `NAME=value` shell assignment gives, first occurrence, unquoted.
+fn shell_assignment(source: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    source.lines().map(str::trim).find_map(|line| {
+        line.strip_prefix(&prefix).map(|rest| {
+            rest.split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string()
+        })
+    })
+}
+
+/// The registry path the release publishes to, derived from the single repository identity
+/// `build-image.sh` holds. Restating it here would only prove this file agrees with itself, and a
+/// registry move would then have two places to happen.
+fn published_image() -> String {
+    let build = read(BUILD_IMAGE);
+    let repo = shell_assignment(&build, "REPO")
+        .unwrap_or_else(|| panic!("{BUILD_IMAGE} names the repository that owns the release"));
+    let registry = shell_assignment(&build, "REGISTRY").unwrap_or_else(|| {
+        panic!("{BUILD_IMAGE} must name the registry the release publishes to (`REGISTRY=`)")
+    });
+    let image_name = shell_assignment(&build, "IMAGE_NAME")
+        .unwrap_or_else(|| panic!("{BUILD_IMAGE} must name the published package (`IMAGE_NAME=`)"));
+    let owner = repo
+        .split_once('/')
+        .map(|(owner, _)| owner.to_string())
+        .unwrap_or(repo);
+    format!("{registry}/{owner}/{image_name}")
+}
+
+/// `[workspace.package].version` — the release identity every entry point reads the same way.
+fn workspace_version() -> String {
+    read("Cargo.toml")
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version = "))
+        .expect("[workspace.package].version")
+        .trim()
+        .trim_matches('"')
+        .to_string()
+}
+
 /// Every `--long-flag` an artifact hands to the daemon.
 fn flags_in(source: &str) -> Vec<String> {
     let mut flags: Vec<String> = Vec::new();
@@ -891,6 +935,56 @@ fn the_agent_profile_runs_the_released_image_and_never_a_second_one() {
         strays.is_empty(),
         "deploy/agent/ carries an image build recipe ({strays:?}) — the agent surface reuses \
          {DOCKERFILE}, and a second recipe is a second image to attest"
+    );
+}
+
+/// C-696: both profiles name an image somebody actually publishes, at the release they ship.
+///
+/// Two halves of one defect. `newName: flux-system` was a bare local name no workflow published, so
+/// the profiles were silently build-it-yourself; and `newTag` was never restamped by the cut, so
+/// every release shipped manifests advertising the PREVIOUS version. Pinning both here means a
+/// registry move or a missed restamp fails in ordinary CI rather than in an operator's cluster.
+#[test]
+fn the_profiles_pin_the_published_image_and_the_release_they_ship() {
+    let image = published_image();
+    let version = workspace_version();
+
+    for profile in [KUSTOMIZATION, AGENT_KUSTOMIZATION] {
+        let source = read(profile);
+        let name = yaml_scalar(&source, "newName:")
+            .unwrap_or_else(|| panic!("{profile} pins the image `newName:`"));
+        assert_eq!(
+            name, image,
+            "{profile} pins `newName: {name}`, which is not the path the release publishes to \
+             ({image}) — an operator applying this base cannot pull the image it names"
+        );
+        let tag = yaml_scalar(&source, "newTag:")
+            .unwrap_or_else(|| panic!("{profile} pins the image `newTag:`"));
+        assert_eq!(
+            tag, version,
+            "{profile} pins `newTag: {tag}` while [workspace.package].version is {version} — the \
+             cut must restamp this file (scripts/stamp-deployment-images.sh)"
+        );
+    }
+
+    // The release workflow publishes exactly that, and derives the owner from the repository it is
+    // running in rather than restating an org a fork would silently push past.
+    let workflow = read(".github/workflows/release.yml");
+    assert!(
+        workflow.contains("publish-container-image:"),
+        ".github/workflows/release.yml has no container publication job, so `newName: {image}` \
+         names a path nothing ever pushes"
+    );
+    assert!(
+        workflow.contains("github.repository_owner"),
+        ".github/workflows/release.yml must derive the registry owner from the repository, not \
+         hard-code it beside the copy in {BUILD_IMAGE}"
+    );
+    // Built from the checked asset set — the attested release binary — never a fresh compile.
+    assert!(
+        workflow.contains("--staged") && workflow.contains("deploy/container/build-image.sh"),
+        ".github/workflows/release.yml must build the published image from the staged release \
+         artifacts with {BUILD_IMAGE}, so the layer holds exactly the attested binary"
     );
 }
 

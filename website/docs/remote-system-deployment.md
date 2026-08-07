@@ -67,23 +67,32 @@ produces a daemon that refuses to start. That is the intended failure, not a bug
 
 ## Container profile
 
-Build the image from a release. The published `flux-cli-x86_64-unknown-linux-gnu.tar.xz` for that tag
-is downloaded, checked against its published `.sha256` sidecar, and repacked, so the binary in the
-layer is the binary the release workflow attested:
+Every release publishes the image. Pull it:
 
 ```sh
-deploy/container/build-image.sh --release 0.58.0
+docker pull ghcr.io/codewandler/flux-system:0.58.0
 ```
 
 The image runs only `flux system serve`, as uid 10001, and carries no bearer token, no TLS private key
-and no workspace content in any layer — all three are mounted at run time. Its version label and
-default tag come from the same workspace version every other release entry point reads.
+and no workspace content in any layer — all three are mounted at run time. Its version label and tag
+come from the same workspace version every other release entry point reads.
 
-Verify the provenance of the binary it carries:
+It is built by repacking the *released* `flux-cli-x86_64-unknown-linux-gnu.tar.xz` — the archive the
+release already attested and published, re-checked against its `.sha256` sidecar — so the binary in
+the layer is the binary the release workflow attested, and both carry provenance you can check:
 
 ```sh
+gh attestation verify oci://ghcr.io/codewandler/flux-system:0.58.0 --repo codewandler/flux
+
 gh release download v0.58.0 --pattern 'flux-cli-x86_64-unknown-linux-gnu.tar.xz'
 gh attestation verify flux-cli-x86_64-unknown-linux-gnu.tar.xz --repo codewandler/flux
+```
+
+To build the same image locally instead — an air-gapped registry, or a different base image — use
+the script the release job runs:
+
+```sh
+deploy/container/build-image.sh --release 0.58.0
 ```
 
 Run it with the workspace, TLS material and token mounted rather than baked:
@@ -91,7 +100,7 @@ Run it with the workspace, TLS material and token mounted rather than baked:
 ```yaml
 services:
   flux-system:
-    image: flux-system:0.58.0
+    image: ghcr.io/codewandler/flux-system:0.58.0
     read_only: true
     ports: ["127.0.0.1:8790:8790"]
     volumes:
@@ -198,7 +207,7 @@ window between the two is the expected behaviour and is safe; work in flight is 
 
 | Profile | Upgrade | Rollback |
 |---|---|---|
-| Container | `deploy/container/build-image.sh --release <new>`, then recreate the container against the same workspace volume. | Recreate against the previous image tag. The volume is untouched by either. |
+| Container | `docker pull ghcr.io/codewandler/flux-system:<new>` (or `deploy/container/build-image.sh --release <new>`), then recreate the container against the same workspace volume. | Recreate against the previous image tag. The volume is untouched by either. |
 | Kubernetes | Change `newTag` in `deploy/kubernetes/kustomization.yaml`, `kubectl apply -k`. `Recreate` guarantees the old pod releases the volume first. | `kubectl rollout undo deployment/flux-system`, or reapply the previous tag. |
 | VM / microVM | Re-run `install-flux-system.sh --version <new>`, then `systemctl restart flux-system`. | `cp /usr/local/bin/flux.previous /usr/local/bin/flux && systemctl restart flux-system`. |
 
