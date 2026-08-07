@@ -106,7 +106,37 @@ fn requirements(what: &str) -> Option<Requirements> {
     let Some(flux) = flux else {
         return disposition("a built `flux` binary beside this test");
     };
-    Some(Requirements { sshd, keygen, flux })
+    // The far side runs through a wrapper that accepts unconfined operation explicitly.
+    //
+    // `flux system serve` is an unattended surface at a `Require` sandbox floor, so on a machine
+    // with no confinement backend it refuses to start — correctly. CI runs one job with
+    // `FLUX_BWRAP_BIN=/nonexistent/bwrap` precisely to prove that posture holds, and without this
+    // wrapper the bootstrap chain simply cannot be exercised there.
+    //
+    // A loopback fixture is exactly the operator taking the documented `--no-sandbox` escape, the
+    // same one C-480's container profile takes for the same reason: the confinement lives outside
+    // the process. Using it unconditionally rather than only where bwrap is missing keeps this
+    // chain testing one thing in both CI jobs instead of two different things.
+    let wrapper = flux.with_file_name("flux-ssh-fixture-serve");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec env FLUX_SANDBOX=off {} \"$@\"\n",
+            flux.display()
+        ),
+    )
+    .expect("write the fixture's far-side wrapper");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("make the fixture's far-side wrapper executable");
+    }
+    Some(Requirements {
+        sshd,
+        keygen,
+        flux: wrapper,
+    })
 }
 
 fn free_port() -> u16 {
