@@ -33,3 +33,12 @@ that no local gate had refused. The same drift pattern is already queued again: 
       verifies and publishes through the existing idempotent workflow.
 - [ ] The unreleased `flux-secret` `HostRef` drift is caught by the new check on the next cut
       rather than by hand.
+
+## Progress
+
+- 2026-08-07: drift census across all six independently versioned crates, measured as src commits
+  since each crate's version field last moved: `flux-evidence` 1 (the released collision),
+  `flux-secret` **9** (queued for the next cut), `flux-datasource`/`flux-plugin-protocol`/
+  `flux-policy`/`flux-spec` 0. Blast radius makes the guard non-optional: `flux-evidence` has 17
+  lockstep dependents and `flux-spec` 16, so any unbumped drift in either poisons the entire
+  publish closure, not one crate.
