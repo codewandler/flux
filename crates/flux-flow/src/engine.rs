@@ -982,6 +982,30 @@ impl FlowEngine {
         Ok(())
     }
 
+    /// C-543: adopt an operator-selected loop binding for this engine's next start.
+    ///
+    /// One boundary reloads the executable program *and* its identity, re-validating the binding's
+    /// runtime features and the loaded loop against this engine's live registry — a surface can
+    /// never leave `agent_loop` disagreeing with `agent_loop_binding`, and a loop whose operations
+    /// this engine cannot serve is refused here rather than at the first model call.
+    ///
+    /// This is selection, not admission: [`FlowEngine::begin_turn_lifecycle`] still refuses a
+    /// binding that differs from the one a session already recorded, so adopting mid-session
+    /// remains a new-session/re-admission decision the caller has to make explicitly.
+    pub fn adopt_agent_loop_binding(&mut self, binding: AgentLoopBinding) -> Result<()> {
+        binding.validate_runtime(self.executor.registry())?;
+        let agent_loop =
+            load_agent_loop_with_iterations(binding.spec().clone(), self.max_iterations)?;
+        validate_agent_loop(
+            &agent_loop,
+            self.executor.registry(),
+            self.composites.active_for_session(""),
+        )?;
+        self.agent_loop = agent_loop;
+        self.agent_loop_binding = binding;
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn begin_turn_lifecycle(
         &self,
@@ -4040,6 +4064,32 @@ mod tests {
             .to_string();
         assert!(error.contains("requires a new session"), "{error}");
         assert_eq!(events.turns(&session).unwrap().len(), 1);
+    }
+
+    /// C-543: a loop selected from the TUI is adopted through one engine boundary that re-validates
+    /// the binding's runtime features and reloads the executable loop — a surface can never leave
+    /// `agent_loop` disagreeing with `agent_loop_binding`.
+    #[test]
+    fn adopting_a_selected_loop_binding_reloads_the_executable_loop() {
+        let (mut engine, _events, _requests) =
+            scripted_engine(Vec::new(), AgentLoopSpec::Flux(idle_agent_loop()));
+        let before = engine.agent_loop.clone();
+        let picked = AgentLoopBinding::native_flux(
+            "picked",
+            "1",
+            "/w/.flux/loops/picked.flux",
+            "picked",
+            "flow picked -> string\n  return \"picked\"\n",
+        )
+        .unwrap();
+
+        engine.adopt_agent_loop_binding(picked.clone()).unwrap();
+
+        assert_eq!(engine.agent_loop_binding, picked);
+        assert_ne!(
+            engine.agent_loop, before,
+            "the executable loop is reloaded, not only its identity"
+        );
     }
 
     #[test]

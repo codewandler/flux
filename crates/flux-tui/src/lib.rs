@@ -7,6 +7,7 @@
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
 pub mod attach;
+mod agent_loop;
 mod controller;
 pub mod fleet;
 mod interaction;
@@ -390,6 +391,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-C", "interrupt · clear · quit"),
     ("Ctrl-D", "quit (empty input)"),
+    ("F3", "select the agent's loop · ↵ switch · Esc close"),
     ("F1 / Esc", "open/close this help"),
 ];
 
@@ -1192,6 +1194,11 @@ impl ChatState {
             fleet_rows: Vec::new(),
             operations: None,
             attachment: None,
+            loop_binding: None,
+            loop_admitted: None,
+            loop_dirs: Vec::new(),
+            loop_selector: None,
+            loop_overlay: None,
         }
     }
 
@@ -2758,6 +2765,12 @@ impl ChatState {
         if let Some(segment) = self.budget_segment() {
             right.push(segment);
         }
+        // C-543: which loop drives this agent outranks cumulative counters — an operator who cannot
+        // see the harness cannot tell an implementation loop from the general explorer. The figures
+        // are the engine's resolved binding (C-569), not a filename this surface guessed.
+        if let Some(segment) = self.loop_segment() {
+            right.push(segment);
+        }
         // C-139: `↑` is now every prompt token the session sent (fresh + both cache tiers, summed
         // per model call), so the cache segment's hit % is a share OF it. The old `↑` was the
         // fresh-input side of each turn's last round, and `cache` was read+write added together —
@@ -3890,6 +3903,23 @@ where
         operations_refresh_token,
     } = services;
 
+    // C-543: the surface shows the loop binding the engine actually resolved (C-569) and offers the
+    // workspace's authored loops beside it. A session that already recorded a turn binding is
+    // admitted: the selector then names the new-session path instead of switching a running agent.
+    {
+        let engine = agent.read().await;
+        state.set_loop_binding(Some(engine.agent_loop_binding.metadata().clone()));
+        state.loop_dirs = agent_loop::loop_dirs_for(&engine.cwd);
+        let admitted = engine
+            .events
+            .turns(&state.session_id)
+            .ok()
+            .and_then(|turns| turns.last().and_then(|turn| turn.loop_binding.clone()));
+        if admitted.is_some() {
+            state.set_loop_admitted(admitted);
+        }
+    }
+
     let mut cancel = CancellationToken::new();
     let mut pending_reply: Option<(String, oneshot::Sender<ApprovalChoice>)> = None;
     let mut approval_queue: VecDeque<PendingApproval> = VecDeque::new();
@@ -4670,6 +4700,70 @@ where
                 }
                 if key.code == KeyCode::F(1) {
                     state.help_open = true;
+                    continue;
+                }
+
+                // C-543: the selection overlay — Esc/Enter/q close, everything else is swallowed.
+                if state.loop_overlay.is_some() {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                        state.close_loop_overlay();
+                    }
+                    continue;
+                }
+
+                // C-543: the loop selector. Choosing hands the resolved binding to the engine
+                // through its one adoption boundary; a refusal (an admitted session, an unreadable
+                // or unparseable loop) is reported and changes nothing.
+                if state.loop_selector.is_some() {
+                    let command = state
+                        .loop_selector
+                        .as_mut()
+                        .map(|selector| selector.handle_key(key))
+                        .unwrap_or(agent_loop::LoopSelectorCommand::None);
+                    match command {
+                        agent_loop::LoopSelectorCommand::None => {}
+                        agent_loop::LoopSelectorCommand::Close => state.close_loop_selector(),
+                        agent_loop::LoopSelectorCommand::Choose(index) => {
+                            let previous = state.loop_binding.clone();
+                            match state.choose_loop(index) {
+                                agent_loop::LoopSwitch::Adopt(binding) => {
+                                    let label = format!(
+                                        "{}@{}",
+                                        binding.metadata().profile,
+                                        binding.metadata().revision
+                                    );
+                                    let adopted =
+                                        agent.write().await.adopt_agent_loop_binding(*binding);
+                                    match adopted {
+                                        Ok(()) => state.push(Entry::Notice {
+                                            text: format!("next start runs loop {label}"),
+                                            sev: Sev::Info,
+                                        }),
+                                        Err(error) => {
+                                            // The engine refused the loop; the header must not go
+                                            // on naming one that will never run.
+                                            state.set_loop_binding(previous);
+                                            state.close_loop_overlay();
+                                            state.push(Entry::Notice {
+                                                text: error.to_string(),
+                                                sev: Sev::Err,
+                                            });
+                                        }
+                                    }
+                                }
+                                agent_loop::LoopSwitch::Refused(reason) => {
+                                    state.push(Entry::Notice {
+                                        text: reason,
+                                        sev: Sev::Warn,
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::F(3) {
+                    state.open_loop_selector();
                     continue;
                 }
 
@@ -6113,6 +6207,11 @@ fn start_turn(
     input: String,
 ) -> CancellationToken {
     let action_id = state.begin_action();
+    // C-543/C-569: this turn is the session's behavior admission. From here the recorded binding is
+    // what every later start of this session reconstructs, so the selector stops offering a silent
+    // switch and names the new-session path instead.
+    let admitted = state.loop_binding.clone();
+    state.set_loop_admitted(admitted);
     // C-140: a new *turn* starts the overlay's per-turn view empty. Deliberately here rather than
     // in `begin_action`, which also covers `/compact` — a maintenance action that would otherwise
     // erase the usage of the turn the user just watched finish. Session totals are untouched.
@@ -7284,7 +7383,10 @@ mod tests {
     #[test]
     fn help_overlay_lists_keys_and_all_commands() {
         let mut state = ChatState::new("mock".into());
-        let mut terminal = Terminal::new(TestBackend::new(80, 26)).unwrap();
+        // Tall enough for the whole exact-fit panel: the overlay is clipped to the frame, so a
+        // terminal shorter than its content would drop the last command row rather than the key
+        // rows — C-543's `F3` row made 26 one short of the full list.
+        let mut terminal = Terminal::new(TestBackend::new(80, 28)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(!screen(&terminal).contains("help · Esc close"));
 
