@@ -51,6 +51,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   zero, and readings that came from a remote machine are marked as reported by it rather than
   observed locally.
 
+- **Choosing a confined host no longer costs you the web.** Fetches and HTTP requests made under
+  a selected host now go out through the same reviewed, guarded egress path an ordinary run uses,
+  with the same private-network audit trail — and a host that genuinely cannot make requests
+  still refuses plainly instead of quietly sending them from somewhere else. Sub-agents now
+  inherit exactly the host their parent was running on, and nothing else.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
