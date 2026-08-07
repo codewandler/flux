@@ -523,7 +523,6 @@ _Debugging an agent today means reading a transcript after the fact and running 
 
 ### Recovery and inspection have no CLI, so every failure is hand-driven
 _The happy path has verbs. `fleet run`, `handoff`, `integrate`, `apply`, `reclaim` each do one thing well._
-- [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
 - [C-671 — A turn's evidence outlives the process that ran it](C-671-a-turn-s-evidence-outlives-the-process-that-ran-it.md) · Core · the receipt is written after the turn by the process that ran it, so a killed supervisor loses the commit sha, write set and test argv even though the commit landed
 
 ### Release trust residuals — 2026-08-04
@@ -1179,6 +1178,7 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-648 — A host config table, HostRef and session registry](C-648-a-host-config-table-hostref-and-session-registry.md) · Core · Decision 0018 rules 1-2: declare named hosts the way endpoints are declared; credential references, never values
 - [C-649 — flux host CLI family and host.* operations](C-649-flux-host-cli-family-and-host-operations.md) · Core · Decision 0018 rule 1: ls/add/show/rm/probe plus an ambient-gated host.* op group, mirroring the endpoint surface
 - [C-650 — A named host binding selects the execution substrate](C-650-a-named-host-binding-selects-the-execution-substrate.md) · Core · Decision 0018 rules 2 and 4: --host NAME resolves a registered binding to the selected ExecutionSystem; --remote stays as ephemeral sugar
+- [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)
