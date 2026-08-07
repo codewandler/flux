@@ -1236,6 +1236,7 @@ const GUARDED_PORT_TRAITS: &[&str] = &[
     "GuardedHostFiles",
     "GuardedWorkspaceFiles",
     "GuardedNetwork",
+    "GuardedMetrics",
 ];
 
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
@@ -3956,6 +3957,13 @@ impl Exec for Double {}
             ),
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
             ("crates/flux-system/src/port.rs", "GuardedNetwork", "System"),
+            // C-653. Read-only and measurement-only: the native metrics backend opens no file
+            // outside `/proc` and `/sys` (the roots are a value on the `System`, so a caller can
+            // narrow them but never widen them into the workspace), starts no process, and writes
+            // nothing. What the review is actually about is the *answer* shape — an unsupported
+            // metric must stay explicitly unavailable rather than becoming a zero a projection
+            // would read as a measurement.
+            ("crates/flux-system/src/port.rs", "GuardedMetrics", "System"),
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedProcess",
@@ -3979,6 +3987,14 @@ impl Exec for Double {}
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedNetwork",
+                "RemoteSystem",
+            ),
+            // C-653: an empty impl, so every metrics operation inherits `port.rs`'s `Unserved`
+            // denial. A delegating backend may not improvise a wire operation; C-654 is where the
+            // protocol gains one, and that commit replaces this entry with a delegating impl.
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedMetrics",
                 "RemoteSystem",
             ),
         ];
