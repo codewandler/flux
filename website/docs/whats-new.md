@@ -72,13 +72,25 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   still refuses plainly instead of quietly sending them from somewhere else. Sub-agents now
   inherit exactly the host their parent was running on, and nothing else.
 
-- **Deploy the remote execution system from shipped artifacts.** Flux now ships an OCI image
-  that runs only the serving daemon as a non-root user with no secrets in any layer, a Kubernetes
-  Kustomize base (one replica per workspace, persistent volume, TLS and bearer Secrets, and a
-  default-deny network policy), and a hardened VM/microVM guest unit with a cloud-init install
-  contract. Upgrade, rollback and version-mismatch behavior are documented per profile. Flux
-  still never provisions your Docker hosts, clusters or VMs — the artifacts run where you already
-  have somewhere to run them.
+- **Deploy the remote execution system from shipped, published artifacts.** Flux now ships a
+  container image that runs only the serving daemon as a non-root user with no secrets in any
+  layer, a Kubernetes Kustomize base (one replica per workspace, persistent volume, TLS and bearer
+  Secrets, a default-deny network policy), and a hardened VM/microVM guest unit with a cloud-init
+  install contract. Upgrade, rollback and version-mismatch behavior are documented per profile.
+
+  The image is published per release at `ghcr.io/codewandler/flux-system:<version>` — the released
+  binary repacked rather than rebuilt, so the image and the release archive describe the same
+  bytes — and both Kubernetes profiles point at it, restamped by the cut so the manifests you apply
+  and the binary they run can never name different versions. Check where it came from before you
+  run it:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux
+  ```
+
+  Building locally still works, for an air-gapped registry or a different base. Flux still never
+  provisions your Docker hosts, clusters or VMs — the artifacts run where you already have
+  somewhere to run them.
 
 - **A VM or microVM guest is a host you can name.** Declare `backend = "microvm"` in a `[[host]]`
   entry pointing at a guest that runs the serving daemon, and `--host <name>` runs guarded effects
@@ -107,14 +119,6 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   question in an unattended run, and your key stays a reference to a file flux never opens. Every
   failure names the piece that is missing — no sshd, an unrecognised host key, a key that was
   declined, no flux binary over there — and none of them quietly falls back to your own machine.
-
-- **Deploy the remote system from a published image.** Every release now publishes
-  `ghcr.io/codewandler/flux-system:<version>` — the released binary repacked, not rebuilt, so the
-  image and the release archive describe the same bytes — and both shipped Kubernetes profiles
-  point at it. Verify where it came from before you run it with
-  `gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux`.
-  Cutting a release restamps both profiles, so the manifests you apply and the binary they run can
-  no longer name different versions. Building locally still works for an air-gapped registry.
 
 - **Watch an agent that lives on a server, from your own terminal.**
   `flux tui --attach https://agent.internal:8787` points the full chat UI at an agent served by
