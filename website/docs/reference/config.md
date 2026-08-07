@@ -456,10 +456,11 @@ when you want the equivalent imperative surface. See [Endpoints](../agent/endpoi
 ## Host bindings (`[[host]]`)
 
 Each `[[host]]` table declares a named binding to an execution substrate. `id` and a `backend`
-kind (`local`, `sandboxed`, `container`, `kubernetes` or `remote`) are required; an unknown
-backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused rather
-than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a location
-(the same reference forms as endpoints), never a secret value; non-secret `labels` are optional.
+kind (`local`, `sandboxed`, `container`, `kubernetes`, `microvm` or `remote`) are required; an
+unknown backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused
+rather than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a
+location (the same reference forms as endpoints), never a secret value; non-secret `labels` are
+optional.
 Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
 user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
 
@@ -508,6 +509,30 @@ credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
 grant = ["operator"]
 labels = { region = "eu" }
 ```
+
+A granted `microvm` binding is a VM or microVM guest that serves that same remote protocol: the
+same authenticated client, the same handshake, the same credential *reference*. Flux never
+creates, starts, stops or destroys a guest — the binding consumes an endpoint that already exists.
+That endpoint comes to exist through the [VM or microVM guest
+profile](../remote-system-deployment.md#vm-or-microvm-profile) — a hardened service unit, an
+idempotent install contract and a cloud-init bootstrap in
+[`deploy/vm/`](https://github.com/codewandler/flux/tree/main/deploy/vm) — whose daemon binds
+`0.0.0.0:8790` inside the guest.
+
+```toml
+[[host]]
+id = "vm-guest"
+backend = "microvm"
+url = "https://guest.internal:8790"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+grant = ["operator"]
+```
+
+Declared without a `url`, a `microvm` binding is still legal, and honestly **unwired**: `flux host
+ls` says so and selection fails closed naming the missing endpoint, because that gap is closed by
+deploying the guest rather than by retrying. With one, `flux host probe <id>` reports the
+negotiated protocol version and the guest's own substrate identity, marked as remotely reported —
+the guest measured itself; this machine did not.
 
 `[exchange] host = "<binding>"` names the `[[host]]` entry serving the Exchange catalogue — the
 declared home for what the transitional `FLUX_EXCHANGE_URL`/token environment pair configures.
