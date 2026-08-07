@@ -422,6 +422,7 @@ _The substrate abstraction already exists — `flux-system` owns the guarded por
 - [C-674 — HTTP rides the remote protocol under a version bump](C-674-http-rides-the-remote-protocol-under-a-version-bump.md) · Core · Decision 0018 rule 5's deferred wire change; C-652's review fixed the shape constraints the frame must honor before secrets ride it
 - [C-675 — A selected native substrate serves HTTP](C-675-a-selected-native-substrate-serves-http.md) · Core · C-651/C-652 interplay: a sandboxed selection answers Unserved for web effects — fail-closed, and a capability gap both implementors flagged
 - [C-676 — A kubernetes binding resolves to a served pod substrate](C-676-a-kubernetes-binding-resolves-to-a-served-pod-substrate.md) · Core · Decision 0018 rule 3: compose the delivered remote protocol with the C-480 artifacts; today HostBackend::Kubernetes is 'unwired (selection fails closed)'
+- [C-677 — A microvm binding resolves to a served guest substrate](C-677-a-microvm-binding-resolves-to-a-served-guest-substrate.md) · Core · Decision 0018 rule 3 within C-480's boundary: flux never provisions a VM; a microvm host is the remote protocol served from the C-480 guest profile
 
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
