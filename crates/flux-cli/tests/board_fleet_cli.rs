@@ -3643,3 +3643,202 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     );
     fs::remove_dir_all(root).ok();
 }
+
+/// C-642: quiescing before an install is a verb, and it is safe in the order it does its two jobs.
+///
+/// The window is recorded before liveness is inspected, so the refusal that follows a live worker
+/// cannot be raced by a dispatch; and the verb itself fails while a worker turn is in flight, so
+/// `flux fleet quiesce && install` cannot walk past one the way a process-table scan did.
+#[test]
+fn fleet_quiesce_stops_dispatch_and_refuses_to_confirm_while_a_worker_is_in_flight() {
+    let root = fixture("quiesce-install-window");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/main.md"),
+        "Act as the only main coordinator and acknowledge the request.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/main.flux"),
+        "flow fleet-main -> string\n  result = task({ role: \"scout\", task: \"read-only fixture research\" })\n  return result\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/main-research.flux"),
+        "flow fleet-research -> string\n  return \"acknowledged\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/main-research.flux\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&dispatched.stderr)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let worker = dispatched["data"]["agents"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A prepared worker has no turn behind it, so record the state an operator actually installs
+    // into by mistake: a worker that is genuinely mid-turn, with no terminal receipt to settle it.
+    let state_path = root.join(".flux/fleet/state.json");
+    let set_worker_status = |status: &str| {
+        let mut state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        state["agents"][worker.as_str()]["status"] = serde_json::json!(status);
+        fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    };
+    set_worker_status("working");
+
+    let refused = flux(
+        &root,
+        &[
+            "fleet",
+            "quiesce",
+            "--reason",
+            "install a new binary",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "quiesce confirmed while a worker was in flight: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["class"], "conflict/precondition");
+    let refusal = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        refusal.contains(&worker),
+        "refusal did not name the live worker: {refusal}"
+    );
+
+    // ...and dispatch stopped anyway, because the window is recorded before liveness is inspected.
+    let blocked = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !blocked.status.success(),
+        "a quiesced fleet dispatched a wave: {}",
+        String::from_utf8_lossy(&blocked.stdout)
+    );
+    let blocked: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["class"], "conflict/precondition");
+    let blocked = blocked["error"]["message"].as_str().unwrap();
+    assert!(
+        blocked.contains("quiesced") && blocked.contains("install a new binary"),
+        "dispatch refusal did not name the recorded window: {blocked}"
+    );
+
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["data"]["quiesce"]["reason"], "install a new binary");
+
+    // Once the worker settles, the same command confirms instead of refusing.
+    set_worker_status("completed");
+    let confirmed = flux(
+        &root,
+        &[
+            "fleet",
+            "quiesce",
+            "--reason",
+            "install a new binary",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        confirmed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&confirmed.stdout),
+        String::from_utf8_lossy(&confirmed.stderr)
+    );
+    let confirmed: serde_json::Value = serde_json::from_slice(&confirmed.stdout).unwrap();
+    assert_eq!(confirmed["data"]["safe_to_install"], true);
+    assert_eq!(confirmed["data"]["in_flight"].as_array().unwrap().len(), 0);
+
+    // `resume` is the inverse: it lifts the recorded window and dispatch works again.
+    let resumed = flux(&root, &["fleet", "resume", "--output", "json"]);
+    assert!(
+        resumed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(
+        resumed["data"]["quiesce_lifted"]["reason"],
+        "install a new binary"
+    );
+
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        status["data"]["quiesce"].is_null(),
+        "resume left the window recorded: {status}"
+    );
+
+    let redispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        redispatched.status.success(),
+        "dispatch stayed refused after resume: stdout={} stderr={}",
+        String::from_utf8_lossy(&redispatched.stdout),
+        String::from_utf8_lossy(&redispatched.stderr)
+    );
+    fs::remove_dir_all(root).ok();
+}

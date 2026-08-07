@@ -545,6 +545,26 @@ tasks belong to `main`, a message belongs to the worker it names — and a resum
 continue its own assignment plus the items addressed to it and nothing else. Resuming a worker
 therefore neither shows nor acknowledges the coordinator's queue, so every item is still delivered at
 most once, to the agent it was addressed to.
+### Quiescing before an install
+
+Installing a new Flux binary while a wave is in flight is the one maintenance act that can corrupt a
+run in progress. `fleet quiesce` makes it a verb instead of a procedure.
+
+```sh
+flux fleet quiesce --reason "install 0.9.0" --output json
+flux fleet resume --output json
+```
+
+`quiesce` records a durable maintenance window on fleet state and then reports what is still moving.
+The window is recorded first and unconditionally: `run`, `spawn` and `task` refuse while it is set,
+so no wave can be dispatched between the check and the install. The command itself **fails** with
+`conflict/precondition` while any worker turn is still in flight, naming each one, so
+`flux fleet quiesce && install` cannot walk past a live worker. Re-run it once they settle to
+confirm; `data.safe_to_install` is the machine-readable form of that confirmation.
+
+Inspection, `handoff`, `integrate`, `apply` and `reclaim` stay available while quiesced — the window
+stops new work, it does not blindfold the operator. `fleet status` reports the window under
+`quiesce`, and only `fleet resume` lifts it.
 
 `status` and `dashboard` are bounded projections, not a dump of durable state. They report main
 state, active and attention worker counts, wave and item state, exact board references,

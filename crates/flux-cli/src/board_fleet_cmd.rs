@@ -815,6 +815,16 @@ pub(super) enum FleetAction {
     Validate,
     Start,
     Stop,
+    /// Stop dispatch and confirm no worker turn is in flight, so a new binary can be installed.
+    ///
+    /// The recorded quiesce refuses every dispatch until `flux fleet resume` lifts it, and the
+    /// command itself fails while a worker is still moving — so `flux fleet quiesce && install`
+    /// cannot proceed into a live wave.
+    Quiesce {
+        /// Why the fleet is being quiesced. Recorded on the state and in the journal.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Record and inspect goals the main coordinator must use for every planning decision.
     Goal {
         #[command(subcommand)]
@@ -1117,8 +1127,26 @@ struct FleetState {
     agents: BTreeMap<String, Value>,
     #[serde(default)]
     waves: BTreeMap<String, Value>,
+    /// C-642: the recorded maintenance window. `Some` means dispatch is stopped until
+    /// `flux fleet resume` lifts it. `default` keeps state files written before it existed loadable.
+    #[serde(default)]
+    quiesce: Option<QuiesceRecord>,
     #[serde(default)]
     idempotency: BTreeMap<String, StoredResult>,
+}
+
+/// C-642: the durable fact that dispatch is stopped, and why.
+///
+/// Recorded rather than derived, because process absence and a deliberate pause were previously
+/// indistinguishable: the operator's "is anything running?" test was a process-table scan, and a
+/// `pgrep` that matched its own shell reported idle while three workers ran.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct QuiesceRecord {
+    /// Operator-supplied cause, redacted like every other recorded string.
+    #[serde(default)]
+    reason: Option<String>,
+    /// The fleet revision this quiesce was recorded at, so the journal can be ordered against it.
+    since_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1384,6 +1412,7 @@ impl Default for FleetState {
             intake: BTreeMap::new(),
             agents: BTreeMap::new(),
             waves: BTreeMap::new(),
+            quiesce: None,
             idempotency: BTreeMap::new(),
         }
     }
@@ -4586,6 +4615,24 @@ fn run_fleet_action(
     mut state: FleetState,
     request: Option<Value>,
 ) -> Result<(String, Value, Vec<String>, u64)> {
+    // C-642: one place decides that a quiesced fleet admits no new work.
+    //
+    // Keeping the refusal here rather than at each dispatch site is the whole safety property.
+    // "Quiesce before installing a binary" used to be a procedure — scan for processes, stop what
+    // you find, install — and a procedure can be raced by a dispatch that lands between the scan
+    // and the install. A recorded flag consulted on the way into every admitting verb cannot be.
+    if let Some(quiesce) = state.quiesce.as_ref() {
+        if fleet_action_dispatches(&command.action) {
+            bail!(
+                "conflict/precondition: fleet is quiesced{}; run `flux fleet resume` before dispatching new work",
+                quiesce
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            )
+        }
+    }
     match &command.action {
         FleetAction::Skill => {
             let skill = fleet_skill();
@@ -4813,6 +4860,7 @@ worktree_root = ".flux/fleet/worktrees"
                 state.revision,
             ))
         }
+        FleetAction::Quiesce { reason } => fleet_quiesce(command, root, state, reason.as_deref()),
         FleetAction::Goal { action } => fleet_goal(command, root, state, action),
         FleetAction::Ingest {
             text,
@@ -5589,6 +5637,11 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Resume { target } => {
             let target = target.as_deref().unwrap_or("main");
             state.running = true;
+            // C-642: `resume` is the inverse of `quiesce`, so lifting the recorded maintenance
+            // window is part of resuming rather than a second thing to remember. A window that
+            // ended with the flag still set would be a fleet that silently refuses every later
+            // dispatch, which is the failure this verb pair exists to remove.
+            let quiesce_lifted = state.quiesce.take();
             let request = resume_request_for(&state, target);
             let spec = addressed_turn_spec(root, &state, target, request)?;
             let receipt = execute_and_record_agent_turn(command, root, &mut state, spec, None)?;
@@ -5599,11 +5652,11 @@ worktree_root = ".flux/fleet/worktrees"
                 root,
                 &state,
                 "fleet.resumed",
-                json!({"target": target, "consumed": consumed, "receipt": receipt}),
+                json!({"target": target, "consumed": consumed, "receipt": receipt, "quiesce_lifted": quiesce_lifted}),
             )?;
             Ok((
                 format!("{target} resumed from durable state"),
-                json!({"target": target, "ack": "completed", "consumed": consumed, "receipt": receipt}),
+                json!({"target": target, "ack": "completed", "consumed": consumed, "receipt": receipt, "quiesce_lifted": quiesce_lifted}),
                 vec![],
                 state.revision,
             ))
@@ -5793,12 +5846,26 @@ fn board_action_requires_member(action: &BoardAction) -> bool {
     )
 }
 
+/// The verbs that admit new work, and therefore the exact set a quiesce must refuse.
+///
+/// C-642. These three are what put a new process behind the fleet: a dispatched wave, an admitted
+/// agent, a coordinator task. Inspection, handoff, integration, acceptance and reclamation stay
+/// available while quiesced — a maintenance window that also blindfolded the operator would just be
+/// a worse `fleet stop`.
+fn fleet_action_dispatches(action: &FleetAction) -> bool {
+    matches!(
+        action,
+        FleetAction::Run { .. } | FleetAction::Spawn { .. } | FleetAction::Task { .. }
+    )
+}
+
 fn fleet_action_mutates(action: &FleetAction) -> bool {
     matches!(
         action,
         FleetAction::Init { .. }
             | FleetAction::Start
             | FleetAction::Stop
+            | FleetAction::Quiesce { .. }
             | FleetAction::Decisions { .. }
             | FleetAction::Goal {
                 action: FleetGoalAction::Set { .. } | FleetGoalAction::Remove { .. }
@@ -5969,6 +6036,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "validate",
         "start",
         "stop",
+        // Quiesce MUTATES: it records the durable maintenance window that refuses dispatch.
+        "quiesce",
         "goal",
         "ingest",
         "spawn",
@@ -6078,7 +6147,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -13198,6 +13267,85 @@ fn unpark_wave(
     ))
 }
 
+/// Stop dispatch, then confirm nothing is in flight — the two halves of a safe install window.
+///
+/// C-642. The order is the point. The quiesce is recorded FIRST and unconditionally, because
+/// admission has to stop before liveness is inspected: a wave dispatched between the inspection and
+/// the install is precisely the race this closes. Only then is in-flight work reported, and a fleet
+/// with a live worker turn returns a `conflict/precondition` error, so `flux fleet quiesce &&
+/// install` cannot walk past a running worker. Doing this by hand went wrong twice in one evening —
+/// once corrupting a full workspace test run — because a process-table scan answered "idle" while
+/// three workers ran.
+///
+/// Re-running the verb once those workers settle confirms the same, now-quiet, state; only
+/// `flux fleet resume` lifts the window.
+fn fleet_quiesce(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    reason: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let reason = reason
+        .map(|reason| redact(reason.trim()))
+        .filter(|reason| !reason.is_empty());
+    state.revision += 1;
+    let record = QuiesceRecord {
+        reason: reason.clone(),
+        since_revision: state.revision,
+    };
+    state.quiesce = Some(record.clone());
+    // The same derivation `fleet status` uses: a recorded terminal receipt, transition or dead
+    // supervisor settles a stale `working` row, so this never reports a ghost as in flight.
+    let in_flight = state
+        .agents
+        .iter()
+        .filter(|(_, agent)| worker_activity(agent) == WorkerActivity::Active)
+        .map(|(id, agent)| {
+            let assignment = &agent["assignment"];
+            json!({
+                "agent": bounded_status_text(id, 200),
+                "status": bounded_status_text(agent["status"].as_str().unwrap_or("unknown"), 40),
+                "board_ref": bounded_status_ref(assignment["board_ref"].as_str().or_else(|| agent["board_ref"].as_str())),
+                "wave": bounded_status_ref(assignment["wave"].as_str().or_else(|| agent["wave"].as_str())),
+            })
+        })
+        .collect::<Vec<_>>();
+    let settled = in_flight.is_empty();
+    let data = json!({
+        "schema": "flux.fleet-quiesce/v1",
+        "quiesced": true,
+        "reason": record.reason,
+        "since_revision": record.since_revision,
+        "in_flight": in_flight,
+        "safe_to_install": settled,
+    });
+    persist_fleet_mutation(command, root, &state, "fleet.quiesced", data.clone())?;
+    if !settled {
+        let names = data["in_flight"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|worker| worker["agent"].as_str().unwrap_or("worker").to_string())
+            .collect::<Vec<_>>();
+        bail!(
+            "conflict/precondition: dispatch is quiesced, but {} worker turn(s) are still in \
+             flight: {}. Wait for them to settle and re-run `flux fleet quiesce` before installing \
+             a new binary",
+            names.len(),
+            names.join(", ")
+        )
+    }
+    Ok((
+        format!(
+            "fleet quiesced at revision {}; no worker turn is in flight, so installing a new binary cannot race one",
+            record.since_revision
+        ),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
 fn fleet_control_mutation(
     command: &FleetCommand,
     root: &Path,
@@ -14204,6 +14352,12 @@ fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
         "root": bounded_status_text(&display_path(root), 500),
         "revision": state.revision,
         "running": state.running,
+        // C-642: a quiesced fleet must not read as a merely idle one — that ambiguity is what sent
+        // the operator to the process table in the first place.
+        "quiesce": state.quiesce.as_ref().map(|quiesce| json!({
+            "reason": quiesce.reason.as_deref().map(|reason| bounded_status_text(reason, 300)),
+            "since_revision": quiesce.since_revision,
+        })),
         "config": sources["config"],
         "limits": sources["limits"],
         "main": main,
@@ -14319,7 +14473,9 @@ fn fleet_status_human(data: &Value) -> String {
     let lines = [
         format!(
             "fleet: {} · revision {} · main {}{}",
-            if data["running"].as_bool().unwrap_or(false) {
+            if data["quiesce"].is_object() {
+                "quiesced"
+            } else if data["running"].as_bool().unwrap_or(false) {
                 "running"
             } else {
                 "stopped"
