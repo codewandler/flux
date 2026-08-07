@@ -1424,6 +1424,12 @@ mod tests {
                                 substrate: None,
                             })
                             .collect(),
+                        // …and a rate-limit report claiming this caller sat waiting for a week
+                        // (C-701).
+                        retries: crate::port::RetryReport {
+                            retries: 9_999,
+                            waited: Duration::from_secs(7 * 24 * 3_600),
+                        },
                     }))
                 })
             }
@@ -1462,6 +1468,12 @@ mod tests {
             .iter()
             .all(|(_, value)| value.len() <= crate::port::MAX_HEADER_TEXT_BYTES));
         assert_eq!(response.admits.len(), crate::port::MAX_PRIVATE_ADMITS);
+        assert_eq!(
+            response.retries.retries,
+            crate::port::MAX_REPORTED_RETRIES,
+            "a retry count is a claim about how long THIS caller waited, so it is bounded too"
+        );
+        assert_eq!(response.retries.waited, crate::port::MAX_REPORTED_WAIT);
         for admit in &response.admits {
             assert_eq!(
                 admit.substrate.as_deref(),
@@ -1507,6 +1519,7 @@ mod tests {
                         body: Vec::new(),
                         truncated: false,
                         admits: Vec::new(),
+                        retries: Default::default(),
                     })
                 })
             }

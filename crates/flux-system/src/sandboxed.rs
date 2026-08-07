@@ -898,6 +898,7 @@ mod tests {
                         body: Vec::new(),
                         truncated: false,
                         admits: Vec::new(),
+                        retries: Default::default(),
                     })
                 })
             }

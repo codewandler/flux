@@ -35,6 +35,7 @@ pub mod exchange;
 pub mod fetch;
 pub mod http;
 pub mod native_http;
+mod retry;
 
 pub use browser::{browser_group, chromium_present};
 pub use native_http::NativeHttp;
