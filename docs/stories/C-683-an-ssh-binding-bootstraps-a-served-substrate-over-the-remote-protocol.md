@@ -58,3 +58,43 @@ known-hosts bypass); the key is a credential *reference*, never a value in confi
 - The remote protocol serves TLS; the tunnel adds transport privacy but must not weaken the
   protocol's own auth or identity checks — reuse whatever loopback/pinned-identity form the
   delivered client already supports rather than inventing a bypass.
+
+## Design
+
+The binding is a **composition of two delivered things**, not a new substrate. Nothing implements a
+guarded port for `ssh`: what resolves is the delivered `RemoteSystem`, connected by the delivered
+`HttpDelegate`, over an ssh port-forward it happens to be holding open.
+
+**Bootstrap → attach → handshake** (`crates/flux-server/src/ssh.rs`):
+
+1. Reserve a loopback port through `GuardedNetwork::bind_tcp` — the one reviewed native listener
+   constructor — and release it.
+2. Spawn `ssh -N -L 127.0.0.1:<local>:127.0.0.1:<serve_port>` through `System::spawn_background`,
+   the guarded process path. Wait, bounded, for the local end to accept. A client that dies first is
+   diagnosed from its own words into `Unreachable` / `HostKeyMismatch` / `AuthRefused` / `NoKey`.
+3. Handshake through the forward with the binding's bearer token. Admitted → **attached**.
+4. Refused: if the far side *answered* (an `Error::Config` version refusal, or an HTTP status) the
+   protocol's own refusal is surfaced verbatim — starting a serve cannot change either answer. If
+   nothing answered, `AttachOnly` (every `probe`, and any binding with no far-side `cert`/`key`)
+   refuses naming the missing piece; `VerifyOrStart` runs one pinned remote command —
+   `<binary> system serve --bind 127.0.0.1:<serve_port> --cert … --key …` — over a second session
+   and re-handshakes until a bounded deadline.
+5. `RemoteSystem::tethered(tunnel)`: the substrate **owns** the tunnel, so it is released exactly
+   when the substrate is, on every path.
+
+**Idempotency has no lock.** The far side's `--bind` is the mutex: a second local session that
+starts a serve while one is listening loses the bind, its child exits, and its next handshake
+attaches to the winner. Nothing in flux reserves or reaps a far-side process, so the failure mode is
+"one attempt exits", never "one session kills the other's substrate".
+
+**Where the pieces live.** `crates/flux-system/src/ssh.rs` owns the local half — the pinned argv,
+the live `SshTunnel`, the typed `SshRefusal`s — because the ssh client is an OS process and that is
+the crate that spawns them. `crates/flux-server/src/ssh.rs` owns the state machine, because the
+protocol client lives there. `crates/flux-cli/src/ssh_host.rs` resolves a `HostRef` into a plan,
+turning both credential *references* into a key path and a token. The three `host_cmd.rs` arms are
+thin.
+
+**Two consequences worth stating.** `probe` never starts a far-side serve — the family defines a
+probe as side-effect-free, and launching a process on someone's build machine is an effect; and
+`-F none` means neither ssh config file is read, so the `[[host]]` entry is the whole declaration
+rather than something a file the binding never named can change.

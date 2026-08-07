@@ -24,6 +24,7 @@ mod a2a;
 mod listener;
 pub mod public_docs;
 mod resource;
+pub mod ssh;
 pub mod system;
 
 use std::convert::Infallible;

@@ -1507,7 +1507,9 @@ pub(super) enum HostAction {
     Add {
         /// The binding name (a bare name, e.g. `build-farm`).
         id: String,
-        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes` or `remote`.
+        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes`, `ssh` or `remote`. An
+        /// `ssh` binding's far-side contract (`[[host]].ssh`) is declarative only — declare the
+        /// binding here, then add the sub-table if it needs more than the defaults.
         #[arg(long)]
         backend: String,
         /// Bare `scheme://host[:port]` for backends with an address — no embedded credentials.

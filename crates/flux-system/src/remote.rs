@@ -506,6 +506,16 @@ fn settle<T>(delivered: Delivered<T>) -> Result<T> {
     }
 }
 
+/// A local resource the link depends on for its whole life — the near end of a bootstrap the
+/// protocol itself knows nothing about (C-683's ssh port-forward is the first).
+///
+/// It is a marker rather than a capability on purpose. A lifeline is never *called*: the substrate
+/// only has to hold it, so that the thing carrying the link cannot be dropped while requests are
+/// still riding it, and is dropped the moment the substrate is. Anything reachable through a
+/// lifeline would be a second, unreviewed way to reach the transport, so there is nothing here to
+/// reach.
+pub trait TransportLifeline: Send + Sync {}
+
 /// The guarded-IO port, served by a [`Delegate`].
 ///
 /// Every operation is a straight hand-off: this type holds no workspace, opens no file and starts no
@@ -514,6 +524,9 @@ fn settle<T>(delivered: Delivered<T>) -> Result<T> {
 pub struct RemoteSystem {
     delegate: Arc<dyn Delegate>,
     identity: SubstrateIdentity,
+    /// What the link is riding on, when something local had to be held open for it. `None` for
+    /// every directly-addressed endpoint, which is every binding but `ssh`.
+    lifeline: Option<Arc<dyn TransportLifeline>>,
 }
 
 impl RemoteSystem {
@@ -527,13 +540,35 @@ impl RemoteSystem {
                 confinement: "unreported by remote substrate".into(),
                 remotely_reported: true,
             },
+            lifeline: None,
         }
     }
 
     /// Serve the port from `delegate` with identity established by a transport handshake.
     pub fn identified(delegate: Arc<dyn Delegate>, mut identity: SubstrateIdentity) -> Self {
         identity.remotely_reported = true;
-        Self { delegate, identity }
+        Self {
+            delegate,
+            identity,
+            lifeline: None,
+        }
+    }
+
+    /// Tie a [`TransportLifeline`] to this substrate's own lifetime (C-683).
+    ///
+    /// The bootstrap that produced the link is not part of the protocol and must not outlive what
+    /// rides it, so ownership rather than a session-scoped registry: the tunnel is released exactly
+    /// when the substrate is, on every path including a panic, and no second place has to remember
+    /// to clean it up.
+    pub fn tethered(mut self, lifeline: Arc<dyn TransportLifeline>) -> Self {
+        self.lifeline = Some(lifeline);
+        self
+    }
+
+    /// Whether this substrate is holding a bootstrap open (C-683). The identity a caller displays
+    /// is the far side's, which cannot say this — the near end is local knowledge.
+    pub fn is_tethered(&self) -> bool {
+        self.lifeline.is_some()
     }
 
     /// Serve the port by delegating to an **in-process** substrate — the local-first path, which

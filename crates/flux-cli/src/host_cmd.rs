@@ -19,7 +19,29 @@ pub(super) fn backend_from_config(kind: flux_config::HostBackendKind) -> HostBac
         flux_config::HostBackendKind::Sandboxed => HostBackend::Sandboxed,
         flux_config::HostBackendKind::Container => HostBackend::Container,
         flux_config::HostBackendKind::Kubernetes => HostBackend::Kubernetes,
+        flux_config::HostBackendKind::Ssh => HostBackend::Ssh,
         flux_config::HostBackendKind::Remote => HostBackend::Remote,
+    }
+}
+
+/// The `ssh` sub-table, converted across the same crate boundary [`backend_from_config`] crosses
+/// (C-683). An unparseable `token_ref` is dropped rather than guessed: the resolution seam then
+/// refuses by name against the delivered default, which is a better error than a silently wrong
+/// variable.
+pub(super) fn ssh_from_config(entry: &flux_config::HostSshEntry) -> flux_secret::host::HostSsh {
+    flux_secret::host::HostSsh {
+        binary: entry.binary.clone(),
+        serve_port: entry.serve_port,
+        workspace: entry.workspace.clone(),
+        cert: entry.cert.clone(),
+        key: entry.key.clone(),
+        ca: entry.ca.clone(),
+        known_hosts: entry.known_hosts.clone(),
+        server_name: entry.server_name.clone(),
+        token_ref: entry
+            .token_ref
+            .as_deref()
+            .and_then(|reference| flux_secret::Ref::parse(reference).ok()),
     }
 }
 
@@ -47,6 +69,9 @@ pub(super) fn host_ref_from_parts(
         (HostBackend::Remote, None) => {
             bail!("remote host `{id}` needs a `url` (the `flux system serve` endpoint it binds)")
         }
+        (HostBackend::Ssh, None) => {
+            bail!("ssh host `{id}` needs a `url` naming where sshd is (`ssh://user@host[:port]`)")
+        }
         (HostBackend::Local | HostBackend::Sandboxed, Some(_)) => {
             bail!("host `{id}` binds the {backend} substrate, which has no address; drop `url`")
         }
@@ -56,7 +81,13 @@ pub(super) fn host_ref_from_parts(
         if url.trim().is_empty() {
             bail!("host url must not be empty when given");
         }
-        if url_has_userinfo(url) {
+        // An ssh target's `user@host` is a **login name**, not a credential — the credential is the
+        // key, and it stays a reference. The target parser refuses an embedded password on exactly
+        // the grounds the generic userinfo check refuses one, so the rule holds for both shapes.
+        if backend == HostBackend::Ssh {
+            flux_system::ssh::SshTarget::parse(url)
+                .map_err(|refusal| anyhow::anyhow!("host `{id}`: {refusal}"))?;
+        } else if url_has_userinfo(url) {
             bail!(
                 "url must not embed credentials (`user:pass@…`); pass the bare host and put the \
                  credential location in `credential_ref` (e.g. `env/FLUX_REMOTE_SYSTEM_TOKEN`)"
@@ -104,7 +135,13 @@ pub(super) fn merge_config_hosts(
             &host.grant,
             host.labels.clone(),
         ) {
-            Ok(reference) => registry.put(HostRecord::config(reference)),
+            Ok(mut reference) => {
+                // The `ssh` sub-table rides on the binding rather than through the shared
+                // constructor: it is one backend's far-side contract, not an invariant every
+                // binding shares, so it stays out of the constructor's signature.
+                reference.ssh = host.ssh.as_ref().map(ssh_from_config);
+                registry.put(HostRecord::config(reference))
+            }
             Err(e) => eprintln!(
                 "{}",
                 style::dim(&format!("(ignoring invalid [[host]] `{}`: {e})", host.id))
@@ -142,6 +179,7 @@ pub(super) fn config_kind_from_backend(backend: HostBackend) -> flux_config::Hos
         HostBackend::Sandboxed => flux_config::HostBackendKind::Sandboxed,
         HostBackend::Container => flux_config::HostBackendKind::Container,
         HostBackend::Kubernetes => flux_config::HostBackendKind::Kubernetes,
+        HostBackend::Ssh => flux_config::HostBackendKind::Ssh,
         HostBackend::Remote => flux_config::HostBackendKind::Remote,
     }
 }
@@ -297,6 +335,28 @@ pub(super) async fn resolve_named_host(
             "host `{name}` binds the `{backend}` backend, which has no selectable implementation \
              wired yet; selection fails closed"
         ),
+        // C-683: ssh is the bootstrap, never the substrate. What resolves here is the delivered
+        // remote system — same TLS, same bearer token, same negotiated version, same handshake —
+        // reached through a forward this session holds open for exactly as long as it holds the
+        // substrate. Selection is also the act that carries the intent to *start* a far-side serve;
+        // a probe only attaches.
+        HostBackend::Ssh => {
+            let resolved = ssh_host::resolve_ssh_binding(&host, local)
+                .await
+                .map_err(|failure| anyhow::anyhow!("host `{name}`: {failure}"))?;
+            let system = flux_server::ssh::connect_ssh_system(
+                local,
+                &resolved.bootstrap,
+                resolved.token,
+                &resolved.private_net,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!("host `{name}`: {error}"))?;
+            Ok(SelectedSubstrate {
+                binding: host.id,
+                system: Some(Arc::new(system)),
+            })
+        }
         HostBackend::Remote => {
             let Some(url) = host.url.as_deref() else {
                 // Unreachable through validated construction, but the store is operator-editable.
@@ -457,6 +517,34 @@ impl flux_capabilities::HostProber for CliHostProber {
                     backend: host.backend.as_str().to_string(),
                 })
             }
+            // C-683: the bootstrap runs, the handshake is performed through the forward, and the
+            // tunnel is released with the returned value. The identity reported is the far side's,
+            // carried by the protocol's own handshake with `remotely_reported` provenance — the
+            // tunnel changes nothing about what is being trusted or how it is checked. A probe
+            // never starts a far-side serve: it is defined side-effect-free, and starting a process
+            // on someone's build machine is an effect.
+            HostBackend::Ssh => {
+                let resolved = ssh_host::resolve_ssh_binding(host, &self.system).await?;
+                match flux_server::ssh::probe_ssh_system(
+                    &self.system,
+                    &resolved.bootstrap,
+                    resolved.token,
+                    &resolved.private_net,
+                )
+                .await
+                {
+                    Ok(handshake) => Ok(HostProbeReport {
+                        kind: handshake.substrate_kind,
+                        workspace: handshake.workspace,
+                        confinement: handshake.confinement,
+                        remotely_reported: true,
+                        protocol_version: Some(handshake.protocol_version),
+                    }),
+                    Err(error) => Err(HostProbeFailure::Connect {
+                        detail: error.to_string(),
+                    }),
+                }
+            }
             HostBackend::Remote => {
                 let Some(url) = host.url.as_deref() else {
                     // Unreachable through validated construction paths, but fail typed anyway.
@@ -543,6 +631,25 @@ impl flux_capabilities::HostProber for CliHostProber {
                 return Err(HostProbeFailure::BackendUnwired {
                     backend: host.backend.as_str().to_string(),
                 })
+            }
+            // Measuring a binding is a read on the far side, so it goes through the substrate the
+            // binding resolves to — bootstrap included. Like every other read here it may start a
+            // far-side serve only because `metrics` shares `probe`'s *credential* path, not its
+            // side-effect promise: it is an attach, and a binding with nothing serving says so.
+            HostBackend::Ssh => {
+                let resolved = ssh_host::resolve_ssh_binding(host, &self.system).await?;
+                let admitted = flux_server::ssh::admit_ssh_substrate(
+                    &self.system,
+                    &resolved.bootstrap,
+                    resolved.token,
+                    &resolved.private_net,
+                    flux_server::ssh::SshStartPolicy::AttachOnly,
+                )
+                .await
+                .map_err(|error| HostProbeFailure::Connect {
+                    detail: error.to_string(),
+                })?;
+                Arc::new(admitted.into_system())
             }
             HostBackend::Remote => Arc::new(self.connect_remote(host).await?),
         };
@@ -700,6 +807,10 @@ pub(super) async fn run_host(action: HostAction) -> Result<()> {
                 credential_ref: reference.credential_ref.as_ref().map(ToString::to_string),
                 grant: reference.grant.iter().map(ToString::to_string).collect(),
                 labels,
+                // An `ssh` binding's far-side contract is declarative only, so `[[host]].ssh` is
+                // written in the config rather than flagged onto this command. Absent is every
+                // default, which is a working binding against a far side on `PATH` and port 8790.
+                ssh: None,
             };
             flux_runtime::metadata::persist_user_host_in(
                 entry,

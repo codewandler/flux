@@ -26,17 +26,22 @@ pub enum HostBackend {
     Container,
     /// A Kubernetes-served substrate composing the remote protocol (C-655 context).
     Kubernetes,
+    /// An ssh-bootstrapped substrate composing the remote protocol (C-683). ssh is the bootstrap,
+    /// never the substrate: it starts or verifies `flux system serve` on the far machine and
+    /// forwards its endpoint; every effect still rides the delivered protocol.
+    Ssh,
     /// The delivered remote-system protocol (`flux system serve`).
     Remote,
 }
 
 impl HostBackend {
     /// Every backend kind, in display order.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Local,
         Self::Sandboxed,
         Self::Container,
         Self::Kubernetes,
+        Self::Ssh,
         Self::Remote,
     ];
 
@@ -47,6 +52,7 @@ impl HostBackend {
             Self::Sandboxed => "sandboxed",
             Self::Container => "container",
             Self::Kubernetes => "kubernetes",
+            Self::Ssh => "ssh",
             Self::Remote => "remote",
         }
     }
@@ -160,6 +166,54 @@ pub struct HostRef {
     /// Free-form non-secret labels (region, cluster, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
+    /// The far-side bootstrap contract for an `ssh` binding (C-683). `None` for every other
+    /// backend, and for an `ssh` binding that takes the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<HostSsh>,
+}
+
+/// What an `ssh` binding declares about the far machine (C-683).
+///
+/// Every field is a *declaration about the far side*, not a secret: paths, a port and a name. The
+/// two credentials an ssh binding needs stay references — the private key is the binding's own
+/// `credential_ref`, and the serving endpoint's bearer token is [`token_ref`](Self::token_ref).
+/// Installing the flux binary on that machine remains the operator's step (the C-480 boundary);
+/// what this declares is where to find it and how to reach what it serves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSsh {
+    /// The far-side flux binary. Absent means `flux`, resolved on the far side's `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// The far-side loopback port `flux system serve` binds and the tunnel forwards to. Absent
+    /// means the delivered default, 8790.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve_port: Option<u16>,
+    /// The far-side workspace root a started serve is given. Absent leaves it to the far side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The far-side TLS certificate and key `flux system serve` is started with. Both absent means
+    /// this binding may only *attach* to an already-serving far side, never start one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+    /// The far-side TLS key; see [`cert`](Self::cert).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// A **local** PEM whose roots the client trusts for this binding — the delivered `--remote-ca`
+    /// pinning form, not a bypass. Absent uses the platform roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// A **local** `known_hosts` file scoping strict host-key verification to this binding. Absent
+    /// uses ssh's own default. Verification is strict either way; this only says which record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts: Option<String>,
+    /// The name the far side's certificate carries, used as the tunnelled endpoint's host. Absent
+    /// means `127.0.0.1` — the address the forward actually lands on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// Where the serving endpoint's bearer token lives. Absent means `env/FLUX_REMOTE_SYSTEM_TOKEN`,
+    /// the delivered default on both seats. A location, never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<Ref>,
 }
 
 impl HostRef {
@@ -173,6 +227,7 @@ impl HostRef {
             credential_ref: None,
             grant: Vec::new(),
             labels: BTreeMap::new(),
+            ssh: None,
         }
     }
 
@@ -275,6 +330,37 @@ mod tests {
             parse_err.contains("local") && parse_err.contains("remote"),
             "names the known kinds: {parse_err}"
         );
+    }
+
+    #[test]
+    fn ssh_joins_the_closed_vocabulary_carrying_only_references() {
+        // C-683: the kind parses, round-trips and is listed among the known kinds a refusal names.
+        assert_eq!("ssh".parse::<HostBackend>().unwrap(), HostBackend::Ssh);
+        assert!(HostBackend::ALL.contains(&HostBackend::Ssh));
+        assert!(
+            "warp".parse::<HostBackend>().unwrap_err().contains("ssh"),
+            "an unknown kind's refusal lists ssh"
+        );
+
+        let binding = HostRef {
+            url: Some("ssh://build@devbox.internal:2222".into()),
+            // The *key* is a reference: what resolves is the path openssh opens, and flux never
+            // reads the material itself.
+            credential_ref: Some(Ref::env("FLUX_DEVBOX_KEY")),
+            ssh: Some(HostSsh {
+                binary: Some("/usr/local/bin/flux".into()),
+                serve_port: Some(8790),
+                token_ref: Some(Ref::env("FLUX_REMOTE_SYSTEM_TOKEN")),
+                ..HostSsh::default()
+            }),
+            ..HostRef::declared("devbox", HostBackend::Ssh)
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        let back: HostRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(binding, back);
+        assert_eq!(back.display_address(), "ssh://build@devbox.internal:2222");
+        // Both credentials are locations. There is no value anywhere in the persisted form.
+        assert!(json.contains("FLUX_DEVBOX_KEY") && json.contains("FLUX_REMOTE_SYSTEM_TOKEN"));
     }
 
     #[test]

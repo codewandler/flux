@@ -161,13 +161,16 @@ struct Persisted {
 /// The static (no-side-effect) availability statement for a backend — what `host ls`/`show` may
 /// honestly claim without probing. `local` is the running substrate; a `remote` binding is only a
 /// declaration until `probe` verifies it; `sandboxed` (C-651) is wired but conditional on this
-/// platform having a usable confinement backend, which only a probe can answer; the remaining peer
-/// backends fail closed until their selection stories wire them.
+/// platform having a usable confinement backend, which only a probe can answer; an `ssh` binding
+/// (C-683) claims even less than a `remote` one, because reaching it also means bootstrapping a
+/// serve on the far machine; the remaining peer backends fail closed until their selection stories
+/// wire them.
 pub fn static_availability(backend: HostBackend) -> &'static str {
     match backend {
         HostBackend::Local => "available",
         HostBackend::Remote => "declared (verify with probe)",
         HostBackend::Sandboxed => "available if this platform can confine (verify with probe)",
+        HostBackend::Ssh => "declared; bootstrapped over ssh (verify with probe)",
         HostBackend::Container | HostBackend::Kubernetes => "unwired (selection fails closed)",
     }
 }

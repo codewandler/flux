@@ -175,6 +175,7 @@ pub enum HostBackendKind {
     Sandboxed,
     Container,
     Kubernetes,
+    Ssh,
     Remote,
 }
 
@@ -186,9 +187,47 @@ impl HostBackendKind {
             Self::Sandboxed => "sandboxed",
             Self::Container => "container",
             Self::Kubernetes => "kubernetes",
+            Self::Ssh => "ssh",
             Self::Remote => "remote",
         }
     }
+}
+
+/// The `ssh` sub-table of a `[[host]]` declaration (C-683): what the binding declares about the far
+/// machine. `deny_unknown_fields` for the same reason the parent table has it — a silently dropped
+/// typo in a substrate binding is a safety problem. Mirrors `flux_secret::host::HostSsh`; the two
+/// crates may not depend on each other, so the surface crate owns the conversion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSshEntry {
+    /// The far-side flux binary; absent means `flux` on the far side's `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// The far-side loopback port the serve binds and the tunnel forwards to; absent means 8790.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve_port: Option<u16>,
+    /// The far-side workspace root a started serve is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The far-side TLS certificate a started serve is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+    /// The far-side TLS key a started serve is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// A local PEM whose roots this binding's client trusts (the `--remote-ca` pinning form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// A local `known_hosts` file scoping strict host-key verification to this binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts: Option<String>,
+    /// The name the far side's certificate carries; absent means `127.0.0.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// Credential *location* of the serving endpoint's bearer token; absent means
+    /// `env/FLUX_REMOTE_SYSTEM_TOKEN`. Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<String>,
 }
 
 /// One `[[host]]` declaration: a named, first-class binding to an execution substrate
@@ -219,6 +258,10 @@ pub struct HostEntry {
     /// Non-secret labels (region, cluster, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
+    /// The far-side bootstrap contract for an `ssh` binding (C-683); meaningless for every other
+    /// backend, which the surface crate refuses rather than ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<HostSshEntry>,
 }
 
 /// The `[exchange]` table — the declared home for the Exchange catalogue binding (C-650). Names a
@@ -2364,6 +2407,7 @@ backend = "local"
             credential_ref: None,
             grant: Vec::new(),
             labels: Default::default(),
+            ssh: None,
         };
         let user = vec![
             host("farm", "https://user-farm:8443"),
@@ -2388,6 +2432,7 @@ backend = "local"
             credential_ref: Some("env/FARM_TOKEN".into()),
             grant: Vec::new(),
             labels: Default::default(),
+            ssh: None,
         };
         let body = render_host_upsert(Some(("test", base)), entry.clone()).unwrap();
         assert!(body.contains("enable_shell = true"), "round-trips: {body}");

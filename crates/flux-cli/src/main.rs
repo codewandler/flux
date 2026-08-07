@@ -39,6 +39,7 @@ mod review;
 mod review_progress;
 mod session;
 mod splash;
+mod ssh_host;
 mod stream_json;
 mod system_cmd;
 mod user_interaction;
@@ -1353,6 +1354,7 @@ mod tests {
                     credential_ref: Some("env/FARM_TOKEN".into()),
                     grant: vec!["operator".into()],
                     labels: Default::default(),
+                    ssh: None,
                 },
                 flux_config::HostEntry {
                     id: "here".into(),
@@ -1361,6 +1363,7 @@ mod tests {
                     credential_ref: None,
                     grant: Vec::new(),
                     labels: Default::default(),
+                    ssh: None,
                 },
                 // Invalid (credential-bearing URL) — must be skipped, not abort the merge.
                 flux_config::HostEntry {
@@ -1370,6 +1373,7 @@ mod tests {
                     credential_ref: None,
                     grant: Vec::new(),
                     labels: Default::default(),
+                    ssh: None,
                 },
             ],
             ..Default::default()
@@ -1564,6 +1568,7 @@ mod tests {
             credential_ref: Some("env/FARM_TOKEN".into()),
             grant: vec!["operator".into()],
             labels: Default::default(),
+            ssh: None,
         };
         flux_runtime::metadata::persist_user_host_in(entry("https://one.example:8443"), &env)
             .unwrap();

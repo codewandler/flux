@@ -74,7 +74,10 @@ pub struct SystemHandshake {
 }
 
 impl SystemHandshake {
-    fn identity(&self) -> SubstrateIdentity {
+    /// The substrate identity this handshake establishes. Public because the ssh binding (C-683)
+    /// composes the same client from one layer out and must install the same identity a directly
+    /// addressed `remote` binding would — `remotely_reported` included.
+    pub fn identity(&self) -> SubstrateIdentity {
         SubstrateIdentity {
             kind: self.substrate_kind.clone(),
             workspace: self.workspace.clone(),
@@ -424,7 +427,11 @@ pub async fn serve_tls(
 /// The complete product graph enables both Rustls providers (Slack brings `ring`; reqwest brings
 /// AWS-LC), so Rustls cannot choose one automatically. Installing the workspace's intended provider
 /// is idempotent: an embedder that selected a provider first keeps its selection.
-fn ensure_crypto_provider() {
+///
+/// Public because anything that stands up TLS in this workspace has to make the same choice — a
+/// test's stand-in far side included, and a process that reaches one without ever calling `serve`
+/// would otherwise panic inside Rustls rather than fail a check it can see.
+pub fn ensure_crypto_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
