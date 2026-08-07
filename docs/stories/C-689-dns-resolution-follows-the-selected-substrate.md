@@ -2,8 +2,8 @@
 id: C-689
 title: "DNS resolution follows the selected substrate"
 pillar: "Core"
-status: backlog
-priority: 2
+status: ready
+priority: 3
 epic: the-substrate-seam
 areas: [flux-system]
 design: docs/designs/the-substrate-seam.md

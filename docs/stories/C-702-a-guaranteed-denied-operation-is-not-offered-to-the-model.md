@@ -2,8 +2,8 @@
 id: C-702
 title: "A guaranteed-denied operation is not offered to the model"
 pillar: "Core"
-status: backlog
-priority: 2
+status: ready
+priority: 3
 epic: first-class-hosts
 areas: [flux-runtime]
 design: docs/designs/the-substrate-seam.md

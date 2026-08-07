@@ -2,7 +2,7 @@
 id: C-519
 title: "Extract one shared cross-harness usage timeline"
 pillar: Core
-status: backlog
+status: ready
 epic: usage-observatory
 note: "Make flux usage and the future observatory consume one read-only timeline instead of copying CLI parsers into the TUI"
 ---

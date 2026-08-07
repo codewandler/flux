@@ -2,7 +2,7 @@
 id: C-575
 title: "Record immutable causal resource-usage receipts"
 pillar: Core
-status: backlog
+status: ready
 epic: resource-accounting
 design: docs/designs/resource-accounting.md
 areas: [flux-events, flux-runtime, flux-flow, flux-system]

@@ -2,7 +2,7 @@
 id: C-570
 title: "Agents report typed progress and cooperatively yield upstream"
 pillar: Core
-status: backlog
+status: ready
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-runtime, flux-flow, flux-orchestrate, flux-cli]
