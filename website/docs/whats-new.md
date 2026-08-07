@@ -44,6 +44,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   named local work. `--sandbox`/`--no-sandbox` behave exactly as before, with one deliberate limit:
   they never lower an explicitly selected sandboxed host.
 
+- **Ask a named host how it is doing.** `flux host metrics <name>` reports a machine's own
+  condition — CPU, load, memory, swap, disk, uptime, temperature and fan speed — as typed
+  readings, with JSON output as the automation API and the same view available to the agent. A
+  metric the machine cannot measure is reported as explicitly unavailable with a reason, never as
+  zero, and readings that came from a remote machine are marked as reported by it rather than
+  observed locally.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
