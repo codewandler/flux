@@ -1095,6 +1095,27 @@ pub(super) enum FleetAction {
     },
     Status,
     Schedule,
+    /// Run the unattended driver: one deterministic tick, or an interval loop over it.
+    ///
+    /// C-631. The driver was a 582-line bash script that parsed `state.json` three separate ways with
+    /// no `--if-revision` guard, could not be edited while running, and needed a production failure to
+    /// find each of its defects. Its judgment always lived outside it — planner, retro and scribe are
+    /// authored `.flux` loops it invoked host-side — so this inherits those unchanged and owns only
+    /// tick mechanics: report, advance, accumulate, dispatch.
+    Drive {
+        /// Perform exactly one tick and exit. The default when neither flag is given.
+        #[arg(long)]
+        tick: bool,
+        /// Repeat the tick on an interval, under a durable single-instance guard.
+        #[arg(long = "loop", conflicts_with = "tick")]
+        run_loop: bool,
+        /// Seconds between ticks under `--loop`.
+        #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+        interval: u64,
+        /// Stop after this many ticks under `--loop`; `0` runs until the fleet is stopped or quiesced.
+        #[arg(long, default_value_t = 0)]
+        max_ticks: u64,
+    },
     /// Show unresolved human decisions without stopping unrelated work.
     Decisions {
         /// Queue unresolved decisions for an independent adversarial decision agent.
@@ -1259,8 +1280,31 @@ struct FleetState {
     /// `flux fleet resume` lifts it. `default` keeps state files written before it existed loadable.
     #[serde(default)]
     quiesce: Option<QuiesceRecord>,
+    /// C-631: what the unattended driver has already done, so a tick is comparable to the last one.
+    ///
+    /// The bash driver kept this in files beside the state — a pidfile, a tick counter, a
+    /// last-status text blob — which is why three parsers disagreed about the same fleet. `default`
+    /// keeps state files written before it existed loadable.
+    #[serde(default)]
+    drive: Option<DriveRecord>,
     #[serde(default)]
     idempotency: BTreeMap<String, StoredResult>,
+}
+
+/// C-631: the durable record one `flux fleet drive` tick leaves behind.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct DriveRecord {
+    /// Ticks this fleet has run. Monotonic, and the tick number reported by each result.
+    ticks: u64,
+    /// Fingerprint of the state the previous tick decided on.
+    ///
+    /// A tick whose fingerprint is unchanged decided on exactly the same facts, which is what makes
+    /// an idle tick provable instead of inferred from the absence of output.
+    #[serde(default)]
+    fingerprint: Option<String>,
+    /// The fleet revision the previous tick observed.
+    #[serde(default)]
+    revision: u64,
 }
 
 /// C-642: the durable fact that dispatch is stopped, and why.
@@ -1541,6 +1585,7 @@ impl Default for FleetState {
             agents: BTreeMap::new(),
             waves: BTreeMap::new(),
             quiesce: None,
+            drive: None,
             idempotency: BTreeMap::new(),
         }
     }
@@ -5097,6 +5142,22 @@ worktree_root = ".flux/fleet/worktrees"
             let data = fleet_schedule(root)?;
             Ok((schedule_human(&data), data, vec![], state.revision))
         }
+        FleetAction::Drive {
+            tick,
+            run_loop,
+            interval,
+            max_ticks,
+        } => fleet_drive(
+            command,
+            root,
+            state,
+            DriveOptions {
+                tick: *tick,
+                run_loop: *run_loop,
+                interval: *interval,
+                max_ticks: *max_ticks,
+            },
+        ),
         FleetAction::Decisions { auto } => {
             let decisions = open_decisions(root)?;
             let configured = if root.join(".flux/fleet.toml").is_file() {
@@ -6015,7 +6076,12 @@ fn board_action_requires_member(action: &BoardAction) -> bool {
 fn fleet_action_dispatches(action: &FleetAction) -> bool {
     matches!(
         action,
-        FleetAction::Run { .. } | FleetAction::Spawn { .. } | FleetAction::Task { .. }
+        FleetAction::Run { .. }
+            | FleetAction::Spawn { .. }
+            | FleetAction::Task { .. }
+            // C-631: a tick's last phase sends workers at the schedule, so a quiesced fleet must
+            // refuse the driver itself rather than let each tick walk into the dispatch it wraps.
+            | FleetAction::Drive { .. }
     )
 }
 
@@ -6046,6 +6112,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Note { .. }
             | FleetAction::Reclaim { .. }
             | FleetAction::Repair { .. }
+            | FleetAction::Drive { .. }
     ) || matches!(action, FleetAction::Call { operation } if !matches!(operation.as_str(), "status" | "schedule" | "schema"))
 }
 
@@ -6214,6 +6281,9 @@ fn fleet_operations() -> &'static [&'static str] {
         "apply",
         "status",
         "schedule",
+        // Drive MUTATES and DISPATCHES: one tick advances waves, accumulates its own record, and
+        // sends workers at the schedule.
+        "drive",
         "decisions",
         "events",
         "logs",
@@ -14209,6 +14279,497 @@ fn fleet_schedule(root: &Path) -> Result<Value> {
         "attention_required": !human_decisions.as_array().is_none_or(Vec::is_empty)
     }))
 }
+
+/// C-631: the schema of one deterministic driver tick.
+const DRIVE_TICK_SCHEMA: &str = "flux.fleet-drive-tick/v1";
+
+/// C-631: the durable single-instance guard for `flux fleet drive --loop`.
+const DRIVE_LOCK_PATH: &str = ".flux/fleet/drive.lock";
+
+/// How `flux fleet drive` was invoked.
+struct DriveOptions {
+    tick: bool,
+    run_loop: bool,
+    interval: u64,
+    max_ticks: u64,
+}
+
+/// The decisions one tick makes, computed from durable state alone.
+#[derive(Debug, Default, PartialEq)]
+struct DrivePlan {
+    /// The state this tick decided on, as one comparable value.
+    fingerprint: String,
+    /// Waves whose stories are all handed off and may leave `awaiting-handoffs`.
+    advance: Vec<String>,
+    /// Waves with outstanding stories whose finished turns can still be reconstructed into handoffs.
+    reconstruct: Vec<String>,
+    /// Items this tick will send workers at.
+    dispatch: Vec<String>,
+    /// Items this tick deliberately did not send, each with the reason it was held back.
+    withheld: Vec<Value>,
+    /// Why the dispatch phase sent nothing at all, when that is a property of the fleet.
+    blocked: Option<String>,
+    /// Free worker slots at the configured width.
+    width: usize,
+}
+
+/// The stories a wave's topology names, across every repository in it.
+fn drive_wave_stories(wave: &Value) -> Vec<&Value> {
+    wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+        .collect()
+}
+
+/// The status a wave has *earned*, or `None` if it is already where it belongs.
+///
+/// The only advancement a tick performs. `awaiting-handoffs` is the state a wave sits in while its
+/// stories are recorded one by one; once every story holds an accepted handoff the wave is ready for
+/// its integrator, and nothing else in the fleet was moving it there.
+fn drive_wave_next_status(wave: &Value) -> Option<&'static str> {
+    if wave["status"].as_str() != Some("awaiting-handoffs") {
+        return None;
+    }
+    let stories = drive_wave_stories(wave);
+    if stories.is_empty() {
+        return None;
+    }
+    stories
+        .iter()
+        .all(|story| story["status"].as_str() == Some("handoff-accepted"))
+        .then_some("handoffs-ready")
+}
+
+/// What a tick would decide on, rendered as one stable value.
+///
+/// The bash driver answered "did anything change?" by diffing rendered status text, which changed
+/// whenever a clock did. This is derived only from the facts a tick acts on: the revision, the
+/// admission window, and every wave and worker status.
+fn drive_fingerprint(state: &FleetState) -> String {
+    let mut signature = format!(
+        "r{}|running={}|quiesced={}",
+        state.revision,
+        state.running,
+        state.quiesce.is_some()
+    );
+    for (id, wave) in &state.waves {
+        signature.push_str(&format!(
+            "|w:{id}={}",
+            wave["status"].as_str().unwrap_or("unknown")
+        ));
+    }
+    for (id, agent) in &state.agents {
+        signature.push_str(&format!(
+            "|a:{id}={}",
+            agent["status"].as_str().unwrap_or("unknown")
+        ));
+    }
+    format!("{:016x}", drive_hash(&signature))
+}
+
+/// FNV-1a over a tick signature.
+///
+/// A fingerprint is compared against one written by an earlier *process*, which rules out
+/// `DefaultHasher` — its output is explicitly not stable across builds.
+fn drive_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Items a live wave still holds an attempt at, and the wave holding each.
+fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, String> {
+    let mut claims = BTreeMap::new();
+    for (id, wave) in &state.waves {
+        if !wave_still_claims_items(wave["status"].as_str().unwrap_or("unknown")) {
+            continue;
+        }
+        for item in value_strings(&wave["items"]) {
+            claims.entry(item).or_insert_with(|| id.clone());
+        }
+    }
+    claims
+}
+
+/// Compute one tick's decisions. Pure: every input is already-read durable state.
+///
+/// `reconcile` is `None` when `board reconcile` could not be read, and that case **fails closed**:
+/// an empty already-built set is indistinguishable from "nothing is already built", and answering
+/// the second when the first is true is exactly how `wave-472` dispatched ten stories whose work was
+/// already in `main`.
+fn drive_tick_plan(
+    state: &FleetState,
+    schedule: &Value,
+    reconcile: Option<&Value>,
+    max_workers: usize,
+) -> DrivePlan {
+    let mut plan = DrivePlan {
+        fingerprint: drive_fingerprint(state),
+        ..DrivePlan::default()
+    };
+    for (id, wave) in &state.waves {
+        // A parked wave is one a human is deliberating over. Advancing it would be re-deciding it,
+        // which is the behaviour parking exists to stop.
+        if wave["status"].as_str() == Some("parked") {
+            continue;
+        }
+        if drive_wave_next_status(wave).is_some() {
+            plan.advance.push(id.clone());
+        } else if wave["status"].as_str() == Some("awaiting-handoffs") {
+            plan.reconstruct.push(id.clone());
+        }
+    }
+
+    let active = state
+        .agents
+        .values()
+        .filter(|agent| matches!(worker_activity(agent), WorkerActivity::Active))
+        .count();
+    plan.width = max_workers.saturating_sub(active);
+
+    if !state.running {
+        plan.blocked = Some("fleet is stopped; `flux fleet start` before dispatching".into());
+        return plan;
+    }
+    let Some(reconcile) = reconcile else {
+        plan.blocked = Some(
+            "board reconcile could not be read; an empty already-built set is indistinguishable \
+             from nothing being built, so this tick dispatched nothing"
+                .into(),
+        );
+        return plan;
+    };
+    let already_built = reconcile["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|finding| {
+            finding["id"]
+                .as_str()
+                .map(|id| (id.to_string(), finding.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let claimed = drive_claimed_items(state);
+
+    let mut seen = BTreeSet::new();
+    for wave in schedule["waves"].as_array().into_iter().flatten() {
+        for item in value_strings(&wave["eligible"]) {
+            if !seen.insert(item.clone()) {
+                continue;
+            }
+            if let Some(holder) = claimed.get(&item) {
+                plan.withheld.push(json!({
+                    "item": item,
+                    "reason": "claimed",
+                    "detail": format!("wave {holder} still holds an attempt at this item"),
+                }));
+                continue;
+            }
+            if let Some(finding) = already_built.get(&item) {
+                plan.withheld.push(json!({
+                    "item": item,
+                    "reason": "already-built",
+                    "detail": "board reconcile reports the implementation is already present",
+                    "signals": finding["signals"].clone(),
+                    "transition_path": finding["transition_path"].clone(),
+                }));
+                continue;
+            }
+            if plan.dispatch.len() >= plan.width {
+                plan.withheld.push(json!({
+                    "item": item,
+                    "reason": "width",
+                    "detail": format!("{active} of {max_workers} worker slots are in use"),
+                }));
+                continue;
+            }
+            plan.dispatch.push(item);
+        }
+    }
+    plan
+}
+
+/// Read `board reconcile` the way the board CLI reads it, so the driver and an operator see the
+/// same already-present set.
+fn drive_reconcile(root: &Path) -> Result<Value> {
+    let command = BoardCommand {
+        root: root.to_path_buf(),
+        board: None,
+        scope: Some(default_board_scope(root)?),
+        profile: BoardProfileArg::default(),
+        output: AgentOutput::Json,
+        request: None,
+        idempotency_key: None,
+        if_revision: None,
+        dry_run: false,
+        session: None,
+        action: BoardAction::Reconcile,
+    };
+    let (_, data, _, _) = reconcile_board(&command, root)?;
+    Ok(data)
+}
+
+/// Take the drive lock, or name the live process that already holds it.
+///
+/// The bash driver's guard was a pidfile written after the work started, so two drivers regularly
+/// raced the same wave. The reservation makes taking it atomic, and a recorded pid that is gone is
+/// not a lock — a crashed driver must not need a human to clear a file before the next one starts.
+fn acquire_drive_lock(root: &Path) -> Result<()> {
+    let mine = format!("{}\n", std::process::id());
+    let updated = guarded_system(root)?
+        .update_file_reserved(DRIVE_LOCK_PATH, |current| {
+            match current.and_then(|held| held.trim().parse::<u32>().ok()) {
+                Some(pid)
+                    if pid != std::process::id() && supervisor_process_is_live(i64::from(pid)) =>
+                {
+                    Err(flux_core::Error::Other(format!(
+                        "`flux fleet drive --loop` is already running as pid {pid}"
+                    )))
+                }
+                _ => Ok(mine.clone()),
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("conflict/precondition: {error}"))?;
+    if !updated {
+        bail!("conflict/precondition: another writer holds the drive lock reservation; retry")
+    }
+    Ok(())
+}
+
+/// Release the drive lock. Failure is never fatal: a stale lock naming a dead pid is not a lock.
+fn release_drive_lock(root: &Path) {
+    if let Ok(system) = guarded_system(root) {
+        let _ = system.write_file_atomic(DRIVE_LOCK_PATH, "");
+    }
+}
+
+/// `flux fleet drive`: the native unattended driver.
+fn fleet_drive(
+    command: &FleetCommand,
+    root: &Path,
+    state: FleetState,
+    options: DriveOptions,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    if options.tick && options.run_loop {
+        bail!("input/schema: drive takes either --tick or --loop, not both")
+    }
+    if !options.run_loop {
+        return drive_one_tick(command, root, state);
+    }
+    if options.interval == 0 {
+        bail!("input/schema: drive --interval must be at least one second")
+    }
+    acquire_drive_lock(root)?;
+    let outcome = drive_interval_loop(command, root, &options);
+    release_drive_lock(root);
+    outcome
+}
+
+/// Run ticks on an interval until the fleet says to stop.
+///
+/// `flux fleet stop` and `flux fleet quiesce` are the off switch, and they are durable facts rather
+/// than a signal to a shell, so the loop reads them at the top of every tick instead of holding a
+/// decision it made when it started.
+fn drive_interval_loop(
+    command: &FleetCommand,
+    root: &Path,
+    options: &DriveOptions,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let mut ticks = Vec::new();
+    let mut warnings = Vec::new();
+    let mut revision = read_fleet_state(root)?.revision;
+    let mut stopped = "tick ceiling reached";
+    let mut ran: u64 = 0;
+    loop {
+        let state = read_fleet_state(root)?;
+        if !state.running {
+            stopped = "fleet is stopped";
+            break;
+        }
+        if state.quiesce.is_some() {
+            stopped = "fleet is quiesced";
+            break;
+        }
+        let (_, data, tick_warnings, next) = drive_one_tick(command, root, state)?;
+        revision = next;
+        warnings.extend(tick_warnings);
+        ticks.push(data);
+        ran += 1;
+        if options.max_ticks != 0 && ran >= options.max_ticks {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(options.interval));
+    }
+    Ok((
+        format!("drive ran {ran} tick(s); stopped because {stopped}"),
+        json!({
+            "schema": "flux.fleet-drive/v1",
+            "ticks": ticks,
+            "count": ran,
+            "interval_seconds": options.interval,
+            "stopped_because": stopped,
+        }),
+        warnings,
+        revision,
+    ))
+}
+
+/// One deterministic tick: report, advance, accumulate, dispatch — in that order.
+///
+/// The order is the contract. Reporting first is what makes the tick comparable to the last one;
+/// advancing and accumulating before dispatch is what stops a tick from sending workers at a wave
+/// whose stories it has not yet recorded.
+fn drive_one_tick(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let config = read_fleet_config(root)?;
+    let schedule = fleet_schedule(root)?;
+    let mut warnings = Vec::new();
+    let reconcile = match drive_reconcile(root) {
+        Ok(data) => Some(data),
+        Err(error) => {
+            warnings.push(format!(
+                "board reconcile could not be read ({}); this tick dispatched nothing",
+                redact(&error.to_string())
+            ));
+            None
+        }
+    };
+    let plan = drive_tick_plan(&state, &schedule, reconcile.as_ref(), config.max_workers);
+    let previous = state.drive.clone().unwrap_or_default();
+    let idle = previous.fingerprint.as_deref() == Some(plan.fingerprint.as_str())
+        && plan.dispatch.is_empty()
+        && plan.advance.is_empty()
+        && plan.reconstruct.is_empty();
+
+    let reconstruct = plan.reconstruct.clone();
+    let fingerprint = plan.fingerprint.clone();
+    let mut advanced = Vec::new();
+    let mut reconstructed = Vec::new();
+    let event = json!({
+        "fingerprint": fingerprint,
+        "advance": plan.advance,
+        "reconstruct": plan.reconstruct,
+        "dispatch": plan.dispatch,
+        "withheld": plan.withheld,
+        "blocked": plan.blocked,
+    });
+    persist_delta_mutation(
+        command,
+        root,
+        &mut state,
+        "fleet.drive.tick",
+        event,
+        |state| {
+            // The delta is recomputed on every attempt, so a retry must not double-count what the
+            // previous attempt observed.
+            advanced.clear();
+            reconstructed.clear();
+            for wave in &reconstruct {
+                let reports = record_provisional_handoffs(state, wave);
+                let recorded = reports
+                    .iter()
+                    .filter(|report| report["recorded"] == json!(true))
+                    .count();
+                if recorded > 0 {
+                    reconstructed.push(json!({"wave": wave, "recorded": recorded}));
+                }
+            }
+            for (id, wave) in state.waves.iter_mut() {
+                if wave["status"].as_str() == Some("parked") {
+                    continue;
+                }
+                if let Some(next) = drive_wave_next_status(wave) {
+                    advanced.push(json!({"wave": id, "from": "awaiting-handoffs", "to": next}));
+                    wave["status"] = json!(next);
+                }
+            }
+            let record = state.drive.get_or_insert_with(DriveRecord::default);
+            record.ticks += 1;
+            record.fingerprint = Some(fingerprint.clone());
+            record.revision = state.revision;
+            Ok(())
+        },
+    )?;
+    let tick = state.drive.clone().unwrap_or_default().ticks;
+
+    // Dispatch last, and never from the plan's stale view: the phases above moved the very waves
+    // whose claims decide what is dispatchable.
+    let mut dispatch = json!({
+        "width": plan.width,
+        "items": plan.dispatch,
+        "withheld": plan.withheld,
+        "blocked": plan.blocked,
+    });
+    if !plan.dispatch.is_empty() && !command.dry_run {
+        let run = FleetCommand {
+            root: command.root.clone(),
+            output: command.output,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            action: FleetAction::Run {
+                items: plan.dispatch.clone(),
+                prepare_only: false,
+            },
+        };
+        let current = read_fleet_state(root)?;
+        match run_fleet_action(&run, root, current, None) {
+            Ok((_, data, run_warnings, _)) => {
+                warnings.extend(run_warnings);
+                dispatch["result"] = data;
+            }
+            Err(error) => {
+                // A dispatch that failed is a fact to report, not a reason to lose the tick that
+                // already advanced and recorded a wave. The next tick re-decides from state.
+                let message = redact(&error.to_string());
+                warnings.push(format!("dispatch failed: {message}"));
+                dispatch["error"] = json!(message);
+                append_fleet_event(
+                    root,
+                    "fleet.drive.dispatch-failed",
+                    json!({"items": plan.dispatch, "error": message}),
+                )?;
+            }
+        }
+    }
+    let revision = read_fleet_state(root)?.revision;
+    let data = json!({
+        "schema": DRIVE_TICK_SCHEMA,
+        "tick": tick,
+        "fingerprint": plan.fingerprint,
+        "idle": idle,
+        "report": {
+            "revision": revision,
+            "previous_fingerprint": previous.fingerprint,
+            "workers_configured": config.max_workers,
+            "worker_slots_free": plan.width,
+        },
+        "advanced": advanced,
+        "reconstructed": reconstructed,
+        "dispatch": dispatch,
+    });
+    Ok((
+        format!(
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), dispatched {} item(s), withheld {}",
+            advanced.len(),
+            reconstructed.len(),
+            dispatch["items"].as_array().map_or(0, Vec::len),
+            dispatch["withheld"].as_array().map_or(0, Vec::len),
+        ),
+        data,
+        warnings,
+        revision,
+    ))
+}
 fn schedule_human(data: &Value) -> String {
     data["waves"]
         .as_array()
@@ -20246,6 +20807,232 @@ mod tests {
             .starts_with('z'));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    /// A fleet that is running, with no worker in flight and no wave claiming anything.
+    fn drive_fixture_state() -> FleetState {
+        let mut state = FleetState::default();
+        state.running = true;
+        state
+    }
+
+    fn drive_fixture_schedule(items: &[&str]) -> Value {
+        json!({"waves": [{"id": "ready", "state": "active", "eligible": items}]})
+    }
+
+    /// C-631: the whole point of the reconcile gate. `wave-472` dispatched ten stories whose work was
+    /// already in `main` because an unread already-built set reads exactly like an empty one, so a tick
+    /// that cannot read reconcile must send nobody and say why.
+    #[test]
+    fn drive_dispatch_fails_closed_when_board_reconcile_cannot_be_read() {
+        let state = drive_fixture_state();
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+
+        let plan = drive_tick_plan(&state, &schedule, None, 3);
+
+        assert!(plan.dispatch.is_empty(), "{:?}", plan.dispatch);
+        let blocked = plan.blocked.expect("a refusal names what is missing");
+        assert!(blocked.contains("board reconcile"), "{blocked}");
+        assert!(blocked.contains("indistinguishable"), "{blocked}");
+    }
+
+    /// A story whose implementation is already present is WITHHELD and named, never silently dropped.
+    #[test]
+    fn drive_dispatch_withholds_an_item_whose_work_is_already_present() {
+        let state = drive_fixture_state();
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+        let reconcile = json!({"findings": [{
+            "id": "flux/C-1",
+            "signals": ["commit-subject"],
+            "transition_path": ["in-progress", "done"],
+        }]});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 3);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-2".to_string()]);
+        assert_eq!(plan.withheld.len(), 1);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-1");
+        assert_eq!(plan.withheld[0]["reason"], "already-built");
+        assert_eq!(plan.withheld[0]["signals"], json!(["commit-subject"]));
+        assert!(plan.blocked.is_none());
+    }
+
+    /// An item a live wave still holds an attempt at is not a second wave's to take.
+    #[test]
+    fn drive_dispatch_withholds_an_item_a_live_wave_still_claims() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-9".into(),
+            json!({"status": "awaiting-handoffs", "items": ["flux/C-2"]}),
+        );
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+        let reconcile = json!({"findings": []});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 3);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-2");
+        assert_eq!(plan.withheld[0]["reason"], "claimed");
+        assert!(
+            plan.withheld[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("wave-9"),
+            "{:?}",
+            plan.withheld[0]
+        );
+    }
+
+    /// Dispatch width is what is left of the configured worker count, and the overflow is reported.
+    #[test]
+    fn drive_dispatch_width_is_the_configured_ceiling_minus_live_workers() {
+        let mut state = drive_fixture_state();
+        state.agents.insert(
+            "wave-9-worker-1".into(),
+            json!({"status": "working", "supervisor_pid": std::process::id()}),
+        );
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2", "flux/C-3"]);
+        let reconcile = json!({"findings": []});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 2);
+
+        assert_eq!(plan.width, 1);
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+        assert_eq!(plan.withheld.len(), 2);
+        assert!(plan.withheld.iter().all(|entry| entry["reason"] == "width"));
+    }
+
+    /// A stopped fleet dispatches nothing, and says so rather than reporting an empty schedule.
+    #[test]
+    fn drive_dispatch_refuses_while_the_fleet_is_stopped() {
+        let mut state = drive_fixture_state();
+        state.running = false;
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&["flux/C-1"]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+        assert!(plan.dispatch.is_empty());
+        assert!(plan.blocked.unwrap().contains("stopped"));
+    }
+
+    /// Advancement is earned by every story, and a parked wave is never re-decided.
+    #[test]
+    fn drive_advances_only_a_wave_every_story_handed_off_and_never_a_parked_one() {
+        let mut state = drive_fixture_state();
+        let ready = json!({
+            "status": "awaiting-handoffs",
+            "items": ["flux/C-1"],
+            "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+        });
+        let outstanding = json!({
+            "status": "awaiting-handoffs",
+            "items": ["flux/C-2"],
+            "topology": {"repositories": [{"stories": [
+                {"status": "handoff-accepted"}, {"status": "working"}
+            ]}]},
+        });
+        let mut parked = ready.clone();
+        parked["status"] = json!("parked");
+        parked["park"] = json!({"reason": "a human is deciding"});
+        state.waves.insert("wave-1".into(), ready);
+        state.waves.insert("wave-2".into(), outstanding);
+        state.waves.insert("wave-3".into(), parked);
+
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&[]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+
+        assert_eq!(plan.advance, vec!["wave-1".to_string()]);
+        assert_eq!(plan.reconstruct, vec!["wave-2".to_string()]);
+        assert_eq!(
+            drive_wave_next_status(&state.waves["wave-1"]),
+            Some("handoffs-ready")
+        );
+        assert_eq!(drive_wave_next_status(&state.waves["wave-3"]), None);
+    }
+
+    /// The fingerprint answers "did anything a tick acts on change?" — and only that.
+    #[test]
+    fn drive_fingerprint_tracks_the_facts_a_tick_decides_on() {
+        let mut state = drive_fixture_state();
+        state
+            .waves
+            .insert("wave-1".into(), json!({"status": "awaiting-handoffs"}));
+        let first = drive_fingerprint(&state);
+        assert_eq!(first, drive_fingerprint(&state), "same state, same value");
+
+        state.waves.insert(
+            "wave-1".into(),
+            json!({"status": "handoffs-ready", "note": "unread by the tick"}),
+        );
+        assert_ne!(first, drive_fingerprint(&state));
+    }
+
+    /// The CLI surface the unattended driver is invoked through.
+    #[test]
+    fn drive_takes_one_tick_or_an_interval_loop_but_never_both() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser, Debug)]
+        struct DriveCli {
+            #[command(subcommand)]
+            action: FleetAction,
+        }
+
+        let once = DriveCli::try_parse_from(["fleet", "drive", "--tick"]).unwrap();
+        let FleetAction::Drive {
+            tick,
+            run_loop,
+            interval,
+            max_ticks,
+        } = once.action
+        else {
+            panic!("expected drive")
+        };
+        assert!(tick && !run_loop && interval == 60 && max_ticks == 0);
+
+        let looped = DriveCli::try_parse_from([
+            "fleet",
+            "drive",
+            "--loop",
+            "--interval",
+            "5",
+            "--max-ticks",
+            "3",
+        ])
+        .unwrap();
+        let FleetAction::Drive {
+            run_loop,
+            interval,
+            max_ticks,
+            ..
+        } = looped.action
+        else {
+            panic!("expected drive")
+        };
+        assert!(run_loop && interval == 5 && max_ticks == 3);
+
+        assert!(DriveCli::try_parse_from(["fleet", "drive", "--tick", "--loop"]).is_err());
+    }
+
+    /// Drive is a dispatching mutation: a quiesced fleet must refuse the driver, not each tick's
+    /// dispatch after it has already advanced state.
+    #[test]
+    fn drive_is_a_dispatching_mutation_so_quiesce_refuses_it() {
+        let action = FleetAction::Drive {
+            tick: true,
+            run_loop: false,
+            interval: 60,
+            max_ticks: 0,
+        };
+        assert!(fleet_action_dispatches(&action));
+        assert!(fleet_action_mutates(&action));
+        assert!(fleet_operations().contains(&"drive"));
     }
 
     #[test]
