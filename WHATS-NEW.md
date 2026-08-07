@@ -31,6 +31,13 @@
   never silently inherits a permission granted only to interactive use. `--remote <url>` still
   works for one-off connections.
 
+- **Web requests follow the host you select.** Until now, fetching a page or calling an API always
+  ran from the machine hosting the agent, even when a different execution host was selected. Now
+  HTTP requests and page fetches run against the host you picked with `--host` — and if that
+  host's connection cannot carry web traffic yet, the request refuses with a plain answer naming
+  what is missing, instead of quietly running on the local machine. Browser automation and site
+  crawling still run locally, since they drive a local browser.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

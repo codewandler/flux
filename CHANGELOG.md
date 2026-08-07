@@ -68,6 +68,29 @@ All notable changes to this project are documented in this file. The format is b
   coordinator operation takes the same `independent` flag, because the coordinator is the caller
   that actually chooses waves — a batch selector only a human can reach is one nothing uses.
 
+- **The guarded port measures the substrate itself: `GuardedMetrics` and a closed metric
+  vocabulary (Decision 0018 rule 6, C-653).** A typed, closed `MetricKind` vocabulary — CPU usage
+  and load, memory, swap, per-mount disk, uptime, hwmon temperature and fan — joins
+  `ExecutionSystem` with fail-closed `Unserved` defaults, and the answer taxonomy keeps two
+  negatives distinct: "this substrate serves no metrics" (`Unserved`) versus "this machine has no
+  such instrument" (`Unavailable`), so an absent thermometer can never render as 0 °C. The native
+  backend reads procfs/sysfs/statvfs inside `flux-system` with no new dependency; readings are
+  unit-bearing, bounded (32 mounts, 64 sensors, 64-byte labels) and carry a sampled-at timestamp.
+  `RemoteSystem` deliberately serves nothing until the remote protocol gains a versioned metrics
+  frame (C-654). The codegate census gains the family and two reviewed allowances.
+
+- **HTTP joins the guarded port, so web effects follow the selected substrate (Decision 0018
+  rule 5, C-652).** `GuardedHttp` joins `ExecutionSystem` with a fail-closed `Unserved` default;
+  `http.request` and `web.fetch` move from `NativeSystemOnly` to `SelectedExecutionSystem` and
+  route through the selected substrate whenever one is in force — the branch is on whether a
+  substrate was selected, never on its kind, so nothing can send locally under a selection. The
+  native implementation is `flux_web::NativeHttp`, wrapping the one reviewed egress client
+  (redirect-disabled, response-byte-capped, per-hop secret-scope re-authorization behind the
+  port); the codegate `Http` census still counts exactly two `reqwest::Client` construction
+  points. `RemoteSystem` answers a typed `Unserved` naming the missing wire support rather than
+  approximating; `browser.*` and `web.crawl` stay `NativeSystemOnly`, pinned by a new
+  placement-census test.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
