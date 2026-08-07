@@ -366,10 +366,20 @@ pub(super) const MAX_CA_PEM_BYTES: usize = 256 * 1024;
 /// to physical identities first, so an in-scope symlink cannot name an out-of-scope target, and the
 /// read is capped: a path that is not a CA bundle is refused for its size rather than slurped.
 pub(super) async fn read_ca_pem(system: &System, path: &str) -> Result<Vec<u8>> {
-    flux_system::port::GuardedHostFiles::read_file_scoped(system, path, path, MAX_CA_PEM_BYTES)
-        .await
-        .map(|read| read.bytes)
-        .map_err(|error| anyhow::anyhow!("{error}"))
+    let read =
+        flux_system::port::GuardedHostFiles::read_file_scoped(system, path, path, MAX_CA_PEM_BYTES)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+    // Say *why* it was refused. Dropping this flag would let an oversized file fall through to the
+    // PEM parser and be reported as malformed, which is fail-closed but tells the operator to go
+    // looking for a corrupt certificate instead of the wrong path.
+    if read.truncated {
+        anyhow::bail!(
+            "`{path}` is larger than the {MAX_CA_PEM_BYTES} byte limit for a trust anchor, so it \
+             was refused rather than read — check the path names a CA bundle and not something else"
+        );
+    }
+    Ok(read.bytes)
 }
 
 /// Read and validate the private CA a binding declares (C-684), or `Ok(None)` when it declares

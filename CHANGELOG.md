@@ -326,6 +326,20 @@ All notable changes to this project are documented in this file. The format is b
   a v4 peer lacking them never retried, and the zero default is the truthful reading rather than a
   fabricated one.
 
+- **A named host binding trusts the private CA it declares (C-684).** `[[host]]` gains `ca_cert`, a
+  path to a trust anchor, honoured identically by `remote`, `microvm`, `ssh` and (once wired)
+  `kubernetes` bindings across selection, `probe` and the metrics read. Before this, `--remote-ca`
+  existed and the named binding — the entity Decision 0018 built to *replace* that flag — had no
+  equivalent, so every cluster-issued or self-signed endpoint was reachable by URL and not by name.
+  The CA is read through `GuardedHostFiles::read_file_scoped` with the declared path as both
+  request and scope, so naming a file admits that file and not its directory, both sides reduced to
+  physical identities first; `--remote-ca` moved to the same reader, because leaving the flag jailed
+  would have recreated the same defect with the flag as the odd one out. The read is capped where
+  the previous unscoped read had no cap at all, and an oversized file is refused for its size
+  rather than falling through to be reported as malformed. A certificate that does not chain is
+  refused with the TLS failure named — the error now walks its source chain — and no
+  `--insecure`-style escape exists.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

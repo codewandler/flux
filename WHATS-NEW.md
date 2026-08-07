@@ -141,6 +141,14 @@
   *not* retried: a 429 tells you the server received your request and declined to act on it, which
   is what makes retrying safe even for a POST, while a 503 makes no such promise.
 
+- **Reach your own cluster by name.** A `[[host]]` binding can now name the private CA its endpoint
+  uses (`ca_cert = "/etc/flux/ca.pem"`), so a Kubernetes pod, VM guest or container with a
+  certificate from your own CA is reachable as `flux --host cluster …` rather than only through
+  `--remote … --remote-ca`. The CA is read as one exactly-named file — naming it grants that file
+  and nothing else in its directory — and if it is missing, unreadable or too large the binding
+  refuses and tells you which file. It never quietly falls back to public trust, and there is no
+  flag to skip the check.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
