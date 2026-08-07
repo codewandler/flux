@@ -4297,7 +4297,11 @@ mod tests {
         assert_eq!(
             hits.load(std::sync::atomic::Ordering::SeqCst),
             2,
-            "the origin was contacted twice, and only the daemon can reach it — so the retry \
+            // Both listeners are in-process loopback, so reachability is not what isolates this:
+            // the coordinator makes ONE framed call, HttpDelegate has no retry loop, and
+            // RemoteSystem never falls back to sending locally. Two accepted connections at the
+            // origin can therefore only have come from the daemon's own retry.
+            "the origin was contacted twice by the daemon's own retry loop — so the retry \
              happened on the substrate that sends, not on the coordinator"
         );
         assert_eq!(
