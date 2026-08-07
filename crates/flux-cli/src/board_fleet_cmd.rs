@@ -6377,7 +6377,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -13603,9 +13603,16 @@ fn park_wave(
         // ordering every other fleet record is already read against.
         "revision": state.revision + 1,
     });
-    let data = json!({"wave": wave_id, "status": "parked", "park": park});
-    let event = data.clone();
+    let event = json!({"wave": wave_id, "status": "parked", "park": park.clone()});
+    let mut harvested = Vec::new();
     persist_delta_mutation(command, root, &mut state, "wave.parked", event, |state| {
+        // R-10: harvest before the pause. A worker that committed its deliverable and then ran out of
+        // turn holds that work in a worktree nothing has recorded, and parking on top of it buries a
+        // finished story under a decision — three separate waves once held the same completed story,
+        // were parked as failures, and a human dug the commits out days later. The delta is recomputed
+        // on every attempt, so a retry rebuilds this report rather than double-counting it.
+        harvested.clear();
+        harvested.extend(record_provisional_handoffs(state, wave_id));
         let wave = state
             .waves
             .get_mut(wave_id)
@@ -13614,12 +13621,74 @@ fn park_wave(
         wave["park"] = park.clone();
         Ok(())
     })?;
+    let recorded = harvested
+        .iter()
+        .filter(|report| report["recorded"] == json!(true))
+        .count();
+    let data = json!({
+        "wave": wave_id, "status": "parked", "park": park, "harvested": harvested,
+    });
+    if recorded > 0 {
+        append_fleet_event(
+            root,
+            "wave.park.harvested",
+            json!({"wave": wave_id, "harvested": data["harvested"].clone()}),
+        )?;
+    }
+    let harvest_note = if recorded > 0 {
+        format!(" (harvested {recorded} handoff(s) first)")
+    } else {
+        String::new()
+    };
     Ok((
-        format!("{wave_id} parked: {reason}"),
+        format!("{wave_id} parked: {reason}{harvest_note}"),
         data,
         vec![],
         state.revision,
     ))
+}
+
+/// Clear the rework budget a park exhausted, and return the stories the park froze to work.
+///
+/// R-13, counter hygiene. Rework escalation parks by writing `parked` onto the story *and* the wave
+/// once `rework_attempts` reaches the configured ceiling. Restoring only the wave left both facts
+/// behind: the story stayed `parked`, so the wave could never earn `handoffs-ready` again, and the
+/// counter stayed at the ceiling, so the very next review parked it again on its first round — the
+/// human's answer bought zero rework rounds. Unparking is the moment the pause was answered, so it is
+/// the moment the budget resets.
+fn reset_parked_story_budgets(wave: &mut Value) -> Vec<Value> {
+    let mut reset = Vec::new();
+    for repository in wave["topology"]["repositories"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        for story in repository["stories"].as_array_mut().into_iter().flatten() {
+            let attempts = story["rework_attempts"].as_u64().unwrap_or(0);
+            let was_parked = story["status"].as_str() == Some("parked");
+            if attempts == 0 && !was_parked {
+                continue;
+            }
+            // A story parked by rework always holds the accepted handoff its findings reviewed. One
+            // parked any other way has nothing to return to, so its status is left exactly as it is
+            // and the report says so rather than inventing a state it never held.
+            let restored = (was_parked && story["handoff"]["status"].as_str() == Some("accepted"))
+                .then_some("handoff-accepted");
+            if let Some(status) = restored {
+                story["status"] = json!(status);
+            }
+            if attempts > 0 {
+                story["rework_attempts"] = json!(0);
+            }
+            reset.push(json!({
+                "item": story["board_ref"].as_str().unwrap_or_default(),
+                "status": story["status"].as_str().unwrap_or("unknown"),
+                "restored": restored.is_some(),
+                "rework_attempts_cleared": attempts,
+            }));
+        }
+    }
+    reset
 }
 
 /// Return a parked wave to the lifecycle state it held, and clear the park record.
@@ -13641,25 +13710,35 @@ fn unpark_wave(
         .as_str()
         .unwrap_or(PARK_DEFAULT_RETURN_STATUS)
         .to_string();
-    let data = json!({
+    let event = json!({
         "wave": wave_id,
         "status": restored,
         "previous_status": "parked",
         "reason": wave["park"]["reason"].clone(),
     });
-    let event = data.clone();
+    let reason = wave["park"]["reason"].clone();
     let target = restored.clone();
+    let mut budget_reset = Vec::new();
     persist_delta_mutation(command, root, &mut state, "wave.unparked", event, |state| {
         let wave = state
             .waves
             .get_mut(wave_id)
             .with_context(|| format!("not-found: wave {wave_id}"))?;
         wave["status"] = json!(target);
+        budget_reset.clear();
+        budget_reset.extend(reset_parked_story_budgets(wave));
         if let Some(record) = wave.as_object_mut() {
             record.remove("park");
         }
         Ok(())
     })?;
+    let data = json!({
+        "wave": wave_id,
+        "status": restored,
+        "previous_status": "parked",
+        "reason": reason,
+        "budget_reset": budget_reset,
+    });
     Ok((
         format!("{wave_id} unparked: {restored}"),
         data,
@@ -14382,15 +14461,37 @@ fn drive_hash(text: &str) -> u64 {
     hash
 }
 
+/// The wave holding one item's attempt, and whether that hold is a pause a human owns.
+struct ItemClaim {
+    wave: String,
+    /// The recorded park reason, when the holding wave is parked rather than working.
+    parked: Option<String>,
+}
+
 /// Items a live wave still holds an attempt at, and the wave holding each.
-fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, String> {
-    let mut claims = BTreeMap::new();
+///
+/// A claim is released only when the wave provably ends — accepted and applied, or cancelled. A park
+/// is not an ending: the wave keeps its claim, because the work it holds is still on disk and the
+/// pause is a decision a human has yet to answer. The distinction is carried here so the driver can
+/// say *which* of the two withheld the item instead of reporting one as the other.
+fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, ItemClaim> {
+    let mut claims: BTreeMap<String, ItemClaim> = BTreeMap::new();
     for (id, wave) in &state.waves {
-        if !wave_still_claims_items(wave["status"].as_str().unwrap_or("unknown")) {
+        let status = wave["status"].as_str().unwrap_or("unknown");
+        if !wave_still_claims_items(status) {
             continue;
         }
+        let parked = (status == "parked").then(|| {
+            wave["park"]["reason"]
+                .as_str()
+                .unwrap_or("no reason recorded")
+                .to_string()
+        });
         for item in value_strings(&wave["items"]) {
-            claims.entry(item).or_insert_with(|| id.clone());
+            claims.entry(item).or_insert_with(|| ItemClaim {
+                wave: id.clone(),
+                parked: parked.clone(),
+            });
         }
     }
     claims
@@ -14462,12 +14563,22 @@ fn drive_tick_plan(
             if !seen.insert(item.clone()) {
                 continue;
             }
-            if let Some(holder) = claimed.get(&item) {
-                plan.withheld.push(json!({
-                    "item": item,
-                    "reason": "claimed",
-                    "detail": format!("wave {holder} still holds an attempt at this item"),
-                }));
+            if let Some(claim) = claimed.get(&item) {
+                let holder = &claim.wave;
+                plan.withheld.push(match &claim.parked {
+                    Some(reason) => json!({
+                        "item": item,
+                        "reason": "parked",
+                        "detail": format!(
+                            "wave {holder} is parked pending a decision: {reason}"
+                        ),
+                    }),
+                    None => json!({
+                        "item": item,
+                        "reason": "claimed",
+                        "detail": format!("wave {holder} still holds an attempt at this item"),
+                    }),
+                });
                 continue;
             }
             if let Some(finding) = already_built.get(&item) {
@@ -20880,6 +20991,101 @@ mod tests {
                 .contains("wave-9"),
             "{:?}",
             plan.withheld[0]
+        );
+    }
+
+    /// A parked wave keeps its claim — the work is still on disk and the pause is a human's to answer
+    /// — but the driver must name the park and its reason rather than report it as live work.
+    #[test]
+    fn drive_dispatch_names_the_park_that_holds_an_item_rather_than_a_generic_claim() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-9".into(),
+            json!({
+                "status": "parked",
+                "items": ["flux/C-2"],
+                "park": {"reason": "waiting on the API decision"},
+            }),
+        );
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&json!({"findings": []})), 3);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-2");
+        assert_eq!(plan.withheld[0]["reason"], "parked");
+        let detail = plan.withheld[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("wave-9"), "{detail}");
+        assert!(detail.contains("waiting on the API decision"), "{detail}");
+
+        // Ending the wave releases the claim; the item is dispatchable again.
+        state.waves.insert(
+            "wave-9".into(),
+            json!({"status": "cancelled", "items": ["flux/C-2"]}),
+        );
+        let released = drive_tick_plan(&state, &schedule, Some(&json!({"findings": []})), 3);
+        assert_eq!(
+            released.dispatch,
+            vec!["flux/C-1".to_string(), "flux/C-2".to_string()]
+        );
+    }
+
+    /// C-631 (R-13, failing first): a wave parked by exhausted rework rounds must come back with its
+    /// budget reset. Restoring only the wave left the story `parked` — so the wave could never earn
+    /// `handoffs-ready` — and left `rework_attempts` at the ceiling, so the next review parked it again
+    /// on its first round and the human's answer bought nothing.
+    #[test]
+    fn unparking_resets_the_rework_budget_and_frees_the_stories_the_park_froze() {
+        let mut wave = json!({
+            "status": "parked",
+            "topology": {"repositories": [{"stories": [
+                {
+                    "board_ref": "flux/C-1",
+                    "status": "parked",
+                    "rework_attempts": 2,
+                    "handoff": {"status": "accepted", "commit": "abc123"},
+                },
+                {"board_ref": "flux/C-2", "status": "handoff-accepted"},
+            ]}]},
+        });
+
+        let reset = reset_parked_story_budgets(&mut wave);
+
+        let story = &wave["topology"]["repositories"][0]["stories"][0];
+        assert_eq!(story["status"], "handoff-accepted");
+        assert_eq!(story["rework_attempts"], 0);
+        assert_eq!(
+            reset.len(),
+            1,
+            "only the parked story is touched: {reset:?}"
+        );
+        assert_eq!(reset[0]["item"], "flux/C-1");
+        assert_eq!(reset[0]["restored"], true);
+        assert_eq!(reset[0]["rework_attempts_cleared"], 2);
+        assert_eq!(
+            wave["topology"]["repositories"][0]["stories"][1]["status"],
+            "handoff-accepted"
+        );
+    }
+
+    /// A story parked with no accepted handoff has no reviewed state to return to. Its counter still
+    /// resets, but the report says the status was left alone rather than inventing one.
+    #[test]
+    fn unparking_never_invents_a_status_for_a_story_that_holds_no_accepted_handoff() {
+        let mut wave = json!({
+            "topology": {"repositories": [{"stories": [
+                {"board_ref": "flux/C-3", "status": "parked", "rework_attempts": 1},
+            ]}]},
+        });
+
+        let reset = reset_parked_story_budgets(&mut wave);
+
+        assert_eq!(reset[0]["restored"], false);
+        assert_eq!(reset[0]["status"], "parked");
+        assert_eq!(reset[0]["rework_attempts_cleared"], 1);
+        assert_eq!(
+            wave["topology"]["repositories"][0]["stories"][0]["rework_attempts"],
+            0
         );
     }
 

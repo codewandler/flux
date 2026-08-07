@@ -311,6 +311,56 @@ flux fleet task api "audit the next ready contract" --mode read-only --output js
 flux fleet task api/C-41 "implement the accepted story" --mode write --output json
 ```
 
+## Unattended driving
+
+`flux fleet drive` is the driver itself, as a verb. One tick runs four phases in a fixed order and
+nothing else:
+
+```sh
+flux fleet drive --tick --output json                       # exactly one tick
+flux fleet drive --loop --interval 60 --output json         # ticks until stopped or quiesced
+flux fleet drive --loop --interval 60 --max-ticks 20 --output json
+```
+
+| phase | what it does |
+|---|---|
+| report | fingerprints exactly the facts a tick acts on — revision, admission window, every wave and worker status |
+| advance | a wave whose every story holds an accepted handoff leaves `awaiting-handoffs` for `handoffs-ready` |
+| accumulate | records the tick on fleet state (`drive.ticks`, `drive.fingerprint`) and journals `fleet.drive.tick` |
+| dispatch | sends workers at the schedule, up to the free width |
+
+Judgment stays outside the driver: planner, retro and scribe remain authored `.flux` loops, and
+`drive` owns only these mechanics. Every read goes through the native store and every write through
+the revision-guarded delta path, so a tick can never race a coordinator or an operator.
+
+Dispatch consults `flux board reconcile` and **fails closed**. If reconcile cannot be read the
+tick dispatches nothing and says so, because an empty already-built set is indistinguishable from
+"nothing is already built" — the case that once sent ten workers at stories whose work was already
+merged. Anything held back is named with its reason rather than dropped:
+
+```json
+{
+  "schema": "flux.fleet-drive-tick/v1",
+  "tick": 12,
+  "idle": false,
+  "dispatch": {
+    "width": 2,
+    "items": ["api/C-41"],
+    "withheld": [
+      {"item": "api/C-40", "reason": "already-built", "signals": ["commit-subject"]},
+      {"item": "web/C-12", "reason": "claimed", "detail": "wave-88 still holds an attempt at this item"},
+      {"item": "db/C-7", "reason": "parked", "detail": "wave-91 is parked pending a decision: waiting on the API decision"}
+    ]
+  }
+}
+```
+
+`--loop` runs under a durable single-instance guard, so a second driver refuses and names the pid
+holding it; a lock naming a process that is gone is not a lock and needs no hand cleanup. The loop
+is stopped by durable facts rather than a signal: `flux fleet stop` and `flux fleet quiesce` both
+end it at the next tick boundary, and a quiesced fleet refuses `drive` outright because a tick
+dispatches.
+
 ## The typed handoff
 
 A worker result is not parsed from prose. Its `FleetHandoff` names:
@@ -518,6 +568,23 @@ both its JSON and human forms, so a paused wave is legible without reading durab
 re-decides it every minute; `unpark` restores the recorded previous status, so leaving the pause is a
 verb rather than an edit. A wave parked by exhausted rework rounds carries no recorded previous
 status and returns to `awaiting-handoffs`.
+
+**Parking harvests first.** A worker that committed its deliverable and then ran out of turn holds
+that work in a worktree nothing has recorded, and a pause written on top of it buries a finished
+story under a decision. `park` records those handoffs from the worktrees before it writes the pause,
+reports them as `data.harvested`, and journals `wave.park.harvested`.
+
+**Unparking resets the budget the park exhausted.** The pause has been answered, so every story the
+park froze returns to its accepted handoff and its `rework_attempts` counter is cleared, reported as
+`data.budget_reset`. Without that, the story stayed `parked` — so the wave could never earn
+`handoffs-ready` again — and the very next review parked it again on its first round, buying the
+human's answer nothing.
+
+A parked wave keeps its claim on its items: the work it holds is still on disk and the pause is a
+decision a human has yet to answer. `fleet drive` therefore withholds those items with
+`"reason": "parked"` and the recorded reason, rather than reporting them as live work. The claim is
+released only when the wave provably ends — applied or cancelled — and the items become dispatchable
+again.
 
 Parking never overwrites an existing reason: a second `park` is a `conflict/precondition`, as is
 unparking a wave that is not parked. A parked wave is not counted as requiring attention — the
