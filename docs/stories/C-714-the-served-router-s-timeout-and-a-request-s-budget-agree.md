@@ -2,11 +2,12 @@
 id: C-714
 title: "The served router's timeout and a request's budget agree"
 pillar: "Core"
-status: backlog
+status: ready
 epic: first-class-hosts
 areas: [flux-server, flux-web]
 design: docs/designs/the-substrate-seam.md
 note: "C-701's review: the router times out at 120s while a caller's budget clamps at 300s, and the 408 that results is classified Refused rather than as a timeout the caller can recognise"
+priority: 4
 ---
 
 # The served router's timeout and a request's budget agree

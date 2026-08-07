@@ -2,11 +2,12 @@
 id: C-706
 title: "A served agent maps a contextId to its task"
 pillar: "Core"
-status: backlog
+status: ready
 epic: remote-agents
 areas: [flux-server]
 design: docs/designs/tui-attach.md
 note: "C-686's review: task id IS the session id server-side and find_correlated maps context to session, but nothing exposes it — so a fresh process can only replay history after sending something"
+priority: 4
 ---
 
 # A served agent maps a contextId to its task

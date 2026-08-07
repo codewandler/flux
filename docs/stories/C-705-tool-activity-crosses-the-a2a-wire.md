@@ -2,11 +2,12 @@
 id: C-705
 title: "Tool activity crosses the A2A wire"
 pillar: "Core"
-status: backlog
+status: ready
 epic: remote-agents
 areas: [flux-server]
 design: docs/designs/tui-attach.md
 note: "C-686's review: flux-server's StreamSink implements text_delta only, so an attached operator sees prose and never learns which files were read or commands ran"
+priority: 4
 ---
 
 # Tool activity crosses the A2A wire
