@@ -384,10 +384,18 @@ impl Tool for HttpRequestTool {
         if response.truncated && !body.ends_with("…[truncated]") {
             body.push_str("\n…[truncated]");
         }
+        // Latency the operator paid has to be explainable (C-701). The note goes in the *view* and
+        // not the record: the record's shape is declared (`{status, headers, body}`) and a flow
+        // selects fields out of it, while the view is the human surface where "why did that take
+        // eleven seconds" is asked. A request answered first time renders exactly as before.
+        let retried = match response.retries.note() {
+            Some(note) => format!("{note}\n"),
+            None => String::new(),
+        };
         // A completed request is a successful op: the HTTP status (incl. 4xx/5xx) is *data* in the
         // record — never a tool-level error.
         let view = format!(
-            "HTTP {status}\n{}\n{}",
+            "HTTP {status}\n{retried}{}\n{}",
             headers.rendered,
             ctx.redactor.redact(&body)
         );
@@ -836,6 +844,95 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A loopback server that answers a scripted sequence of raw responses, one per connection —
+    /// the fixture a retry needs, since "it was retried" is "the second answer is the one returned".
+    async fn scripted(script: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut turn = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let answer = script.get(turn).or_else(|| script.last()).cloned();
+                turn += 1;
+                let _ = sock.write_all(answer.unwrap_or_default().as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// C-701, acceptance 4 — a rate-limited request explains its latency where a person reads it,
+    /// and nothing else about the result moves.
+    ///
+    /// The note goes in the `view` rather than the record on purpose: the record's shape is declared
+    /// (`{status, headers, body}`) and an authored flow selects fields out of it, so widening it
+    /// would be a contract change to explain a latency. The view is the human surface, which is
+    /// exactly where "why did that take a second" gets asked.
+    #[tokio::test]
+    async fn a_retried_request_explains_the_wait_in_the_view_and_leaves_the_record_alone() {
+        let base = scripted(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 4\r\nconnection: close\r\n\r\nwait".into(),
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 6\r\nconnection: close\r\n\r\nserved".into(),
+        ])
+        .await;
+
+        let result = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .expect("a rate-limited request that succeeds on the retry is a successful op");
+
+        let view = result
+            .view
+            .as_deref()
+            .expect("a record result carries a view");
+        assert!(
+            view.starts_with("HTTP 200 OK\nrate-limited, retried 1 time over "),
+            "the wait is explained right under the status line: {view}"
+        );
+        let record = record(&result);
+        let mut fields: Vec<&str> = record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["body", "headers", "status"],
+            "the declared record shape is unchanged by a retry: {record}"
+        );
+        assert_eq!(record["status"], 200, "{record}");
+        assert_eq!(record["body"], "served", "{record}");
+    }
+
+    /// …and a request that was not retried renders exactly as it always did — no empty line, no
+    /// note, nothing for a reader to wonder about.
+    #[tokio::test]
+    async fn a_request_that_was_not_retried_renders_exactly_as_before() {
+        let base = one_shot_with_headers(
+            "200 OK",
+            vec!["content-type: text/plain".into()],
+            "served".into(),
+        )
+        .await;
+        let result = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .unwrap();
+        let view = result
+            .view
+            .as_deref()
+            .expect("a record result carries a view");
+        assert!(
+            view.starts_with("HTTP 200 OK\ncontent-type: text/plain\n"),
+            "the header block still follows the status line directly: {view}"
+        );
+        assert!(!view.contains("rate-limited"), "{view}");
     }
 
     /// The result record a completed request produces (`content` is canonical JSON since C-304).
