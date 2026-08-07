@@ -21,7 +21,9 @@ All notable changes to this project are documented in this file. The format is b
   The objective is deliberately lexicographic — more items beats better priority, since an idle
   worker delivers nothing — and the result carries a `held_back` list naming, for every excluded
   item, the batch member it collided with and why. That list is the point as much as the batch is:
-  a width that cannot be filled is a fact about the shape of the backlog.
+  a width that cannot be filled is a fact about the shape of the backlog. The native `board.next`
+  coordinator operation takes the same `independent` flag, because the coordinator is the caller
+  that actually chooses waves — a batch selector only a human can reach is one nothing uses.
 
 ### Fixed
 

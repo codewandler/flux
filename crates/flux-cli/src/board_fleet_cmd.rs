@@ -1579,6 +1579,14 @@ struct NativeBoardIdInput {
 struct NativeBoardNextInput {
     #[serde(default = "default_native_board_next_limit")]
     limit: usize,
+    /// Return the largest wave-safe set instead of the highest-priority prefix.
+    ///
+    /// The coordinator is the caller that actually needs this: it is choosing a wave, and a prefix
+    /// of the priority order is not one. Without it the only way to ask for a batch is to take the
+    /// top N and hope they do not collide, which on this Board returns eight stories writing one
+    /// crate.
+    #[serde(default)]
+    independent: bool,
 }
 
 fn default_native_board_next_limit() -> usize {
@@ -1709,7 +1717,11 @@ impl NativeCoordinatorOperation {
                 "Read one exact namespaced item from the authoritative workspace Board."
             }
             Self::BoardNext => {
-                "List dependency-satisfied ready Board items in deterministic priority order."
+                "List dependency-satisfied ready Board items in deterministic priority order. Set \
+                 `independent` when choosing a wave: it returns the largest set that can be built \
+                 at the same time, with `held_back` naming what each excluded item collides with. \
+                 A priority prefix is not a wave — integration refuses one in which two stories \
+                 wrote the same path."
             }
             Self::BoardCheck => {
                 "Validate the authoritative workspace Board configuration and story contracts."
@@ -1843,6 +1855,9 @@ impl NativeCoordinatorOperation {
                 }
                 let mut args = board_prefix(root);
                 args.extend(["next".into(), "--limit".into(), input.limit.to_string()]);
+                if input.independent {
+                    args.push("--independent".into());
+                }
                 args
             }
             Self::BoardStart | Self::BoardUnblock => {
@@ -5920,7 +5935,7 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
 }
 
 fn board_skill() -> String {
-    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board next --limit 8 --independent --output json  # a wave-safe set, not a priority prefix\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn fleet_skill() -> String {
@@ -15027,6 +15042,38 @@ mod tests {
 
         assert_eq!(batch, vec![0]);
         assert_eq!(held_back[0]["reason"], "declared dependency");
+    }
+
+    /// The coordinator is the caller that actually chooses waves, so a batch selector it cannot ask
+    /// for is a batch selector nobody uses. The flag has to reach the native operation, not just
+    /// the CLI a human types.
+    #[test]
+    fn the_coordinator_can_ask_board_next_for_an_independent_batch() {
+        let root = Path::new("/tmp/board-next-independent");
+
+        let plain = NativeCoordinatorOperation::BoardNext
+            .cli_args(root, json!({"limit": 8}))
+            .expect("board.next accepts a bare limit");
+        assert!(
+            !plain.iter().any(|arg| arg == "--independent"),
+            "a priority prefix stays the default: {plain:?}"
+        );
+
+        let batch = NativeCoordinatorOperation::BoardNext
+            .cli_args(root, json!({"limit": 8, "independent": true}))
+            .expect("board.next accepts the independent flag");
+        assert!(
+            batch.iter().any(|arg| arg == "--independent"),
+            "the coordinator's request must reach the CLI: {batch:?}"
+        );
+
+        // `deny_unknown_fields` is what would silently drop a misspelled flag, so prove the schema
+        // admits this one by name rather than trusting the round trip above.
+        let schema = NativeCoordinatorOperation::BoardNext.input_schema();
+        assert!(
+            schema.to_string().contains("independent"),
+            "the published schema must advertise it: {schema}"
+        );
     }
 
     /// The width is a ceiling, not a target.
