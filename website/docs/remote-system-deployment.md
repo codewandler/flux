@@ -186,7 +186,7 @@ check with no negotiation window, so a mixed pair does not degrade — it refuse
 A client whose release disagrees with the daemon's fails at connect, before any operation is sent:
 
 ```
-remote-system protocol mismatch: local 3, remote 2
+remote-system protocol mismatch: local 4, remote 3
 ```
 
 The daemon enforces the same rule per request, answering `400 Bad Request` with
@@ -227,6 +227,24 @@ on the control machine. Physical path confinement, process sandboxing, egress en
 operation-bound credentials act on or cross into the remote host. Returned results are remotely
 reported, not independently observed by the local runtime. See the complete
 [guarantees table](./topologies.md#which-guarantees-cross-the-link).
+
+### Web requests on the remote host
+
+`http.request` and `web.fetch` run on the selected system, so the request leaves the remote host's
+network with the remote host's source address. The daemon applies its own egress guard to every hop,
+enforces the response byte cap itself, and re-authorizes each `$secret` grant at every redirect it
+follows — a `Location` outside a grant's `to=` list is refused on the machine that would have
+followed it. A daemon that admits a request to a private or internal address logs it locally and
+reports it back, so the admission appears in the calling turn's audit trail naming the substrate it
+happened on.
+
+A credential your request carries is resolved on the control machine and sent to the remote host,
+which necessarily sees its value. Scope such secrets with `NAME;to=<host>` so the grant, not the
+network, decides where they can travel.
+
+A daemon that was started without a web backend does not advertise the operation and answers
+"this guarded substrate cannot perform a guarded HTTP request" without sending anything — a missing
+capability, never a request quietly made from the control machine instead.
 
 ## Production checklist
 

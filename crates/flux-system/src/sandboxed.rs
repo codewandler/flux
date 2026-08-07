@@ -335,6 +335,10 @@ impl GuardedNetwork for SandboxedSystem {
 /// against this machine's network is the same request the composed `System` would make. Refusing it
 /// would cost a capability without adding a boundary.
 impl GuardedHttp for SandboxedSystem {
+    fn serves_http(&self) -> bool {
+        GuardedHttp::serves_http(&self.inner)
+    }
+
     fn http_request<'a>(
         &'a self,
         request: &'a crate::port::HttpRequest,
@@ -893,6 +897,7 @@ mod tests {
                         headers: Vec::new(),
                         body: Vec::new(),
                         truncated: false,
+                        admits: Vec::new(),
                     })
                 })
             }

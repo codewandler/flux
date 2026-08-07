@@ -12,6 +12,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+### Action needed
+
+- **Upgrade `flux system serve` daemons together with their clients.** This release changes the
+  remote execution protocol twice over — host metrics and guarded HTTP both cross the wire now —
+  and the two ends check that they agree before doing anything. A daemon from an older release and
+  a client from this one will refuse to pair at all, saying so plainly rather than degrading. If
+  you run the serving daemon anywhere (a container, a pod, a VM guest, a build box reached over
+  ssh), update it in the same step you update the machines that talk to it.
+
 ### New
 
 - **Name the machines your work runs on.** A new `[[host]]` config section declares named execution
@@ -28,12 +37,18 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   never silently inherits a permission granted only to interactive use. `--remote <url>` still
   works for one-off connections.
 
-- **Web requests follow the host you select.** Until now, fetching a page or calling an API always
-  ran from the machine hosting the agent, even when a different execution host was selected. Now
-  HTTP requests and page fetches run against the host you picked with `--host` — and if that
-  host's connection cannot carry web traffic yet, the request refuses with a plain answer naming
-  what is missing, instead of quietly running on the local machine. Browser automation and site
-  crawling still run locally, since they drive a local browser.
+- **Web requests actually run on the host you select.** Fetching a page or calling an API now
+  travels to the execution host you picked with `--host` and leaves *that* machine's network, with
+  that machine's address — not the one your agent happens to be sitting on. The remote host applies
+  its own egress guard to every hop, enforces the response size limit itself, and re-checks each
+  `$secret` grant at every redirect it follows, so a `Location` pointing outside a grant's `to=`
+  list is refused on the machine that would have followed it. If that host admits a request to a
+  private or internal address, the admission appears in your session's audit trail naming the host
+  it happened on. A credential your request carries is necessarily visible to the host that sends
+  it — scope it with `NAME;to=<host>` so the grant, not the network, decides where it can travel.
+  A host started without web support says so up front and refuses, rather than quietly running the
+  request locally. Browser automation and site crawling still run locally, since they drive a local
+  browser.
 
 - **Confinement is now a host you can name.** `[[host]] backend = "sandboxed"` declares a host that
   runs guarded effects under the operating-system sandbox (bubblewrap on Linux, Seatbelt on macOS)
@@ -82,6 +97,16 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   default in both directions. The manifests cannot express an unauthenticated public listener: a
   bind that reaches beyond loopback without a token fails the shipped checks, and the running
   daemon refuses it too.
+
+- **Use the dev box you already have.** Declare an `ssh` host binding and flux reaches a machine
+  that has nothing on it but sshd: it opens a port-forward, makes sure flux is serving on the other
+  side, and runs your work there over the same secure protocol a `remote` host uses — same
+  authentication, same version check, same approval gates. ssh only gets you there; it never
+  becomes the way your work runs, so the far machine keeps enforcing its own permissions. Nothing
+  prompts: host-key checking is strict, a changed key is a refusal you can read rather than a
+  question in an unattended run, and your key stays a reference to a file flux never opens. Every
+  failure names the piece that is missing — no sshd, an unrecognised host key, a key that was
+  declined, no flux binary over there — and none of them quietly falls back to your own machine.
 
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
