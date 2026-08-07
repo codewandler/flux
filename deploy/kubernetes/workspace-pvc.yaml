@@ -1,0 +1,19 @@
+# The canonical workspace. Everything the remote system reads and writes lives here, including the
+# bounded delivery ledger at .flux/remote-system-delivery.json that stops one operation id from
+# executing twice. Losing this volume loses both.
+#
+# ReadWriteOnce is correct and not a limitation to work around: the ledger is local to the workspace,
+# so one replica per workspace is the supported topology. Two replicas sharing a volume is not a
+# coordination mechanism.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: flux-system-workspace
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+  # Uncomment and name a class whose reclaim policy you have actually checked.
+  # storageClassName: ""

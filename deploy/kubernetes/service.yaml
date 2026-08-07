@@ -1,0 +1,19 @@
+# ClusterIP, deliberately. This daemon executes guarded effects on a canonical workspace; it is not
+# a public endpoint, and neither a LoadBalancer nor an Ingress belongs in front of it by default.
+#
+# If an ingress or service mesh re-terminates TLS, keep authenticated encryption and the expected
+# certificate identity intact all the way to the daemon. The bearer token is not a substitute for
+# server authentication.
+apiVersion: v1
+kind: Service
+metadata:
+  name: flux-system
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: flux-system
+  ports:
+    - name: https
+      port: 8790
+      targetPort: https
+      protocol: TCP
