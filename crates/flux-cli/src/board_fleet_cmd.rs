@@ -572,6 +572,12 @@ pub(super) enum BoardAction {
     Evidence { id: String, evidence: String },
     /// Validate frontmatter, ids, priorities and planning-document links.
     Check,
+    /// Report items whose work is already present while their status says it is outstanding.
+    ///
+    /// A story implemented in `main` while its row still read `ready` was dispatched again, and a
+    /// worker turn reproduced code committed hours earlier. Every input was already recorded and
+    /// nothing could ask. Detection is the whole value: this reports and never repairs.
+    Reconcile,
     /// Regenerate the Track marker region byte-for-byte compatibly.
     Render,
     /// Validate then render the selected board.
@@ -4058,7 +4064,11 @@ fn run_session_board_action(
             let data = session_snapshot_value(&snapshot);
             Ok((serde_json::to_string_pretty(&data)?, data, vec![], current))
         }
+        // A session board keeps neither git history nor acceptance prose, so it has nothing
+        // reconcile could read. Refusing beats answering "nothing drifted" from a backend that
+        // could not have seen drift.
         BoardAction::Call { .. }
+        | BoardAction::Reconcile
         | BoardAction::Render
         | BoardAction::Sync
         | BoardAction::Import { .. }
@@ -4338,6 +4348,7 @@ fn run_board_action(
                 check_board(root)
             }
         }
+        BoardAction::Reconcile => reconcile_board(command, root),
         BoardAction::Render => {
             let rendered = render_track(root, command.dry_run)?;
             Ok((
@@ -5680,6 +5691,7 @@ fn board_operations() -> &'static [&'static str] {
         "comment",
         "evidence",
         "check",
+        "reconcile",
         "render",
         "sync",
         "graph",
@@ -5734,7 +5746,7 @@ fn board_action_mutates(action: &BoardAction) -> bool {
             }
             | BoardAction::Report { out: Some(_), .. }
             | BoardAction::Export { out: Some(_) }
-    ) || matches!(action, BoardAction::Call { target, operation } if !matches!(operation.as_deref().unwrap_or(target), "get" | "list" | "query" | "stats" | "check" | "graph" | "schema"))
+    ) || matches!(action, BoardAction::Call { target, operation } if !matches!(operation.as_deref().unwrap_or(target), "get" | "list" | "query" | "stats" | "check" | "reconcile" | "graph" | "schema"))
 }
 
 fn board_action_requires_member(action: &BoardAction) -> bool {
@@ -6029,7 +6041,7 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
 }
 
 fn board_skill() -> String {
-    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board next --limit 8 --independent --output json  # a wave-safe set, not a priority prefix\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board next --limit 8 --independent --output json  # a wave-safe set, not a priority prefix\nflux board reconcile --output json  # items whose work is already in the tree\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn fleet_skill() -> String {
@@ -7937,6 +7949,302 @@ fn check_workspace_board(root: &Path) -> Result<(String, Value, Vec<String>, Opt
     ))
 }
 
+/// How far back `board reconcile` reads history for landed implementation.
+///
+/// The failure this catches is hours old, not months — a story dispatched again while its work was
+/// already committed — so a fixed depth keeps one `git log` bounded on a long history. A scan that
+/// reaches the ceiling says so rather than reporting a partial answer as complete.
+const RECONCILE_HISTORY_DEPTH: usize = 500;
+
+/// How many landed commits one finding cites before it just counts the rest.
+const RECONCILE_COMMITS_PER_FINDING: usize = 5;
+
+/// The board's own documents. A commit confined to these is the status record, not the work.
+const RECONCILE_BOARD_PREFIX: &str = "docs/stories/";
+
+/// Record and field separators for the single `git log` pass. ASCII 0x1e/0x1f cannot appear in a
+/// path and are vanishingly unlikely in a commit message, so one bounded call yields hash, subject,
+/// body and file list without a delimiter a message could forge.
+const RECONCILE_RECORD_SEPARATOR: char = '\u{1e}';
+const RECONCILE_FIELD_SEPARATOR: char = '\u{1f}';
+
+/// One commit from the scanned history, with its message and how its files divide.
+struct HistoryCommit {
+    hash: String,
+    subject: String,
+    /// Subject and body together, so an item named only in a trailer still matches.
+    message: String,
+    /// Files outside the board's own directory: the implementation, if this commit carries any.
+    work_files: usize,
+}
+
+/// Split one `git log` pass into commits and divide each one's files from the board's own.
+fn parse_history_records(stdout: &str) -> Vec<HistoryCommit> {
+    let mut commits = Vec::new();
+    for record in stdout.split(RECONCILE_RECORD_SEPARATOR) {
+        let mut fields = record.splitn(4, RECONCILE_FIELD_SEPARATOR);
+        let (Some(hash), Some(subject), Some(body), Some(files)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let hash = hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        let work_files = files
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && !path.starts_with(RECONCILE_BOARD_PREFIX))
+            .count();
+        commits.push(HistoryCommit {
+            hash: hash.to_string(),
+            subject: subject.trim().to_string(),
+            message: format!("{subject}\n{body}"),
+            work_files,
+        });
+    }
+    commits
+}
+
+/// Read a bounded slice of `root`'s history, newest first, and say whether it hit the ceiling.
+///
+/// `None` means there is no readable history here at all — an unborn branch or a directory that is
+/// not a repository. That is a fact worth reporting, not a reason to fail the whole verb, so the
+/// caller degrades to the evidence that needs no history.
+fn read_reconcile_history(root: &Path, depth: usize) -> Option<(Vec<HistoryCommit>, bool)> {
+    let limit = depth.to_string();
+    let format = format!(
+        "--format={RECONCILE_RECORD_SEPARATOR}%H{RECONCILE_FIELD_SEPARATOR}%s{RECONCILE_FIELD_SEPARATOR}%b{RECONCILE_FIELD_SEPARATOR}"
+    );
+    let output = guarded_git(
+        root,
+        &[
+            "log",
+            "--no-merges",
+            "-n",
+            limit.as_str(),
+            "--name-only",
+            format.as_str(),
+            "HEAD",
+        ],
+    )
+    .ok()
+    .filter(|output| output.exit_code == 0)?;
+    let commits = parse_history_records(&output.stdout);
+    let truncated = commits.len() >= depth;
+    Some((commits, truncated))
+}
+
+/// Is `id` named as a whole token in `text`?
+///
+/// Ids share prefixes by construction, so a substring search finds `C-63` inside `C-637` and
+/// reports the wrong item — and a wrong finding is worse than none, because the repair it suggests
+/// is a status lie. `/` is not part of a token, so the workspace spelling `member/C-637` still
+/// names the item its own repository calls `C-637`.
+fn names_item(text: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let in_token = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+    text.match_indices(id).any(|(index, _)| {
+        let before = index.checked_sub(1).map(|previous| bytes[previous]);
+        let after = bytes.get(index + id.len()).copied();
+        !before.is_some_and(in_token) && !after.is_some_and(in_token)
+    })
+}
+
+/// Evidence that this item's work is already present while its status says it is outstanding.
+///
+/// Two independent signals, both derived from what the board already records:
+///
+/// - **`implementation-landed`** — a commit reachable from `HEAD` names the item *and* touches a
+///   path outside the board's own directory. Adding the item, flipping its status and re-rendering
+///   the marker region all name it and all land in `docs/stories/`; counting those as
+///   implementation would report every item on the board, which is the same as reporting none.
+/// - **`acceptance-complete`** — every checkbox under `## Acceptance` is ticked. It is the weaker
+///   signal and deliberately kept: it needs no history and no commit-message convention, so a
+///   repository with neither still gets an answer.
+///
+/// A `done` item is never a finding — its status and its tree already agree.
+fn already_present_evidence(
+    story: &Story,
+    local_id: &str,
+    history: &[HistoryCommit],
+) -> Vec<Value> {
+    if story.status == "done" {
+        return Vec::new();
+    }
+    let mut evidence = Vec::new();
+    let (ticked, _, total) = checkbox_counts(&story.body, "Acceptance");
+    if total > 0 && ticked == total {
+        evidence.push(json!({
+            "signal": "acceptance-complete",
+            "detail": format!("{ticked} of {total} Acceptance criteria ticked"),
+        }));
+    }
+    let landed = history
+        .iter()
+        .filter(|commit| commit.work_files > 0 && names_item(&commit.message, local_id))
+        .collect::<Vec<_>>();
+    for commit in landed.iter().take(RECONCILE_COMMITS_PER_FINDING) {
+        evidence.push(json!({
+            "signal": "implementation-landed",
+            "commit": commit.hash,
+            "subject": commit.subject,
+            "files": commit.work_files,
+        }));
+    }
+    if landed.len() > RECONCILE_COMMITS_PER_FINDING {
+        evidence.push(json!({
+            "signal": "implementation-landed",
+            "more_commits": landed.len() - RECONCILE_COMMITS_PER_FINDING,
+        }));
+    }
+    evidence
+}
+
+/// The shortest profile-valid transition path from `status` to `done`.
+///
+/// The repair is a transition, so the report has to name one the state machine will accept. Every
+/// step here is checked against [`valid_planning_transition`] by test rather than restated beside
+/// it, because two copies of a state machine are how they drift apart.
+fn path_to_done(status: &str) -> Vec<&'static str> {
+    match status {
+        "backlog" => vec!["ready", "in-progress", "done"],
+        "ready" => vec!["in-progress", "done"],
+        "in-progress" | "blocked" => vec!["done"],
+        _ => Vec::new(),
+    }
+}
+
+/// Split a board id into the member whose history holds its work and the id that member uses.
+///
+/// A workspace item is `member/ID` and the commit that implemented it lives in that member's
+/// repository, not in the workspace root. An empty member means "this root".
+fn reconcile_member_split(id: &str, workspace: bool) -> (&str, &str) {
+    match id.split_once('/') {
+        Some((member, local)) if workspace => (member, local),
+        _ => ("", id),
+    }
+}
+
+/// `board reconcile`: items whose work is already present while their status says otherwise.
+///
+/// Read-only by construction. The fix is a transition anyone can make once they know, so each
+/// finding names the evidence that fired and the profile-valid path that would close it, and the
+/// verb itself writes nothing — which is what makes it safe to run from a coordinator loop.
+fn reconcile_board(
+    command: &BoardCommand,
+    root: &Path,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let stories = read_board_items(command, root)?;
+    let workspace = command.scope() == BoardScopeArg::Workspace && command.board.is_none();
+    let outstanding = stories
+        .iter()
+        .filter(|story| story.status != "done")
+        .collect::<Vec<_>>();
+
+    let mut warnings = Vec::new();
+    let mut histories: BTreeMap<String, Vec<HistoryCommit>> = BTreeMap::new();
+    let members = outstanding
+        .iter()
+        .map(|story| reconcile_member_split(&story.id, workspace).0.to_string())
+        .collect::<BTreeSet<_>>();
+    for member in members {
+        let member_root = if member.is_empty() {
+            root.to_path_buf()
+        } else {
+            member_root(root, &member)?
+        };
+        let label = if member.is_empty() {
+            display_path(&member_root)
+        } else {
+            member.clone()
+        };
+        match read_reconcile_history(&member_root, RECONCILE_HISTORY_DEPTH) {
+            Some((history, truncated)) => {
+                if truncated {
+                    warnings.push(format!(
+                        "{label}: history scan stopped at {RECONCILE_HISTORY_DEPTH} commits; \
+                         implementation older than that is not visible to this report"
+                    ));
+                }
+                histories.insert(member, history);
+            }
+            None => {
+                warnings.push(format!(
+                    "{label}: no readable git history; only acceptance evidence is available"
+                ));
+                histories.insert(member, Vec::new());
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for story in &outstanding {
+        let (member, local_id) = reconcile_member_split(&story.id, workspace);
+        let history = histories.get(member).map(Vec::as_slice).unwrap_or_default();
+        let evidence = already_present_evidence(story, local_id, history);
+        if evidence.is_empty() {
+            continue;
+        }
+        let signals = evidence
+            .iter()
+            .filter_map(|entry| entry["signal"].as_str())
+            .collect::<BTreeSet<_>>();
+        findings.push(json!({
+            "id": story.id,
+            "title": story.title,
+            "status": story.status,
+            "file": story.file,
+            "signals": signals,
+            "evidence": evidence,
+            "transition_path": path_to_done(&story.status),
+        }));
+    }
+
+    let summary = format!(
+        "{} of {} outstanding item(s) already have work present",
+        findings.len(),
+        outstanding.len()
+    );
+    let rows = findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{}\t{}\t{}",
+                finding["id"].as_str().unwrap_or_default(),
+                finding["status"].as_str().unwrap_or_default(),
+                finding["signals"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    let human = if rows.is_empty() {
+        summary
+    } else {
+        format!("{}\n\n{summary}", rows.join("\n"))
+    };
+    Ok((
+        human,
+        json!({
+            "findings": findings,
+            "outstanding": outstanding.len(),
+            "items": stories.len(),
+            "history_depth": RECONCILE_HISTORY_DEPTH,
+        }),
+        warnings,
+        None,
+    ))
+}
+
 fn markdown_link_targets(body: &str) -> Vec<&str> {
     let mut targets = Vec::new();
     let mut rest = body;
@@ -8934,6 +9242,7 @@ fn board_call(
             ))
         }
         "check" if request.is_none() => check_board(root),
+        "reconcile" if request.is_none() => reconcile_board(command, root),
         "schema" => Ok((
             String::new(),
             family_schema("board", board_operations()),
@@ -15560,6 +15869,167 @@ mod tests {
         let (batch, _, _) = select_independent_batch(&stories, 3);
 
         assert_eq!(batch, vec![0, 1, 2]);
+    }
+
+    fn outstanding_story(id: &str, status: &str, body: &str) -> Story {
+        let mut story = ready_story(id, 0, &["flux-cli"]);
+        story.status = status.to_string();
+        story.body = body.to_string();
+        story
+    }
+
+    fn history_commit(hash: &str, subject: &str, work_files: usize) -> HistoryCommit {
+        HistoryCommit {
+            hash: hash.to_string(),
+            subject: subject.to_string(),
+            message: subject.to_string(),
+            work_files,
+        }
+    }
+
+    /// C-637's own failure: the work was committed, the row still read `ready`, and the coordinator
+    /// dispatched a second worker at it. The commit that named the item and touched code is the
+    /// evidence nobody could ask for.
+    #[test]
+    fn an_item_whose_work_landed_while_its_status_reads_ready_is_reported() {
+        let story = outstanding_story("C-637", "ready", "## Acceptance\n\n- [ ] not yet\n");
+        let history = vec![history_commit(
+            "abc1234",
+            "feat(board): report items whose work is already present (C-637)",
+            3,
+        )];
+
+        let evidence = already_present_evidence(&story, "C-637", &history);
+
+        assert_eq!(evidence.len(), 1, "one signal fired: {evidence:?}");
+        assert_eq!(evidence[0]["signal"], "implementation-landed");
+        assert_eq!(evidence[0]["commit"], "abc1234");
+        assert_eq!(evidence[0]["files"], 3);
+        assert_eq!(path_to_done(&story.status), vec!["in-progress", "done"]);
+    }
+
+    /// Creating the item, flipping its status and re-rendering the marker region all name the item
+    /// and all land in the board's own directory. Counting them as implementation would report every
+    /// item on the board, which is the same as reporting none.
+    #[test]
+    fn a_board_only_commit_is_not_implementation() {
+        let story = outstanding_story("C-637", "ready", "## Acceptance\n\n- [ ] not yet\n");
+        let history = parse_history_records(
+            "\u{1e}abc1234\u{1f}board: add C-637 board reconcile\u{1f}\u{1f}\n\
+             docs/stories/C-637-board-reconcile.md\ndocs/stories/README.md\n",
+        );
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].work_files, 0);
+        assert!(already_present_evidence(&story, "C-637", &history).is_empty());
+    }
+
+    /// A `done` item's status and tree already agree; reporting it is noise that hides the real one.
+    #[test]
+    fn a_done_item_is_never_a_finding() {
+        let story = outstanding_story("C-637", "done", "## Acceptance\n\n- [x] shipped\n");
+        let history = vec![history_commit("abc1234", "feat: C-637 landed", 9)];
+
+        assert!(already_present_evidence(&story, "C-637", &history).is_empty());
+    }
+
+    /// The weaker signal has to stand alone: a repository with no message convention, or no readable
+    /// history at all, still gets an answer from what the item says about itself.
+    #[test]
+    fn a_fully_ticked_acceptance_stands_on_its_own() {
+        let story = outstanding_story(
+            "C-637",
+            "in-progress",
+            "## Acceptance\n\n- [x] first\n- [X] second\n",
+        );
+
+        let evidence = already_present_evidence(&story, "C-637", &[]);
+
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert_eq!(evidence[0]["signal"], "acceptance-complete");
+        assert_eq!(evidence[0]["detail"], "2 of 2 Acceptance criteria ticked");
+        assert_eq!(path_to_done(&story.status), vec!["done"]);
+    }
+
+    /// Ids share a prefix by construction, so a substring search reports the wrong item — and a
+    /// wrong finding is worse than none, because the repair it suggests is a status lie.
+    #[test]
+    fn an_item_id_matches_only_as_a_whole_token() {
+        assert!(names_item("closes C-637 at last", "C-637"));
+        assert!(names_item("flux/C-637: the workspace spelling", "C-637"));
+        assert!(names_item("trailing punctuation C-637.", "C-637"));
+        assert!(!names_item("C-6370 is a different item", "C-637"));
+        assert!(!names_item("C-637 is a longer id", "C-63"));
+    }
+
+    /// The repair is a transition, so the suggested path has to be one the state machine accepts.
+    /// Restating the arrows beside `valid_planning_transition` is how they drift apart.
+    #[test]
+    fn the_repair_path_is_accepted_by_the_planning_state_machine() {
+        for status in ["backlog", "ready", "in-progress", "blocked"] {
+            let path = path_to_done(status);
+            assert_eq!(
+                path.last().copied(),
+                Some("done"),
+                "{status} must reach done"
+            );
+            let mut from = status;
+            for step in &path {
+                assert!(
+                    valid_planning_transition(from, step),
+                    "{from} -> {step} is not a planning transition"
+                );
+                from = step;
+            }
+        }
+        assert!(path_to_done("done").is_empty(), "done needs no repair");
+    }
+
+    /// One `git log` pass has to survive multi-line bodies and separate the board's own documents
+    /// from the work, because both appear in the same commit list.
+    #[test]
+    fn one_git_log_pass_splits_records_and_divides_files() {
+        let commits = parse_history_records(
+            "\u{1e}aaa1111\u{1f}feat: one (C-1)\u{1f}body line\nsecond body line\n\u{1f}\n\
+             crates/flux-cli/src/board_fleet_cmd.rs\ndocs/stories/C-1-x.md\n\
+             \u{1e}bbb2222\u{1f}board: add C-2\u{1f}\u{1f}\ndocs/stories/C-2-y.md\n",
+        );
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, "aaa1111");
+        assert_eq!(commits[0].subject, "feat: one (C-1)");
+        assert!(commits[0].message.contains("second body line"));
+        assert_eq!(commits[0].work_files, 1, "the story file is not the work");
+        assert_eq!(commits[1].work_files, 0);
+    }
+
+    /// A workspace item is `member/ID`, and the commit that implemented it is in that member's
+    /// repository. Looking for it in the workspace root would report every member as untouched.
+    #[test]
+    fn a_workspace_id_names_the_member_whose_history_holds_its_work() {
+        assert_eq!(
+            reconcile_member_split("flux/C-637", true),
+            ("flux", "C-637")
+        );
+        assert_eq!(reconcile_member_split("C-637", true), ("", "C-637"));
+        assert_eq!(
+            reconcile_member_split("flux/C-637", false),
+            ("", "flux/C-637"),
+            "a repository board owns ids with slashes in them"
+        );
+    }
+
+    /// Detection is the whole value, so reconcile must be reachable from the published API and must
+    /// never be classed as a mutation — an operator asking what drifted cannot risk writing.
+    #[test]
+    fn board_reconcile_is_a_published_read_only_operation() {
+        assert!(board_operations().contains(&"reconcile"));
+        assert!(!board_action_mutates(&BoardAction::Reconcile));
+        assert!(!board_action_requires_member(&BoardAction::Reconcile));
+        assert!(!board_action_mutates(&BoardAction::Call {
+            target: "reconcile".into(),
+            operation: None,
+        }));
     }
 
     /// C-596: the integrator's authority ends at a green gate. Apply, push, Board mutation and
