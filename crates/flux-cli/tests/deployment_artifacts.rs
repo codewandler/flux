@@ -1,10 +1,20 @@
-//! Executable contract for the shipped remote-system deployment artifacts (C-480).
+//! Executable contract for the shipped deployment artifacts — the remote-system substrate (C-480)
+//! and the agent surface (C-685).
 //!
 //! `deploy/` turns the BYO recipe in the deployment guide into artifacts an operator applies. That
 //! only helps if the artifacts stay true to the daemon they package, so this suite derives what it
-//! can from the code — the flags the shipped binary accepts, the protocol version it enforces — and
-//! pins the rest: the controls each profile promises, the secret material none of them may carry,
-//! and the provisioning boundary all of them state.
+//! can from the code — the flags the shipped binary accepts, the protocol version it enforces, the
+//! routes it leaves auth-exempt — and pins the rest: the controls each profile promises, the secret
+//! material none of them may carry, and the provisioning boundary all of them state.
+//!
+//! Two axes are packaged here, and they are not the same deployment
+//! (`docs/designs/operating-a-deployed-host.md`):
+//!
+//! - **substrate** — `deploy/kubernetes/` runs `flux system serve`, so only guarded effects land in
+//!   the pod; the model, the approvals and the session stay on the operator's machine.
+//! - **agent** — `deploy/agent/` runs `flux app run --serve`, so the *whole* agent lives in the
+//!   pod. It reuses the substrate's released image with a command override; a second image would
+//!   be a second thing to attest.
 //!
 //! The container profile's *behaviour* is proved separately and needs Docker:
 //! `crates/flux-server/tests/remote_system_container.rs`. Everything here runs in ordinary CI.
@@ -27,6 +37,26 @@ const DEPLOY_README: &str = "deploy/README.md";
 const VM_README: &str = "deploy/vm/README.md";
 const KUBERNETES_README: &str = "deploy/kubernetes/README.md";
 const PUBLIC_GUIDE: &str = "website/docs/remote-system-deployment.md";
+
+// C-685 — the agent surface's Kubernetes profile. A sibling base rather than an overlay on
+// `deploy/kubernetes/`: it runs a different program (`flux app run --serve`, not `flux system
+// serve`) on a different port, with a different secret, a different volume and a public health
+// route, so an overlay would patch every field it inherited and the two would collide on names in
+// a cluster running both.
+const AGENT_KUSTOMIZATION: &str = "deploy/agent/kustomization.yaml";
+const AGENT_NAMESPACE: &str = "deploy/agent/namespace.yaml";
+const AGENT_DEPLOYMENT: &str = "deploy/agent/deployment.yaml";
+const AGENT_SERVICE: &str = "deploy/agent/service.yaml";
+const AGENT_PVC: &str = "deploy/agent/state-pvc.yaml";
+const AGENT_NETWORKPOLICY: &str = "deploy/agent/networkpolicy.yaml";
+const AGENT_README: &str = "deploy/agent/README.md";
+const AGENT_GUIDE: &str = "website/docs/agent/deployment.md";
+
+/// Where the CLI's served-agent auth is resolved, and where the served surface refuses an
+/// unauthenticated non-loopback bind. The manifests are checked against these, not against a
+/// remembered spelling.
+const APP_CMD: &str = "crates/flux-cli/src/app_cmd.rs";
+const SERVER: &str = "crates/flux-server/src/lib.rs";
 
 fn repo_path(rel: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -53,7 +83,20 @@ fn all_artifacts() -> Vec<&'static str> {
         UNIT,
         INSTALL,
         CLOUD_INIT,
+        AGENT_KUSTOMIZATION,
+        AGENT_NAMESPACE,
+        AGENT_DEPLOYMENT,
+        AGENT_SERVICE,
+        AGENT_PVC,
+        AGENT_NETWORKPOLICY,
     ]
+}
+
+/// Every Kubernetes manifest that starts a listener, across both profiles. The Dockerfile and the
+/// systemd unit are deliberately absent: neither can carry a Kubernetes Secret reference, and the
+/// binary's own refusal is what protects them (`guard_open_bind`, flux-server).
+fn listener_manifests() -> Vec<&'static str> {
+    vec![DEPLOYMENT, AGENT_DEPLOYMENT]
 }
 
 /// `flux <path…> --help`, as the shipped binary renders it.
@@ -97,11 +140,16 @@ fn continued_directive(source: &str, start: &str) -> String {
     collected.join(" ")
 }
 
-/// The `args:` list a Kubernetes container hands to the image entrypoint.
-fn yaml_args(source: &str) -> String {
+/// A `command:`/`args:` block-sequence a Kubernetes container declares, flattened to argv.
+///
+/// The `take_while` stops at the first line that is not a `- ` item, so a **commented** entry ends
+/// the list. That is deliberate and load-bearing for C-685: the agent profile parks its alternative
+/// approval posture as a trailing `# - --remote-approval`, and it must read as documentation rather
+/// than as a second active flag.
+fn yaml_list(source: &str, key: &str) -> String {
     source
         .lines()
-        .skip_while(|line| line.trim() != "args:")
+        .skip_while(|line| line.trim() != key)
         .skip(1)
         .take_while(|line| line.trim().starts_with("- "))
         .map(str::trim)
@@ -109,7 +157,7 @@ fn yaml_args(source: &str) -> String {
         .join(" ")
 }
 
-/// Only the argv the artifact hands to `flux system serve` — never the surrounding `useradd`,
+/// Only the argv the artifact hands to the flux binary — never the surrounding `useradd`,
 /// `apt-get` or systemd directives, whose flags belong to other programs entirely.
 fn daemon_argv(artifact: &str, source: &str) -> String {
     match artifact {
@@ -118,10 +166,138 @@ fn daemon_argv(artifact: &str, source: &str) -> String {
             continued_directive(source, "ENTRYPOINT"),
             continued_directive(source, "CMD")
         ),
-        DEPLOYMENT => yaml_args(source),
+        DEPLOYMENT => yaml_list(source, "args:"),
+        // The agent profile overrides the image entrypoint, so its subcommand path lives in
+        // `command:` and only the flags live in `args:`. Both halves are the argv.
+        AGENT_DEPLOYMENT => format!(
+            "{} {}",
+            yaml_list(source, "command:"),
+            yaml_list(source, "args:")
+        ),
         UNIT => continued_directive(source, "ExecStart="),
         other => panic!("no argv extractor for {other}"),
     }
+}
+
+/// The `key: value` a YAML manifest sets, first occurrence, unquoted and uncommented.
+fn yaml_scalar(source: &str, key: &str) -> Option<String> {
+    source.lines().map(str::trim).find_map(|line| {
+        line.strip_prefix(key).map(|rest| {
+            rest.trim()
+                .trim_matches(|c| c == '"' || c == '\'')
+                .to_string()
+        })
+    })
+}
+
+/// An extracted argv as the words the binary would actually receive: the YAML block-sequence `-`
+/// markers and JSON-array punctuation of the source form are separators, not arguments.
+fn argv_tokens(argv: &str) -> Vec<String> {
+    argv.split_whitespace()
+        .map(|token| token.trim_matches(|c| c == '"' || c == ',' || c == '[' || c == ']'))
+        .filter(|token| !token.is_empty() && *token != "-")
+        .map(str::to_string)
+        .collect()
+}
+
+/// The value an argv gives an option that takes one, in either spelling: `--flag value` or
+/// `--flag=value`.
+fn argv_value(argv: &str, flag: &str) -> Option<String> {
+    let tokens = argv_tokens(argv);
+    for (index, token) in tokens.iter().enumerate() {
+        if let Some(inline) = token.strip_prefix(&format!("{flag}=")) {
+            return Some(inline.to_string());
+        }
+        if token == flag {
+            return tokens
+                .get(index + 1)
+                .filter(|n| !n.starts_with('-'))
+                .cloned();
+        }
+    }
+    None
+}
+
+/// Every address an argv asks a flux listener to bind: `--bind <addr>` (the substrate daemon) and
+/// `--serve <addr>` / `--serve=<addr>` (the agent surface).
+fn bind_addresses(argv: &str) -> Vec<String> {
+    ["--bind", "--serve"]
+        .into_iter()
+        .filter_map(|flag| argv_value(argv, flag))
+        .collect()
+}
+
+/// Mirrors `addr_is_loopback` in `crates/flux-cli/src/app_cmd.rs` and `unauthenticated_bind_allowed`
+/// in `crates/flux-server/src/lib.rs`: the question both of them ask before admitting an
+/// unauthenticated listener. Restated rather than imported — neither is public — and the test below
+/// pins that the CLI still asks it, so a rename cannot leave this copy answering about nothing.
+fn addr_is_loopback(addr: &str) -> bool {
+    use std::net::{IpAddr, SocketAddr};
+    if let Ok(socket) = addr.parse::<SocketAddr>() {
+        return socket.ip().is_loopback();
+    }
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
+/// The env var names a manifest populates from a Kubernetes Secret. A value that is not a
+/// `secretKeyRef` is a value somebody typed into a file, which is the thing these profiles exist
+/// to avoid.
+fn secret_backed_env(source: &str) -> Vec<String> {
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    let mut names = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(name) = line.strip_prefix("- name: ") else {
+            continue;
+        };
+        // `valueFrom:` / `secretKeyRef:` / `name:` / `key:` — within a short window of the env entry,
+        // and before the next entry starts.
+        let following = lines
+            .iter()
+            .skip(index + 1)
+            .take_while(|next| !next.starts_with("- name: "))
+            .take(6)
+            .any(|next| next.starts_with("secretKeyRef:"));
+        if following {
+            names.push(name.trim().to_string());
+        }
+    }
+    names
+}
+
+/// The routes `flux app run --serve` registers OUTSIDE its authentication layer — the documented
+/// health/discovery exemptions `AGENTS.md` carves out of "keep served HTTP routes authenticated".
+///
+/// Read from the single-agent router (the first `let exempt` block, which is the one `serve` and
+/// `serve_with_approvals` build) so a probe in a manifest can be checked against the shipped
+/// exemption set rather than against a remembered path.
+fn auth_exempt_routes() -> Vec<String> {
+    let server = read(SERVER);
+    let block: String = server
+        .lines()
+        .skip_while(|line| !line.trim().starts_with("let exempt = Router::new()"))
+        .take_while(|line| !line.trim().starts_with(".layer("))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut routes: Vec<String> = block
+        .match_indices(".route(\"")
+        .filter_map(|(index, _)| {
+            let rest = &block[index + ".route(\"".len()..];
+            rest.find('"').map(|end| rest[..end].to_string())
+        })
+        .collect();
+    routes.sort();
+    routes.dedup();
+    assert!(
+        routes.contains(&"/health".to_string()),
+        "{SERVER}'s auth-exempt router no longer registers /health — the extractor stopped \
+         matching, which would make every probe check below vacuous"
+    );
+    routes
 }
 
 /// Every `--long-flag` an artifact hands to the daemon.
@@ -221,7 +397,19 @@ fn no_deployment_artifact_carries_a_token_or_a_private_key() {
     );
 
     // A committed Secret manifest is the same defect wearing Kubernetes clothes.
-    for manifest in [KUSTOMIZATION, DEPLOYMENT, SERVICE, PVC, NETWORKPOLICY] {
+    for manifest in [
+        KUSTOMIZATION,
+        DEPLOYMENT,
+        SERVICE,
+        PVC,
+        NETWORKPOLICY,
+        AGENT_KUSTOMIZATION,
+        AGENT_NAMESPACE,
+        AGENT_DEPLOYMENT,
+        AGENT_SERVICE,
+        AGENT_PVC,
+        AGENT_NETWORKPOLICY,
+    ] {
         assert!(
             !read(manifest).contains("kind: Secret"),
             "{manifest} declares a Secret — create both Secrets out of band instead"
@@ -456,11 +644,19 @@ fn the_guest_profile_is_hardened_and_keeps_the_sandbox_floor() {
 #[test]
 fn every_flag_the_profiles_pass_is_one_the_shipped_binary_accepts() {
     let serve_help = flux_help(&["system", "serve"]);
+    // C-685: the agent profile drives a different subcommand, so it is checked against that
+    // subcommand's own help rather than the daemon's.
+    let app_run_help = flux_help(&["app", "run"]);
     let global_help = flux_help(&[]);
 
     let mut checked = 0usize;
     let mut missing = Vec::new();
-    for artifact in [DOCKERFILE, DEPLOYMENT, UNIT] {
+    for (artifact, subcommand_help) in [
+        (DOCKERFILE, &serve_help),
+        (DEPLOYMENT, &serve_help),
+        (UNIT, &serve_help),
+        (AGENT_DEPLOYMENT, &app_run_help),
+    ] {
         let argv = daemon_argv(artifact, &read(artifact));
         let flags = flags_in(&argv);
         assert!(
@@ -470,7 +666,7 @@ fn every_flag_the_profiles_pass_is_one_the_shipped_binary_accepts() {
             flags.len()
         );
         for flag in flags {
-            if !serve_help.contains(&flag) && !global_help.contains(&flag) {
+            if !subcommand_help.contains(&flag) && !global_help.contains(&flag) {
                 missing.push(format!("{artifact}: {flag}"));
             }
             checked += 1;
@@ -595,7 +791,7 @@ fn the_public_guide_uses_the_shipped_artifacts_and_states_the_provisioning_bound
     // Every artifact is indexed somewhere a reader will land: the top-level map, or the README
     // sitting beside it. An artifact nothing indexes is an artifact nobody applies.
     let index = read(DEPLOY_README);
-    let profile_readmes: String = [KUBERNETES_README, VM_README]
+    let profile_readmes: String = [KUBERNETES_README, VM_README, AGENT_README]
         .iter()
         .map(|r| read(r))
         .collect();
@@ -618,5 +814,438 @@ fn the_public_guide_uses_the_shipped_artifacts_and_states_the_provisioning_bound
     assert!(
         read(KUBERNETES_README).contains("kubectl apply -k"),
         "{KUBERNETES_README} must show how the profile is applied"
+    );
+}
+
+/// C-685: the agent surface runs the image the substrate profile already ships, reached by a
+/// command override. A second image is a second thing to build, attest, publish and get wrong.
+#[test]
+fn the_agent_profile_runs_the_released_image_and_never_a_second_one() {
+    let substrate = read(KUSTOMIZATION);
+    let agent = read(AGENT_KUSTOMIZATION);
+
+    // Derived, not restated: whatever image the substrate profile pins, the agent profile pins the
+    // same name and the same tag. A profile that drifts to its own tag is running a release nobody
+    // attested against this one.
+    for key in ["newName:", "newTag:"] {
+        let expected = yaml_scalar(&substrate, key)
+            .unwrap_or_else(|| panic!("{KUSTOMIZATION} pins the image `{key}`"));
+        let actual = yaml_scalar(&agent, key)
+            .unwrap_or_else(|| panic!("{AGENT_KUSTOMIZATION} must pin the image `{key}`"));
+        assert_eq!(
+            actual, expected,
+            "{AGENT_KUSTOMIZATION} pins `{key} {actual}` while {KUSTOMIZATION} pins `{expected}` — \
+             the agent surface must run the SAME released image as the substrate, not a second one"
+        );
+    }
+    let substrate_image =
+        yaml_scalar(&read(DEPLOYMENT), "image:").expect("the substrate Deployment names an image");
+    let agent_image = yaml_scalar(&read(AGENT_DEPLOYMENT), "image:")
+        .expect("the agent Deployment names an image");
+    assert_eq!(
+        agent_image, substrate_image,
+        "{AGENT_DEPLOYMENT} references image `{agent_image}` but {DEPLOYMENT} references \
+         `{substrate_image}` — one image, reached two ways"
+    );
+
+    // The image's entrypoint is the substrate daemon, so the agent profile can only be a command
+    // override. Both halves are derived from the Dockerfile that actually ships.
+    let dockerfile = read(DOCKERFILE);
+    let entrypoint = continued_directive(&dockerfile, "ENTRYPOINT");
+    assert!(
+        entrypoint.contains("\"system\", \"serve\""),
+        "{DOCKERFILE}'s ENTRYPOINT is no longer `flux system serve` — re-derive what the agent \
+         profile has to override"
+    );
+    let binary = "/usr/local/bin/flux";
+    assert!(
+        entrypoint.contains(binary),
+        "{DOCKERFILE} no longer installs the binary at {binary}"
+    );
+    let command = yaml_list(&read(AGENT_DEPLOYMENT), "command:");
+    for expected in [binary, "app", "run"] {
+        assert!(
+            command.contains(expected),
+            "{AGENT_DEPLOYMENT}'s `command:` must override the image entrypoint with \
+             `{binary} app run` (missing `{expected}`); it currently reads `{command}`"
+        );
+    }
+    assert!(
+        !command.contains("system"),
+        "{AGENT_DEPLOYMENT} still runs the substrate daemon — the agent surface is `flux app run \
+         --serve`, a different program in the same image"
+    );
+
+    // No build recipe of its own. A Dockerfile under deploy/agent/ is exactly how a second image
+    // gets built without anyone deciding to build one.
+    let agent_dir = repo_path("deploy/agent");
+    let strays: Vec<String> = fs::read_dir(&agent_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", agent_dir.display()))
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().to_string_lossy().to_string();
+            let lower = name.to_ascii_lowercase();
+            (lower.contains("dockerfile") || lower.ends_with(".sh")).then_some(name)
+        })
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "deploy/agent/ carries an image build recipe ({strays:?}) — the agent surface reuses \
+         {DOCKERFILE}, and a second recipe is a second image to attest"
+    );
+}
+
+/// C-685: no shipped manifest expresses an unauthenticated non-loopback listener.
+///
+/// Both halves are structural. The binary refuses such a bind at startup
+/// (`guard_open_bind`, flux-server), and the manifest that would provoke the refusal must carry the
+/// Secret-backed token that makes the bind legitimate — required, never `optional`, so a cluster
+/// missing the Secret fails to start the container instead of starting an open one.
+#[test]
+fn no_manifest_binds_a_public_address_without_a_token() {
+    // The refusal these manifests are written against still exists, so the check below is about
+    // something.
+    let server = read(SERVER);
+    assert!(
+        server.contains("refusing to build an unauthenticated router for non-loopback bind"),
+        "{SERVER} no longer refuses an unauthenticated non-loopback bind — the release boundary \
+         these manifests encode has moved"
+    );
+    assert!(
+        read(APP_CMD).contains("refusing to serve on a non-loopback address"),
+        "{APP_CMD} no longer refuses to serve `flux app run --serve` on a non-loopback address \
+         without authentication"
+    );
+
+    let mut public_binds = 0usize;
+    let mut violations = Vec::new();
+    for manifest in listener_manifests() {
+        let source = read(manifest);
+        let addresses = bind_addresses(&daemon_argv(manifest, &source));
+        assert!(
+            !addresses.is_empty(),
+            "recovered no bind address from {manifest} — the extractor stopped matching, which \
+             would make this whole check vacuous"
+        );
+        let secret_env = secret_backed_env(&source);
+        for address in addresses {
+            if addr_is_loopback(&address) {
+                continue;
+            }
+            public_binds += 1;
+            let token_env: Vec<&String> = secret_env
+                .iter()
+                .filter(|name| name.ends_with("_TOKEN"))
+                .collect();
+            if token_env.is_empty() {
+                violations.push(format!(
+                    "{manifest} binds {address} but populates no `*_TOKEN` env var from a \
+                     secretKeyRef"
+                ));
+            }
+            if source.contains("optional: true") {
+                violations.push(format!(
+                    "{manifest} binds {address} and marks a Secret reference `optional: true` — an \
+                     optional token is a listener that can come up with no token at all"
+                ));
+            }
+        }
+    }
+    assert!(
+        public_binds >= 2,
+        "expected both profiles to bind a non-loopback address, found {public_binds}"
+    );
+    assert!(
+        violations.is_empty(),
+        "a deployment manifest expresses an unauthenticated non-loopback listener, which \
+         AGENTS.md forbids outright:\n  {}",
+        violations.join("\n  ")
+    );
+
+    // The agent profile must read the token through the exact env var the CLI resolves its
+    // shared-secret auth from — derived from the source, so a rename breaks the test and not the
+    // deployment.
+    let app_cmd = read(APP_CMD);
+    let token_var = app_cmd
+        .lines()
+        .find_map(|line| {
+            let rest = line.trim().strip_prefix("let token = std::env::var(\"")?;
+            rest.split('"').next().map(str::to_string)
+        })
+        .expect("`server_auth_from_config` reads the served agent's bearer token from an env var");
+    assert!(
+        secret_backed_env(&read(AGENT_DEPLOYMENT)).contains(&token_var),
+        "{AGENT_DEPLOYMENT} must populate `{token_var}` from a Secret — that is the variable \
+         `server_auth_from_config` ({APP_CMD}) reads, and without it the served agent is either \
+         open or refuses to start"
+    );
+}
+
+/// C-685: the agent profile carries every control its acceptance names, in the files that would
+/// actually be applied.
+#[test]
+fn the_agent_profile_carries_every_required_control() {
+    let deployment = read(AGENT_DEPLOYMENT);
+    for (required, why) in [
+        ("replicas: 1", "one replica per session store"),
+        ("type: Recreate", "two pods must never hold one store"),
+        ("runAsNonRoot: true", "non-root"),
+        ("type: RuntimeDefault", "seccomp"),
+        ("readOnlyRootFilesystem: true", "read-only root filesystem"),
+        ("allowPrivilegeEscalation: false", "no privilege escalation"),
+        ("- ALL", "all capabilities dropped"),
+        ("fsGroup: 10001", "the agent can write its own store"),
+        (
+            "automountServiceAccountToken: false",
+            "an agent in a pod must not be handed the cluster API",
+        ),
+        ("readinessProbe", "readiness"),
+        ("livenessProbe", "liveness"),
+        ("secretKeyRef", "the bearer token comes from a Secret"),
+        ("persistentVolumeClaim", "the durable session store"),
+        (
+            "--no-sandbox",
+            "the sandbox floor is waived explicitly, not silently",
+        ),
+    ] {
+        assert!(
+            deployment.contains(required),
+            "{AGENT_DEPLOYMENT} no longer carries `{required}` ({why})"
+        );
+    }
+
+    assert!(
+        read(AGENT_SERVICE).contains("type: ClusterIP"),
+        "{AGENT_SERVICE} must stay ClusterIP — an agent endpoint reached from outside the cluster \
+         goes through an ingress that keeps the bearer token intact, not a LoadBalancer added here"
+    );
+    assert!(
+        read(AGENT_NAMESPACE).contains("pod-security.kubernetes.io/enforce: restricted"),
+        "{AGENT_NAMESPACE} must enforce the restricted Pod Security Standard"
+    );
+    assert!(
+        read(AGENT_PVC).contains("kind: PersistentVolumeClaim"),
+        "{AGENT_PVC} must claim durable storage for the session store"
+    );
+
+    // Session durability, derived: the directory the argv names as the store has to be a mount
+    // point in the same pod, and the volume behind it has to be the claim.
+    let argv = daemon_argv(AGENT_DEPLOYMENT, &deployment);
+    let store = argv_value(&argv, "--store").unwrap_or_else(|| {
+        panic!("{AGENT_DEPLOYMENT} must name the session store directory with `--store <DIR>`")
+    });
+    assert!(
+        deployment.contains(&format!("mountPath: {store}")),
+        "{AGENT_DEPLOYMENT} stores sessions in `{store}` but never mounts a volume there — a \
+         restart would lose every session it claims to keep"
+    );
+
+    // Default-deny plus ONE explicit operator allowance. An empty `from:` admits the whole cluster
+    // and is exactly the shortcut the substrate profile already refuses to take.
+    let policy = read(AGENT_NETWORKPOLICY);
+    let default_deny = policy
+        .split("---")
+        .find(|document| document.contains("name: default-deny"))
+        .expect("a default-deny NetworkPolicy");
+    assert!(
+        default_deny.contains("podSelector: {}")
+            && default_deny.contains("- Ingress")
+            && default_deny.contains("- Egress"),
+        "{AGENT_NETWORKPOLICY}'s default-deny must select every pod and deny both directions"
+    );
+    let ingress = policy
+        .split("---")
+        .find(|document| document.contains("ingress:"))
+        .expect("an explicit ingress allowance for the operator path");
+    assert!(
+        ingress.contains("namespaceSelector:") || ingress.contains("podSelector:"),
+        "{AGENT_NETWORKPOLICY}'s operator ingress must name who may reach the agent"
+    );
+    assert!(
+        !ingress.contains("- from: []") && !ingress.contains("from: []"),
+        "{AGENT_NETWORKPOLICY}'s operator ingress admits the whole cluster; a bearer token would \
+         be the only barrier left"
+    );
+
+    // The base has to name every manifest, or an applied profile is missing a control the file set
+    // claims to have.
+    let kustomization = read(AGENT_KUSTOMIZATION);
+    for manifest in [
+        "namespace.yaml",
+        "state-pvc.yaml",
+        "deployment.yaml",
+        "service.yaml",
+        "networkpolicy.yaml",
+    ] {
+        assert!(
+            kustomization.contains(manifest),
+            "{AGENT_KUSTOMIZATION} does not include {manifest} — an unlisted manifest is never \
+             applied"
+        );
+    }
+}
+
+/// C-685: the agent profile chooses an approval posture out loud, chooses exactly one, and
+/// documents the other.
+#[test]
+fn the_agent_profile_states_exactly_one_approval_posture() {
+    let deployment = read(AGENT_DEPLOYMENT);
+    let argv = daemon_argv(AGENT_DEPLOYMENT, &deployment);
+    let tokens = argv_tokens(&argv);
+    let active: Vec<&str> = ["--yes", "--remote-approval"]
+        .into_iter()
+        .filter(|flag| tokens.iter().any(|token| token == flag))
+        .collect();
+    assert_eq!(
+        active.len(),
+        1,
+        "{AGENT_DEPLOYMENT} passes {active:?} — `flux app run --serve` with no program refuses to \
+         start unless exactly one of `--yes` / `--remote-approval` is chosen \
+         (`ServedApprovalPosture::select`, {APP_CMD}), so the manifest must choose one and only one"
+    );
+
+    // The refusal the manifest is written against still exists.
+    assert!(
+        read(APP_CMD).contains("needs an approval posture"),
+        "{APP_CMD} no longer refuses a served agent with no approval posture"
+    );
+
+    // Both options documented, wherever an operator decides between them.
+    for document in [AGENT_DEPLOYMENT, AGENT_README, AGENT_GUIDE] {
+        let source = read(document);
+        for option in ["--yes", "--remote-approval"] {
+            assert!(
+                source.contains(option),
+                "{document} must document the `{option}` posture — a deployed agent's approval \
+                 posture is a decision, and half of it is not a decision"
+            );
+        }
+        assert!(
+            source.contains("C-687"),
+            "{document} must note that `--remote-approval` supports only the shared operator token \
+             (or open loopback) until the supervisor authorization model lands (C-687)"
+        );
+    }
+    // Not a paraphrase: the constraint the profile passes on to operators comes from the flag's own
+    // documentation, so C-687 landing is what retires it rather than someone remembering to.
+    assert!(
+        read("crates/flux-cli/src/args.rs")
+            .contains("auth is refused until approvals have a distinct supervisor"),
+        "the `--remote-approval` flag no longer documents that principal auth is refused — \
+         re-derive what the agent profile tells operators about C-687"
+    );
+}
+
+/// C-685: the pod's probes use a route that is authenticated-exempt by construction, so no manifest
+/// ever needs to carry the bearer token to prove liveness.
+#[test]
+fn the_agent_probes_target_an_auth_exempt_route() {
+    let deployment = read(AGENT_DEPLOYMENT);
+    let exempt = auth_exempt_routes();
+    let probe_paths: Vec<String> = deployment
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.strip_prefix("path: ").map(str::to_string))
+        .collect();
+    assert!(
+        !probe_paths.is_empty(),
+        "{AGENT_DEPLOYMENT} declares no HTTP probe path — the served agent has a documented \
+         unauthenticated `/health`, so it does not need the substrate's TCP-only probe"
+    );
+    for path in &probe_paths {
+        assert!(
+            exempt.contains(path),
+            "{AGENT_DEPLOYMENT} probes `{path}`, which is not one of the routes \
+             {SERVER} registers outside its authentication layer ({exempt:?}) — a probe against a \
+             protected route would need the bearer token in the manifest"
+        );
+    }
+    // Uncommented lines only: `--yes` is described in prose as "Authorization policy … constrains
+    // this agent", and that sentence is not a header.
+    let declared: Vec<&str> = deployment
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .collect();
+    for smell in ["httpHeaders", "Authorization"] {
+        assert!(
+            !declared.iter().any(|line| line.contains(smell)),
+            "{AGENT_DEPLOYMENT} declares `{smell}` — a probe that authenticates would need the \
+             bearer token in the manifest, which is the thing the Secret exists to avoid"
+        );
+    }
+}
+
+/// C-685: an operator can get from a workstation to the deployed agent, and knows what a restart
+/// costs them, without leaving the docs.
+#[test]
+fn reaching_the_deployed_agent_is_documented_end_to_end() {
+    let guide = read(AGENT_GUIDE);
+    for (required, why) in [
+        ("flux a2a", "the client an operator actually types"),
+        ("FLUX_A2A_TOKEN", "how the bearer token reaches that client"),
+        ("port-forward", "the zero-config route into a ClusterIP"),
+        (
+            "/.well-known/agent-card.json",
+            "the discovery endpoint that proves the agent answered",
+        ),
+        (
+            "kubectl apply -k deploy/agent",
+            "how the profile is applied",
+        ),
+        (
+            "channel",
+            "whether a program's channel endpoints are exposed alongside the agent",
+        ),
+    ] {
+        assert!(
+            guide.contains(required),
+            "{AGENT_GUIDE} does not cover `{required}` ({why})"
+        );
+    }
+
+    // What survives a restart, stated rather than implied.
+    let durability = guide
+        .split("## ")
+        .find(|section| section.starts_with("What survives a restart"))
+        .unwrap_or_else(|| {
+            panic!("{AGENT_GUIDE} must have a `## What survives a restart` section")
+        });
+    for required in ["--store", "does not"] {
+        assert!(
+            durability.contains(required),
+            "{AGENT_GUIDE}'s restart section omits `{required}` — an operator has to be able to \
+             tell what the volume keeps from what it does not"
+        );
+    }
+
+    // The same provisioning boundary every other profile states.
+    for document in [AGENT_GUIDE, AGENT_README] {
+        let source = read(document).to_ascii_lowercase();
+        assert!(
+            source.contains("does not provision") || source.contains("does not create"),
+            "{document} must state that Flux does not provision the cluster it runs on"
+        );
+    }
+
+    // An unlinked page is a page nobody reads.
+    let sidebar = read("website/sidebars.js");
+    let slug = AGENT_GUIDE
+        .trim_start_matches("website/docs/")
+        .trim_end_matches(".md");
+    assert!(
+        sidebar.contains(&format!("'{slug}'")),
+        "website/sidebars.js does not list `{slug}` — an unlinked deployment guide is one an \
+         operator never finds"
+    );
+
+    // The contributor's map indexes the new profile beside the ones that already ship.
+    assert!(
+        read(DEPLOY_README).contains("deploy/agent") || read(DEPLOY_README).contains("agent/"),
+        "{DEPLOY_README} does not index the agent-surface profile"
+    );
+    assert!(
+        read(AGENT_README).contains("kubectl apply -k"),
+        "{AGENT_README} must show how the profile is applied"
     );
 }

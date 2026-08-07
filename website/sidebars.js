@@ -73,6 +73,7 @@ const sidebars = {
             'agent/http-api',
             'agent/a2a',
             'agent/a2a-conformance',
+            'agent/deployment',
             'agent/fleet',
             'agent/endpoints',
             'agent/realtime',
