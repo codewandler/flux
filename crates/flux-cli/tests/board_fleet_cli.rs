@@ -2577,6 +2577,110 @@ fn a_story_that_made_several_commits_integrates_all_of_them() {
     fs::remove_dir_all(root).ok();
 }
 
+/// Failing first: a handoff derives the write set and the owning worker from the story worktree.
+///
+/// Both facts are already recorded — the range `base..HEAD` in that worktree, and the agent whose
+/// assignment names it — yet every handoff restated them by hand. Harvesting six delivered stories in
+/// one evening meant reading `state.json` to find the owning worker for each and running
+/// `git diff base..HEAD` to retype its write set. A retyped write set is not a typo when it is wrong,
+/// it is false evidence; and a story attempted by more than one wave made the item-wide worker lookup
+/// "ambiguous" even though the wave records exactly which worker was given this worktree.
+#[test]
+fn handoff_derives_the_write_set_and_the_owning_worker_from_the_worktree() {
+    let (root, story) = one_story_wave("handoff-from-worktree");
+    let commit = commit_result(&story, "derived");
+    // A second wave holding an attempt at the same item, which is what made the identity ambiguous:
+    // two agents now carry `repo/C-1`, and only the one assigned THIS worktree owns this handoff.
+    let second = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--from-worktree",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "Derived the write set and the owning worker",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    // The range proves the write set; nothing was claimed by hand.
+    assert_eq!(
+        handoff["data"]["write_set"],
+        serde_json::json!(["result.txt"])
+    );
+    // And the worker is the one this wave gave the worktree, not merely one that carries the item.
+    assert_eq!(handoff["data"]["worker"], "wave-2-worker-1");
+    assert_eq!(
+        handoff["data"]["worktree"],
+        story.to_string_lossy().as_ref()
+    );
+
+    // A hand-typed claim and a derived one are mutually exclusive: one handoff, one source of truth.
+    let both = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--from-worktree",
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--summary",
+            "both at once",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !both.status.success(),
+        "a derived handoff must refuse a hand-typed write set: {}",
+        String::from_utf8_lossy(&both.stdout)
+    );
+    fs::remove_dir_all(root).ok();
+}
+
 /// Failing first: two stories in ONE repository that both write the SAME file integrate, as long as
 /// their commits actually combine.
 ///

@@ -339,6 +339,11 @@ flux fleet handoff wave-7 api/C-41 --commit FULL_SHA \
   --failing-before --passing-after --summary "Implemented the accepted contract" --output json
 ```
 
+`--from-worktree` replaces the repeated `--write-set` when the commit range already proves it: the
+host derives the write set from `base..HEAD` in the story worktree, and the owning worker from the
+agent that wave assigned to that worktree. Neither recorded fact is retyped, so neither can be
+mistyped.
+
 ## Review and bounded rework
 
 A fresh read-only reviewer inspects the exact handoff commit. Findings are structured path/line,

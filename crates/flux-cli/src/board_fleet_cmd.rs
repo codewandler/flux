@@ -850,6 +850,9 @@ pub(super) enum FleetAction {
         worker: Option<String>,
         #[arg(long)]
         session: Option<String>,
+        /// Derive the write set from `base..HEAD` instead of restating what the range already proves.
+        #[arg(long, conflicts_with = "write_set")]
+        from_worktree: bool,
         #[arg(long = "write-set", value_name = "PATH")]
         write_set: Vec<String>,
         #[arg(long = "test-arg", value_name = "ARGV", allow_hyphen_values = true)]
@@ -5299,6 +5302,7 @@ worktree_root = ".flux/fleet/worktrees"
             commit,
             worker,
             session,
+            from_worktree,
             write_set,
             test_argv,
             failing_before,
@@ -5315,6 +5319,7 @@ worktree_root = ".flux/fleet/worktrees"
                 commit,
                 worker: worker.as_deref(),
                 session: session.as_deref(),
+                from_worktree: *from_worktree,
                 write_set,
                 test_argv,
                 failing_before: *failing_before,
@@ -13489,6 +13494,7 @@ struct HandoffInput<'a> {
     commit: &'a str,
     worker: Option<&'a str>,
     session: Option<&'a str>,
+    from_worktree: bool,
     write_set: &'a [String],
     test_argv: &'a [String],
     failing_before: bool,
@@ -13643,7 +13649,7 @@ fn fleet_handoff(
     if input.summary.trim().is_empty() {
         bail!("input/schema: handoff summary cannot be empty")
     }
-    if input.write_set.is_empty() {
+    if input.write_set.is_empty() && !input.from_worktree {
         bail!("input/schema: handoff requires an explicit write set")
     }
     if input.test_argv.is_empty() {
@@ -13657,11 +13663,10 @@ fn fleet_handoff(
     let (repository_index, story_index) = wave_story_indices(&wave, input.item)?;
     let repository = &wave["topology"]["repositories"][repository_index];
     let story = &repository["stories"][story_index];
-    let worktree = PathBuf::from(
-        story["worktree"]
-            .as_str()
-            .context("validation/gate: story assignment has no worktree")?,
-    );
+    let story_worktree = story["worktree"]
+        .as_str()
+        .context("validation/gate: story assignment has no worktree")?;
+    let worktree = PathBuf::from(story_worktree);
     let branch = story["branch"]
         .as_str()
         .context("validation/gate: story assignment has no branch")?;
@@ -13702,8 +13707,15 @@ fn fleet_handoff(
                 .join(", ")
         )
     }
-    let claimed = normalize_write_set(input.write_set)?;
     let observed = diff_write_set(&worktree, base, input.commit)?;
+    // `--from-worktree` declines to restate what the range already proves. The observed set is what
+    // gets recorded either way, so a hand-typed claim only adds a way to be wrong — and a wrong write
+    // set is not a typo, it is false evidence. An empty range is still refused below.
+    let claimed = if input.from_worktree {
+        observed.clone()
+    } else {
+        normalize_write_set(input.write_set)?
+    };
     if observed.is_empty() || claimed != observed {
         bail!(
             "validation/gate: observed write set does not equal the approved write set (approved={claimed:?}, observed={observed:?})"
@@ -13807,12 +13819,30 @@ fn fleet_handoff(
         )
     }
 
-    let matching_workers = state
+    // The owning worker is already recorded: a worker's assignment IS this wave's story record, and
+    // that record names the worktree this handoff was just verified in. Matching on `board_ref` alone
+    // spans every wave that ever attempted the item — four waves once each held an attempt at the same
+    // story — so a second attempt made the identity "ambiguous" and the operator had to read
+    // `state.json` to name a worker Fleet already knew. Fall back to the item-wide set only when no
+    // agent records this worktree, which is how a wave dispatched before assignments carried one still
+    // hands off.
+    let mut matching_workers = state
         .agents
         .iter()
-        .filter(|(_, agent)| agent["board_ref"].as_str() == Some(input.item))
+        .filter(|(_, agent)| {
+            agent["board_ref"].as_str() == Some(input.item)
+                && agent["assignment"]["worktree"].as_str() == Some(story_worktree)
+        })
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
+    if matching_workers.is_empty() {
+        matching_workers = state
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent["board_ref"].as_str() == Some(input.item))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+    }
     let worker = match input.worker {
         Some(worker) if matching_workers.iter().any(|candidate| candidate == worker) => {
             worker.to_string()
