@@ -45,6 +45,23 @@ fn guarded_run(root: &Path, argv: &[String]) -> Result<flux_system::ProcessOutpu
     })
 }
 
+/// [`guarded_run`] with caller-chosen environment entries, through the same guarded boundary.
+fn guarded_run_with_env(
+    root: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<flux_system::ProcessOutput> {
+    if argv.is_empty() {
+        bail!("input/schema: process argv cannot be empty")
+    }
+    let system = guarded_system(root)?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(system.run_with_env(argv, env, CONTROL_PROCESS_TIMEOUT))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    })
+}
+
 /// [`guarded_run`] with a document on standard input, through the same guarded boundary.
 fn guarded_run_with_stdin(
     root: &Path,
@@ -11671,6 +11688,59 @@ fn sccache_dir(fleet_root: &Path) -> PathBuf {
     fleet_root.join(".flux/fleet/sccache")
 }
 
+/// Populate the shared cache once, at the base every worker in this wave branches from.
+///
+/// Without this the first worker to start pays the whole cold-compile cost while its siblings
+/// duplicate it in parallel, contending for the same cores — the wave's slowest possible shape. One
+/// warm pass ahead of dispatch turns that into a single sequential cost every worker then reads.
+///
+/// The `verify` worktree is the right site because it is already pinned to the exact base commit
+/// and it has to build anyway for the failing-before check, so this mostly moves work earlier
+/// rather than adding it.
+///
+/// Entirely best-effort. It is an optimisation, and an optimisation that can fail a wave is a
+/// liability — a warm that errors, times out or finds no cache is recorded and ignored.
+fn warm_wave_build_cache(fleet_root: &Path, wave: &str, repository: &str, verify_worktree: &Path) {
+    if sccache_executable().is_none() {
+        return;
+    }
+    let argv = ["cargo", "build", "--workspace", "--tests"]
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect::<Vec<_>>();
+    let mut environment = vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())];
+    environment.extend(worker_build_environment(fleet_root));
+
+    let started = std::time::Instant::now();
+    let outcome = guarded_run_with_env(verify_worktree, &argv, &environment);
+    let elapsed = started.elapsed().as_secs();
+    let (status, detail) = match &outcome {
+        Ok(output) if output.exit_code == 0 => ("warmed", String::new()),
+        // A base that does not build is a real signal, but it is the gate's to report, not this
+        // step's: refusing to prepare the wave here would turn a slow start into no start.
+        Ok(output) => (
+            "failed",
+            clipped_redacted(output.stderr.as_bytes())
+                .chars()
+                .take(400)
+                .collect(),
+        ),
+        Err(error) => ("failed", error.to_string()),
+    };
+    let _ = append_fleet_event(
+        fleet_root,
+        "wave.build-cache.warmed",
+        json!({
+            "wave": wave,
+            "repository": repository,
+            "status": status,
+            "seconds": elapsed,
+            "worktree": display_path(verify_worktree),
+            "detail": detail,
+        }),
+    );
+}
+
 /// Build knobs for a story worker, on top of `CARGO_INCREMENTAL=0`.
 ///
 /// Every worker in a wave branches from the *same* pinned base, so at width eight they compile a
@@ -13608,6 +13678,9 @@ fn prepare_wave_worktrees(
                     &base,
                 )?;
             }
+            // Every worktree above sits on the same base commit, so one compile populates the cache
+            // for all of them. Done after they exist and before anything is dispatched.
+            warm_wave_build_cache(root, wave, &repository_id, &verify_path);
         }
         repositories.push(json!({
             "id": repository_id,
@@ -15408,6 +15481,34 @@ mod tests {
                 .iter()
                 .any(|(name, _)| name == "CARGO_TARGET_DIR"),
             "one shared target dir is locked exclusively by cargo, which serialises the wave"
+        );
+    }
+
+    /// Warming shares one cold compile across the wave instead of making the first worker pay it
+    /// while its siblings duplicate it in parallel. Its contract is that it can never fail a wave:
+    /// it returns no error to ignore, and whether it skips (no cache installed), succeeds, or the
+    /// build itself fails, preparation continues. An optimisation that can stop a wave is a
+    /// liability.
+    ///
+    /// This asserts the invariant that holds on any machine, rather than a branch that depends on
+    /// whether `sccache` happens to be installed on the one running the test.
+    #[test]
+    fn warming_can_never_fail_a_wave_or_fabricate_state() {
+        let scratch = std::env::temp_dir().join("flux-warm-cache-probe");
+        let absent = scratch.join("verify-worktree-that-does-not-exist");
+
+        // Deliberately handed a worktree that is not there: the build cannot succeed, and the point
+        // is that preparation survives it anyway.
+        warm_wave_build_cache(&scratch, "wave-1", "flux", &absent);
+
+        assert!(
+            !absent.exists(),
+            "warming must not conjure the worktree it was handed"
+        );
+        assert!(
+            !scratch.join(".flux").exists(),
+            "a warm against a root with no fleet must not scaffold one: {}",
+            scratch.display()
         );
     }
 

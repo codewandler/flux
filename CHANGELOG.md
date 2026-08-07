@@ -40,6 +40,12 @@ All notable changes to this project are documented in this file. The format is b
   operator's own rebuilds keep incremental compilation, full debug info and no wrapper. A missing
   `sccache` degrades instead of failing, and records `worker.build-cache.unavailable` — a silently
   disabled fast path is indistinguishable from a working one.
+  The cache is also warmed once per wave, before any worker is dispatched: every worktree in a
+  wave sits on the same base commit, so one compile in the base-pinned `verify` checkout populates
+  the cache for all of them. Otherwise the first worker pays the whole cold cost while its siblings
+  duplicate it in parallel, contending for the same cores — the wave's slowest possible shape.
+  Warming is best-effort and records `wave.build-cache.warmed`; a warm that fails is reported and
+  ignored, because an optimisation that can stop a wave is a liability.
 
 - **Board and fleet operations no longer re-read every story with its own process.** Resolving a
   workspace member ran one `git show` per story file: across this workspace's four members that is
