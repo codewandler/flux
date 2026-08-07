@@ -1642,14 +1642,24 @@ pub(super) fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
 /// C-650: `--host <name>` resolves a registered, granted binding through the session registry;
 /// `--remote <url>` remains as sugar constructing an ephemeral unnamed binding, recorded in the
 /// registry as `@session/remote` so it lists and probes like any named one.
+///
+/// C-651: `floor` is the resolved posture's confinement floor, and it participates in *which
+/// backend a named binding resolves to* — see `backend_under_floor`. It deliberately does not
+/// manufacture a selection where the operator made none: with no `--host`/`--remote`, absence
+/// stays meaningful and the native workspace-following path is preserved, exactly as C-650
+/// shipped it. The spawn-time modifier still confines that path through `apply_sandbox_env`,
+/// which this touches in no way.
 async fn resolve_selected_execution_system(
     flags: &AgentFlags,
     local: &System,
     hosts: &flux_capabilities::HostRegistry,
     surface: flux_secret::host::HostGrant,
+    floor: flux_runtime::SandboxFloor,
 ) -> Result<Option<SelectedSubstrate>> {
     if let Some(name) = flags.host.as_deref() {
-        return Ok(Some(resolve_named_host(name, hosts, surface, local).await?));
+        return Ok(Some(
+            resolve_named_host(name, hosts, surface, local, floor).await?,
+        ));
     }
     let Some(endpoint) = flags.remote.as_deref() else {
         return Ok(None);
@@ -2270,8 +2280,14 @@ pub(super) async fn build_agent_with(
     } else {
         flux_secret::host::HostGrant::Operator
     };
-    let selected_substrate =
-        resolve_selected_execution_system(flags, &system, &host_registry, host_surface).await?;
+    let selected_substrate = resolve_selected_execution_system(
+        flags,
+        &system,
+        &host_registry,
+        host_surface,
+        posture.sandbox_floor(),
+    )
+    .await?;
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());

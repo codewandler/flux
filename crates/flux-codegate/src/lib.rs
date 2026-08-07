@@ -3981,6 +3981,40 @@ impl Exec for Double {}
                 "GuardedNetwork",
                 "RemoteSystem",
             ),
+            // C-651's confinement peer. Reviewable on the same grounds as `remote.rs`'s entries,
+            // and on one narrower one: `SandboxedSystem` holds a native `System` and every
+            // operation forwards to that system's own inherent method, so it can neither add a
+            // permission nor remove one — the guarantees stay exactly the ones `System` enforces,
+            // including the single `build_command` spawn choke point the sandbox wraps. What it
+            // owns is *admission*: it refuses to exist unless the composed `Sandbox` actually
+            // confines, which makes the type itself the evidence of the posture it reports. A
+            // future edit that widened it beyond delegation would be a new backend wearing this
+            // allowance — read `crates/flux-system/src/sandboxed.rs` before extending it.
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedProcess",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedHostFiles",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedWorkspaceFiles",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedEnv",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedNetwork",
+                "SandboxedSystem",
+            ),
         ];
         let mut allowance_use = vec![0usize; ALLOW.len()];
 
@@ -4039,6 +4073,55 @@ impl Exec for Double {}
             violations.is_empty(),
             "guarded-IO port implemented outside the reviewed native backend:\n  {}",
             violations.join("\n  ")
+        );
+    }
+
+    /// C-651: the **confinement peer** is a reviewed guarded-IO backend, and a complete one.
+    ///
+    /// Decision 0018 rule 3 makes `sandboxed` a selectable peer rather than only a spawn-time
+    /// modifier, which means a second type inside `flux-system` now claims to *be* a guarded
+    /// substrate. Two things have to hold, and neither is implied by the other:
+    ///
+    /// - It serves **every** port `ExecutionSystem` bundles. A peer that implemented four of the
+    ///   five would not be an `ExecutionSystem` at all, and the gap would show up as a confusing
+    ///   trait-bound error at a distant call site rather than here.
+    /// - Each of those impls is in the reviewed ALLOW of
+    ///   [`no_unreviewed_guarded_port_backend_outside_system`], which is what makes the claim a
+    ///   review rather than a formality. That test enforces the allowance half; this one enforces
+    ///   that the backend it allows actually exists and is whole.
+    #[test]
+    fn the_confinement_peer_backend_is_reviewed_and_complete() {
+        // The `ExecutionSystem` constituent ports as of C-651. Deliberately spelled out rather than
+        // read from `GUARDED_PORT_TRAITS`: a port that joins the guarded set but not the execution
+        // bundle would otherwise be demanded of this backend by drift alone.
+        const EXECUTION_PORTS: &[&str] = &[
+            "GuardedEnv",
+            "GuardedHostFiles",
+            "GuardedNetwork",
+            "GuardedProcess",
+            "GuardedWorkspaceFiles",
+        ];
+        const PEER: &str = "SandboxedSystem";
+
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let peer_rs = crates_dir.join("flux-system/src/sandboxed.rs");
+        let source = std::fs::read_to_string(&peer_rs).unwrap_or_else(|error| {
+            panic!(
+                "the `sandboxed` peer backend must live at {}: {error}",
+                peer_rs.display()
+            )
+        });
+
+        let hits = guarded_port_impls(&source).unwrap();
+        let mut served: Vec<&str> = hits
+            .iter()
+            .filter(|hit| hit.backend == PEER)
+            .map(|hit| hit.port.as_str())
+            .collect();
+        served.sort_unstable();
+        assert_eq!(
+            served, EXECUTION_PORTS,
+            "the confinement peer must serve every execution port as a production impl: {hits:?}"
         );
     }
 

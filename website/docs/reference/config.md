@@ -469,6 +469,15 @@ classes allowed to select it — `operator` (attended sessions) and/or `unattend
 inherits an `operator` grant. A granted `remote` binding executes guarded effects on its serving
 endpoint; `--remote <url>` keeps working as sugar for an ephemeral, session-only binding.
 
+A granted `sandboxed` binding runs guarded effects on this machine under OS confinement
+(bubblewrap or Seatbelt). It is the `--sandbox` posture as a *substrate* rather than a flag, so it
+fails closed: on a platform with no usable confinement backend the binding refuses at startup and
+names the reason, instead of quietly running unconfined. `flux host probe <id>` reports whether
+this machine can serve it, and which backend it would use. An autonomy posture that will not run
+unconfined (`bounded-autonomy`, `exploratory`) selects this backend for a named `local` binding —
+a posture may tighten a selection, never loosen one — while `--sandbox`/`--no-sandbox` continue to
+control the spawn-time sandbox exactly as before.
+
 ```toml
 [[host]]
 id = "build-farm"

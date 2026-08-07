@@ -215,15 +215,47 @@ impl std::fmt::Debug for SelectedSubstrate {
     }
 }
 
+/// Tightest-wins **backend** selection (C-651): a posture floor that will not run unconfined
+/// raises a `local` binding to the `sandboxed` peer, exactly as `SandboxFloor::raise_mode` raises
+/// the spawn-time sandbox mode — a floor may tighten a selection, never loosen one.
+///
+/// Only `local` is raised, and only from a `Require` floor. A `remote`, `container` or
+/// `kubernetes` binding carries its own physical boundary, so silently re-pointing it at this
+/// machine's sandbox would answer a different question than the operator asked; and an `On` floor
+/// tolerates an unconfined run by construction, so forcing a fail-closed backend under it would
+/// turn a tolerated degradation into a startup refusal.
+///
+/// This applies only where a binding is being selected. It does not reach into the *unselected*
+/// case: `flux --yes …` with no `--host` still installs no system override, because that override
+/// is a snapshot and the native path has to keep following worktree transitions. The consequence
+/// of a raise is therefore worth stating plainly — `--host <local binding>` under a `Require`
+/// posture pins the workspace the same way selecting a `remote` binding does, which is what
+/// selecting a substrate has always meant.
+pub(super) fn backend_under_floor(
+    backend: HostBackend,
+    floor: flux_runtime::SandboxFloor,
+) -> HostBackend {
+    match backend {
+        HostBackend::Local if floor.mode == flux_system::sandbox::SandboxMode::Require => {
+            HostBackend::Sandboxed
+        }
+        other => other,
+    }
+}
+
 /// Resolve `--host <name>`: a registered binding, granted to `surface`, selects the execution
 /// substrate. Every refusal is a startup refusal — an unknown name lists the known bindings, an
 /// ungranted binding names the missing class (an unattended surface never inherits `operator`,
 /// so a serving surface cannot widen a grant silently), and an unwired backend fails closed.
+///
+/// `floor` is the confinement floor the resolved autonomy posture carries (C-651); see
+/// [`backend_under_floor`] for what it may and may not do to the declared backend kind.
 pub(super) async fn resolve_named_host(
     name: &str,
     hosts: &flux_capabilities::HostRegistry,
     surface: HostGrant,
     local: &System,
+    floor: flux_runtime::SandboxFloor,
 ) -> Result<SelectedSubstrate> {
     let Some(record) = hosts.get(name) else {
         return Err(unknown_binding_error(name, hosts));
@@ -245,15 +277,25 @@ pub(super) async fn resolve_named_host(
              entry deliberately, since widening a grant is an escalation"
         );
     }
-    match host.backend {
+    match backend_under_floor(host.backend, floor) {
         HostBackend::Local => Ok(SelectedSubstrate {
             binding: host.id,
             system: None,
         }),
-        HostBackend::Sandboxed | HostBackend::Container | HostBackend::Kubernetes => bail!(
-            "host `{name}` binds the `{}` backend, which has no selectable implementation wired \
-             yet; selection fails closed",
-            host.backend
+        // C-651: confinement is a peer substrate. It composes the running native system rather
+        // than replacing it, so the workspace and its guards are unchanged; what the selection
+        // adds is a posture that must hold before the binding resolves at all.
+        HostBackend::Sandboxed => {
+            let peer = flux_system::sandboxed::SandboxedSystem::from_env(local.clone())
+                .map_err(|error| anyhow::anyhow!("host `{name}`: {error}"))?;
+            Ok(SelectedSubstrate {
+                binding: host.id,
+                system: Some(Arc::new(peer)),
+            })
+        }
+        backend @ (HostBackend::Container | HostBackend::Kubernetes) => bail!(
+            "host `{name}` binds the `{backend}` backend, which has no selectable implementation \
+             wired yet; selection fails closed"
         ),
         HostBackend::Remote => {
             let Some(url) = host.url.as_deref() else {
@@ -360,8 +402,10 @@ fn unknown_binding_error(id: &str, registry: &flux_capabilities::HostRegistry) -
 }
 
 /// The CLI's [`HostProber`]: local identity through the running guarded `System`, remote identity
-/// through the protocol handshake (a GET of the identity route — nothing executes). The peer
-/// backends report [`HostProbeFailure::BackendUnwired`] until their selection stories wire them.
+/// through the protocol handshake (a GET of the identity route — nothing executes), and (C-651)
+/// `sandboxed` identity by resolving the confinement peer, which reports whether this platform can
+/// confine at all. The remaining peer backends report [`HostProbeFailure::BackendUnwired`] until
+/// their selection stories wire them.
 pub(super) struct CliHostProber {
     pub(super) system: Arc<System>,
 }
@@ -386,7 +430,29 @@ impl flux_capabilities::HostProber for CliHostProber {
                     protocol_version: None,
                 })
             }
-            HostBackend::Sandboxed | HostBackend::Container | HostBackend::Kubernetes => {
+            // Resolving the peer is the identity check: it discovers the platform's confinement
+            // backend (a cached preflight, no workspace effect) and either reports the posture it
+            // would run under or names why this machine cannot serve the binding.
+            HostBackend::Sandboxed => {
+                match flux_system::sandboxed::SandboxedSystem::from_env((*self.system).clone()) {
+                    Ok(peer) => {
+                        let identity =
+                            flux_system::port::ExecutionIdentity::substrate_identity(&peer);
+                        Ok(HostProbeReport {
+                            kind: identity.kind,
+                            workspace: identity.workspace,
+                            confinement: identity.confinement,
+                            remotely_reported: identity.remotely_reported,
+                            protocol_version: None,
+                        })
+                    }
+                    Err(error) => Err(HostProbeFailure::BackendUnavailable {
+                        backend: host.backend.as_str().to_string(),
+                        detail: error.to_string(),
+                    }),
+                }
+            }
+            HostBackend::Container | HostBackend::Kubernetes => {
                 Err(HostProbeFailure::BackendUnwired {
                     backend: host.backend.as_str().to_string(),
                 })

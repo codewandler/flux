@@ -158,15 +158,15 @@ struct Persisted {
 
 /// The static (no-side-effect) availability statement for a backend — what `host ls`/`show` may
 /// honestly claim without probing. `local` is the running substrate; a `remote` binding is only a
-/// declaration until `probe` verifies it; the peer backends fail closed until their selection
-/// stories wire them.
+/// declaration until `probe` verifies it; `sandboxed` (C-651) is wired but conditional on this
+/// platform having a usable confinement backend, which only a probe can answer; the remaining peer
+/// backends fail closed until their selection stories wire them.
 pub fn static_availability(backend: HostBackend) -> &'static str {
     match backend {
         HostBackend::Local => "available",
         HostBackend::Remote => "declared (verify with probe)",
-        HostBackend::Sandboxed | HostBackend::Container | HostBackend::Kubernetes => {
-            "unwired (selection fails closed)"
-        }
+        HostBackend::Sandboxed => "available if this platform can confine (verify with probe)",
+        HostBackend::Container | HostBackend::Kubernetes => "unwired (selection fails closed)",
     }
 }
 
@@ -192,6 +192,11 @@ pub enum HostProbeFailure {
     CredentialUnavailable { reference: String, detail: String },
     /// The backend kind has no probe-able implementation wired yet; selection fails closed too.
     BackendUnwired { backend: String },
+    /// The backend is wired, but this platform cannot serve it — the `sandboxed` peer with no
+    /// usable confinement backend is the case (C-651). Distinct from
+    /// [`BackendUnwired`](Self::BackendUnwired): flux can do this, this machine cannot, and
+    /// `detail` says why.
+    BackendUnavailable { backend: String, detail: String },
     /// The transport-level identity check failed (unreachable, refused, handshake error).
     Connect { detail: String },
 }
@@ -207,6 +212,9 @@ impl fmt::Display for HostProbeFailure {
                     f,
                     "backend `{backend}` has no probe-able implementation wired yet"
                 )
+            }
+            Self::BackendUnavailable { backend, detail } => {
+                write!(f, "backend `{backend}` is unavailable here: {detail}")
             }
             Self::Connect { detail } => write!(f, "identity check failed: {detail}"),
         }
