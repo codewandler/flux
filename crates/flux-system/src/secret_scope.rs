@@ -113,11 +113,41 @@ impl Destination {
 /// from [`net::guard_url_scoped_for_secret`](crate::net::guard_url_scoped_for_secret). Keeping the
 /// parsed URL, its exact connection pins and the destination token in one value prevents a caller
 /// from claiming an arbitrary pair was guard-vetted.
-#[derive(Debug)]
+///
+/// `Debug` is hand-written and **never prints the query** (C-674): a `$secret` placed
+/// [`in=query`](InjectionSite::Query) lives in this URL, so a derived `Debug` would be a plaintext
+/// credential one `{:?}` away from a log line — harmless while the value stayed in one process, and
+/// not harmless now that it crosses a frame.
 pub struct GuardedSecretTarget {
     url: url::Url,
     pinned: Vec<SocketAddr>,
     destination: Result<Destination>,
+}
+
+impl fmt::Debug for GuardedSecretTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GuardedSecretTarget")
+            .field("url", &redacted_url(&self.url))
+            .field("pinned", &self.pinned)
+            .field("destination", &self.destination)
+            .finish()
+    }
+}
+
+/// The admitted URL with its query and fragment replaced by a marker — the spelling every
+/// diagnostic that names a guarded target uses, because either part can carry a credential.
+///
+/// The authority and path stay legible: an operator reading a refusal needs to know *which host*
+/// was involved, and that is the axis every scope is measured on.
+pub fn redacted_url(url: &url::Url) -> String {
+    let mut shown = url.clone();
+    let had_query = shown.query().is_some();
+    shown.set_query(None);
+    shown.set_fragment(None);
+    match had_query {
+        true => format!("{shown}?<redacted>"),
+        false => shown.to_string(),
+    }
 }
 
 impl GuardedSecretTarget {
@@ -290,6 +320,11 @@ impl fmt::Display for Refusal {
 /// allowing everything.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretGrant {
+    /// The operator's entry, verbatim (trimmed). Kept so an allowlist can be re-stated losslessly —
+    /// a remote substrate re-authorizes every redirect hop itself (C-674) and therefore needs the
+    /// scope, and re-*rendering* it from the parsed axes would turn an unusable entry back into a
+    /// bare name, which is the one direction that silently widens a grant.
+    raw: String,
     name: String,
     destinations: Option<Vec<String>>,
     principals: Option<Vec<String>>,
@@ -308,6 +343,7 @@ impl SecretGrant {
         let mut parts = entry.split(';');
         let name = parts.next().unwrap_or_default().trim().to_string();
         let mut grant = Self {
+            raw: entry.to_string(),
             name: name.clone(),
             destinations: None,
             principals: None,
@@ -364,6 +400,13 @@ impl SecretGrant {
     /// The environment-variable name this grant covers.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The operator's entry as written, so an allowlist can be restated somewhere else and
+    /// re-parsed into the identical grant — names, scopes and unusable entries alike. Never a
+    /// value: an entry is a name plus its scope axes.
+    pub fn entry(&self) -> &str {
+        &self.raw
     }
 
     /// Whether this grant constrains nothing — the bare `NAME` spelling that behaves exactly as it
@@ -500,6 +543,13 @@ impl SecretAllowlist {
     /// Every parsed grant, in the order the operator wrote them.
     pub fn grants(&self) -> &[SecretGrant] {
         &self.grants
+    }
+
+    /// The operator's entries as written, in order — the inverse of [`parse`](Self::parse), exact
+    /// enough that `SecretAllowlist::parse(list.entries())` is the same allowlist. This is how a
+    /// scope reaches a substrate that will follow the redirect chain on another machine (C-674).
+    pub fn entries(&self) -> Vec<&str> {
+        self.grants.iter().map(SecretGrant::entry).collect()
     }
 
     /// The names carrying no scope at all. An unscoped secret stays valid on purpose; this is what

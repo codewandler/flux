@@ -163,14 +163,16 @@ struct Persisted {
 /// only a declaration until `probe` verifies it; `sandboxed` (C-651) is wired but conditional on
 /// this platform having a usable confinement backend, which only a probe can answer; a `microvm`
 /// binding (C-677) is wired but conditional on naming a served guest endpoint, which the kind alone
-/// cannot say — see [`binding_availability`]; the remaining peer backends fail closed until their
-/// selection stories wire them.
+/// cannot say — see [`binding_availability`]; an `ssh` binding (C-683) claims even less than a
+/// `remote` one, because reaching it also means bootstrapping a serve on the far machine; the
+/// remaining peer backends fail closed until their selection stories wire them.
 pub fn static_availability(backend: HostBackend) -> &'static str {
     match backend {
         HostBackend::Local => "available",
         HostBackend::Remote => "declared (verify with probe)",
         HostBackend::Sandboxed => "available if this platform can confine (verify with probe)",
         HostBackend::Microvm => "unwired without a served guest endpoint (selection fails closed)",
+        HostBackend::Ssh => "declared; bootstrapped over ssh (verify with probe)",
         HostBackend::Container | HostBackend::Kubernetes => "unwired (selection fails closed)",
     }
 }

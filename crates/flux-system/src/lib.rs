@@ -142,6 +142,7 @@ pub mod remote;
 pub mod sandbox;
 pub mod sandboxed;
 pub mod secret_scope;
+pub mod ssh;
 pub mod websocket;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
