@@ -67,11 +67,17 @@ produces a daemon that refuses to start. That is the intended failure, not a bug
 
 ## Container profile
 
-Every release publishes the image. Pull it:
+Every release publishes the image. Pull the version you want — `<version>` throughout this section
+is a released version such as the one this page ships with:
 
 ```sh
-docker pull ghcr.io/codewandler/flux-system:0.58.0
+docker pull ghcr.io/codewandler/flux-system:<version>
 ```
+
+Image publishing arrives with this release, so the first published image is the first release cut
+after it — earlier versions have no image and must be built locally with the script below. The
+package is also private until its owner makes it public once, so a pull that fails to authenticate
+rather than reporting a missing tag means that step is still outstanding.
 
 The image runs only `flux system serve`, as uid 10001, and carries no bearer token, no TLS private key
 and no workspace content in any layer — all three are mounted at run time. Its version label and tag
@@ -82,9 +88,9 @@ release already attested and published, re-checked against its `.sha256` sidecar
 the layer is the binary the release workflow attested, and both carry provenance you can check:
 
 ```sh
-gh attestation verify oci://ghcr.io/codewandler/flux-system:0.58.0 --repo codewandler/flux
+gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux
 
-gh release download v0.58.0 --pattern 'flux-cli-x86_64-unknown-linux-gnu.tar.xz'
+gh release download v<version> --pattern 'flux-cli-x86_64-unknown-linux-gnu.tar.xz'
 gh attestation verify flux-cli-x86_64-unknown-linux-gnu.tar.xz --repo codewandler/flux
 ```
 
@@ -92,7 +98,7 @@ To build the same image locally instead — an air-gapped registry, or a differe
 the script the release job runs:
 
 ```sh
-deploy/container/build-image.sh --release 0.58.0
+deploy/container/build-image.sh --release <version>
 ```
 
 Run it with the workspace, TLS material and token mounted rather than baked:
@@ -100,7 +106,7 @@ Run it with the workspace, TLS material and token mounted rather than baked:
 ```yaml
 services:
   flux-system:
-    image: ghcr.io/codewandler/flux-system:0.58.0
+    image: ghcr.io/codewandler/flux-system:<version>
     read_only: true
     ports: ["127.0.0.1:8790:8790"]
     volumes:
@@ -159,7 +165,7 @@ idempotent install contract, and a cloud-init profile that expresses the same co
 bootstrap.
 
 ```sh
-sudo deploy/vm/install-flux-system.sh --version 0.58.0
+sudo deploy/vm/install-flux-system.sh --version <version>
 ```
 
 That fetches and checksum-verifies the pinned release archive, creates the non-root `flux` service

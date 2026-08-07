@@ -108,6 +108,23 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   failure names the piece that is missing — no sshd, an unrecognised host key, a key that was
   declined, no flux binary over there — and none of them quietly falls back to your own machine.
 
+- **Deploy the remote system from a published image.** Every release now publishes
+  `ghcr.io/codewandler/flux-system:<version>` — the released binary repacked, not rebuilt, so the
+  image and the release archive describe the same bytes — and both shipped Kubernetes profiles
+  point at it. Verify where it came from before you run it with
+  `gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux`.
+  Cutting a release restamps both profiles, so the manifests you apply and the binary they run can
+  no longer name different versions. Building locally still works for an air-gapped registry.
+
+- **Watch an agent that lives on a server, from your own terminal.**
+  `flux tui --attach https://agent.internal:8787` points the full chat UI at an agent served by
+  `flux app run --serve`: its turns stream into the ordinary transcript, your messages go into the
+  live session, and reconnecting replays what happened while you were away, read from the agent's
+  own history. The bearer token is always named by reference, never typed on the command line. The
+  UI is honest about the seams — anything the protocol does not carry (tool call details, for now)
+  is shown as unavailable with the reason, and the conversation lives in the server's session
+  store, so it deliberately does not appear in your local `flux sessions`.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
