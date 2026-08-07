@@ -495,6 +495,12 @@ flux fleet stop --output json
 
 Status has an independent read lane, so a busy or stuck worker cannot make fleet inspection hang.
 
+Resume is addressed. Each pending item records the agent it was sent to — coordinator intake and
+tasks belong to `main`, a message belongs to the worker it names — and a resumed agent is asked to
+continue its own assignment plus the items addressed to it and nothing else. Resuming a worker
+therefore neither shows nor acknowledges the coordinator's queue, so every item is still delivered at
+most once, to the agent it was addressed to.
+
 `status` and `dashboard` are bounded projections, not a dump of durable state. They report main
 state, active and attention worker counts, wave and item state, exact board references,
 repositories, current sessions, the last transition or error summary and the current revision, and

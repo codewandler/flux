@@ -4464,6 +4464,76 @@ fn run_fleet_checked(command: FleetCommand) -> Result<()> {
     }
 }
 
+/// C-618: every intake item belongs to exactly one addressee.
+///
+/// Coordinator intake and tasks are recorded with `target: "main"`; a message carries the agent it
+/// was sent to. Items persisted before the field existed are the coordinator's, so an absent target
+/// reads as `main` rather than as "anybody's".
+fn intake_addressee(item: &Value) -> &str {
+    item["target"].as_str().unwrap_or("main")
+}
+
+/// The accepted items addressed to `target`, rendered one per line.
+///
+/// C-618: resume used to render *every* accepted item, so a story worker was handed the
+/// coordinator's queue — operator traffic it is contractually forbidden to act on, and unrelated
+/// context it should never see.
+fn pending_intake_for(state: &FleetState, target: &str) -> Vec<String> {
+    state
+        .intake
+        .values()
+        .filter(|item| item["ack"].as_str() == Some("accepted") && intake_addressee(item) == target)
+        .map(|item| {
+            format!(
+                "- {}: {}",
+                item["id"].as_str().unwrap_or("unknown"),
+                item["text"]
+                    .as_str()
+                    .or_else(|| item["instruction"].as_str())
+                    .or_else(|| item["message"].as_str())
+                    .unwrap_or("resume")
+            )
+        })
+        .collect()
+}
+
+/// The request a resumed agent is given: its own standing assignment plus its own pending items.
+fn resume_request_for(state: &FleetState, target: &str) -> String {
+    let pending = pending_intake_for(state, target);
+    let standing = if target == "main" {
+        "Resume from the durable manifest and board. Inspect in-flight waves, blocked decisions, failed/crashed turns and dependency-satisfied work; continue only previously authorized work."
+    } else {
+        // A worker's assignment already travels with its admitted record; resume tells it to carry
+        // that same assignment on, and never to inspect the fleet on the coordinator's behalf.
+        "Resume your existing assignment from your worktree and carry it to its stated completion. Work only on the board item you were admitted for; do not select other work or coordinate the fleet."
+    };
+    if pending.is_empty() {
+        standing.into()
+    } else {
+        format!(
+            "{standing}\n\nThen process these accepted inputs addressed to you, in order:\n{}",
+            pending.join("\n")
+        )
+    }
+}
+
+/// Acknowledge exactly the items the resumed agent was actually given, and report their ids.
+///
+/// C-618: the delivery bound. A resume that consumed every accepted item made each item deliverable
+/// at most once *to the wrong agent* — the coordinator's queue was acknowledged by a worker turn that
+/// never saw it, or replayed into the next worker when it was not acknowledged at all.
+fn complete_resumed_intake(state: &mut FleetState, target: &str, receipt: &Value) -> Vec<String> {
+    let mut consumed = Vec::new();
+    for (id, intake) in state.intake.iter_mut() {
+        if intake["ack"].as_str() == Some("accepted") && intake_addressee(intake) == target {
+            intake["ack"] = json!("completed");
+            intake["receipt"] = receipt.clone();
+            consumed.push(id.clone());
+        }
+    }
+    consumed
+}
+
 fn run_fleet_action(
     command: &FleetCommand,
     root: &Path,
@@ -5443,49 +5513,21 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Resume { target } => {
             let target = target.as_deref().unwrap_or("main");
             state.running = true;
-            let pending = state
-                .intake
-                .values()
-                .filter(|item| item["ack"].as_str() == Some("accepted"))
-                .map(|item| {
-                    format!(
-                        "- {}: {}",
-                        item["id"].as_str().unwrap_or("unknown"),
-                        item["text"]
-                            .as_str()
-                            .or_else(|| item["instruction"].as_str())
-                            .or_else(|| item["message"].as_str())
-                            .unwrap_or("resume")
-                    )
-                })
-                .collect::<Vec<_>>();
-            let request = if pending.is_empty() {
-                "Resume from the durable manifest and board. Inspect in-flight waves, blocked decisions, failed/crashed turns and dependency-satisfied work; continue only previously authorized work.".into()
-            } else {
-                format!(
-                    "Resume from the durable manifest and process these accepted inputs in order:\n{}",
-                    pending.join("\n")
-                )
-            };
+            let request = resume_request_for(&state, target);
             let spec = addressed_turn_spec(root, &state, target, request)?;
             let receipt = execute_and_record_agent_turn(command, root, &mut state, spec, None)?;
-            for intake in state.intake.values_mut() {
-                if intake["ack"].as_str() == Some("accepted") {
-                    intake["ack"] = json!("completed");
-                    intake["receipt"] = receipt.clone();
-                }
-            }
+            let consumed = complete_resumed_intake(&mut state, target, &receipt);
             state.revision += 1;
             persist_fleet_mutation(
                 command,
                 root,
                 &state,
                 "fleet.resumed",
-                json!({"target": target, "receipt": receipt}),
+                json!({"target": target, "consumed": consumed, "receipt": receipt}),
             )?;
             Ok((
                 format!("{target} resumed from durable state"),
-                json!({"target": target, "ack": "completed", "receipt": receipt}),
+                json!({"target": target, "ack": "completed", "consumed": consumed, "receipt": receipt}),
                 vec![],
                 state.revision,
             ))
@@ -15204,6 +15246,107 @@ mod tests {
             coordinator["read_root_count"].as_u64() > worker["read_root_count"].as_u64(),
             "the umbrella is asymmetric by design: coordinator spans roots, worker does not"
         );
+    }
+
+    /// The observed shape from the story: eight coordinator intakes pending while a story worker is
+    /// resumed, plus one message actually addressed to that worker and one legacy item persisted
+    /// before intake carried a target at all.
+    fn inbox_with_pending_coordinator_intake() -> FleetState {
+        let mut state = FleetState {
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 1..=8 {
+            state.intake.insert(
+                format!("intake-{index}"),
+                json!({
+                    "id": format!("intake-{index}"),
+                    "target": "main",
+                    "source": "automation",
+                    "text": "Autopilot tick. Report only: current revision, active workers",
+                    "ack": "accepted",
+                }),
+            );
+        }
+        // No `target` field: written before intake was addressed, and the coordinator's by default.
+        state.intake.insert(
+            "intake-9".into(),
+            json!({
+                "id": "intake-9",
+                "source": "user",
+                "text": "Legacy coordinator requirement",
+                "ack": "accepted",
+            }),
+        );
+        state.intake.insert(
+            "message-49".into(),
+            json!({
+                "id": "message-49",
+                "target": "wave-308-worker-1",
+                "message": "Finish only these C-560 items in your existing session",
+                "ack": "accepted",
+            }),
+        );
+        state
+    }
+
+    /// C-618 (failing first): `fleet resume wave-308-worker-1` built the *worker's* request out of the
+    /// coordinator's pending inbox — eight autopilot ticks and a task addressed to `main`, handed to an
+    /// agent whose contract forbids coordinating the fleet at all.
+    #[test]
+    fn a_resumed_worker_is_asked_only_about_its_own_pending_items() {
+        let state = inbox_with_pending_coordinator_intake();
+
+        let request = resume_request_for(&state, "wave-308-worker-1");
+
+        assert!(
+            request.contains("message-49"),
+            "the worker's own pending message must reach it: {request}"
+        );
+        for foreign in ["intake-1", "intake-8", "intake-9", "Autopilot tick"] {
+            assert!(
+                !request.contains(foreign),
+                "coordinator traffic {foreign:?} leaked into a worker resume: {request}"
+            );
+        }
+        assert!(
+            !request.contains("blocked decisions"),
+            "a worker must not be told to inspect the fleet: {request}"
+        );
+    }
+
+    /// C-618 (failing first): the delivery bound. Resuming a worker acknowledged every accepted item,
+    /// so coordinator intake was marked completed by a turn that never saw it; the coordinator's own
+    /// resume then found nothing pending.
+    #[test]
+    fn resuming_a_worker_never_consumes_coordinator_intake() {
+        let mut state = inbox_with_pending_coordinator_intake();
+        let receipt = json!({"status": "completed"});
+
+        let consumed = complete_resumed_intake(&mut state, "wave-308-worker-1", &receipt);
+
+        assert_eq!(consumed, vec!["message-49".to_string()]);
+        for id in ["intake-1", "intake-8", "intake-9"] {
+            assert_eq!(
+                state.intake[id]["ack"], "accepted",
+                "{id} must still be awaiting its own addressee"
+            );
+            assert!(
+                state.intake[id].get("receipt").is_none(),
+                "{id} must not carry a receipt from another agent's turn"
+            );
+        }
+
+        // The coordinator still gets its queue, in full, exactly once.
+        let coordinator_request = resume_request_for(&state, "main");
+        assert!(coordinator_request.contains("intake-1"));
+        assert!(coordinator_request.contains("intake-9"));
+        assert_eq!(
+            complete_resumed_intake(&mut state, "main", &receipt).len(),
+            9
+        );
+        assert!(pending_intake_for(&state, "main").is_empty());
+        assert!(complete_resumed_intake(&mut state, "main", &receipt).is_empty());
     }
 
     /// C-624 (failing first): Fleet writes its own loop-binding snapshot into the worktree it hands to a

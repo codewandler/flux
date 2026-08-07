@@ -17,12 +17,12 @@ the **coordinator's** pending inbox, so a story worker is asked to answer messag
 
 ## Acceptance
 
-- [ ] A resumed story worker's prompt contains its own assignment and its own pending items only.
-- [ ] Coordinator-addressed intakes stay addressed to the coordinator and are not consumed by any other
+- [x] A resumed story worker's prompt contains its own assignment and its own pending items only.
+- [x] Coordinator-addressed intakes stay addressed to the coordinator and are not consumed by any other
       agent's resume.
-- [ ] Failing first, a test resumes a worker while coordinator intakes are pending and asserts none of
+- [x] Failing first, a test resumes a worker while coordinator intakes are pending and asserts none of
       them appear in the worker's assignment.
-- [ ] An intake is delivered at most once; a resume that does not target the coordinator must not
+- [x] An intake is delivered at most once; a resume that does not target the coordinator must not
       consume or acknowledge coordinator items.
 
 ## Notes
