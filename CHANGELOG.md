@@ -257,6 +257,23 @@ All notable changes to this project are documented in this file. The format is b
   `omitted_mounts`) rather than a bare array, under an unchanged `flux.host-metrics/v1` token;
   the remote wire payload is byte-identical and the protocol version is unchanged.
 
+- **Guarded HTTP rides the remote protocol (Decision 0018 rule 5, C-674).** `PROTOCOL_VERSION`
+  3→4, and `RemoteSystem`'s `GuardedHttp` delegates where C-652 left a typed `Unserved`. HTTP gets
+  its own framed route rather than riding `execute`, deliberately: `execute` carries arguments as a
+  freely `Debug`-printable, freely serializable `serde_json::Value`, and a resolved credential in
+  there would defeat the story's own secret requirement. Header values become `port::HeaderValue` —
+  private field, no `Display`, no `Serialize`, and a hand-written `Debug` that prints length and
+  owner *including* for values a caller labelled literal, because a wrapper that trusted that label
+  would leak precisely when the label was wrong. The serving side re-runs the egress guard on the
+  URL it was handed (vetted addresses are not on the wire at all), caps the response itself, bounds
+  header and scope lists, and re-authorizes every hop against the union of the caller's declared
+  secrets and what the headers themselves declare. Private-destination admissions are reported back
+  stamped with the substrate that made them. A peer that declares no HTTP frame is answered a typed
+  `Unserved` from the handshake, without a request. **Known limitation, stated rather than hidden:**
+  the framed route does not use the delivery ledger, so it carries no at-most-once guarantee — the
+  same position every delegated operation is in today, since the client mints a fresh operation id
+  per call and never queries the recovery route.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

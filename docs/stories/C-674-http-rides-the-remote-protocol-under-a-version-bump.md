@@ -2,7 +2,7 @@
 id: C-674
 title: "HTTP rides the remote protocol under a version bump"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system, flux-web]
 design: first-class-hosts
@@ -23,15 +23,15 @@ today the substrate's promise, which a wire decoder must not extend trust to.
 
 ## Acceptance
 
-- [ ] The protocol gains a versioned HTTP frame; version negotiation refuses a mixed pair, and
+- [x] The protocol gains a versioned HTTP frame; version negotiation refuses a mixed pair, and
       `RemoteSystem`'s `GuardedHttp` delegates instead of refusing once the negotiated version
       carries it.
-- [ ] No plaintext secret is `Debug`-printable or serialized un-redacted: the request type's
+- [x] No plaintext secret is `Debug`-printable or serialized un-redacted: the request type's
       header carriage becomes redaction-safe by construction before it crosses a frame boundary.
-- [ ] The serving side enforces the egress guard, redirect-scope rules and `max_response_bytes`
+- [x] The serving side enforces the egress guard, redirect-scope rules and `max_response_bytes`
       itself; the requesting side re-caps rather than trusting the wire, and labels route through
       bounded construction on decode.
-- [ ] Private-destination admission on the serving substrate emits its own audit event, surfaced
+- [x] Private-destination admission on the serving substrate emits its own audit event, surfaced
       in the caller's audit trail with substrate provenance.
 
 ## Design
