@@ -11666,6 +11666,58 @@ fn agent_turn_argv(executable: &Path, spec: &AgentTurnSpec, prompt: String) -> V
     argv
 }
 
+/// Where the fleet keeps the compilation cache every worker shares.
+fn sccache_dir(fleet_root: &Path) -> PathBuf {
+    fleet_root.join(".flux/fleet/sccache")
+}
+
+/// Build knobs for a story worker, on top of `CARGO_INCREMENTAL=0`.
+///
+/// Every worker in a wave branches from the *same* pinned base, so at width eight they compile a
+/// near-identical dependency graph eight times over. The fix cannot be a shared `CARGO_TARGET_DIR`
+/// — cargo locks one exclusively, which would turn the wave back into a queue (see the note in
+/// `flux-system`'s `SAFE_ENV`) — and it cannot be a copied warm target directory either, because
+/// the filesystem here has no reflink support and eight copies of a multi-gigabyte baseline is real
+/// disk. A **content-keyed compilation cache** gives the sharing without the lock: separate target
+/// directories, identical `rustc` invocations served from cache instead of recompiled.
+///
+/// `CARGO_PROFILE_DEV_DEBUG` attacks what the cache cannot. sccache caches compilation but not
+/// linking, and full debug info dominates both link time and the on-disk size that actually caps
+/// how many workers fit. `line-tables-only` keeps file and line in a panic — which is the entire
+/// reason a worker's build output exists — while dropping the rest.
+///
+/// These go through the caller-override slot of `apply_safe_env`, which is applied after the
+/// allow-list and wins, so no `SAFE_ENV` entry is needed and an operator's own rebuilds keep
+/// incremental compilation, full debug info and no wrapper.
+///
+/// **A missing `sccache` degrades rather than fails.** It is an optimisation; a fleet that refuses
+/// to dispatch because a cache is absent is worse than a slow one. The caller records which of the
+/// two happened, because a silently-disabled fast path is indistinguishable from a working one.
+fn worker_build_environment(fleet_root: &Path) -> Vec<(String, String)> {
+    let mut environment = vec![(
+        "CARGO_PROFILE_DEV_DEBUG".to_string(),
+        "line-tables-only".to_string(),
+    )];
+    if let Some(sccache) = sccache_executable() {
+        environment.push(("RUSTC_WRAPPER".to_string(), sccache));
+        environment.push((
+            "SCCACHE_DIR".to_string(),
+            sccache_dir(fleet_root).display().to_string(),
+        ));
+        environment.push(("SCCACHE_CACHE_SIZE".to_string(), "40G".to_string()));
+    }
+    environment
+}
+
+/// `sccache` on `PATH`, or `None` when it is not installed.
+fn sccache_executable() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("sccache"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.display().to_string())
+}
+
 fn execute_agent_turn_with_runtime(
     fleet_root: &Path,
     spec: &AgentTurnSpec,
@@ -11686,7 +11738,23 @@ fn execute_agent_turn_with_runtime(
     // Set here rather than in a shared cargo config because it is only true for one-shot builders. An
     // operator's own rebuilds legitimately want incremental compilation, and this must not take it away
     // from them.
+    // It is now load-bearing twice over: incremental artifacts are also not cacheable, so leaving
+    // incremental compilation on would defeat the shared cache configured just below.
     let mut environment = vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())];
+    environment.extend(worker_build_environment(fleet_root));
+    if sccache_executable().is_none() {
+        // Not an error — the turn proceeds uncached. Recorded because "slower than it should be"
+        // is otherwise invisible, and a fast path nobody can see is a fast path nobody notices is
+        // off.
+        let _ = append_fleet_event(
+            fleet_root,
+            "worker.build-cache.unavailable",
+            json!({
+                "agent": spec.id,
+                "reason": "sccache is not on PATH; this worker compiles without the shared cache",
+            }),
+        );
+    }
     if spec.shell_capability {
         environment.push(("FLUX_ENABLE_BASH".to_string(), "1".to_string()));
     }
@@ -15276,6 +15344,71 @@ mod tests {
         );
         let flat: Vec<&str> = chunks.iter().flatten().copied().collect();
         assert_eq!(flat.len(), 3, "nothing may be dropped: {chunks:?}");
+    }
+
+    /// Eight workers in a wave branch from one pinned base and compile a near-identical dependency
+    /// graph eight times. A shared `CARGO_TARGET_DIR` would serialise them on cargo's exclusive
+    /// lock and a copied warm target directory costs real bytes on a filesystem without reflink, so
+    /// the sharing has to be a content-keyed cache with separate target directories.
+    #[test]
+    fn a_worker_compiles_against_the_shared_cache_when_one_is_available() {
+        let fleet_root = Path::new("/tmp/fleet-build-env");
+
+        let environment = worker_build_environment(fleet_root);
+        let value = |key: &str| {
+            environment
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+
+        // Debug info is most of a target directory and most of link time, and sccache caches
+        // compilation but never linking — so this knob is not redundant with the cache.
+        assert_eq!(
+            value("CARGO_PROFILE_DEV_DEBUG").as_deref(),
+            Some("line-tables-only"),
+            "a worker's build output exists to explain a failing test, not to be debugged live"
+        );
+
+        match sccache_executable() {
+            Some(_) => {
+                assert!(
+                    value("RUSTC_WRAPPER").is_some(),
+                    "an available cache must actually be wired up: {environment:?}"
+                );
+                assert_eq!(
+                    value("SCCACHE_DIR").as_deref(),
+                    Some(sccache_dir(fleet_root).display().to_string().as_str()),
+                    "the cache is fleet-owned, so every worker in every wave shares one"
+                );
+                assert!(
+                    value("SCCACHE_CACHE_SIZE").is_some(),
+                    "an uncapped cache is a disk leak"
+                );
+            }
+            None => {
+                // Degrade, never fail: a missing cache must slow the fleet, not stop it.
+                assert!(
+                    value("RUSTC_WRAPPER").is_none(),
+                    "a wrapper that is not installed would fail every build: {environment:?}"
+                );
+            }
+        }
+    }
+
+    /// These are fleet policy, not ambient forwarding. They reach the worker's `cargo` through the
+    /// caller-override slot of `apply_safe_env`, which is applied after the allow-list and wins —
+    /// so an operator's own rebuilds keep incremental compilation and full debug info.
+    #[test]
+    fn worker_build_knobs_never_include_a_shared_target_directory() {
+        let environment = worker_build_environment(Path::new("/tmp/fleet-build-env"));
+
+        assert!(
+            !environment
+                .iter()
+                .any(|(name, _)| name == "CARGO_TARGET_DIR"),
+            "one shared target dir is locked exclusively by cargo, which serialises the wave"
+        );
     }
 
     /// The width is a ceiling, not a target.

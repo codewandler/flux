@@ -27,6 +27,20 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Performance
 
+- **Fleet workers share one compilation cache instead of each compiling the same graph from
+  scratch.** Every worker in a wave branches from the same pinned base, so at width eight they
+  compile a near-identical dependency graph eight times. The sharing cannot be a common
+  `CARGO_TARGET_DIR` — cargo locks one exclusively, turning the wave back into a queue — nor a
+  copied warm target directory, which costs real bytes on a filesystem without reflink support. A
+  worker now runs under `sccache` against a fleet-owned cache with separate target directories, so
+  identical `rustc` invocations are served rather than repeated. Worker builds also drop to
+  `line-tables-only` debug info, which attacks what the cache cannot: sccache caches compilation
+  but never linking, and full debug info dominates both link time and the on-disk size that
+  actually caps how many workers fit. Both are set through the per-worker environment, so an
+  operator's own rebuilds keep incremental compilation, full debug info and no wrapper. A missing
+  `sccache` degrades instead of failing, and records `worker.build-cache.unavailable` — a silently
+  disabled fast path is indistinguishable from a working one.
+
 - **Board and fleet operations no longer re-read every story with its own process.** Resolving a
   workspace member ran one `git show` per story file: across this workspace's four members that is
   roughly 1,690 guarded process spawns on *every* board call, including `board get`, which needs
