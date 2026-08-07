@@ -2,8 +2,7 @@
 id: C-641
 title: "fleet handoff derives the write set and the owning worker from the worktree"
 pillar: "Core"
-status: ready
-priority: 10
+status: done
 epic: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
 areas: [flux-cli]
 design: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
@@ -20,11 +19,11 @@ agent that wave assigned to that worktree.
 
 ## Acceptance
 
-- [ ] `flux fleet handoff <wave> <item> --commit <sha> --from-worktree` is accepted without
+- [x] `flux fleet handoff <wave> <item> --commit <sha> --from-worktree` is accepted without
       `--write-set` and records the write set observed in `base..HEAD`.
-- [ ] `--from-worktree` and `--write-set` are mutually exclusive, so one handoff never carries both a
+- [x] `--from-worktree` and `--write-set` are mutually exclusive, so one handoff never carries both a
       derived and a hand-typed write set.
-- [ ] The owning worker is derived from the wave's story worktree, so another wave holding an attempt
+- [x] The owning worker is derived from the wave's story worktree, so another wave holding an attempt
       at the same item no longer makes the worker identity ambiguous.
-- [ ] An empty observed write set, a mismatched hand-typed claim, and every other handoff
+- [x] An empty observed write set, a mismatched hand-typed claim, and every other handoff
       verification stay exactly as they were.

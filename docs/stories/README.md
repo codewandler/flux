@@ -219,9 +219,6 @@ _The happy path has verbs. `fleet run`, `handoff`, `integrate`, `apply`, `reclai
 - [C-647 — Attention is a present condition, not an accumulated history](C-647-attention-is-a-present-condition-not-an-accumulated-history.md) · Core · 25 of 25 flagged workers are cancelled or failed corpses of waves long finished; the driver halts on attention_required and therefore halts forever
 - [C-657 — Split board_fleet_cmd so fleet verbs stop serialising on one file](C-657-split-board-fleet-cmd-so-fleet-verbs-stop-serialising-on-one-file.md) · Core · one 17k-line file holds all 52 FleetAction arms, so every story in the ops-CLI epic collides with every other one
 - [C-658 — fleet schedule proposes a wave-safe batch at a requested width](C-658-fleet-schedule-proposes-a-wave-safe-batch-at-a-requested-width.md) · Core · board next --independent picks the set; nothing yet asks it for a wave, and the board cannot see fleet claims
-- [C-637 — board reconcile reports stories whose work is already present](C-637-board-reconcile-reports-stories-whose-work-is-already-present.md) · Core · a story implemented in main while its status read ready was dispatched again and a worker turn reproduced committed code
-- [C-641 — fleet handoff derives the write set and the owning worker from the worktree](C-641-fleet-handoff-derives-the-write-set-and-the-owning-worker-from-the-worktree.md) · Core · both are already recorded; requiring them by hand invites a wrong write set, which is false evidence rather than a typo
-- [C-638 — fleet repair rebuilds structure a topology names and disk lacks](C-638-fleet-repair-rebuilds-structure-a-topology-names-and-disk-lacks.md) · Core · reclamation removed an integration worktree an unfinished wave still needed; rebuilding it took a hand-written git worktree add
 - [C-640 — fleet land merges accepted candidates and re-gates against the canonical branch](C-640-fleet-land-merges-accepted-candidates-and-re-gates-against-the-canonical-branch.md) · Core · acceptance pins a candidate against the base it was gated on; landing is a separate act needing its own verification, and it is a bash approximation in the driver
 
 ### Remote agents — run the agent here, land the effects there
@@ -272,7 +269,6 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 
 ### Tui Board Surface
 - [C-661 — TUI /task starts a sub-agent, with @ references for files and agents](C-661-tui-task-starts-a-sub-agent-with-references-for-files-and-agents.md) · Core
-- [C-621 — Expanding a board item renders its story body as markdown in place](C-621-expanding-a-board-item-renders-its-story-body-as-markdown-in-place.md) · Core
 - [C-622 — Board item expand and collapse works by click and by keyboard alike](C-622-board-item-expand-and-collapse-works-by-click-and-by-keyboard-alike.md) · Core
 
 ### Unattended run integrity — surviving provider transport failure, and being honest when you don't
@@ -1170,11 +1166,15 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-618 — fleet resume must not replay the coordinator inbox into a story worker](C-618-fleet-resume-must-not-replay-the-coordinator-inbox-into-a-story-worker.md) · Core
 - [C-619 — Applying a wave must advance its Board items, or autonomy re-implements the same story forever](C-619-applying-a-wave-must-advance-its-board-items-or-autonomy-re-implements-the-same-story-forever.md) · Core
 - [C-620 — Board pane renders items as collapsed boxes grouped by status and ordered by priority](C-620-board-pane-renders-items-as-collapsed-boxes-grouped-by-status-and-ordered-by-priority.md) · Core
+- [C-621 — Expanding a board item renders its story body as markdown in place](C-621-expanding-a-board-item-renders-its-story-body-as-markdown-in-place.md) · Core
 - [C-623 — The TUI board pane is read-only and cannot mutate planning state](C-623-the-tui-board-pane-is-read-only-and-cannot-mutate-planning-state.md) · Core
 - [C-624 — Fleet must not leave the worktree it hands a worker permanently dirty](C-624-fleet-must-not-leave-the-worktree-it-hands-a-worker-permanently-dirty.md) · Core
 - [C-635 — fleet doctor reports runtime health, not only configuration](C-635-fleet-doctor-reports-runtime-health-not-only-configuration.md) · Core · agents recorded active whose supervisor is gone, waves wedged in a transient state, worktrees a topology names but disk lacks, items claimed by more than one live wave, branches holding nothing unique
 - [C-636 — fleet inspect gate prints a repository gate's own output, tail first](C-636-fleet-inspect-gate-prints-a-repository-gate-s-own-output-tail-first.md) · Core · a failing gate's reason is the most-wanted fact in the system and currently requires knowing the shape of state.json
+- [C-637 — board reconcile reports stories whose work is already present](C-637-board-reconcile-reports-stories-whose-work-is-already-present.md) · Core · a story implemented in main while its status read ready was dispatched again and a worker turn reproduced committed code
+- [C-638 — fleet repair rebuilds structure a topology names and disk lacks](C-638-fleet-repair-rebuilds-structure-a-topology-names-and-disk-lacks.md) · Core · reclamation removed an integration worktree an unfinished wave still needed; rebuilding it took a hand-written git worktree add
 - [C-639 — fleet park and unpark make parking a recorded lifecycle state](C-639-fleet-park-and-unpark-make-parking-a-recorded-lifecycle-state.md) · Core · parking lives in a driver-owned text file, invisible to fleet status, so a parked wave was re-decided every minute and unparking meant editing text
+- [C-641 — fleet handoff derives the write set and the owning worker from the worktree](C-641-fleet-handoff-derives-the-write-set-and-the-owning-worker-from-the-worktree.md) · Core · both are already recorded; requiring them by hand invites a wrong write set, which is false evidence rather than a typo
 - [C-642 — fleet quiesce and resume make installing a new binary safe by construction](C-642-fleet-quiesce-and-resume-make-installing-a-new-binary-safe-by-construction.md) · Core · stopping dispatch by hand went wrong twice in one evening, once corrupting a full workspace test run
 - [C-648 — A host config table, HostRef and session registry](C-648-a-host-config-table-hostref-and-session-registry.md) · Core · Decision 0018 rules 1-2: declare named hosts the way endpoints are declared; credential references, never values
 - [C-649 — flux host CLI family and host.* operations](C-649-flux-host-cli-family-and-host-operations.md) · Core · Decision 0018 rule 1: ls/add/show/rm/probe plus an ambient-gated host.* op group, mirroring the endpoint surface

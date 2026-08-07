@@ -2,8 +2,7 @@
 id: C-637
 title: "board reconcile reports stories whose work is already present"
 pillar: "Core"
-status: ready
-priority: 7
+status: done
 epic: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
 areas: [flux-cli]
 design: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
@@ -23,24 +22,24 @@ and never repairs.
 
 ## Acceptance
 
-- [ ] `flux board reconcile` reports every item whose status says the work is outstanding while
+- [x] `flux board reconcile` reports every item whose status says the work is outstanding while
       evidence of that work is already present, and writes nothing.
-- [ ] Two independent signals count as evidence and each finding names which fired: an
+- [x] Two independent signals count as evidence and each finding names which fired: an
       `implementation-landed` commit reachable from `HEAD` that names the item and touches paths
       outside the board's own item directory, and an `acceptance-complete` section whose every
       checkbox is ticked.
-- [ ] A commit that touches only the board's own documents — adding the item, flipping its status,
+- [x] A commit that touches only the board's own documents — adding the item, flipping its status,
       re-rendering the marker region — is never mistaken for implementation.
-- [ ] A `done` item is never a finding, and an item id matches only as a whole token, so `C-63` is
+- [x] A `done` item is never a finding, and an item id matches only as a whole token, so `C-63` is
       not found inside `C-637`.
-- [ ] Each finding names the profile-valid transition path that would close it, and every step of
+- [x] Each finding names the profile-valid transition path that would close it, and every step of
       that path is accepted by the planning state machine rather than restated beside it.
-- [ ] The verb is read-only wherever the board API exposes it: it appears in `board schema`, `board
+- [x] The verb is read-only wherever the board API exposes it: it appears in `board schema`, `board
       call reconcile` is not classed as a mutation, and the session backend refuses it rather than
       answering from a backend that has neither history nor acceptance text.
-- [ ] History reading is bounded and says so: the scan depth is fixed, and a scan that reaches the
+- [x] History reading is bounded and says so: the scan depth is fixed, and a scan that reaches the
       ceiling warns that older implementation is not visible to the report.
-- [ ] Failing first, tests prove a landed-but-`ready` item is reported, a board-only commit is not
+- [x] Failing first, tests prove a landed-but-`ready` item is reported, a board-only commit is not
       evidence, a `done` item is never a finding, and the fully-ticked acceptance signal stands on
       its own.
 
