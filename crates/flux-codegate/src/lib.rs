@@ -4021,8 +4021,26 @@ impl Exec for Double {}
             // the port's fail-closed default when nobody attached one — which is every `System`
             // this crate constructs. The client count is unaffected: attaching decides who may ask
             // an existing backend, never who builds one.
-            // `RemoteSystem`'s impl is a typed `Unserved` naming the missing wire support — it
-            // cannot send anything.
+            //
+            // `RemoteSystem`'s impl **delegates** since C-674, where C-652 left it answering a typed
+            // `Unserved` naming the missing wire. It still constructs no client and opens no socket:
+            // it hands the request to a `Delegate` and the far side makes it, which is the same
+            // shape as the four families above. What it adds — and what to re-read on any change —
+            // is the pair of obligations the metrics entry states, applied here:
+            //
+            // - The answer is re-bounded through `port::bounded_response` against the *request's*
+            //   own `max_response_bytes`, plus the header and admit-list caps, because the caps on
+            //   `HttpResponse` are the substrate's promise and `Delegate` is implementable by
+            //   anyone. The HTTPS decoder bounds too; that is depth, not a substitute.
+            // - `PrivateAdmit::substrate` is stamped here rather than read off the answer. A far
+            //   side that could set it to `None` would be asserting that this process admitted the
+            //   private destination — the substitution `SubstrateIdentity` exists to prevent.
+            //
+            // What must not drift: the far side owns admission for every hop (it re-runs the egress
+            // guard on the URL it was handed rather than trusting the pins this process vetted), the
+            // per-hop secret re-authorization, the redirect bound and the byte cap; and a delegate
+            // that does not serve the family still answers `Unserved` without a request rather than
+            // falling back to sending from the coordinator's own process.
             ("crates/flux-system/src/port.rs", "GuardedHttp", "System"),
             (
                 "crates/flux-system/src/remote.rs",

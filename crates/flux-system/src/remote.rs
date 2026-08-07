@@ -5,9 +5,9 @@
 //! operation to a [`Delegate`] and turning what comes back into a `flux_core::Result`. A caller
 //! therefore runs operations somewhere other than its own process while the guarantees stay stated
 //! in exactly one place — `port.rs` — because nothing here re-states them. Host metrics delegate
-//! too since C-654, with two things added on the way back: the reading is re-bounded and stamped
-//! `remotely_reported`, because a measurement of another machine is a claim rather than an
-//! observation.
+//! too since C-654 and guarded HTTP since C-674, with the same two things added on the way back:
+//! the answer is re-bounded, and its provenance is stamped by the hop that crossed the boundary,
+//! because what another machine reports is a claim rather than an observation.
 //!
 //! **This is not a second IO path**, for the same reason the port is not: `RemoteSystem` cannot open
 //! a file or start a process. It can only ask something else to, and that something else is
@@ -23,6 +23,13 @@
 //! failure semantics of delegation — and leaves the open question in
 //! `docs/designs/remote-agents.md` (is the remote wire a channel API or a port delegation?) open,
 //! which is where it currently belongs. A wire format invented here would have pre-answered it.
+//!
+//! That still holds with [`Delegate::http_request`] on the trait (C-674). The *operation* is
+//! delegable; the frame that carries it lives in `flux-server` with the rest of the remote
+//! protocol, under a version bump, because it is a wire decision and this crate holds no wire.
+//! What this crate does own is the part a transport must not be trusted with: the request's header
+//! carriage cannot be printed or serialized un-redacted ([`crate::port::HeaderValue`]), and every
+//! answer is re-bounded before a caller sees it.
 //!
 //! ## Local-first: no service is required
 //!
@@ -376,6 +383,38 @@ pub trait Delegate: Send + Sync {
         unserved("read host metrics")
     }
 
+    // -- guarded HTTP -----------------------------------------------------------------------------
+
+    /// Whether the far side serves the HTTP family at all.
+    ///
+    /// A *declaration*, like [`served_metric_kinds`](Self::served_metric_kinds) and for the same
+    /// reason: it costs no round trip, and it lets a caller answer "this substrate makes no HTTP
+    /// requests" with the port's typed `Unserved` **without sending a request** whose failure it
+    /// would then have to interpret. A transport learns it from whatever it negotiated.
+    fn serves_http(&self) -> bool {
+        false
+    }
+
+    /// Send one guarded HTTP request from the far side, following the redirect chain **there**.
+    ///
+    /// Not reducible to anything, and deliberately not approximable: performing it locally because
+    /// the delegate cannot would put the effect, the source address the far end sees and any
+    /// credential the request carries on the coordinator, while dispatch provenance recorded the
+    /// selected substrate.
+    ///
+    /// The far side owns admission for every hop, the connection pin, the redirect bound, the
+    /// response-byte cap and the per-hop secret re-authorization — it re-runs the egress guard at
+    /// its own boundary rather than trusting the addresses this process vetted. What comes back is
+    /// re-bounded here (see [`GuardedHttp for RemoteSystem`](RemoteSystem#impl-GuardedHttp-for-RemoteSystem)).
+    fn http_request<'a>(
+        &'a self,
+        request: &'a crate::port::HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, crate::port::HttpResponse> {
+        let _ = (request, allow);
+        unserved("perform a guarded HTTP request")
+    }
+
     // -- workspace files --------------------------------------------------------------------------
 
     /// The raw bytes of a workspace file on the far side.
@@ -722,40 +761,58 @@ fn reported_remotely(answer: MetricAnswer) -> MetricAnswer {
     }
 }
 
-/// HTTP is on the port (C-652), but the protocol behind [`RemoteSystem`] has no frame that carries
-/// an HTTP request yet — Decision 0018 rule 5 keeps that a separate, versioned protocol change
-/// rather than an implicit extension.
+/// HTTP, delegated (C-674) — the request is made **by the far side**, from its address space, with
+/// its source address and its egress guard.
 ///
-/// So this answers with the port's typed [`FailureMode::Unserved`] and *names what is missing*,
-/// which is the one thing an operator can act on: this mode means "implement it, or stop asking",
-/// and retrying never helps.
+/// C-652 put the family on the port and left this answering a typed `Unserved` naming the missing
+/// wire; Decision 0018 rule 5 held that a wire for a new family is a versioned protocol change
+/// rather than an implicit extension. That change has now happened, so this delegates. What has
+/// *not* changed is the refusal to approximate: a delegate that does not serve the family still
+/// answers `Unserved`, and nothing here falls back to sending from the coordinator's own process.
 ///
-/// The alternative — sending the request from this process because the delegate cannot — is the
-/// approximation the whole backend refuses to make. It would leave the effect, the source address
-/// the far end sees, and any credential the request carries on the coordinator, while dispatch
-/// provenance recorded the selected substrate. A missing capability is reported, never simulated.
+/// Two things happen to every answer on the way through, for the reason the metrics family gives
+/// above — an answer from another trust boundary is a claim, not an observation:
 ///
-/// There is deliberately no `Delegate::http_request` to override: adding one would invent the wire
-/// this decision defers.
+/// - **Re-bounding.** [`crate::port::bounded_response`] re-imposes the response-byte cap the
+///   *request* named, plus the header and admit-list bounds, on whatever came back. The cap on
+///   [`crate::port::HttpResponse`] is the substrate's promise; a caller that re-caps is not
+///   distrusting one transport but declining to extend trust to the answer, and [`Delegate`] is
+///   implementable by anyone. A wire decoder that also bounds is depth, not a substitute.
+/// - **Provenance.** Each reported [`crate::port::PrivateAdmit`] is stamped with this substrate's
+///   kind here rather than accepted from the answer. A far side that could stamp it itself could
+///   claim a private admission happened locally — the same substitution
+///   [`SubstrateIdentity`] exists to prevent, and the same rule `remotely_reported` follows.
 impl GuardedHttp for RemoteSystem {
+    fn serves_http(&self) -> bool {
+        self.delegate.serves_http()
+    }
+
     fn http_request<'a>(
         &'a self,
         request: &'a crate::port::HttpRequest,
         allow: &'a PrivateNetAllow,
     ) -> Guarded<'a, crate::port::HttpResponse> {
-        let _ = allow;
-        let operation = request.operation.clone();
         Box::pin(async move {
-            Err(Error::GuardedIo(GuardedIoError::new(
-                FailureMode::Unserved,
-                format!(
-                    "carry `{operation}` to a delegated substrate — the remote protocol has no HTTP \
-                     wire support yet, and this backend reports the gap rather than sending the \
-                     request from the coordinator's own process"
-                ),
-            )))
+            settle(self.delegate.http_request(request, allow).await).map(|response| {
+                admitted_remotely(
+                    crate::port::bounded_response(response, request.max_response_bytes),
+                    &self.identity.kind,
+                )
+            })
         })
     }
+}
+
+/// Stamp every reported private-destination admission with the substrate that made it, so the
+/// caller's audit trail records *where* the guard let a request through to an internal host.
+fn admitted_remotely(
+    mut response: crate::port::HttpResponse,
+    substrate: &str,
+) -> crate::port::HttpResponse {
+    for admit in &mut response.admits {
+        admit.substrate = Some(substrate.to_string());
+    }
+    response
 }
 
 impl GuardedHostFiles for RemoteSystem {
@@ -986,6 +1043,23 @@ impl<T: GuardedSubstrate + ?Sized> Delegate for Loopback<T> {
 
     fn read_metrics(&self) -> Answered<'_, Vec<MetricAnswer>> {
         Box::pin(async move { relay(GuardedMetrics::read_metrics(&*self.substrate).await) })
+    }
+
+    /// A loopback declares the family exactly when the substrate it wraps does, so the
+    /// short-circuit a transport uses for a peer that serves no HTTP behaves the same with nothing
+    /// running — which is the point of having a local-first delegate at all.
+    fn serves_http(&self) -> bool {
+        GuardedHttp::serves_http(&*self.substrate)
+    }
+
+    fn http_request<'a>(
+        &'a self,
+        request: &'a crate::port::HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Answered<'a, crate::port::HttpResponse> {
+        Box::pin(
+            async move { relay(GuardedHttp::http_request(&*self.substrate, request, allow).await) },
+        )
     }
 
     fn read_file_bytes<'a>(&'a self, path: &'a str) -> Answered<'a, Vec<u8>> {
@@ -1227,29 +1301,14 @@ mod tests {
         assert!(GuardedMetrics::served_metric_kinds(&remote).is_empty());
     }
 
-    /// C-652 — a delegated substrate answers HTTP by *naming what is missing*, never by sending the
-    /// request from this process.
-    ///
-    /// Decision 0018 rule 5 puts HTTP on the port and leaves wire support for it a separate,
-    /// versioned protocol change. Until that lands there is no frame to carry an HTTP request to the
-    /// far side, and the only two honest answers are "unserved" or a lie. Approximating — running
-    /// the request locally because the delegate cannot — would place the effect, its source address
-    /// and its credentials on the coordinator while the operator's provenance says otherwise, which
-    /// is exactly the substitution the port exists to prevent.
-    ///
-    /// The refusal is checked structurally *and* for the phrase an operator has to act on: this is
-    /// the one failure mode where retrying never helps and the fix is "implement the wire".
-    #[tokio::test]
-    async fn remote_http_is_unserved_and_names_the_missing_wire_support() {
-        struct ServesNothing;
-        impl Delegate for ServesNothing {}
-
+    /// One guarded HTTP request at a closed loopback port, admitted under an `Any` grant.
+    fn http_request_fixture() -> crate::port::HttpRequest {
         let target = crate::net::guard_url_scoped_for_secret(
             "http://127.0.0.1:9/probe",
             &crate::net::PrivateNetAllow::Any,
         )
         .expect("a loopback literal is admitted under an `Any` grant");
-        let request = crate::port::HttpRequest {
+        crate::port::HttpRequest {
             operation: "http.request".into(),
             method: "GET".into(),
             target,
@@ -1258,27 +1317,182 @@ mod tests {
             timeout: Duration::from_secs(1),
             max_response_bytes: 1024,
             secrets: crate::port::HttpSecretScope::default(),
-        };
+        }
+    }
+
+    /// C-652, carried forward by C-674 — a delegate that does not serve HTTP answers the port's
+    /// typed `Unserved`, never a request sent from this process.
+    ///
+    /// The wire now exists, so the refusal no longer names a missing protocol; what it must still
+    /// never do is approximate. Running the request locally because the delegate cannot would place
+    /// the effect, its source address and its credentials on the coordinator while the operator's
+    /// provenance says otherwise — the substitution the port exists to prevent. The *mode* is the
+    /// part a caller acts on: `Unserved` means retrying never helps.
+    #[tokio::test]
+    async fn a_delegate_that_serves_no_http_answers_a_typed_unserved() {
+        struct ServesNothing;
+        impl Delegate for ServesNothing {}
 
         let remote = RemoteSystem::new(Arc::new(ServesNothing));
+        assert!(
+            !crate::port::GuardedHttp::serves_http(&remote),
+            "a delegate that declares nothing must not be credited with the family"
+        );
         let error = crate::port::GuardedHttp::http_request(
             &remote,
-            &request,
+            &http_request_fixture(),
             &crate::net::PrivateNetAllow::Any,
         )
         .await
-        .expect_err("a delegated substrate cannot serve HTTP until the wire carries it");
+        .expect_err("a delegate that serves no HTTP cannot answer the request");
 
         assert_eq!(
             failure_mode(&error),
             Some(FailureMode::Unserved),
             "retrying never helps, so the mode must be unserved rather than refused: {error}"
         );
-        let message = error.to_string();
+    }
+
+    /// C-674, acceptances 1, 3 and 4 — `RemoteSystem` delegates, re-caps, and stamps provenance.
+    ///
+    /// The delegate here is *hostile* in the only ways a delegate can be: it answers with more body
+    /// than the request's cap allows, more headers and admits than the port bounds, control
+    /// characters in an operator-facing label, and an admit that claims it was made locally. None of
+    /// those survive, and none of them depend on the transport having behaved — this is the seat
+    /// that owes the caller the invariant, so this is the seat that re-imposes it.
+    #[tokio::test]
+    async fn a_delegated_answer_is_recapped_relabelled_and_stamped_with_its_substrate() {
+        struct Overreaching;
+        impl Delegate for Overreaching {
+            fn serves_http(&self) -> bool {
+                true
+            }
+
+            fn http_request<'a>(
+                &'a self,
+                _request: &'a crate::port::HttpRequest,
+                _allow: &'a PrivateNetAllow,
+            ) -> Answered<'a, crate::port::HttpResponse> {
+                Box::pin(async {
+                    Ok(Answer::Served(crate::port::HttpResponse {
+                        status: 200,
+                        headers: (0..(crate::port::MAX_RESPONSE_HEADERS + 40))
+                            .map(|index| (format!("x-{index}"), "v".repeat(64 * 1024)))
+                            .collect(),
+                        body: vec![b'a'; 64 * 1024],
+                        truncated: false,
+                        admits: (0..(crate::port::MAX_PRIVATE_ADMITS + 16))
+                            .map(|_| crate::port::PrivateAdmit {
+                                host: format!("10.0.0.1\u{1b}[2J{}", "h".repeat(4096)),
+                                grant_source: "config:web".into(),
+                                // The lie: "this happened on the caller's own machine".
+                                substrate: None,
+                            })
+                            .collect(),
+                    }))
+                })
+            }
+        }
+
+        let request = http_request_fixture();
+        let remote = RemoteSystem::identified(
+            Arc::new(Overreaching),
+            SubstrateIdentity {
+                kind: "remote".into(),
+                workspace: "/srv/work".into(),
+                confinement: "none".into(),
+                remotely_reported: false,
+            },
+        );
+        let response = crate::port::GuardedHttp::http_request(
+            &remote,
+            &request,
+            &crate::net::PrivateNetAllow::Any,
+        )
+        .await
+        .expect("a delegate that serves the family answers");
+
+        assert_eq!(
+            response.body.len(),
+            request.max_response_bytes,
+            "the requesting side re-caps rather than trusting the substrate's promise"
+        );
         assert!(
-            message.contains("wire support"),
-            "the refusal must name the missing wire support so an operator knows what to build: \
-             {message}"
+            response.truncated,
+            "a body this side had to cut must report itself cut"
+        );
+        assert_eq!(response.headers.len(), crate::port::MAX_RESPONSE_HEADERS);
+        assert!(response
+            .headers
+            .iter()
+            .all(|(_, value)| value.len() <= crate::port::MAX_HEADER_TEXT_BYTES));
+        assert_eq!(response.admits.len(), crate::port::MAX_PRIVATE_ADMITS);
+        for admit in &response.admits {
+            assert_eq!(
+                admit.substrate.as_deref(),
+                Some("remote"),
+                "provenance is the hop's to assert, never the far side's: {admit:?}"
+            );
+            assert!(admit.host.len() <= crate::port::MAX_ADMIT_LABEL_BYTES);
+            assert!(
+                !admit.host.chars().any(char::is_control),
+                "a control sequence reached an operator's audit record: {:?}",
+                admit.host
+            );
+        }
+    }
+
+    /// C-674 — a `Loopback` serves the family exactly when the substrate it wraps does, so the
+    /// whole delegation path is exercisable with nothing running.
+    #[tokio::test]
+    async fn a_loopback_declares_http_exactly_as_the_substrate_it_wraps_does() {
+        let bare = Arc::new(crate::System::new(
+            crate::Workspace::new(std::env::temp_dir()).unwrap(),
+        ));
+        assert!(
+            !crate::port::GuardedHttp::serves_http(&RemoteSystem::loopback(bare.clone())),
+            "a system nobody attached a backend to declares no HTTP"
+        );
+
+        struct Answers;
+        impl crate::port::GuardedHttp for Answers {
+            fn serves_http(&self) -> bool {
+                true
+            }
+
+            fn http_request<'a>(
+                &'a self,
+                _request: &'a crate::port::HttpRequest,
+                _allow: &'a PrivateNetAllow,
+            ) -> Guarded<'a, crate::port::HttpResponse> {
+                Box::pin(async {
+                    Ok(crate::port::HttpResponse {
+                        status: 204,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        truncated: false,
+                        admits: Vec::new(),
+                    })
+                })
+            }
+        }
+
+        let composed = Arc::new(
+            crate::System::new(crate::Workspace::new(std::env::temp_dir()).unwrap())
+                .with_http(Arc::new(Answers)),
+        );
+        let remote = RemoteSystem::loopback(composed);
+        assert!(crate::port::GuardedHttp::serves_http(&remote));
+        assert_eq!(
+            crate::port::GuardedHttp::http_request(
+                &remote,
+                &http_request_fixture(),
+                &crate::net::PrivateNetAllow::Any
+            )
+            .await
+            .expect("a composed loopback serves the family")
+            .status,
+            204
         );
     }
 }

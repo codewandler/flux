@@ -25,7 +25,9 @@ use flux_spec::{
     IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
-use flux_system::port::{GuardedHttp, HttpRequest, HttpSecretScope};
+use flux_system::port::{
+    GuardedHttp, HeaderValue as PortHeaderValue, HttpRequest, HttpSecretScope,
+};
 use flux_system::secret_scope::{Destination, InjectionSite, Refusal, SecretAllowlist, SecretUse};
 
 use crate::{NativeHttp, WebOptions};
@@ -284,16 +286,21 @@ impl Tool for HttpRequestTool {
         //
         // Validated here rather than at the substrate so the operator-facing message names the
         // header the *caller* wrote; the port carries the validated text.
-        let mut request_headers: Vec<(String, String)> = Vec::new();
+        //
+        // The value goes onto the request inside a `port::HeaderValue`, which names the `$secret`
+        // it materialized and refuses to print or serialize itself (C-674). That is what makes the
+        // credential visible to per-hop re-authorization on whichever substrate follows the chain,
+        // without a second list that can drift out of step with the headers themselves.
+        let mut request_headers: Vec<(String, PortHeaderValue)> = Vec::new();
         if let Some(headers) = params.get("headers").and_then(Value::as_object) {
             for (name, val) in headers {
-                let resolved = match as_secret_ref(val) {
+                let (resolved, secret_name) = match as_secret_ref(val) {
                     Some(secret) => {
                         authorize(secret, InjectionSite::Header)?;
                         carried.push((secret.to_string(), InjectionSite::Header));
-                        resolve_secret_env(secret, ctx)?
+                        (resolve_secret_env(secret, ctx)?, Some(secret.to_string()))
                     }
-                    None => plain_header_value(val)?,
+                    None => (plain_header_value(val)?, None),
                 };
                 let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                     Error::Other(format!("http.request: invalid header name `{name}`: {e}"))
@@ -303,7 +310,11 @@ impl Tool for HttpRequestTool {
                         "http.request: invalid value for header `{name}`: {e}"
                     ))
                 })?;
-                request_headers.push((name.as_str().to_string(), resolved));
+                let carriage = match secret_name {
+                    Some(secret) => PortHeaderValue::secret(secret, resolved),
+                    None => PortHeaderValue::literal(resolved),
+                };
+                request_headers.push((name.as_str().to_string(), carriage));
             }
         }
         let body = params
@@ -349,6 +360,11 @@ impl Tool for HttpRequestTool {
                     .await?
             }
         };
+        // A private-destination admission that happened on another substrate lands in *this* turn's
+        // audit trail, stamped with where it happened (C-674). An admit made here already reached
+        // the sink at the hop, so this adds nothing for an unselected run.
+        self.native
+            .record_reported_admits("http.request", &response.admits);
 
         // Rebuilt from the port's numeric status so the rendered view keeps its reason phrase
         // ("HTTP 200 OK"): the port carries a status code, not one client's status type.
@@ -1018,7 +1034,10 @@ mod tests {
     ///
     /// Placement moving to `SelectedExecutionSystem` keeps `http.request` visible under a selected
     /// host, and that visibility is only honest if the effect actually follows the selection. A
-    /// `RemoteSystem` whose protocol carries no HTTP answers `Unserved`; the op must surface that.
+    /// `RemoteSystem` whose delegate serves no HTTP answers `Unserved`; the op must surface that.
+    /// C-674 gave the protocol a frame, so what is missing here is the delegate's family rather
+    /// than the wire — and the refusal is checked structurally, which is how it is meant to be
+    /// classified.
     ///
     /// The loopback server is live and reachable on purpose. If the op still held a local client on
     /// this path it would answer `200 OK` and the test would pass for the wrong reason — so the
@@ -1044,9 +1063,10 @@ mod tests {
             .expect_err("a selected substrate that serves no HTTP must refuse the effect");
 
         let message = error.to_string();
-        assert!(
-            message.contains("wire support"),
-            "the operator must be told the substrate cannot carry this yet, not handed a local \
+        assert_eq!(
+            flux_system::remote::failure_mode(&error),
+            Some(flux_system::remote::FailureMode::Unserved),
+            "the operator must be told the substrate cannot carry this, not handed a local \
              answer: {message}"
         );
         assert!(

@@ -193,6 +193,10 @@ impl Tool for WebFetchTool {
                     .await?
             }
         };
+        // A private-destination admission that happened on another substrate lands in *this* turn's
+        // audit trail, stamped with where it happened (C-674).
+        self.native
+            .record_reported_admits("web.fetch", &response.admits);
 
         // Rebuilt from the port's numeric status so `[200 OK]` keeps its reason phrase.
         let status = reqwest::StatusCode::from_u16(response.status).map_err(|e| {
@@ -429,12 +433,14 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// C-652 — `web.fetch` is `SelectedExecutionSystem` now, so the read follows the operator's
-    /// selection instead of being served from the coordinator's process.
+    /// C-652, unchanged in substance by C-674 — `web.fetch` is `SelectedExecutionSystem`, so the
+    /// read follows the operator's selection instead of being served from the coordinator's process.
     ///
-    /// A `RemoteSystem` with no HTTP wire support refuses; the op surfaces that refusal. The
-    /// loopback server stands live and untouched, which is what makes the assertion mean "the local
-    /// client is off this path" rather than "the fixture was unreachable".
+    /// The wire now exists, so what is missing is the *delegate's* HTTP family rather than the
+    /// protocol's; the refusal is checked structurally, through the port's own typed `Unserved`,
+    /// which is how it is meant to be classified. The loopback server stands live and untouched,
+    /// which is what makes the assertion mean "the local client is off this path" rather than "the
+    /// fixture was unreachable".
     #[tokio::test]
     async fn a_selected_substrate_that_serves_no_http_refuses_the_read() {
         struct ServesNothing;
@@ -454,9 +460,14 @@ mod tests {
             .execute(&ctx, json!({ "url": base }))
             .await
             .expect_err("a selected substrate that serves no HTTP must refuse the read");
+        assert_eq!(
+            flux_system::remote::failure_mode(&error),
+            Some(flux_system::remote::FailureMode::Unserved),
+            "the refusal must classify as a missing capability, not a guard saying no: {error}"
+        );
         assert!(
-            error.to_string().contains("wire support"),
-            "the refusal must name what is missing: {error}"
+            !error.to_string().contains("local"),
+            "the request reached the network from the coordinator's process: {error}"
         );
     }
 
