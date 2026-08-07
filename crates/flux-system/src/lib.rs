@@ -1446,6 +1446,10 @@ pub struct System {
     sandbox: Sandbox,
     worktree_base: WorktreeBase,
     metrics_roots: metrics::MetricsRoots,
+    /// The HTTP backend a composition site attached (C-675). Empty by default and on every
+    /// construction path in this crate — see [`port::AttachedHttp`] for why the one family whose
+    /// client lives a layer up travels as a value rather than as a client built here.
+    http: port::AttachedHttp,
 }
 
 impl System {
@@ -1464,6 +1468,7 @@ impl System {
             sandbox: Sandbox::disabled(),
             worktree_base: WorktreeBase::from_process(),
             metrics_roots: metrics::MetricsRoots::native(),
+            http: port::AttachedHttp::default(),
         }
     }
 
@@ -1479,6 +1484,7 @@ impl System {
             sandbox,
             worktree_base: WorktreeBase::from_process(),
             metrics_roots: metrics::MetricsRoots::native(),
+            http: port::AttachedHttp::default(),
         })
     }
 
@@ -1518,6 +1524,34 @@ impl System {
         &self.metrics_roots
     }
 
+    /// Attach the HTTP backend this system serves [`port::GuardedHttp`] with (C-675) — the builder
+    /// a **composition site** calls, and the only way this family is ever served.
+    ///
+    /// The workspace's one HTTP client lives a layer above this crate, so the surface that holds it
+    /// hands it down: `flux-cli` builds `flux_web::NativeHttp` over the session's resolved egress
+    /// wiring and attaches it to the system it hands to substrate selection. A substrate composed
+    /// from that system — the confinement peer today, a container backend next — then serves web
+    /// effects through the same reviewed client an unselected run uses, rather than losing them
+    /// because the client is out of reach downward.
+    ///
+    /// Deliberately **not** applied to the session's own native system: leaving the default
+    /// unattached keeps "a bare `System` serves no HTTP" true for every path that did not ask for
+    /// a substrate, which is the C-652 posture and the reason a selection cannot be silently
+    /// approximated by the caller's process.
+    ///
+    /// This adds no IO path. The backend's guarantees are the backend's; attaching only decides who
+    /// may ask it. See [`port::AttachedHttp`].
+    pub fn with_http(mut self, backend: Arc<dyn port::GuardedHttp>) -> Self {
+        self.http = port::AttachedHttp::new(backend);
+        self
+    }
+
+    /// The HTTP backend attached to this system, if any. Read by the [`port::GuardedHttp`] impl and
+    /// by substrates that compose a `System` and delegate the family to it.
+    pub(crate) fn attached_http(&self) -> &port::AttachedHttp {
+        &self.http
+    }
+
     /// Allocate a fresh private worktree parent under this system's base — the guarded entry point
     /// `git_worktree_enter` and `fleet.isolate` use. See [`WorktreeBase::allocate`].
     pub fn allocate_worktree_dir(&self) -> Result<PathBuf> {
@@ -1547,6 +1581,10 @@ impl System {
             sandbox: self.sandbox.clone(),
             worktree_base: self.worktree_base.clone(),
             metrics_roots: self.metrics_roots.clone(),
+            // An attached HTTP backend is not workspace-relative: it carries the egress guard and
+            // the client, neither of which changes with a root, so a re-rooted system serves the
+            // same family it served before the transition.
+            http: self.http.clone(),
         })
     }
 

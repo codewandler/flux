@@ -1512,6 +1512,14 @@ impl ToolContext {
     /// reviewed native backend when the operator selected nothing. The distinction is *whether a
     /// substrate was chosen*, never what kind it is, so nothing here can smuggle an effect past a
     /// selection.
+    ///
+    /// C-675 lets a selected *native-composed* substrate serve that family — by composition rather
+    /// than by kind: the surface attaches the same reviewed client to the system the selection is
+    /// built from (`System::with_http`). This method is unchanged and still answers only whether a
+    /// substrate was chosen; what changed is that the answer for such a substrate is now a served
+    /// request instead of a refusal. It also makes `Some(native)` and `None` genuinely different
+    /// answers, so a caller must never manufacture the former from the latter — see `task`'s spawn
+    /// request, which carries this method's answer verbatim.
     pub fn selected_execution_system(&self) -> Option<Arc<dyn ExecutionSystem>> {
         self.execution_system.clone()
     }

@@ -1360,7 +1360,14 @@ impl Tool for TaskTool {
             // spawned inside a worktree session inherits the transitioned root (with its own
             // independent WorkspaceContext — a child transition never affects the parent).
             system: Some(ctx.system()),
-            execution_system: Some(ctx.execution_system()),
+            // C-675: the parent's **selection**, not the native fallback. `execution_system()`
+            // resolves an absent selection to the native `System`, so snapshotting that would hand
+            // every child a selection its parent never made — and one family can tell the two
+            // apart: `http.request`/`web.fetch` follow the selected substrate whenever there is
+            // one, so a fabricated `Some(native)` turns a sub-agent's web effect into a refusal in
+            // a run the operator selected nothing for. `None` keeps the child on the same
+            // native, worktree-following path its parent is on.
+            execution_system: ctx.selected_execution_system(),
             tool_registry: ctx.runtime_turn_context().tool_registry(),
             tool_registry_base: ctx.runtime_turn_context().tool_registry_base(),
         };
@@ -4959,6 +4966,134 @@ mod tests {
         );
         // And nothing dragged the child back through the parent's state: the child really did move.
         assert_ne!(canon(&parent_worktree_root), canon(&child_worktree_root));
+    }
+
+    /// Records what the CHILD context says about the operator's **selection** — the narrower
+    /// question `ToolContext::selected_execution_system` asks, not the native-resolving
+    /// `execution_system`. `None` is the answer that matters: it is what an unselected run means,
+    /// and the family that reads it (`http.request` / `web.fetch`, C-652) behaves differently for
+    /// `Some(native)` than for `None`.
+    struct SelectionProbe {
+        seen: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    }
+    #[async_trait]
+    impl Tool for SelectionProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("selection_probe", "p", json!({"type": "object"}))
+        }
+        async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+            *self.seen.lock().unwrap() = Some(
+                ctx.selected_execution_system()
+                    .map(|substrate| substrate.substrate_identity().kind),
+            );
+            Ok(ToolResult::ok("probed"))
+        }
+    }
+
+    /// A provider that selects and calls `selection_probe`, then finishes with prose.
+    struct SelectionProbePlanMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for SelectionProbePlanMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            if request_has_tool(&request, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("probe the selection", &["core"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                native_call("probe-1", "selection_probe", json!({}))
+            } else {
+                prose_chunks("done")
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// Spawn one sub-agent through the real `task` seam and report what the child observed about
+    /// the parent's substrate selection.
+    async fn spawned_child_selection(parent: &ToolContext) -> Option<String> {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut base = ToolRegistry::new();
+        base.try_register_from_with_placement(
+            "C-675 selection probe fixture",
+            Arc::new(SelectionProbe { seen: seen.clone() }),
+            OperationPlacement::SelectedExecutionSystem,
+        )
+        .unwrap();
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [selection_probe]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner: Arc<dyn Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(SelectionProbePlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            parent.system(),
+            "mock",
+            1024,
+        ));
+        let out = TaskTool
+            .execute(
+                &parent.clone().with_spawner(spawner),
+                json!({"role": "scout", "task": "probe"}),
+            )
+            .await
+            .expect("the sub-agent runs");
+        assert!(!out.is_error, "the sub-agent must run: {}", out.content);
+        let seen = seen.lock().unwrap().clone();
+        seen.expect("the probe ran in the child")
+    }
+
+    /// C-675 (acceptance 3) — a spawned sub-agent's context carries the parent's **selected**
+    /// substrate, and carries *nothing* when the parent selected nothing.
+    ///
+    /// This is the open question C-652's review routed here. `task` snapshots the parent's
+    /// substrate onto the `SpawnRequest`, and the question is which of the two readings it
+    /// snapshots. `execution_system()` resolves an absent selection to the native `System`, so
+    /// passing that hands every child a selection its parent never made — and one family can tell
+    /// the difference: `http.request`/`web.fetch` route to the selected substrate *when there is
+    /// one*, and a bare `System` serves no HTTP. A fabricated `Some(native)` therefore turns a
+    /// sub-agent's web effect into a refusal in a run where the operator selected nothing.
+    ///
+    /// Both directions are asserted here because either alone is satisfiable by the wrong code: a
+    /// child that always inherits passes the first, a child that never inherits passes the second.
+    #[tokio::test]
+    async fn a_spawned_sub_agent_carries_the_parents_selected_substrate() {
+        let selected: Arc<dyn flux_system::port::ExecutionSystem> = Arc::new(
+            flux_system::remote::RemoteSystem::loopback(unique_system("c675-parent-selection")),
+        );
+        let chosen = selected.substrate_identity().kind;
+        let parent =
+            ToolContext::new(unique_system("c675-parent")).with_execution_system(selected.clone());
+
+        assert_eq!(
+            spawned_child_selection(&parent).await,
+            Some(chosen),
+            "a child must inherit the substrate the operator selected for the parent"
+        );
+
+        let unselected = ToolContext::new(unique_system("c675-unselected-parent"));
+        assert_eq!(
+            spawned_child_selection(&unselected).await,
+            None,
+            "a child of an unselected parent must not carry a selection its parent never made — \
+             `Some(native)` is not the same answer as `None` to the family that asks"
+        );
     }
 
     /// C-100: nested delegation re-bases the depth-incremented spawner on the CHILD's snapshot —

@@ -315,20 +315,34 @@ impl GuardedNetwork for SandboxedSystem {
     }
 }
 
-/// HTTP is **not** served (C-652), and the empty impl is the whole implementation.
+/// HTTP delegates like everything else (C-675), and the delegation is the whole implementation.
 ///
-/// Every operation therefore inherits [`crate::port`]'s fail-closed `Unserved` denial. This is not
-/// an oversight and not a stub to fill in here: the peer serves by delegating to a [`System`], and
-/// a bare `System` serves no HTTP either — the native client is `flux_web::NativeHttp` at L5,
-/// which this L2 type may not reach, and the layer map forbids the alternative outright. Building
-/// a client here would create a second egress path beside the one `flux-web`'s reviewed broker
-/// owns, which is exactly what the codegate `Http` census exists to prevent.
+/// C-652 left this impl empty because the peer serves by delegating to a [`System`] and a bare
+/// `System` served no HTTP: the native client is `flux_web::NativeHttp` at L5, which this L2 type
+/// may not reach, and building one here would be a second egress path beside the reviewed broker —
+/// exactly what the codegate `Http` census exists to prevent. That reasoning is unchanged, and
+/// nothing here reaches upward.
 ///
-/// So a run that selected this substrate refuses HTTP in the port's own words rather than quietly
-/// borrowing the caller's process to make the request — the same fail-closed answer `RemoteSystem`
-/// gives for the same family. Teaching a *selected native* substrate to serve HTTP is a follow-up
-/// story.
-impl GuardedHttp for SandboxedSystem {}
+/// What changed is the composed system. A composition site that holds the client can attach it
+/// ([`System::with_http`]), so the peer forwards this family the same way it forwards network and
+/// metrics — one call, to the system it already holds — and the answer is whatever that system was
+/// composed with: the reviewed egress client under a selection the surface assembled, and the
+/// port's own `Unserved` under a system nobody attached one to. No client is constructed here, no
+/// second path exists, and the fail-closed direction is still the default.
+///
+/// That confinement does not itself confine an HTTP request is the same call [`GuardedMetrics`]
+/// makes below: the peer confines what this process *spawns*, and a request made in this process
+/// against this machine's network is the same request the composed `System` would make. Refusing it
+/// would cost a capability without adding a boundary.
+impl GuardedHttp for SandboxedSystem {
+    fn http_request<'a>(
+        &'a self,
+        request: &'a crate::port::HttpRequest,
+        allow: &'a PrivateNetAllow,
+    ) -> Guarded<'a, crate::port::HttpResponse> {
+        GuardedHttp::http_request(&self.inner, request, allow)
+    }
+}
 
 /// Metrics delegate rather than deny (C-653).
 ///
@@ -820,10 +834,11 @@ mod tests {
             "a metric read happens in this process, on this machine"
         );
 
-        // HTTP does not: the empty impl inherits the port's refusal, in the port's own words, so a
-        // sandboxed selection cannot silently borrow the caller's process to make the request.
-        // A loopback literal pins without a DNS lookup, so this is about the port's answer rather
-        // than about a network.
+        // HTTP does not: nothing attached a backend to the composed system here, so the delegation
+        // lands on the port's own refusal (C-675 changed who may serve this family, not what an
+        // unattached substrate answers). A sandboxed selection still cannot silently borrow the
+        // caller's process to make the request. A loopback literal pins without a DNS lookup, so
+        // this is about the port's answer rather than about a network.
         let target = crate::net::guard_url_scoped_for_secret(
             "http://127.0.0.1:9/probe",
             &PrivateNetAllow::Any,
@@ -842,7 +857,7 @@ mod tests {
         let http = port
             .http_request(&request, &PrivateNetAllow::Any)
             .await
-            .expect_err("a sandboxed selection must not serve HTTP");
+            .expect_err("a peer composed over an unattached system must not serve HTTP");
         assert!(
             http.to_string().starts_with(crate::port::UNSERVED),
             "the refusal must be the port's own `Unserved`, not an improvised error: {http}"
@@ -850,5 +865,75 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// C-675 (acceptance 1 and 4) — the peer serves HTTP by **delegating to the system it
+    /// composes**, exactly as it serves every other family.
+    ///
+    /// The composed `System` is what a composition site attaches a backend to, so this is the whole
+    /// mechanism: the surface that holds the workspace's one egress client hands it down, and the
+    /// peer forwards to it. Both directions are asserted, because the interesting property is not
+    /// "it can serve" but "it serves *that*, and nothing when there is nothing" — a peer that
+    /// improvised a client would pass the first half and fail the second, and one that kept the
+    /// old empty impl would fail the first.
+    #[tokio::test]
+    async fn the_peer_serves_the_http_backend_attached_to_the_composed_system() {
+        struct Attached(std::sync::Mutex<Vec<String>>);
+
+        impl GuardedHttp for Attached {
+            fn http_request<'a>(
+                &'a self,
+                request: &'a crate::port::HttpRequest,
+                _allow: &'a PrivateNetAllow,
+            ) -> Guarded<'a, crate::port::HttpResponse> {
+                self.0.lock().unwrap().push(request.operation.clone());
+                Box::pin(async {
+                    Ok(crate::port::HttpResponse {
+                        status: 204,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        truncated: false,
+                    })
+                })
+            }
+        }
+
+        let _env = EnvGuard::new(SANDBOX_KEYS);
+        let (root, system) = fixture("sandboxed-http");
+        let backend = std::sync::Arc::new(Attached(std::sync::Mutex::new(Vec::new())));
+
+        let peer =
+            SandboxedSystem::from_env(nested_under_outer_flux(system).with_http(backend.clone()))
+                .expect("the nested fixture admits");
+        let port: &dyn ExecutionSystem = &peer;
+
+        let target = crate::net::guard_url_scoped_for_secret(
+            "http://127.0.0.1:9/probe",
+            &PrivateNetAllow::Any,
+        )
+        .expect("a loopback literal is admitted under an `Any` grant");
+        let request = crate::port::HttpRequest {
+            operation: "web.fetch".into(),
+            method: "GET".into(),
+            target,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(1),
+            max_response_bytes: 1024,
+            secrets: crate::port::HttpSecretScope::default(),
+        };
+
+        let served = port
+            .http_request(&request, &PrivateNetAllow::Any)
+            .await
+            .expect("the peer serves the backend its composed system carries");
+        assert_eq!(served.status, 204);
+        assert_eq!(
+            backend.0.lock().unwrap().as_slice(),
+            ["web.fetch".to_string()],
+            "the peer must forward to the attached backend rather than improvise a client"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
