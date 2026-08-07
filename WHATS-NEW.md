@@ -68,6 +68,16 @@
   still never provisions your Docker hosts, clusters or VMs — the artifacts run where you already
   have somewhere to run them.
 
+- **A VM or microVM guest is a host you can name.** Declare `backend = "microvm"` in a `[[host]]`
+  entry pointing at a guest that runs the serving daemon, and `--host <name>` runs guarded effects
+  inside it — same authenticated protocol, same handshake, same credential *reference* as a remote
+  host. `flux host probe` reports the negotiated protocol version and the guest's own substrate
+  identity, marked as reported by it. Flux still never creates, starts, stops or destroys a guest:
+  the binding consumes an endpoint that already exists, and the VM/microVM deployment profile is
+  how you make one. A binding declared before its guest exists is legal and says so — it lists as
+  unwired and refuses selection naming the missing endpoint, instead of quietly falling back to
+  your machine.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

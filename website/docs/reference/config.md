@@ -495,9 +495,13 @@ Four consequences are worth stating plainly before you declare one.
   is resolved once at startup, so guarded effects continue against the root it was selected with
   even after a worktree transition (`git_worktree_enter`, `fleet.isolate`) moves the native path.
   With no `--host`, nothing is pinned and the native path follows transitions as it always has.
-- **It serves no HTTP, and browser operations are hidden.** Like every selected substrate, a
-  `sandboxed` binding refuses guarded HTTP rather than sending the request from the calling process
-  behind your back, and `browser.*` / `web.crawl` are withheld while a selection is in force. Use a
+- **It serves HTTP; browser operations stay hidden.** A `sandboxed` binding makes web requests
+  through the same guarded egress path, redirect rules and private-network audit trail an
+  unselected run uses — the request is made in this process against this machine's network, which
+  is what confinement of *spawned* work already implied. A substrate that genuinely cannot make
+  requests (a remote binding, until HTTP rides the wire) still refuses rather than sending from
+  the calling process behind your back. `browser.*` and `web.crawl` remain withheld while any
+  selection is in force, because they drive a browser and a crawl frontier in this process; use a
   binding-free run for those.
 
 ```toml
