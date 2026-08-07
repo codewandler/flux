@@ -205,6 +205,30 @@ fn production_catalog() -> ToolRegistry {
     flux_capabilities::try_register_endpoint_ops(&mut registry, broker, endpoints)
         .expect("the endpoint ops register");
 
+    // The host ops, as `assemble_integrations` builds them (C-649). A refusing prober stands in
+    // for the CLI's: the census pins specs and placement, never live probing.
+    struct CensusProber;
+    #[async_trait::async_trait]
+    impl flux_capabilities::HostProber for CensusProber {
+        async fn probe(
+            &self,
+            _host: &flux_secret::host::HostRef,
+        ) -> std::result::Result<
+            flux_capabilities::HostProbeReport,
+            flux_capabilities::HostProbeFailure,
+        > {
+            Err(flux_capabilities::HostProbeFailure::BackendUnwired {
+                backend: "census".to_string(),
+            })
+        }
+    }
+    flux_capabilities::try_register_host_ops(
+        &mut registry,
+        Arc::new(flux_capabilities::HostRegistry::new()),
+        Arc::new(CensusProber),
+    )
+    .expect("the host ops register");
+
     // A config-authored model stage. Every `[agent.stages.*]` entry lowers through this one
     // registrar with a caller-supplied name and schema, so one representative stage covers the
     // shape all of them share.
@@ -564,6 +588,7 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
         ("browser.close", "flux-web browser tier"),
         ("search", "datasource"),
         ("endpoint.import", "endpoint"),
+        ("host.probe", "host"),
         ("task", "sub-agent delegation"),
         ("fleet.dispatch", "outbound A2A fleet dispatch"),
         ("census_board.claim", "declared work boards"),
@@ -662,6 +687,7 @@ const COVERED_REGISTRATION_SEAMS: &[&str] = &[
     "try_register_flows",
     "try_register_render",
     "try_register_datasource_ops",
+    "try_register_host_ops",
     "try_register_work_board",
     "try_register_fleet",
     "try_register_web",

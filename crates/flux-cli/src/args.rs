@@ -741,6 +741,12 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Inspect and operate the named execution-substrate bindings (`[[host]]`). Operator-only,
+    /// weak refs only — never prints a secret value.
+    Host {
+        #[command(subcommand)]
+        action: HostAction,
+    },
     /// Install and operate the separately released local Exchange authority.
     Exchange {
         #[command(subcommand)]
@@ -1465,6 +1471,64 @@ pub(super) enum EndpointAction {
         /// A weak `EndpointRef` (JSON) to import directly when the id is not already in the store.
         #[arg(long, value_name = "JSON")]
         from_json: Option<String>,
+    },
+}
+
+/// `flux host …` — the operator mirror of the agent's `host.*` ops over the session's named
+/// execution-substrate bindings (Decision 0018 / C-649). Every path is reference-only: it shows
+/// the credential *location*, never a value.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum HostAction {
+    /// List the session's host bindings: id, backend kind, address and availability.
+    #[command(alias = "list")]
+    Ls {
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
+    },
+    /// Show one binding in full by name (still reference-only).
+    Show {
+        /// Binding name (e.g. `build-farm`).
+        id: String,
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
+    },
+    /// Declare a named binding: upsert one `[[host]]` entry in `~/.flux/config.toml`. The
+    /// credential is a *location* (`--credential-ref`), never a value; the URL must be
+    /// credential-free. The declarative alternative is a `[[host]]` block in either config layer.
+    Add {
+        /// The binding name (a bare name, e.g. `build-farm`).
+        id: String,
+        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes` or `remote`.
+        #[arg(long)]
+        backend: String,
+        /// Bare `scheme://host[:port]` for backends with an address — no embedded credentials.
+        #[arg(long)]
+        url: Option<String>,
+        /// Credential *location*: `env/KEY`, `kubernetes/<ns>/<name>/<key>`, or
+        /// `plugin/<p>/<i>/<slot>`. Omit for an unauthenticated binding. Never a value.
+        #[arg(long, value_name = "REF")]
+        credential_ref: Option<String>,
+        /// Repeatable non-secret label `key=value` (region, cluster, tags) for display/filtering.
+        #[arg(long = "label", value_name = "K=V")]
+        labels: Vec<String>,
+    },
+    /// Remove a binding declared in `~/.flux/config.toml` (a project-declared binding is reported,
+    /// not removed — edit the project config where it lives).
+    Rm {
+        /// Binding name to remove.
+        id: String,
+    },
+    /// Verify one binding by its backend's side-effect-free identity check: substrate identity
+    /// (kind, workspace, confinement, remotely_reported) and, for a remote backend, the
+    /// negotiated protocol version. Executes nothing on the substrate.
+    Probe {
+        /// Binding name to probe.
+        id: String,
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
     },
 }
 

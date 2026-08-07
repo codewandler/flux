@@ -6,12 +6,20 @@
 //! `credential_ref` location, re-resolved live each session, never a secret. Resolution of a
 //! binding to a live `ExecutionSystem` lives in the surface crate (C-650), not here.
 
+mod ops;
+
+pub use ops::{host_tools, register_host_ops, try_register_host_ops, HOST_GROUP};
+
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+use async_trait::async_trait;
+use serde::Serialize;
+
 use flux_core::{Error, Result};
-use flux_secret::host::HostRecord;
+use flux_secret::host::{HostBackend, HostRecord, HostRef};
 
 /// A session-scoped registry of host bindings, keyed by binding name. Config-declared hosts are
 /// registered at session start; ephemeral (session-only) bindings may join in memory and are never
@@ -61,6 +69,11 @@ impl HostRegistry {
     /// Answer a record by binding name (the weak ref — no secret).
     pub fn get(&self, id: &str) -> Option<HostRecord> {
         self.records.read().unwrap().get(id).cloned()
+    }
+
+    /// Remove a record by binding name, returning it if present (the store half of `flux host rm`).
+    pub fn remove(&self, id: &str) -> Option<HostRecord> {
+        self.records.write().unwrap().remove(id)
     }
 
     /// Whether the registry holds no bindings at all. Cheap — the ambient-signal wiring asks this
@@ -143,6 +156,74 @@ struct Persisted {
     host: Vec<HostRecord>,
 }
 
+/// The static (no-side-effect) availability statement for a backend — what `host ls`/`show` may
+/// honestly claim without probing. `local` is the running substrate; a `remote` binding is only a
+/// declaration until `probe` verifies it; the peer backends fail closed until their selection
+/// stories wire them.
+pub fn static_availability(backend: HostBackend) -> &'static str {
+    match backend {
+        HostBackend::Local => "available",
+        HostBackend::Remote => "declared (verify with probe)",
+        HostBackend::Sandboxed | HostBackend::Container | HostBackend::Kubernetes => {
+            "unwired (selection fails closed)"
+        }
+    }
+}
+
+/// A backend's side-effect-free identity check result (C-649 `probe`): the resolved
+/// `SubstrateIdentity` fields, plus the negotiated protocol version for a remote backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HostProbeReport {
+    pub kind: String,
+    pub workspace: String,
+    pub confinement: String,
+    pub remotely_reported: bool,
+    /// The negotiated remote-system protocol version; `None` for a local identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<u32>,
+}
+
+/// Why a probe could not produce an identity — typed, not stringly (C-649). The classes are the
+/// contract; `detail` strings carry transport specifics for display only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "class", rename_all = "snake_case")]
+pub enum HostProbeFailure {
+    /// The binding names a credential the current environment cannot supply.
+    CredentialUnavailable { reference: String, detail: String },
+    /// The backend kind has no probe-able implementation wired yet; selection fails closed too.
+    BackendUnwired { backend: String },
+    /// The transport-level identity check failed (unreachable, refused, handshake error).
+    Connect { detail: String },
+}
+
+impl fmt::Display for HostProbeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CredentialUnavailable { reference, detail } => {
+                write!(f, "credential `{reference}` unavailable: {detail}")
+            }
+            Self::BackendUnwired { backend } => {
+                write!(
+                    f,
+                    "backend `{backend}` has no probe-able implementation wired yet"
+                )
+            }
+            Self::Connect { detail } => write!(f, "identity check failed: {detail}"),
+        }
+    }
+}
+
+impl std::error::Error for HostProbeFailure {}
+
+/// Performs a backend's side-effect-free identity check (C-649 `probe`). Implemented in the
+/// surface crate — the remote handshake client lives above this layer — and shared by the
+/// `host.probe` op and the `flux host probe` command so the two cannot drift.
+#[async_trait]
+pub trait HostProber: Send + Sync {
+    async fn probe(&self, host: &HostRef)
+        -> std::result::Result<HostProbeReport, HostProbeFailure>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,7 +239,7 @@ mod tests {
     fn farm() -> HostRecord {
         HostRecord::config(HostRef {
             url: Some("https://farm.example:8443".into()),
-            credential_ref: Some(Ref::env("FLUX_FARM_TOKEN")),
+            credential_ref: Some(Ref::env("FARM_TOKEN")),
             ..HostRef::declared("build-farm", HostBackend::Remote)
         })
     }
@@ -192,7 +273,7 @@ mod tests {
         // value anywhere in the pipeline to leak.
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(
-            body.contains("scheme = \"env\"") && body.contains("FLUX_FARM_TOKEN"),
+            body.contains("scheme = \"env\"") && body.contains("FARM_TOKEN"),
             "location persisted: {body}"
         );
         assert!(body.contains("backend = \"remote\""), "{body}");
@@ -223,7 +304,7 @@ mod tests {
         assert_eq!(rec.host.display_address(), "https://farm.example:8443");
         assert_eq!(
             rec.host.credential_ref.as_ref().map(|r| r.to_string()),
-            Some("env/FLUX_FARM_TOKEN".to_string())
+            Some("env/FARM_TOKEN".to_string())
         );
     }
 }

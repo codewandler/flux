@@ -95,6 +95,9 @@ optional arguments are in `[brackets]`.
 | `endpoint.info` | `id` | Low | One endpoint reference in full by id (e.g. `@endpoint/monitoring-prometheus`): URL, product, protocol, labels, owner, health; never a secret |
 | `endpoint.select` | `id` | Low | Bind a discovered endpoint by id and return its weak reference, to reuse across turns; the host resolves it and injects the credential when a call runs |
 | `endpoint.import` | `id` | Medium | Persist an endpoint reference to the local endpoints store so it survives the session — the weak reference only (URL + credential *location*); the credential is re-resolved live each session |
+| `host.list` | | Low | The named execution-substrate bindings registered this session (`[[host]]` config + hosts store): backend kind, address, availability — weak references only |
+| `host.info` | `id` | Low | One host binding in full by name: backend kind, address, availability, labels and a credential *presence* marker; never a value |
+| `host.probe` | `id` | Low | The backend's side-effect-free identity check: substrate identity (kind, workspace, confinement, remotely_reported) and, for a remote backend, the negotiated protocol version — nothing executes on the substrate |
 | `flux_reload` | | High | **`--dev` only**: recompile `flux-cli` in place. The new binary lands on disk but this session keeps the old one, so it returns instructions to exit and re-run with `--resume`; it never replaces the running process (C-57) |
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,

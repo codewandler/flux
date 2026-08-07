@@ -21,6 +21,20 @@ All notable changes to this project are documented in this file. The format is b
   The entity is inert in this story: the `flux host` family arrives with C-649 and named selection
   with C-650.
 
+- **The host entity is operable: `flux host` and an ambient-gated `host.*` op group (C-649).**
+  `flux host ls`/`show` render id, backend kind, address and a static availability statement
+  (`--output json`/`ndjson` is the automation API); `add`/`rm` edit the `[[host]]` table in
+  `~/.flux/config.toml` atomically through the same validated parts as the config path, refusing
+  inline secret values before anything is written; `probe` performs the backend's side-effect-free
+  identity check — the resolved substrate identity for a local binding, the protocol handshake
+  (identity route only, nothing executes) with the negotiated version for a remote one — and its
+  failures are a typed taxonomy (`credential_unavailable`, `backend_unwired`, `connect`), not
+  strings. The agent-facing mirror is `host.list`/`host.info`/`host.probe`, registered at
+  `LocalControlPlane` placement — bindings must stay inspectable precisely when a non-native
+  substrate is selected — behind the session-ambient `host` signal, with the op list pinned by the
+  placement census, the group manifest test, and the website ops reference. Integration-assembly
+  tools now carry their placement per pack instead of assuming one shared placement.
+
 - **`flux board next --independent` returns the largest wave-safe set instead of the
   highest-priority prefix.** Dependency satisfaction says only that nothing an item *waits on* is
   outstanding; it says nothing about whether two ready items can be built at the same time.

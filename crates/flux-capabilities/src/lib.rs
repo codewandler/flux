@@ -45,7 +45,10 @@ pub use endpoint::{
     EndpointBrokerHostCaps, EndpointRegistry, HostCredentialReader, HostProviderInvoker,
     PluginRegistry, ProviderEntry, ProviderInvoker, StaticResolver, ENDPOINT_GROUP,
 };
-pub use host::HostRegistry;
+pub use host::{
+    host_tools, register_host_ops, static_availability, try_register_host_ops, HostProbeFailure,
+    HostProbeReport, HostProber, HostRegistry, HOST_GROUP,
+};
 
 #[cfg(feature = "embeddings")]
 pub use datasource::OpenAiEmbedder;

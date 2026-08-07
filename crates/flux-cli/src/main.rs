@@ -123,11 +123,11 @@ mod tests {
         format_evidence, host_ref_from_parts, implicit_plugin_group, integration_plugin_caps,
         loop_machinery_label, merge_config_hosts, merge_static_endpoints, new_render_suffix,
         parse_labels, plugin_binaries_in, plugin_status_one, redact_plugin_echo,
-        render_endpoint_row, render_review_markdown, resolve_plugin_operation_name,
-        run_endpoint_in, run_plugin_in, run_usage_with, should_fail, tool_preview, truncate,
-        url_has_userinfo, usage_annotation, write_generated_skill, EndpointAction, EventStore,
-        EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness, PluginAction,
-        RedactorSecretSink, ReviewSeverity,
+        render_endpoint_row, render_host_row, render_review_markdown,
+        resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
+        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill,
+        CliHostProber, EndpointAction, EventStore, EventStoreCrossPluginAudit,
+        EventStoreEgressAudit, Liveness, PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
@@ -1318,7 +1318,7 @@ mod tests {
 
         // All three reference schemes are accepted — the existing vocabulary, nothing new.
         for scheme in [
-            "env/FLUX_FARM_TOKEN",
+            "env/FARM_TOKEN",
             "plugin/k8s/main/token",
             "kubernetes/ns/name/key",
         ] {
@@ -1345,7 +1345,7 @@ mod tests {
                     id: "build-farm".into(),
                     backend: flux_config::HostBackendKind::Remote,
                     url: Some("https://farm.example:8443".into()),
-                    credential_ref: Some("env/FLUX_FARM_TOKEN".into()),
+                    credential_ref: Some("env/FARM_TOKEN".into()),
                     labels: Default::default(),
                 },
                 flux_config::HostEntry {
@@ -1373,10 +1373,160 @@ mod tests {
         assert_eq!(farm.host.display_address(), "https://farm.example:8443");
         assert_eq!(
             farm.host.credential_ref.as_ref().map(ToString::to_string),
-            Some("env/FLUX_FARM_TOKEN".into())
+            Some("env/FARM_TOKEN".into())
         );
         assert!(reg.get("bad").is_none(), "invalid entry skipped");
         assert_eq!(reg.known_names(), ["build-farm", "here"]);
+    }
+
+    /// C-649: the host group manifest gates every registered host op — the manifest is what
+    /// config-based reassignment edits, so the explicit list must stay complete — and each op
+    /// self-declares the group.
+    #[test]
+    fn host_group_manifest_matches_host_tools() {
+        use std::sync::Arc;
+        struct NoProbe;
+        #[async_trait::async_trait]
+        impl flux_capabilities::HostProber for NoProbe {
+            async fn probe(
+                &self,
+                _host: &flux_secret::host::HostRef,
+            ) -> std::result::Result<
+                flux_capabilities::HostProbeReport,
+                flux_capabilities::HostProbeFailure,
+            > {
+                Err(flux_capabilities::HostProbeFailure::BackendUnwired {
+                    backend: "test".to_string(),
+                })
+            }
+        }
+        let tools = flux_capabilities::host_tools(
+            Arc::new(flux_capabilities::HostRegistry::new()),
+            Arc::new(NoProbe),
+        );
+        let mut op_names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
+        op_names.sort();
+        let group = flux_tools::groups::builtin_groups()
+            .into_iter()
+            .find(|g| g.name == "host")
+            .expect("host group exists");
+        let mut listed = group.tools.clone();
+        listed.sort();
+        assert_eq!(
+            listed, op_names,
+            "the host group manifest must gate every registered host op"
+        );
+        for t in &tools {
+            assert_eq!(t.spec().group.as_deref(), Some("host"), "{}", t.spec().name);
+        }
+    }
+
+    /// C-649: `flux host add` upserts a validated `[[host]]` entry in the user config, `rm`
+    /// removes it, and a second add with the same id retargets in place — all round-tripping
+    /// every other setting.
+    #[test]
+    fn host_add_and_rm_edit_the_user_host_table() {
+        let home = std::env::temp_dir().join(format!("flux-host-user-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let env = flux_runtime::metadata::DiscoveryEnv::empty().with_home(&home);
+
+        let entry = |url: &str| flux_config::HostEntry {
+            id: "build-farm".into(),
+            backend: flux_config::HostBackendKind::Remote,
+            url: Some(url.into()),
+            credential_ref: Some("env/FARM_TOKEN".into()),
+            labels: Default::default(),
+        };
+        flux_runtime::metadata::persist_user_host_in(entry("https://one.example:8443"), &env)
+            .unwrap();
+        flux_runtime::metadata::persist_user_host_in(entry("https://two.example:8443"), &env)
+            .unwrap();
+        let config_path = home.join(".flux").join("config.toml");
+        let body = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            body.matches("build-farm").count(),
+            1,
+            "upsert, not append: {body}"
+        );
+        assert!(body.contains("https://two.example:8443"), "{body}");
+        assert!(
+            body.contains("env/FARM_TOKEN"),
+            "location, never a value: {body}"
+        );
+
+        assert!(
+            flux_runtime::metadata::remove_user_host_in("build-farm", &env).unwrap(),
+            "declared binding removes"
+        );
+        assert!(
+            !flux_runtime::metadata::remove_user_host_in("build-farm", &env).unwrap(),
+            "an absent binding reports false rather than erroring"
+        );
+        let body = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!body.contains("build-farm"), "{body}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C-649: rows render id, backend kind, address, availability and the credential *location* —
+    /// never a value, even when the referenced environment variable is set.
+    #[test]
+    fn host_rows_render_reference_only() {
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+        std::env::set_var("ROW_TOKEN", "sk-row-secret");
+        let record = HostRecord::config(HostRef {
+            url: Some("https://farm.example:8443".into()),
+            credential_ref: Some(flux_secret::Ref::env("ROW_TOKEN")),
+            ..HostRef::declared("build-farm", HostBackend::Remote)
+        });
+        let row = render_host_row(&record);
+        assert!(row.contains("build-farm"), "{row}");
+        assert!(row.contains("[remote]"), "{row}");
+        assert!(row.contains("https://farm.example:8443"), "{row}");
+        assert!(row.contains("declared"), "availability rendered: {row}");
+        assert!(row.contains("env/ROW_TOKEN"), "the location column: {row}");
+        assert!(!row.contains("sk-row-secret"), "never a value: {row}");
+        std::env::remove_var("ROW_TOKEN");
+    }
+
+    /// C-649: probing a `local` binding reports the running substrate's identity (native,
+    /// locally observed, no protocol version) without executing anything on it, and remote-probe
+    /// failures are typed — a missing credential and an unreachable endpoint each carry their
+    /// class, not a stringly panic.
+    #[tokio::test]
+    async fn host_probe_reports_identity_and_types_failures() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+
+        let report = prober
+            .probe(&HostRef::declared("here", HostBackend::Local))
+            .await
+            .expect("the local substrate always has an identity");
+        assert_eq!(report.kind, "native");
+        assert!(!report.remotely_reported);
+        assert!(report.protocol_version.is_none());
+
+        let no_credential = HostRef {
+            url: Some("https://farm.example:8443".into()),
+            ..HostRef::declared("farm", HostBackend::Remote)
+        };
+        match prober.probe(&no_credential).await.unwrap_err() {
+            HostProbeFailure::CredentialUnavailable { .. } => {}
+            other => panic!("expected CredentialUnavailable, got {other:?}"),
+        }
+
+        let unwired = HostRef::declared("box", HostBackend::Container);
+        match prober.probe(&unwired).await.unwrap_err() {
+            HostProbeFailure::BackendUnwired { backend } => assert_eq!(backend, "container"),
+            other => panic!("expected BackendUnwired, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// D-116 e2e (gated on `TEST_POSTGRES_URL`, like the pg backend tests): an operator-added

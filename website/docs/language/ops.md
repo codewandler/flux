@@ -303,6 +303,18 @@ was non-empty at session startup. See [Endpoints](../agent/endpoints.md).
 | `endpoint.select` | `id` | Return one model-safe `EndpointRef` for reuse in another operation |
 | `endpoint.import` | `id` | Persist a known record to `~/.flux/endpoints.toml` (approval-gated local write) |
 
+## Hosts
+
+Registered as one evidence-gated group, surfaced when named execution-substrate bindings are
+declared (`[[host]]` config or the hosts store). Weak references only: backend kind, address,
+availability and a credential *presence* marker — never a value.
+
+| op | arguments | description |
+|---|---|---|
+| `host.list` | | List the session's named execution-substrate bindings |
+| `host.info` | `id` | Inspect one host binding: backend kind, address, availability, labels |
+| `host.probe` | `id` | Side-effect-free identity check: substrate identity and, for a remote backend, the negotiated protocol version |
+
 ## Agent-invoked commands and skills
 
 Registered as one evidence-gated group, surfaced only when the session discovers at least one

@@ -180,6 +180,7 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Export { .. }
         | Commands::Auth { .. }
         | Commands::Endpoint { .. }
+        | Commands::Host { .. }
         | Commands::Exchange { .. }
         | Commands::Integration { .. }
         | Commands::Policy { .. }
@@ -848,6 +849,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
+            Some(Commands::Host { action }) => run_host(action).await,
             Some(Commands::Exchange { action }) => run_exchange_boundary(action),
             Some(Commands::Integration { action }) => run_integration_boundary(action),
             Some(Commands::Policy { action }) => run_policy(action),

@@ -2,7 +2,7 @@
 id: C-649
 title: "flux host CLI family and host.* operations"
 pillar: "Core"
-status: backlog
+status: in-progress
 epic: first-class-hosts
 areas: [flux-cli, flux-capabilities]
 design: first-class-hosts
@@ -21,12 +21,12 @@ remote backend) without side effects.
 
 ## Acceptance
 
-- [ ] `flux host ls`/`show` render id, backend kind, address and availability; JSON output is the
+- [x] `flux host ls`/`show` render id, backend kind, address and availability; JSON output is the
       automation API.
-- [ ] `add`/`rm` edit the `[[host]]` config table the way `flux endpoint add` edits endpoints, and
+- [x] `add`/`rm` edit the `[[host]]` config table the way `flux endpoint add` edits endpoints, and
       refuse inline secret values.
-- [ ] `probe` reports the resolved `SubstrateIdentity` (kind, workspace, confinement,
+- [x] `probe` reports the resolved `SubstrateIdentity` (kind, workspace, confinement,
       remotely_reported) and, for a remote backend, the negotiated protocol version; failures are
       typed, not stringly.
-- [ ] `host.*` operations register with `LocalControlPlane` placement behind the ambient gate; the
+- [x] `host.*` operations register with `LocalControlPlane` placement behind the ambient gate; the
       placement census test pins the new operation list deliberately.

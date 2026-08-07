@@ -17,6 +17,13 @@
 
 ### New
 
+- **Name the machines your work runs on.** A new `[[host]]` config section declares named execution
+  hosts — your local machine, or a remote one served over the secure remote protocol — with the
+  credential kept as a reference to where it lives, never pasted into config. Manage them with
+  `flux host ls / show / add / rm`, and verify one end-to-end with `flux host probe`, which checks
+  the host's identity without running anything on it. Declared hosts also become visible to the
+  agent, which can list, inspect and probe them (never reading a credential value).
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

@@ -309,6 +309,11 @@ flux endpoint list               # inspect the persisted endpoint store (~/.flux
                                  #   add <id> --url <bare-url> [--product/--protocol/--credential-ref/
                                  #   --label] · show <id> · resolve <id> (what a ref WOULD bind to) ·
                                  #   import <id> [--from-json <ref>]
+flux host ls                     # the session's named execution-substrate bindings ([[host]] config +
+                                 #   hosts store): id, backend, address, availability; reference-only.
+                                 #   Also: show <id> · add <id> --backend <kind> [--url/--credential-ref/
+                                 #   --label] · rm <id> · probe <id> (side-effect-free identity check);
+                                 #   --output json is the automation API
 flux policy simulate p.toml      # POLICY SIMULATION (C-131): replay a proposed authorization policy over
                                  #   the recorded op history and print a diff — newly blocked / newly
                                  #   allowed / unchanged, with the deciding requirement per op. A pure

@@ -207,7 +207,7 @@ pub struct HostEntry {
     /// Bare `scheme://host[:port]` for backends with an address — never with embedded credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    /// Credential *location* in `scheme/...` form (`env/FLUX_FARM_TOKEN`,
+    /// Credential *location* in `scheme/...` form (`env/FARM_TOKEN`,
     /// `kubernetes/<ns>/<name>/<key>`, `plugin/<p>/<i>/<slot>`); optional. Never a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
@@ -1277,6 +1277,40 @@ pub fn render_theme(current: Option<(&str, &str)>, theme: &str) -> Result<String
     toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
 }
 
+/// Re-render `current` (usually `~/.flux/config.toml`) with `host` upserted into the `[[host]]`
+/// table by id, round-tripping every other setting — the pure half of `flux host add` (C-649).
+/// The guarded outer control plane owns the atomic write.
+pub fn render_host_upsert(current: Option<(&str, &str)>, host: HostEntry) -> Result<String> {
+    let mut cfg = current
+        .map(|(source, text)| parse_source(source, text))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(slot) = cfg.hosts.iter_mut().find(|h| h.id == host.id) {
+        *slot = host;
+    } else {
+        cfg.hosts.push(host);
+    }
+    toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
+}
+
+/// Re-render `current` with the `[[host]]` entry named `id` removed, round-tripping every other
+/// setting — the pure half of `flux host rm` (C-649). `Ok(None)` when no such entry is declared
+/// in this document, so the caller can distinguish "nothing to do here" from a write.
+pub fn render_host_removal(current: Option<(&str, &str)>, id: &str) -> Result<Option<String>> {
+    let mut cfg = current
+        .map(|(source, text)| parse_source(source, text))
+        .transpose()?
+        .unwrap_or_default();
+    let before = cfg.hosts.len();
+    cfg.hosts.retain(|h| h.id != id);
+    if cfg.hosts.len() == before {
+        return Ok(None);
+    }
+    toml::to_string_pretty(&cfg)
+        .map(Some)
+        .map_err(|error| Error::Config(error.to_string()))
+}
+
 /// Merge `project` onto `user`: lists (and policy grants) concatenate (user first), scalars prefer
 /// project, legacy `allow_private_net` is true if either enables it, scoped private-net grants merge.
 fn merge(user: Config, project: Config) -> Config {
@@ -2239,7 +2273,7 @@ url = "http://prom.internal:9090"
 id = "build-farm"
 backend = "remote"
 url = "https://farm.example:8443"
-credential_ref = "env/FLUX_FARM_TOKEN"
+credential_ref = "env/FARM_TOKEN"
 labels = { region = "eu" }
 
 [[host]]
@@ -2253,7 +2287,7 @@ backend = "local"
         assert_eq!(farm.id, "build-farm");
         assert_eq!(farm.backend, HostBackendKind::Remote);
         assert_eq!(farm.url.as_deref(), Some("https://farm.example:8443"));
-        assert_eq!(farm.credential_ref.as_deref(), Some("env/FLUX_FARM_TOKEN"));
+        assert_eq!(farm.credential_ref.as_deref(), Some("env/FARM_TOKEN"));
         assert_eq!(farm.labels.get("region").map(String::as_str), Some("eu"));
         // A minimal declaration: just a name and a backend kind (the local substrate needs no
         // address and no credential).
@@ -2312,6 +2346,40 @@ backend = "local"
         assert_eq!(merged[0].id, "farm");
         assert_eq!(merged[0].url.as_deref(), Some("https://project-farm:8443"));
         assert_eq!(merged[1].id, "gpu");
+    }
+
+    #[test]
+    fn render_host_upsert_and_removal_round_trip() {
+        let base = "enable_shell = true\n";
+        let entry = HostEntry {
+            id: "farm".into(),
+            backend: HostBackendKind::Remote,
+            url: Some("https://farm.example:8443".into()),
+            credential_ref: Some("env/FARM_TOKEN".into()),
+            labels: Default::default(),
+        };
+        let body = render_host_upsert(Some(("test", base)), entry.clone()).unwrap();
+        assert!(body.contains("enable_shell = true"), "round-trips: {body}");
+        assert!(body.contains("[[host]]"), "{body}");
+
+        // A second upsert with the same id retargets in place rather than appending.
+        let retargeted = HostEntry {
+            url: Some("https://elsewhere.example:8443".into()),
+            ..entry
+        };
+        let body = render_host_upsert(Some(("test", &body)), retargeted).unwrap();
+        assert_eq!(body.matches("[[host]]").count(), 1, "{body}");
+        assert!(body.contains("https://elsewhere.example:8443"), "{body}");
+
+        // Removal drops the entry, keeps everything else, and reports absence as None.
+        let removed = render_host_removal(Some(("test", &body)), "farm")
+            .unwrap()
+            .expect("declared entry removes");
+        assert!(!removed.contains("[[host]]"), "{removed}");
+        assert!(removed.contains("enable_shell = true"), "{removed}");
+        assert!(render_host_removal(Some(("test", &removed)), "farm")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

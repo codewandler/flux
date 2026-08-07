@@ -2266,6 +2266,18 @@ pub async fn connect_remote_system(
     Ok(RemoteSystem::identified(delegate, handshake.identity()))
 }
 
+/// Perform the remote protocol's identity handshake and return it without installing an
+/// execution system — the side-effect-free `host probe` seam (C-649). The handshake is a GET of
+/// the identity route; nothing executes on the substrate.
+pub async fn probe_remote_system(
+    endpoint: &str,
+    token: String,
+    private_net: &flux_system::net::PrivateNetAllow,
+) -> Result<SystemHandshake> {
+    let (_delegate, handshake) = HttpDelegate::connect(endpoint, token, private_net).await?;
+    Ok(handshake)
+}
+
 /// Connect while trusting an operator-supplied private CA certificate.
 pub async fn connect_remote_system_with_ca_pem(
     endpoint: &str,

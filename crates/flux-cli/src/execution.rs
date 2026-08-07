@@ -1628,7 +1628,7 @@ mod loop_binding_session_tests {
 /// This is a bound on the *grant*, never a substitute for the guard: every `fleet.*` op resolves its
 /// caller-supplied endpoint through `guard_url_scoped` before any request either way (A-116), and
 /// each reports the worker's origin as its permission subject.
-fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
+pub(super) fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
     if private_net_cli_override() {
         flux_system::net::PrivateNetAllow::Any
     } else {
@@ -2482,12 +2482,8 @@ pub(super) async fn build_agent_with(
     )
     .await?;
     let live_plugins = Arc::new(integrations.live_plugins);
-    for (source, tool) in integrations.tools {
-        registry.try_register_from_with_placement(
-            source,
-            tool,
-            flux_runtime::OperationPlacement::NativeSystemOnly,
-        )?;
+    for (source, tool, placement) in integrations.tools {
+        registry.try_register_from_with_placement(source, tool, placement)?;
     }
     let plugin_groups = integrations.groups;
     let mut ambient_signals = integrations.ambient_signals;

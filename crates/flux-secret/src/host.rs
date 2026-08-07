@@ -174,13 +174,13 @@ mod tests {
     fn host_ref_round_trips_and_carries_no_secret() {
         let r = HostRef {
             url: Some("https://build-farm.internal:8443".into()),
-            credential_ref: Some(Ref::env("FLUX_BUILD_FARM_TOKEN")),
+            credential_ref: Some(Ref::env("BUILD_FARM_TOKEN")),
             ..HostRef::declared("build-farm", HostBackend::Remote)
         };
         let json = serde_json::to_string(&r).unwrap();
         // The credential is only a *reference* (a location), never a value.
         assert!(
-            json.contains("FLUX_BUILD_FARM_TOKEN") && json.contains("\"env\""),
+            json.contains("BUILD_FARM_TOKEN") && json.contains("\"env\""),
             "location, not value: {json}"
         );
         let back: HostRef = serde_json::from_str(&json).unwrap();

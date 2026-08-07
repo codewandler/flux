@@ -88,9 +88,15 @@ pub(super) fn integration_plugin_caps(
     )) as Arc<dyn flux_plugin::HostCapabilities>
 }
 
-/// Surface-neutral result of assembling endpoint/plugin integrations once.
+/// Surface-neutral result of assembling endpoint/host/plugin integrations once. Each tool carries
+/// its declared execution placement so packs with different placements (the host pack is
+/// `LocalControlPlane`; everything else `NativeSystemOnly`) register through one seam.
 pub(super) struct IntegrationAssembly {
-    pub(super) tools: Vec<(String, Arc<dyn flux_runtime::Tool>)>,
+    pub(super) tools: Vec<(
+        String,
+        Arc<dyn flux_runtime::Tool>,
+        flux_runtime::OperationPlacement,
+    )>,
     pub(super) groups: Vec<flux_evidence::ToolGroup>,
     pub(super) ambient_signals: Vec<String>,
     pub(super) live_plugins: LivePluginCatalog,
@@ -155,11 +161,27 @@ pub(super) async fn assemble_integrations(
     };
 
     // Host bindings are session substrate state, not a plugin integration — they register even
-    // when no plugins directory exists (C-648).
+    // when no plugins directory exists (C-648). The pack is LocalControlPlane (C-649): the ops
+    // describe and verify substrate bindings and must stay operable when a non-native substrate
+    // is selected.
     let host_registry = session_host_registry(cfg);
     if !host_registry.is_empty() {
         assembly.ambient_signals.push(HOST_SIGNAL.to_string());
     }
+    let host_prober = Arc::new(CliHostProber {
+        system: system.clone(),
+    }) as Arc<dyn flux_capabilities::HostProber>;
+    assembly.tools.extend(
+        flux_capabilities::host_tools(host_registry, host_prober)
+            .into_iter()
+            .map(|tool| {
+                (
+                    "cli host integration".to_string(),
+                    tool,
+                    flux_runtime::OperationPlacement::LocalControlPlane,
+                )
+            }),
+    );
 
     let Some(dir) = plugins_dir() else {
         return Ok(assembly);
@@ -212,7 +234,13 @@ pub(super) async fn assemble_integrations(
     assembly.tools.extend(
         flux_capabilities::endpoint_tools(broker.clone(), endpoint_registry)
             .into_iter()
-            .map(|tool| ("cli endpoint integration".to_string(), tool)),
+            .map(|tool| {
+                (
+                    "cli endpoint integration".to_string(),
+                    tool,
+                    flux_runtime::OperationPlacement::NativeSystemOnly,
+                )
+            }),
     );
 
     let (plugins, stale) = split_stale_plugins(flux_plugin::discover(&dir));
@@ -301,13 +329,15 @@ pub(super) async fn assemble_integrations(
                 if let Some(group) = implicit_plugin_group(&loaded.manifest, &specs) {
                     assembly.groups.push(group);
                 }
-                assembly.tools.extend(
-                    loaded
-                        .tools
-                        .iter()
-                        .cloned()
-                        .map(|tool| (format!("plugin:{plugin_name}"), tool)),
-                );
+                assembly
+                    .tools
+                    .extend(loaded.tools.iter().cloned().map(|tool| {
+                        (
+                            format!("plugin:{plugin_name}"),
+                            tool,
+                            flux_runtime::OperationPlacement::NativeSystemOnly,
+                        )
+                    }));
                 assembly.live_plugins.insert(plugin_name, loaded);
             }
             Err(error) => eprintln!(
@@ -742,11 +772,20 @@ pub(super) async fn run_app(
     // future Jira/Trello providers—extend this seam without entering the datasource catalogue.
     let ProgramBoards { execution: boards } =
         build_program_boards(&program.boards, &program_dir, &system)?;
-    let mut extra_tools: Vec<(String, Arc<dyn flux_runtime::Tool>)> =
-        flux_capabilities::datasource_tools(backend.clone())
-            .into_iter()
-            .map(|tool| ("app datasource integration".to_string(), tool))
-            .collect();
+    let mut extra_tools: Vec<(
+        String,
+        Arc<dyn flux_runtime::Tool>,
+        flux_runtime::OperationPlacement,
+    )> = flux_capabilities::datasource_tools(backend.clone())
+        .into_iter()
+        .map(|tool| {
+            (
+                "app datasource integration".to_string(),
+                tool,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )
+        })
+        .collect();
     // The app-path event store + this run's stream identity (D-65): built here, BEFORE `App`, so the
     // plugin/endpoint wiring below can install the SAME audit/secret-sink hooks the `build_agent` path
     // installs (`with_egress_audit`/`with_cross_plugin_audit`/the credential secret sink) — then handed
@@ -794,12 +833,8 @@ pub(super) async fn run_app(
         })
         .transpose()?;
     let mut integration_registry = ToolRegistry::new();
-    for (source, tool) in extra_tools {
-        integration_registry.try_register_from_with_placement(
-            source,
-            tool,
-            flux_runtime::OperationPlacement::NativeSystemOnly,
-        )?;
+    for (source, tool, placement) in extra_tools {
+        integration_registry.try_register_from_with_placement(source, tool, placement)?;
     }
     // The declared work boards (A-113's port). `try_register_work_board` *derives* the generated op
     // set from the port itself, so an operation added to `WorkBoard` reaches a Program through this

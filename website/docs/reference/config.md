@@ -453,6 +453,25 @@ credential-free `url` are required; `product`, `protocol`, `credential_ref`, and
 value. Project declarations override user declarations with the same id. Use `flux endpoint add`
 when you want the equivalent imperative surface. See [Endpoints](../agent/endpoints.md).
 
+## Host bindings (`[[host]]`)
+
+Each `[[host]]` table declares a named binding to an execution substrate. `id` and a `backend`
+kind (`local`, `sandboxed`, `container`, `kubernetes` or `remote`) are required; an unknown
+backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused rather
+than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a location
+(the same reference forms as endpoints), never a secret value; non-secret `labels` are optional.
+Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
+user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
+
+```toml
+[[host]]
+id = "build-farm"
+backend = "remote"
+url = "https://farm.internal:8443"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+labels = { region = "eu" }
+```
+
 ## Scheduled wake-ups (`[wakeup]`)
 
 The `schedule_wakeup` op lets an agent schedule its own later turn. It is **off by default** and
