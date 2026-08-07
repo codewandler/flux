@@ -112,6 +112,13 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   bind that reaches beyond loopback without a token fails the shipped checks, and the running
   daemon refuses it too.
 
+- **A clearer answer when a remote machine will not start.** If an `ssh` host binding cannot bring
+  up flux on the far machine, the message names the problem you actually have. A machine with no
+  sandbox available says so, and points at the fix on *that* machine, instead of claiming flux is
+  not installed there when it plainly is. "Not installed" and "installed but refused to start" are
+  told apart by the far side's exit status rather than by how its shell happens to word things, so
+  the distinction holds whatever shell that machine runs.
+
 - **Use the dev box you already have.** Declare an `ssh` host binding and flux reaches a machine
   that has nothing on it but sshd: it opens a port-forward, makes sure flux is serving on the other
   side, and runs your work there over the same secure protocol a `remote` host uses — same

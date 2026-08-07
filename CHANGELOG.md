@@ -361,6 +361,20 @@ All notable changes to this project are documented in this file. The format is b
   autopilot once drive reaches parity, which has not happened, so both exist in this release and
   the story stays open.
 
+- **A far side that refused to start is told apart from one that is not installed (C-683).** The
+  start face was wrong in both directions: a confinement refusal reads "bwrap **not found** on
+  PATH", so a bare `not found` rule reported a missing binary, while a genuinely missing binary
+  never matched at all under a fish login shell (`Unknown command:`) and fell through to a
+  45-second timeout. Classification now keys on the far side's **exit status** — 127 not-found and
+  126 not-executable are consistent across sh, bash, dash, zsh and fish, ssh reserves 255, and any
+  other status means the far side ran and decided something. Two faces replace the wrong one:
+  `FarSideCannotConfine`, which names confinement and carries the fix for the *far* machine, and
+  `FarSideRefusedToStart` for an unrecognised refusal; both state that the binary is installed and
+  quote the far side verbatim. A phrase now only selects a sub-case within a bucket the exit status
+  already established, so a reworded refusal costs specificity rather than resurrecting a wrong
+  claim. A serve that exits is also reported immediately instead of at the deadline, taking the ssh
+  suite from 45s to about 3s.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
