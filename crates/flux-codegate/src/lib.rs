@@ -2620,6 +2620,28 @@ pub fn pinned_discovery_calls(
     discovery_calls_named(src, scope, &PINNED_DISCOVERY_ENTRY_POINTS)
 }
 
+/// The setter that can replace a `System`'s metric roots (C-673).
+///
+/// The metrics allowance in `no_unreviewed_guarded_port_backend_outside_system` rests on this name
+/// having no production caller: the roots the native reader consults are `/proc` and `/sys`
+/// because every entry point constructs `MetricsRoots::native()` and nothing operation-, CLI- or
+/// wire-shaped can replace them. That is a claim about the tree, so it is checked against the tree.
+pub const METRICS_ROOTS_SETTER: &str = "with_metrics_roots";
+
+/// Every **production** call to [`METRICS_ROOTS_SETTER`] in `src`, by line (C-673).
+///
+/// Structural, through the same visitor as [`plugin_response_ingest_sites`], which is what makes
+/// the answer trustworthy: the `pub fn with_metrics_roots` definition is not a call, prose and
+/// string literals naming it are not calls, and — the finding this replaced a text scan for — the
+/// production half of a file whose inline test module appears near the top is read rather than
+/// skipped.
+pub fn metrics_roots_setter_calls(src: &str) -> syn::Result<Vec<usize>> {
+    Ok(production_calls_named(src, &[METRICS_ROOTS_SETTER])?
+        .into_iter()
+        .map(|hit| hit.line)
+        .collect())
+}
+
 /// C-404 — one **production** call to `PluginHost::call_with_host`: a place where a
 /// plugin-authored response enters flux.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2635,16 +2657,24 @@ pub struct PluginResponseIngest {
 /// `PluginHost::call` is a thin self-delegation this scanner sees as the call it is.
 pub const PLUGIN_RESPONSE_INGEST_METHOD: &str = "call_with_host";
 
-struct PluginIngestVisitor {
+/// Every production call to one of `names`, by line.
+///
+/// Shared by the C-404 plugin-response census and C-673's metrics-roots guard. Both ask the same
+/// question — *does non-test code call this?* — and the answer has to be anchored on the
+/// `#[cfg(test)]` attribute the way [`TestScope::CfgTestItems`] documents, not on the first
+/// occurrence of the marker in the file's text: production code follows an inline test module in
+/// 63 of this workspace's source files, and a text scan reads all of it as test code.
+struct ProductionCallVisitor<'a> {
+    names: &'a [&'a str],
     /// `true` once inside a `#[cfg(test)]` item — test code has no operator-visible surface to
     /// protect and is deliberately not counted.
     in_test: bool,
     hits: Vec<PluginResponseIngest>,
 }
 
-impl PluginIngestVisitor {
+impl ProductionCallVisitor<'_> {
     fn record(&mut self, callee: &proc_macro2::Ident) {
-        if self.in_test || *callee != PLUGIN_RESPONSE_INGEST_METHOD {
+        if self.in_test || !self.names.contains(&callee.to_string().as_str()) {
             return;
         }
         self.hits.push(PluginResponseIngest {
@@ -2689,7 +2719,7 @@ impl PluginIngestVisitor {
     }
 }
 
-impl<'ast> Visit<'ast> for PluginIngestVisitor {
+impl<'ast> Visit<'ast> for ProductionCallVisitor<'_> {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         let gated = has_cfg_test(&item.attrs);
         self.scoped(gated, item, |this, item| {
@@ -2747,8 +2777,20 @@ impl<'ast> Visit<'ast> for PluginIngestVisitor {
 /// written. Items carrying `#[cfg(test)]` are excluded; the method's own `pub async fn` definition
 /// is not a call and so is not a hit.
 pub fn plugin_response_ingest_sites(src: &str) -> syn::Result<Vec<PluginResponseIngest>> {
+    production_calls_named(src, &[PLUGIN_RESPONSE_INGEST_METHOD])
+}
+
+/// Every production call to one of `names` in `src`.
+///
+/// Structural rather than textual, which is the whole reason this replaced a doc-comment census:
+/// `syn` excludes comments and string literals for free, so the table *describing* a site is not
+/// itself counted as one — the failure mode that made the prose census wrong on the day it was
+/// written. Items carrying `#[cfg(test)]` are excluded by the attribute, not by their position in
+/// the file; a name's own `fn` definition is not a call and so is not a hit.
+fn production_calls_named(src: &str, names: &[&str]) -> syn::Result<Vec<PluginResponseIngest>> {
     let file = syn::parse_file(src)?;
-    let mut visitor = PluginIngestVisitor {
+    let mut visitor = ProductionCallVisitor {
+        names,
         in_test: false,
         hits: Vec::new(),
     };
@@ -3965,12 +4007,21 @@ impl Exec for Double {}
             // the code actually enforces. `MetricsRoots::pinned` accepts *any* pair of paths —
             // nothing type-level keeps it inside `/proc` and `/sys`, and the earlier note claiming
             // a caller could only ever narrow them was describing a containment nothing enforces.
-            // What is true, and grep-provable, is narrower: every production entry
-            // point constructs `MetricsRoots::native()`, and the one setter that can replace them,
+            // What is true is narrower: every production entry point constructs
+            // `MetricsRoots::native()`, and the one setter that can replace them,
             // `System::with_metrics_roots`, has no caller anywhere outside a test — no operation,
             // no CLI flag and no wire field reaches it.
-            // `the_metrics_roots_allowance_note_states_only_what_the_code_enforces` is the check
-            // that fails if either half stops holding.
+            //
+            // The second half is checked rather than asserted:
+            // `the_metrics_roots_allowance_note_states_only_what_the_code_enforces` runs
+            // `metrics_roots_setter_calls` over every workspace source file, structurally, scoped
+            // on the `#[cfg(test)]` attribute the way `TestScope::CfgTestItems` documents. That
+            // scoping is the whole difference between a check and a claim: this guard's first cut
+            // scanned from the first `#[cfg(test)]` marker to end of file, which reads the
+            // production half of 63 source files as test code — including `flux-system/src/lib.rs`,
+            // where the setter itself lives. What no check covers is the *first* half: nothing
+            // stops a future entry point from calling `MetricsRoots::pinned` directly, and a
+            // reviewer adding one has to come here.
             //
             // What the review is actually about is the *answer* shape — an unsupported metric must
             // stay explicitly unavailable rather than becoming a zero a projection would read as a
@@ -4188,6 +4239,83 @@ impl Exec for Double {}
         );
     }
 
+    /// The metrics-roots scanner's own pins (C-673 review).
+    ///
+    /// The first cut of this guard scanned from the first `#[cfg(test)]` marker to EOF and treated
+    /// everything below it as test code. That is the heuristic
+    /// [`TestScope::CfgTestItems`] exists to refuse: 63 of the 451 scanned files declare an inline
+    /// test module near the top and carry production code below it — including
+    /// `crates/flux-system/src/lib.rs`, which *defines* the setter at line 1511 while its first
+    /// `#[cfg(test)]` sits at line 842, so 4431 lines of the setter's own file went unread. A guard
+    /// that cannot see the file it is about is not evidence, and the census note claiming it was
+    /// the check that fails is exactly the overclaim acceptance 4 exists to remove.
+    ///
+    /// So: the early test module must not blind it, the definition and prose must not count, and a
+    /// call inside a macro body must.
+    #[test]
+    fn metrics_roots_setter_scanner_sees_production_calls_below_an_early_test_module() {
+        let src = r#"
+//! Prose naming `with_metrics_roots` is not a call.
+#[cfg(test)]
+mod early;
+
+impl System {
+    pub fn with_metrics_roots(mut self, roots: MetricsRoots) -> Self {
+        self.metrics_roots = roots;
+        self
+    }
+}
+
+fn production(system: System, roots: MetricsRoots) -> System {
+    let _ = "with_metrics_roots";
+    system.with_metrics_roots(roots)
+}
+
+fn ufcs(system: System, roots: MetricsRoots) -> System {
+    System::with_metrics_roots(system, roots)
+}
+
+fn in_a_macro(system: System, roots: MetricsRoots) {
+    assert!(system.with_metrics_roots(roots).is_ok());
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture(system: System, roots: MetricsRoots) -> System {
+        system.with_metrics_roots(roots)
+    }
+}
+"#;
+        let hits = metrics_roots_setter_calls(src).unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "the method call, the UFCS call and the one inside `assert!` — all of them below an \
+             early `#[cfg(test)]`, and none of the definition, the doc comment, the string literal \
+             or the real test module: {hits:?}"
+        );
+        let lines: Vec<&str> = src.lines().collect();
+        for line in &hits {
+            assert!(
+                lines[line - 1].contains("with_metrics_roots"),
+                "hit at line {line} does not name the setter: {:?}",
+                lines[line - 1]
+            );
+        }
+
+        // The vacuity floor: a file with no production call must read as none, or the census above
+        // passes because the scanner sees nothing anywhere.
+        let test_only = r#"
+#[cfg(test)]
+mod tests {
+    fn fixture(system: System, roots: MetricsRoots) -> System {
+        system.with_metrics_roots(roots)
+    }
+}
+"#;
+        assert!(metrics_roots_setter_calls(test_only).unwrap().is_empty());
+    }
+
     /// C-673: the metrics allowance note must claim only the property the code enforces.
     ///
     /// The note reviewed with C-653 said a caller "can narrow but never widen" the metric roots.
@@ -4198,8 +4326,10 @@ impl Exec for Double {}
     /// rests on.
     #[test]
     fn the_metrics_roots_allowance_note_states_only_what_the_code_enforces() {
-        const SETTER: &str = "with_metrics_roots";
         const ENTRY: &str = "\"crates/flux-system/src/port.rs\", \"GuardedMetrics\", \"System\"";
+        // The name the census claims about is the one the scanner looks for — two spellings would
+        // eventually disagree, and the note would go on describing a check of something else.
+        let setter = METRICS_ROOTS_SETTER;
 
         // The note is the run of comment lines immediately above the allowance entry, so this
         // reads what a reviewer reads rather than the whole file.
@@ -4219,33 +4349,35 @@ impl Exec for Double {}
              `MetricsRoots::pinned` accepts any pair of paths:\n{note}"
         );
         assert!(
-            note.contains(SETTER),
-            "the allowance must name `{SETTER}`, the fact its narrower claim rests on:\n{note}"
+            note.contains(setter),
+            "the allowance must name `{setter}`, the fact its narrower claim rests on:\n{note}"
         );
 
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let repo_root = crates_dir.parent().unwrap();
+        let files = workspace_source_files(repo_root);
+        assert!(
+            files.len() > 20,
+            "expected to scan a representative set of source files, found {}",
+            files.len()
+        );
         let mut callers = Vec::new();
-        for file in workspace_source_files(repo_root) {
-            let source = std::fs::read_to_string(&file).unwrap();
-            let first_test = source
-                .lines()
-                .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
-                .unwrap_or(usize::MAX);
-            for (index, line) in source.lines().enumerate() {
-                if !line.contains(SETTER)
-                    || line.contains(&format!("fn {SETTER}"))
-                    || index > first_test
-                {
-                    continue;
-                }
-                let rel = file.strip_prefix(repo_root).unwrap_or(&file);
-                callers.push(format!("{}:{}: {}", rel.display(), index + 1, line.trim()));
+        for file in &files {
+            let source = std::fs::read_to_string(file).unwrap();
+            let hits = metrics_roots_setter_calls(&source).unwrap_or_else(|error| {
+                panic!(
+                    "parse {} for the metrics-roots scan: {error}",
+                    file.display()
+                )
+            });
+            let rel = file.strip_prefix(repo_root).unwrap_or(file);
+            for line in hits {
+                callers.push(format!("{}:{line}", rel.display()));
             }
         }
         assert!(
             callers.is_empty(),
-            "the allowance says only tests reach `{SETTER}`, but production code calls it:\n  {}",
+            "the allowance says only tests reach `{setter}`, but production code calls it:\n  {}",
             callers.join("\n  ")
         );
     }

@@ -192,11 +192,15 @@ pub struct DiskUsage {
     /// The mounts this reading carries, at most [`MAX_MOUNTS`] of them.
     pub mounts: Vec<MountUsage>,
     /// How many mounted filesystems this reading does **not** carry: those the cap dropped, and
-    /// those the substrate listed but could not measure at sample time.
+    /// those the substrate listed but could not measure at sample time. Counted per *filesystem*,
+    /// so a mount point listed several times is one.
     ///
-    /// Zero means the list is complete — not "unknown". Filesystems that are not disk capacity at
-    /// all (`proc`, `tmpfs`, a network mount) are outside the family and are not counted here;
-    /// they were never candidates for the list.
+    /// Non-zero is load-bearing — it means the list is short by that many. Zero means whatever
+    /// built this reading left nothing out, which is not quite the same as "the list is complete":
+    /// a reading decoded from a peer too old to report the field also arrives as zero, because a
+    /// substrate that cannot count its omissions cannot tell you about them either. Filesystems
+    /// that are not disk capacity at all (`proc`, `tmpfs`, a network mount) are outside the family
+    /// and are never counted here; they were not candidates for the list.
     pub omitted_mounts: u32,
 }
 
@@ -552,7 +556,7 @@ pub fn bounded_mount_point(raw: &str) -> String {
     const { assert!(MAX_LABEL_BYTES > MOUNT_POINT_DIGEST_BYTES * 2) };
     // Measured rather than collected: `raw` may be a megabyte from a decoder, and nothing here may
     // allocate proportionally to it.
-    let length: usize = sanitised(raw).map(char::len_utf8).sum();
+    let length = sanitised_len(raw);
     if length <= MAX_LABEL_BYTES {
         return bounded_prefix(raw, MAX_LABEL_BYTES);
     }
@@ -563,14 +567,37 @@ pub fn bounded_mount_point(raw: &str) -> String {
 /// The bytes a truncated mount point spends on its disambiguator: `~` and sixteen hex digits.
 const MOUNT_POINT_DIGEST_BYTES: usize = 17;
 
-/// A label's characters with the noise removed: surrounding whitespace, and control characters
-/// that are an injection into an operator's terminal rather than part of an identity.
+/// A label's characters with the noise removed: control characters that are an injection into an
+/// operator's terminal rather than part of an identity, then any leading whitespace.
+///
+/// Order matters, and the reverse order is a bug this had (C-673 review): trimming *first* leaves
+/// `"\u{7}  /mnt/data"` as `"  /mnt/data"`, because the control character was what stopped the trim
+/// — and a second pass then returns something different, so the bounded identity is not a fixed
+/// point. A far side's mount point crosses [`bounded_reading`] again on every hop, so an identity
+/// that moves under re-bounding is an identity a consumer cannot store.
 fn sanitised(raw: &str) -> impl Iterator<Item = char> + '_ {
-    raw.trim().chars().filter(|c| !c.is_control())
+    raw.chars()
+        .filter(|c| !c.is_control())
+        .skip_while(|c| c.is_whitespace())
+}
+
+/// The byte length [`sanitised`] would produce, trailing whitespace excluded, without building it.
+fn sanitised_len(raw: &str) -> usize {
+    let mut length = 0;
+    let mut trailing = 0;
+    for c in sanitised(raw) {
+        if c.is_whitespace() {
+            trailing += c.len_utf8();
+        } else {
+            length += trailing + c.len_utf8();
+            trailing = 0;
+        }
+    }
+    length
 }
 
 /// The longest run of [`sanitised`] characters fitting in `max` bytes, cut on a character boundary
-/// rather than mid-codepoint.
+/// rather than mid-codepoint and with trailing whitespace removed.
 fn bounded_prefix(raw: &str, max: usize) -> String {
     let mut out = String::with_capacity(max);
     for c in sanitised(raw) {
@@ -579,6 +606,9 @@ fn bounded_prefix(raw: &str, max: usize) -> String {
         }
         out.push(c);
     }
+    // After the cut, not before: a value that lost its tail to the bound must not keep the space
+    // that happened to sit on the boundary, or bounding it again would remove it.
+    out.truncate(out.trim_end().len());
     out
 }
 
@@ -610,6 +640,13 @@ mod linux {
     //! not expose is [`MetricUnavailable::NoInstrument`], and one that exists but would not parse is
     //! [`MetricUnavailable::ReadFailed`]. Reporting zero in either case would be a lie a projection
     //! could not distinguish from a genuinely idle machine.
+    //!
+    //! "Would not parse" includes *arithmetic* on what was parsed, which is the half C-673's review
+    //! found still open. Every counter here is text a substrate handed this process, so every sum,
+    //! product and scaling of one is checked: a value that does not fit answers `ReadFailed`. The
+    //! two alternatives are both worse than an unavailable answer — with `overflow-checks` the read
+    //! panics and takes the caller with it, and without them it wraps into a small number that
+    //! looks exactly like a measurement.
 
     use super::*;
     use std::collections::BTreeMap;
@@ -670,8 +707,12 @@ mod linux {
     /// same hazard as the network filesystems beside them, and the reason those are excluded is
     /// that a metrics read must not hang, not that the numbers would be wrong.
     ///
-    /// `fuseblk` is deliberately absent: it is a block device with a userspace driver, so it is
-    /// real local capacity an operator asked about.
+    /// `fuseblk` is deliberately absent, and not because it is safe — ntfs-3g serves it through
+    /// exactly such a userspace process, and a disconnected USB NTFS volume is the classic wedge.
+    /// It stays because it is the one FUSE type that is real local disk capacity an operator asked
+    /// about, so excluding it would drop a disk to avoid a hang. That is a trade, not an
+    /// exemption: if a metrics read is ever observed hanging on `fuseblk`, the fix is to move it
+    /// into the list and lose the reading, not to add a timeout to a synchronous syscall.
     fn is_non_disk_filesystem(filesystem: &str) -> bool {
         filesystem.starts_with("fuse.") || NON_DISK_FILESYSTEMS.contains(&filesystem)
     }
@@ -748,7 +789,16 @@ mod linux {
                 if values.len() < 5 {
                     return None;
                 }
-                aggregate = Some((values.iter().sum::<u64>(), values[3] + values[4]));
+                // Checked, because these are counters a substrate hands us rather than numbers
+                // this process computed: `cpu 18446744073709551615 18446744073709551615 …`
+                // overflows the sum. With `overflow-checks` on that aborts the caller, and
+                // without them it wraps — which is worse, because a wrapped total makes
+                // `busy_ratio` return a confident `0.0` that reads as an idle machine. A counter
+                // that does not fit is an unreadable instrument, and this module answers those.
+                let total = values
+                    .iter()
+                    .try_fold(0u64, |sum, value| sum.checked_add(*value))?;
+                aggregate = Some((total, values[3].checked_add(values[4])?));
             } else if let Some(index) = name.strip_prefix("cpu") {
                 if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) {
                     logical_cores = logical_cores.saturating_add(1);
@@ -835,12 +885,17 @@ mod linux {
             let Some((key, rest)) = line.split_once(':') else {
                 continue;
             };
-            if let Some(value) = rest
+            // Scaled with a *checked* multiply: a kibibyte count that does not survive the
+            // conversion is not a pool this reader can describe, and saturating it would report a
+            // fabricated sixteen exbibytes a consumer could not tell from a real measurement. The
+            // field is dropped instead, which the callers already read as `ReadFailed`.
+            if let Some(bytes) = rest
                 .split_whitespace()
                 .next()
                 .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|value| value.checked_mul(1024))
             {
-                fields.insert(key, value.saturating_mul(1024));
+                fields.insert(key, bytes);
             }
         }
         fields
@@ -918,9 +973,13 @@ mod linux {
     /// `(mount point, filesystem type)` for every mount that is real disk capacity, and how many
     /// the cap left out.
     ///
-    /// The cap is applied to the map as it is built rather than to a finished `Vec`: `mounts` is
-    /// the one procfs file that grows with the machine, and sorting a hostile one before
-    /// truncating it would already have paid for every entry.
+    /// The reading's cap is applied to the map as it is built rather than to a finished `Vec`:
+    /// sorting a hostile mount table before truncating it would already have paid for every entry.
+    /// What the count needs, though, is the number of *filesystems* left out, and that cannot be
+    /// derived from evictions — a mount point past the cap listed three times evicts three times
+    /// and is one mount (C-673 review). So the distinct points are tracked alongside, bounded by
+    /// `PROC_FILE_CAP`: `seen` holds a subset of bytes already in `text`, which `read_capped`
+    /// bounded before this function was called.
     ///
     /// Keyed by mount point, last entry winning, because that is what the kernel means: a mount
     /// stacked over an earlier one shadows it, and `statvfs` on the path answers about the
@@ -928,7 +987,7 @@ mod linux {
     /// reading with a filesystem it does not describe.
     fn parse_mounts(text: &str) -> (Vec<(String, String)>, u32) {
         let mut mounts: BTreeMap<String, String> = BTreeMap::new();
-        let mut omitted = 0u32;
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for line in text.lines() {
             let mut fields = line.split_whitespace();
             let (Some(_device), Some(point), Some(filesystem)) =
@@ -939,16 +998,18 @@ mod linux {
             if is_non_disk_filesystem(filesystem) {
                 continue;
             }
-            mounts.insert(
-                unescape_mount_field(point),
-                bounded_label(&unescape_mount_field(filesystem)),
-            );
+            let point = unescape_mount_field(point);
+            seen.insert(point.clone());
+            mounts.insert(point, bounded_label(&unescape_mount_field(filesystem)));
             if mounts.len() > MAX_MOUNTS {
                 mounts.pop_last();
-                omitted = omitted.saturating_add(1);
             }
         }
-        (mounts.into_iter().collect(), omitted)
+        let omitted = seen.len().saturating_sub(mounts.len());
+        (
+            mounts.into_iter().collect(),
+            u32::try_from(omitted).unwrap_or(u32::MAX),
+        )
     }
 
     /// Widen a libc counter. The concrete widths differ by target, so this is a conversion rather
@@ -981,11 +1042,16 @@ mod linux {
             // the bounded form is only the identity the answer carries.
             mount_point: bounded_mount_point(point),
             filesystem: filesystem.to_string(),
-            total_bytes: blocks.saturating_mul(frsize),
-            available_bytes: widen(stat.f_bavail).saturating_mul(frsize),
+            // Checked rather than saturating, for the same reason the procfs counters are: block
+            // counts and a fragment size come from the mounted filesystem, and a hostile one can
+            // name a capacity that does not fit. Saturating would answer `u64::MAX` bytes as if it
+            // had measured that; `None` makes this a mount the reading does not carry, which
+            // `read_disk` counts.
+            total_bytes: blocks.checked_mul(frsize)?,
+            available_bytes: widen(stat.f_bavail).checked_mul(frsize)?,
             used_bytes: blocks
                 .saturating_sub(widen(stat.f_bfree))
-                .saturating_mul(frsize),
+                .checked_mul(frsize)?,
         })
     }
 
@@ -1568,6 +1634,136 @@ SwapFree:        1024000 kB
 
             std::fs::remove_dir_all(&root).ok();
         }
+    }
+
+    /// C-673 review: the panic class the uptime fix closed is a *class*, and `/proc/stat` is the
+    /// other end of it. Kernel counters are text this process was handed, so summing them is
+    /// `u64` arithmetic over attacker-shaped input: under `overflow-checks` (on by default in this
+    /// workspace's dev and test profiles) it aborts the caller, and in release it wraps — which is
+    /// worse, because `busy_ratio` then returns a fabricated `0.0` that reads as an idle machine.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn procfs_counters_that_overflow_answer_read_failed_rather_than_panicking() {
+        // Verbatim from the review.
+        const OVERFLOWING: &str = "cpu 18446744073709551615 18446744073709551615 1 2 3 0 0 0";
+        assert!(
+            parse_cpu_times(OVERFLOWING).is_none(),
+            "a total that does not fit a u64 is an unreadable instrument, not a measurement"
+        );
+
+        let root = sandbox::fixture_dir("metrics-cpu-overflow");
+        let proc = write_procfs(&root, MEMINFO);
+        std::fs::write(
+            proc.join("stat"),
+            format!("{OVERFLOWING}\ncpu0 1 0 1 1 0 0 0 0 0 0\n"),
+        )
+        .unwrap();
+        let system = fixture_system(&root);
+        let port: &dyn GuardedMetrics = &system;
+        assert_eq!(
+            port.read_metric(MetricKind::CpuUsage).await.unwrap(),
+            MetricAnswer::Unavailable {
+                kind: MetricKind::CpuUsage,
+                reason: MetricUnavailable::ReadFailed,
+            }
+        );
+        std::fs::remove_dir_all(&root).ok();
+
+        // `meminfo` is the same shape one file over: kibibytes scaled to bytes. A total that does
+        // not survive the scaling must not saturate into a fabricated sixteen exbibytes.
+        let root = sandbox::fixture_dir("metrics-meminfo-overflow");
+        write_procfs(
+            &root,
+            "MemTotal:       18446744073709551615 kB\n\
+             MemFree:         4096000 kB\n\
+             MemAvailable:    8192000 kB\n\
+             SwapTotal:       2048000 kB\n\
+             SwapFree:        1024000 kB\n",
+        );
+        let system = fixture_system(&root);
+        let port: &dyn GuardedMetrics = &system;
+        assert_eq!(
+            port.read_metric(MetricKind::Memory).await.unwrap(),
+            MetricAnswer::Unavailable {
+                kind: MetricKind::Memory,
+                reason: MetricUnavailable::ReadFailed,
+            }
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-673 review: `bounded_mount_point` documents itself idempotent, and a mount point from a
+    /// hostile far side re-crosses `bounded_reading` on every hop. A control character in front of
+    /// whitespace used to expose that whitespace only on the *second* pass, so the identity moved
+    /// under a consumer that had already stored it.
+    #[test]
+    fn a_bounded_identity_is_the_fixed_point_of_bounding_it_again() {
+        let hostile = [
+            "\u{7}  /mnt/data",
+            "  \u{1b}[2J/mnt/data  ",
+            "\u{7}\u{7}\t /var/lib/docker/overlay2/x/merged\n",
+            &format!("\u{7}  /mnt/{}", "z".repeat(4096)),
+            &"é".repeat(500),
+            "",
+        ];
+        for raw in hostile {
+            let once = bounded_mount_point(raw);
+            assert_eq!(
+                bounded_mount_point(&once),
+                once,
+                "bounding {raw:?} again moved it: {once:?}"
+            );
+            assert!(once.len() <= MAX_LABEL_BYTES, "{once:?}");
+            let label = bounded_label(raw);
+            assert_eq!(
+                bounded_label(&label),
+                label,
+                "label {raw:?} moved: {label:?}"
+            );
+        }
+        assert_eq!(bounded_mount_point("\u{7}  /mnt/data"), "/mnt/data");
+    }
+
+    /// C-673 review: `omitted_mounts` counts *filesystems* the reading does not carry, not lines
+    /// past the cap. An overmount sorting past the cap is one mount listed twice, and counting it
+    /// twice reports a machine with more filesystems than it has.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_overmount_past_the_cap_is_one_omitted_mount_not_two() {
+        let root = sandbox::fixture_dir("metrics-overmount");
+        let proc = write_procfs(&root, MEMINFO);
+
+        let mut table = String::new();
+        for index in 0..MAX_MOUNTS {
+            let point = root.join(format!("aa-mount{index:03}"));
+            std::fs::create_dir_all(&point).unwrap();
+            table.push_str(&format!("/dev/a{index} {} ext4 rw 0 0\n", point.display()));
+        }
+        // One mount point past the cap, listed three times the way a stack of overmounts is.
+        let stacked = root.join("zz-stacked");
+        std::fs::create_dir_all(&stacked).unwrap();
+        for filesystem in ["ext4", "xfs", "btrfs"] {
+            table.push_str(&format!(
+                "/dev/stacked {} {filesystem} rw 0 0\n",
+                stacked.display()
+            ));
+        }
+        std::fs::write(proc.join("mounts"), &table).unwrap();
+
+        let system = fixture_system(&root);
+        let port: &dyn GuardedMetrics = &system;
+        match served(port.read_metric(MetricKind::Disk).await.unwrap()).reading {
+            MetricReading::Disk(disk) => {
+                assert_eq!(disk.mounts.len(), MAX_MOUNTS);
+                assert_eq!(
+                    disk.omitted_mounts, 1,
+                    "one mount point was left out, however many lines described it"
+                );
+            }
+            other => panic!("disk answered {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// C-673, acceptance 2 (identity half): two sibling mounts whose paths agree for longer than

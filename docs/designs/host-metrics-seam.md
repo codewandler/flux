@@ -38,6 +38,14 @@ neither is implied by "the list is capped":
   under a single name. `bounded_mount_point` spends the tail of the budget on a digest of the whole
   path instead of on a prefix the sibling also has.
 
-Everything the reader collects is bounded while it is being collected rather than after — a hostile
-`/proc/mounts` or `class/hwmon` must not be allocated in full first — and every parse answers
-`ReadFailed` rather than panicking, including a `/proc/uptime` too large for a `Duration`.
+Everything the reader *reports* is bounded while it is being collected rather than after — a hostile
+`class/hwmon` must not be walked in full first, and the mount map never exceeds the cap, though
+counting distinct filesystems does cost the mount points already inside the `PROC_FILE_CAP`-bounded
+read.
+
+And the no-panic property is about arithmetic, not only parsing. Every counter the reader handles is
+text a substrate gave it, so every sum, product and scaling of one is checked and answers
+`ReadFailed` where it does not fit: a `/proc/uptime` too large for a `Duration`, a `/proc/stat`
+whose jiffies overflow a `u64`, a `meminfo` whose kibibytes do not scale, a `statvfs` whose block
+count times its fragment size does not. Panicking takes the caller down; wrapping is worse, because
+a wrapped total makes the busy ratio report a confident, fabricated idle machine.
