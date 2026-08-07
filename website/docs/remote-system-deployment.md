@@ -23,7 +23,7 @@ profile configures infrastructure you already have.
 |---|---|
 | Version | Pin the same Flux release on client and daemon. The protocol is versioned and rejects incompatible peers. |
 | Workspace | Mount one durable directory and pass it as `--workspace`. This canonical workspace is the tree every remote file and process operation sees. There is no client-side synchronization. |
-| TLS certificate | Terminate TLS in `flux system serve` with `--cert` and `--key`. Use a certificate whose SAN matches the client URL; pass `--remote-ca` only for a private CA. |
+| TLS certificate | Terminate TLS in `flux system serve` with `--cert` and `--key`. Use a certificate whose SAN matches the client URL; pass `--remote-ca` only for a private CA, or declare that CA once as a binding's [`ca_cert`](reference/config.md#host-bindings-host). |
 | Bearer token | Put a long random value in `FLUX_REMOTE_SYSTEM_TOKEN`, or in the environment variable named by `--token-env`. Never put it in an image, URL, command-line literal, or checked-in manifest. |
 | Network | Admit the listener only from intended clients. A private/loopback client target additionally needs its explicit `--allow-private-net` grant. |
 | Persistence | Keep the workspace volume. The bounded persistent delivery ledger lives at `.flux/remote-system-delivery.json` beneath it and prevents an operation id from executing twice. |

@@ -278,6 +278,66 @@ grant = ["operator"]
     );
 }
 
+/// C-684: `ca_cert` means the same thing on every binding kind that dials TLS, `ssh` included.
+///
+/// C-683 shipped an ssh-local anchor at `[host.ssh] ca` before `ca_cert` existed, so the risk this
+/// pins is a binding that declares its CA in the ordinary place and has it quietly ignored — the
+/// precise failure C-684 exists to remove. The ssh-local spelling stays authoritative where it is
+/// used, but declaring *both* to different paths is refused naming both, because one of them would
+/// otherwise have to lose silently.
+#[test]
+fn an_ssh_binding_honours_the_binding_level_ca_and_refuses_two_anchors() {
+    let declare = |tag: &str, anchors: &str| {
+        workspace_declaring(
+            tag,
+            &format!(
+                r#"
+[[host]]
+id = "devbox"
+backend = "ssh"
+url = "ssh://build@devbox.internal:2222"
+credential_ref = "env/FLUX_SSH_KEY"
+grant = ["operator"]
+{anchors}
+"#
+            ),
+        )
+    };
+
+    // The binding-level anchor is accepted by the declaration surface and rendered as a location.
+    let dir = declare("ssh-ca-binding", r#"ca_cert = "/etc/flux/devbox-ca.pem""#);
+    let listed = flux(&dir, &["host", "ls", "--output", "json"], &[]);
+    assert!(listed.ok, "`flux host ls` failed: {}", listed.all());
+    let doc: serde_json::Value = serde_json::from_str(&listed.stdout)
+        .unwrap_or_else(|e| panic!("`host ls` emits JSON ({e}): {}", listed.all()));
+    assert_eq!(
+        doc["hosts"][0]["ca_cert"], "/etc/flux/devbox-ca.pem",
+        "an ssh binding declares its trust anchor in the ordinary field: {doc}"
+    );
+
+    // Two different anchors on one binding: refused, naming both, before anything is dialled.
+    let dir = declare(
+        "ssh-ca-conflict",
+        "ca_cert = \"/etc/flux/one-ca.pem\"\nssh = { ca = \"/etc/flux/other-ca.pem\" }",
+    );
+    let key = dir.path().join("home").join("id_test");
+    std::fs::write(&key, "not-a-real-key\n").unwrap();
+    let probed = flux(
+        &dir,
+        &["host", "probe", "devbox", "--output", "json"],
+        &[
+            ("FLUX_SSH_KEY", key.to_str().unwrap()),
+            ("FLUX_REMOTE_SYSTEM_TOKEN", "a-token-that-is-never-offered"),
+        ],
+    );
+    assert!(!probed.ok, "{}", probed.all());
+    let text = probed.all();
+    assert!(
+        text.contains("one-ca.pem") && text.contains("other-ca.pem"),
+        "the refusal must name both anchors so the operator knows which to drop: {text}"
+    );
+}
+
 fn which(program: &str) -> Option<PathBuf> {
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)

@@ -166,20 +166,27 @@ pub(super) async fn resolve_ssh_binding(
             ),
         })?;
 
-    let ca_pem = match ssh.ca.as_deref() {
-        Some(path) => Some(
-            flux_system::port::GuardedHostFiles::read_file_scoped(
-                local,
-                path,
-                path,
-                MAX_CA_PEM_BYTES,
-            )
-            .await
-            .map(|read| read.bytes)
-            .map_err(|error| {
-                declaration(format!("CA certificate `{path}` is unreadable: {error}"))
-            })?,
-        ),
+    // C-684: one binding, one trust anchor. `[host.ssh] ca` is the ssh-local spelling and stays
+    // authoritative for an ssh binding — it is resolved during the bootstrap that *makes* the
+    // endpoint — but a binding that declares the ordinary `ca_cert` is honoured rather than
+    // silently ignored. Both spellings resolve through `host_cmd::read_ca_pem`, so they agree on
+    // precedence *and* on which paths are nameable; the field means the same thing on every kind
+    // that dials TLS. Declaring both to different paths is refused here, since one of them would
+    // otherwise have to lose.
+    if let (Some(local_ca), Some(binding_ca)) = (ssh.ca.as_deref(), host.ca_cert.as_deref()) {
+        if local_ca != binding_ca {
+            return Err(declaration(format!(
+                "this binding declares two different trust anchors — `ca_cert = \"{binding_ca}\"` \
+                 and [host.ssh] `ca = \"{local_ca}\"`. One of them would have to be ignored, so \
+                 neither is used; keep a single declaration"
+            )));
+        }
+    }
+    let declared_ca = ssh.ca.as_deref().or(host.ca_cert.as_deref());
+    let ca_pem = match declared_ca {
+        Some(path) => Some(host_cmd::read_ca_pem(local, path).await.map_err(|error| {
+            declaration(format!("CA certificate `{path}` is unreadable: {error}"))
+        })?),
         None => None,
     };
 
@@ -205,5 +212,5 @@ pub(super) async fn resolve_ssh_binding(
     })
 }
 
-/// A CA bundle is a handful of certificates; anything larger is a misdeclaration, not a bundle.
-const MAX_CA_PEM_BYTES: usize = 256 * 1024;
+// The CA read's cap and its port live with the shared `ca_cert` resolution in `host_cmd`, so an
+// ssh binding and a remote one cannot end up with different reachability for the same field.
