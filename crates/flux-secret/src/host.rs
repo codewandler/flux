@@ -26,6 +26,11 @@ pub enum HostBackend {
     Container,
     /// A Kubernetes-served substrate composing the remote protocol (C-655 context).
     Kubernetes,
+    /// A VM/microVM guest serving the remote protocol (C-677). Composed, not invented: the guest
+    /// runs the delivered `flux system serve` and the binding consumes the endpoint it already
+    /// serves. Flux never provisions the guest — that is a deployment concern (C-480's profile)
+    /// and, for a lifecycle verb, a future generic isolation-provisioner contract.
+    Microvm,
     /// An ssh-bootstrapped substrate composing the remote protocol (C-683). ssh is the bootstrap,
     /// never the substrate: it starts or verifies `flux system serve` on the far machine and
     /// forwards its endpoint; every effect still rides the delivered protocol.
@@ -36,11 +41,12 @@ pub enum HostBackend {
 
 impl HostBackend {
     /// Every backend kind, in display order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Local,
         Self::Sandboxed,
         Self::Container,
         Self::Kubernetes,
+        Self::Microvm,
         Self::Ssh,
         Self::Remote,
     ];
@@ -52,6 +58,7 @@ impl HostBackend {
             Self::Sandboxed => "sandboxed",
             Self::Container => "container",
             Self::Kubernetes => "kubernetes",
+            Self::Microvm => "microvm",
             Self::Ssh => "ssh",
             Self::Remote => "remote",
         }
@@ -149,8 +156,8 @@ pub struct HostRef {
     pub id: String,
     /// Which substrate backend this binding selects.
     pub backend: HostBackend,
-    /// `scheme://host[:port]` for backends that have an address (`remote`, `kubernetes`) — never
-    /// with embedded credentials.
+    /// `scheme://host[:port]` for backends that have an address (`remote`, `kubernetes`,
+    /// `microvm`) — never with embedded credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     /// Whether this binding was declared in config or constructed ephemerally for the session.
@@ -329,6 +336,55 @@ mod tests {
         assert!(
             parse_err.contains("local") && parse_err.contains("remote"),
             "names the known kinds: {parse_err}"
+        );
+    }
+
+    /// C-677: `microvm` joins the closed vocabulary as a *word*, not a wire. Decision 0018 rule 3
+    /// composes rather than invents — the guest runs the delivered remote protocol — so what is
+    /// added here is a backend kind an operator can declare, list, grant and probe, pointing at a
+    /// served endpoint that something else (C-480's guest profile) brought into existence.
+    #[test]
+    fn microvm_is_a_declarable_backend_kind() {
+        let backend: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+        assert_eq!(backend.as_str(), "microvm");
+        assert!(
+            HostBackend::ALL.contains(&backend),
+            "a kind absent from ALL is unlistable and unparseable: {:?}",
+            HostBackend::ALL
+        );
+        // Serde and `FromStr` are one vocabulary, or a `[[host]]` table and a `--backend` flag
+        // would disagree about what exists.
+        assert_eq!(
+            serde_json::from_str::<HostBackend>("\"microvm\"").unwrap(),
+            backend
+        );
+        assert_eq!(serde_json::to_string(&backend).unwrap(), "\"microvm\"");
+        // Still closed: an unknown kind stays a hard error, and it now names `microvm` among the
+        // known ones. A *hypervisor* is not a backend kind — flux never provisions one.
+        let err = "firecracker".parse::<HostBackend>().unwrap_err();
+        assert!(
+            err.contains("microvm") && err.contains("firecracker"),
+            "the refusal must list the real vocabulary: {err}"
+        );
+
+        // A microvm binding is address-bearing and credential-referencing like any remote-shaped
+        // one, and its persisted form still carries the credential *location* only.
+        let reference = HostRef {
+            url: Some("https://guest.internal:8443".into()),
+            credential_ref: Some(Ref::env("GUEST_TOKEN")),
+            ..HostRef::declared("vm-guest", backend)
+        };
+        let json = serde_json::to_string(&reference).unwrap();
+        assert!(
+            json.contains("\"microvm\"") && json.contains("GUEST_TOKEN"),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<HostRef>(&json).unwrap(),
+            reference,
+            "the binding round-trips"
         );
     }
 

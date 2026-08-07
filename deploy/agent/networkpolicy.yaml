@@ -1,0 +1,114 @@
+# Default deny, then admit exactly what the profile needs.
+#
+# NetworkPolicy is enforced by the CNI plugin. On a cluster whose CNI ignores it, these objects
+# apply cleanly and restrict nothing — check your CNI before treating this as a boundary.
+---
+# Nothing in or out of this namespace unless a later policy admits it. An empty podSelector selects
+# every pod; naming both policy types is what makes the egress half deny rather than stay unset.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# The one path the agent exists to serve: an operator, or a service acting for one, reaching
+# `/a2a` and the sessions API. Label the client pod `flux-agent-client: "true"` and its namespace
+# `flux-agent-client: "true"`, or replace this selector with the one your cluster actually uses.
+#
+# Widening this to an empty `from:` admits every pod in the cluster and is not a shortcut worth
+# taking: at that point a single shared bearer token is all that separates any workload in the
+# cluster from an agent that runs tools.
+#
+# A `kubectl port-forward` does NOT come through here — the kubelet opens the connection on the
+# node, so a policy that admits nobody still admits your laptop through a port-forward. That is a
+# property of port-forward, not a hole in this policy; see deploy/agent/README.md.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flux-agent-allow-operator
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: flux-agent
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              flux-agent-client: "true"
+          podSelector:
+            matchLabels:
+              flux-agent-client: "true"
+      ports:
+        - port: 8787
+          protocol: TCP
+---
+# Egress is denied by default above, which also denies DNS. This restores name resolution only.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flux-agent-allow-dns
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: flux-agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+---
+# The model call happens in this pod, so unlike the substrate profile this one CANNOT work with
+# egress denied. That is the substantive cost of moving the whole agent into the cluster, and it is
+# stated here rather than discovered when the first turn hangs.
+#
+# NetworkPolicy selects by IP, not by hostname, so "let it reach api.anthropic.com" is not
+# expressible. What is expressible — and what this does — is: reach the public internet on 443, and
+# nothing else. The exclusions matter more than the allowance:
+#
+#   169.254.0.0/16   the cloud metadata endpoint. An agent that can reach 169.254.169.254 can read
+#                    the node's instance credentials, which is a privilege escalation out of every
+#                    other control in this profile.
+#   10/8, 172.16/12, 192.168/16   the cluster and your private network. The agent has no business
+#                    reaching other workloads; that is what the default-deny is for.
+#
+# If your egress is genuinely constrained, replace this with the resolved address ranges your
+# provider publishes, or route it through an egress proxy you operate and allow only that proxy.
+# Whichever you choose, this policy is the agent's outbound blast radius — read it as such.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flux-agent-allow-model-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: flux-agent
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - port: 443
+          protocol: TCP

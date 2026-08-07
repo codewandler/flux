@@ -1,16 +1,34 @@
-# Deployment artifacts for the remote execution system
+# Deployment artifacts
 
-These are the shipped deployment profiles for `flux system serve` — the daemon that keeps the model,
-policy and approval UI on your machine while file, process and network effects land somewhere else.
-The operator-facing guide is
-[website/docs/remote-system-deployment.md](../website/docs/remote-system-deployment.md); this file is
-the contributor's map of what is in the tree and what each artifact promises.
+These are the shipped deployment profiles for the two things Flux can move onto someone else's
+machine. This file is the contributor's map of what is in the tree and what each artifact promises.
+
+## The substrate: `flux system serve`
+
+The daemon that keeps the model, policy and approval UI on your machine while file, process and
+network effects land somewhere else. The operator-facing guide is
+[website/docs/remote-system-deployment.md](../website/docs/remote-system-deployment.md).
 
 | Profile | Artifacts | Isolation boundary |
 |---|---|---|
 | Container / OCI | [`container/Dockerfile`](container/Dockerfile), [`container/build-image.sh`](container/build-image.sh) | the container |
 | Kubernetes | [`kubernetes/`](kubernetes/) (Kustomize base) | the pod |
 | VM / microVM guest | [`vm/flux-system.service`](vm/flux-system.service), [`vm/install-flux-system.sh`](vm/install-flux-system.sh), [`vm/cloud-init.yaml`](vm/cloud-init.yaml) | the guest, plus bubblewrap inside it |
+
+## The agent: `flux app run --serve`
+
+The whole agent — planning, model calls, session — living in the cluster, reached with `flux a2a`.
+Its operator-facing guide is
+[website/docs/agent/deployment.md](../website/docs/agent/deployment.md), and
+[`agent/README.md`](agent/README.md) explains how the two axes differ.
+
+| Profile | Artifacts | Isolation boundary |
+|---|---|---|
+| Kubernetes | [`agent/`](agent/) (Kustomize base) | the pod |
+
+It runs the **same image** as the container profile above — the agent surface is a different program
+inside one released binary, selected by a `command:` override. There is no second image, so the
+release identity and provenance path below cover it unchanged.
 
 ## What these artifacts are not
 
@@ -84,8 +102,9 @@ cargo test -p flux-cli --test deployment_artifacts
 cargo build --target x86_64-unknown-linux-musl --bin flux
 FLUX_TEST_CONTAINER=1 cargo test -p codewandler-flux-server --test remote_system_container
 
-# The Kubernetes profile renders and validates against real API schemas.
+# Each Kubernetes profile renders and validates against real API schemas.
 kubectl kustomize deploy/kubernetes | kubectl apply --dry-run=client -f -
+kubectl kustomize deploy/agent | kubectl apply --dry-run=client -f -
 
 # The guest unit parses and its hardening is what it claims.
 systemd-analyze verify deploy/vm/flux-system.service

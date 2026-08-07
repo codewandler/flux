@@ -21,9 +21,9 @@ use axum::{Json, Router};
 use base64::Engine;
 use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 use flux_system::metrics::{
-    bounded_label, CpuUsage, FanSensor, LoadAverage, MemoryUsage, MetricAnswer, MetricKind,
-    MetricReading, MetricSnapshot, MetricUnavailable, MountUsage, TemperatureSensor, MAX_MOUNTS,
-    MAX_SENSORS,
+    bounded_label, bounded_mount_point, CpuUsage, DiskUsage, FanSensor, LoadAverage, MemoryUsage,
+    MetricAnswer, MetricKind, MetricReading, MetricSnapshot, MetricUnavailable, MountUsage,
+    TemperatureSensor, MAX_MOUNTS, MAX_SENSORS,
 };
 use flux_system::net::{
     BindExposure, DatagramEndpoint, DatagramHandle, DialTarget, DuplexReadHalf,
@@ -1434,8 +1434,15 @@ fn metric_reading_value(reading: &MetricReading) -> Value {
             "available_bytes": pool.available_bytes,
             "used_bytes": pool.used_bytes,
         }),
-        MetricReading::Disk(mounts) => Value::Array(
-            mounts
+        // The mount list stays a bare array, byte for byte what C-654 shipped. The C-673 cap
+        // marker rides beside `reading` in `metric_answers_value` instead, which is the placement
+        // that is additive in both directions: a peer built before this change ignores the extra
+        // key and decodes the list it always did, and one built after it reads a missing key as
+        // the zero an older peer had no way to report. Folding the marker into `reading` would
+        // have made the value an object, which an older decoder refuses outright — a wire break
+        // for a field that is pure gain.
+        MetricReading::Disk(disk) => Value::Array(
+            disk.mounts
                 .iter()
                 .map(|mount| {
                     json!({
@@ -1472,12 +1479,21 @@ fn metric_answers_value(answers: &[MetricAnswer]) -> Result<Value> {
     let mut encoded = Vec::with_capacity(answers.len());
     for answer in answers {
         encoded.push(match answer {
-            MetricAnswer::Served(snapshot) => json!({
-                "kind": snapshot.kind().as_str(),
-                "status": "served",
-                "sampled_at_ms": system_time_millis(snapshot.sampled_at)?,
-                "reading": metric_reading_value(&snapshot.reading),
-            }),
+            MetricAnswer::Served(snapshot) => {
+                let mut value = json!({
+                    "kind": snapshot.kind().as_str(),
+                    "status": "served",
+                    "sampled_at_ms": system_time_millis(snapshot.sampled_at)?,
+                    "reading": metric_reading_value(&snapshot.reading),
+                });
+                // C-673: how many mounts the far side left out. Carried beside `reading` so the
+                // frame stays readable by a peer that predates the field — see the note on the
+                // `Disk` arm of `metric_reading_value`.
+                if let MetricReading::Disk(disk) = &snapshot.reading {
+                    value["omitted_mounts"] = json!(disk.omitted_mounts);
+                }
+                value
+            }
             MetricAnswer::Unavailable { kind, reason } => json!({
                 "kind": kind.as_str(),
                 "status": "unavailable",
@@ -1551,20 +1567,39 @@ fn decode_metric_reading(
         }),
         MetricKind::Memory => MetricReading::Memory(pool(value)?),
         MetricKind::Swap => MetricReading::Swap(pool(value)?),
-        MetricKind::Disk => MetricReading::Disk(
-            capped_entries(value, MAX_MOUNTS)?
-                .into_iter()
-                .map(|mount| {
-                    Ok(MountUsage {
-                        mount_point: label(mount, "mount_point")?,
-                        filesystem: label(mount, "filesystem")?,
-                        total_bytes: count(mount, "total_bytes")?,
-                        available_bytes: count(mount, "available_bytes")?,
-                        used_bytes: count(mount, "used_bytes")?,
+        MetricKind::Disk => {
+            // What the cap drops here is counted rather than lost: a peer that sent a hundred
+            // mounts is a peer with more mounts than a reading carries, and saying nothing would
+            // make its frame decode into the same answer as a machine with thirty-two.
+            let dropped = value
+                .as_array()
+                .map_or(0, Vec::len)
+                .saturating_sub(MAX_MOUNTS);
+            MetricReading::Disk(DiskUsage {
+                mounts: capped_entries(value, MAX_MOUNTS)?
+                    .into_iter()
+                    .map(|mount| {
+                        Ok(MountUsage {
+                            // Through the mount-point bound, not the label bound: cutting a path
+                            // at sixty-four bytes is what makes two of a far side's containers
+                            // decode into one indistinguishable identity (C-673).
+                            mount_point: mount
+                                .get("mount_point")
+                                .and_then(Value::as_str)
+                                .map(bounded_mount_point)
+                                .ok_or_else(|| {
+                                    "metric reading is missing `mount_point`".to_string()
+                                })?,
+                            filesystem: label(mount, "filesystem")?,
+                            total_bytes: count(mount, "total_bytes")?,
+                            available_bytes: count(mount, "available_bytes")?,
+                            used_bytes: count(mount, "used_bytes")?,
+                        })
                     })
-                })
-                .collect::<std::result::Result<Vec<_>, String>>()?,
-        ),
+                    .collect::<std::result::Result<Vec<_>, String>>()?,
+                omitted_mounts: u32::try_from(dropped).unwrap_or(u32::MAX),
+            })
+        }
         MetricKind::Uptime => {
             MetricReading::Uptime(Duration::from_millis(count(value, "uptime_ms")?))
         }
@@ -1619,9 +1654,22 @@ fn decode_metric_answers(value: Value) -> std::result::Result<Vec<MetricAnswer>,
                 let reading = answer
                     .get("reading")
                     .ok_or_else(|| format!("`{token}` is served with no reading"))?;
+                let mut reading = decode_metric_reading(kind, reading)?;
+                // C-673: the far side's own cap marker, added to whatever this decoder's cap
+                // dropped. Absent from a peer that predates the field, which reads as the zero it
+                // could not have told us anyway.
+                if let MetricReading::Disk(disk) = &mut reading {
+                    let reported = answer
+                        .get("omitted_mounts")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    disk.omitted_mounts = disk
+                        .omitted_mounts
+                        .saturating_add(u32::try_from(reported).unwrap_or(u32::MAX));
+                }
                 answers.push(MetricAnswer::Served(MetricSnapshot {
                     sampled_at,
-                    reading: decode_metric_reading(kind, reading)?,
+                    reading,
                     remotely_reported: false,
                 }));
             }
@@ -3459,12 +3507,28 @@ mod tests {
                 "the transport does not get to assert provenance; the hop does"
             );
             match &snapshot.reading {
-                MetricReading::Disk(mounts) => {
-                    assert_eq!(mounts.len(), MAX_MOUNTS);
-                    for mount in mounts {
+                MetricReading::Disk(disk) => {
+                    assert_eq!(disk.mounts.len(), MAX_MOUNTS);
+                    // C-673: the mounts the cap dropped are counted, not swallowed — the frame
+                    // carried `MAX_MOUNTS + 64` and this answer must still describe that machine.
+                    assert_eq!(disk.omitted_mounts, 64);
+                    for mount in &disk.mounts {
                         assert!(mount.mount_point.len() <= 64, "{mount:?}");
                         assert!(mount.filesystem.len() <= 64, "{mount:?}");
                     }
+                    // …and each of those long paths kept an identity of its own, rather than
+                    // decoding into sixty-four copies of the same sixty-four-byte prefix.
+                    let identities: std::collections::BTreeSet<&str> = disk
+                        .mounts
+                        .iter()
+                        .map(|mount| mount.mount_point.as_str())
+                        .collect();
+                    assert_eq!(
+                        identities.len(),
+                        disk.mounts.len(),
+                        "the decoder collapsed distinct mount points: {:?}",
+                        disk.mounts
+                    );
                 }
                 MetricReading::Temperature(sensors) => {
                     assert_eq!(sensors.len(), MAX_SENSORS);

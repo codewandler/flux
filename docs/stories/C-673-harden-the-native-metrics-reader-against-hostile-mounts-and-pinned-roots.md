@@ -2,7 +2,7 @@
 id: C-673
 title: "Harden the native metrics reader against hostile mounts and pinned roots"
 pillar: "Core"
-status: backlog
+status: done
 epic: host-metrics-seam
 areas: [flux-system]
 design: host-metrics-seam
@@ -28,12 +28,12 @@ always install `/proc`+`/sys` and nothing operation-, CLI- or wire-shaped reache
 
 ## Acceptance
 
-- [ ] A finite oversized uptime value answers `ReadFailed` rather than panicking; a test drives it
+- [x] A finite oversized uptime value answers `ReadFailed` rather than panicking; a test drives it
       through `MetricsRoots::pinned`.
-- [ ] Exceeding the mount cap is observable in the answer, and mount points longer than the label
+- [x] Exceeding the mount cap is observable in the answer, and mount points longer than the label
       bound keep distinct identities (no dedup-then-truncate collision); a test proves both with
       overlay-length paths, independent of `TMPDIR` length.
-- [ ] The non-disk exclusion covers `fuse.*` generically plus `9p`, `ceph`, `glusterfs` and
+- [x] The non-disk exclusion covers `fuse.*` generically plus `9p`, `ceph`, `glusterfs` and
       `davfs`, and the hwmon walk bounds its intermediate collection, not only its answer.
-- [ ] The codegate allowance note states exactly the property the code enforces, and names the
+- [x] The codegate allowance note states exactly the property the code enforces, and names the
       grep-provable fact that only tests reach the roots setter.

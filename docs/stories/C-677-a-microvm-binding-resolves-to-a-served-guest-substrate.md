@@ -2,7 +2,7 @@
 id: C-677
 title: "A microvm binding resolves to a served guest substrate"
 pillar: "Core"
-status: backlog
+status: done
 epic: first-class-hosts
 areas: [flux-system]
 design: first-class-hosts
@@ -25,15 +25,15 @@ exists, it never creates one.
 
 ## Acceptance
 
-- [ ] `microvm` joins the closed `HostBackend` vocabulary: declarable in `[[host]]`, rendered by
+- [x] `microvm` joins the closed `HostBackend` vocabulary: declarable in `[[host]]`, rendered by
       `flux host ls`/`show`, the unknown-key hard error unchanged; absent a served endpoint the
       static availability answer says unwired and selection fails closed naming the gap.
-- [ ] A microvm binding with an endpoint resolves to the remote-protocol client; admission
+- [x] A microvm binding with an endpoint resolves to the remote-protocol client; admission
       requires the identity handshake; `flux host probe` reports the negotiated protocol version
       and the guest's `SubstrateIdentity` with `remotely_reported` provenance.
-- [ ] No provisioning surface exists: nothing starts, stops or creates a VM anywhere in the
+- [x] No provisioning surface exists: nothing starts, stops or creates a VM anywhere in the
       change; the reference docs point at C-480's guest profile as how the endpoint comes to be.
-- [ ] The backend and placement censuses stay clean, and the non-native kind keeps
+- [x] The backend and placement censuses stay clean, and the non-native kind keeps
       `browser.*`/`web.crawl` hidden under a microvm selection.
 
 ## Notes
@@ -43,3 +43,8 @@ exists, it never creates one.
   discipline the remote backend already uses.
 - Sequencing: touches `flux-cli/src/host_cmd.rs` and `flux-capabilities/src/host/mod.rs` — wait
   for C-654 (metrics surface) to integrate before dispatch.
+
+
+## Comments
+
+- Review minor: deviation 1's stated rationale is factually wrong — flux-capabilities/src/host/mod.rs is absent at v0.58.0, so static_availability was never published and its signature could have changed freely. The two-function outcome is defensible on independent grounds (no call site misuses it, ALL-iterating test guards drift), but the reason should not be reused.

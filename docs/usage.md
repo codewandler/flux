@@ -187,9 +187,20 @@ flux tui                         # dense ratatui chat UI (queue, session replay,
 flux app run --serve 127.0.0.1:8787 --yes  # HTTP/A2A daemon (REST + SSE)
 flux system serve --workspace /srv/project --cert cert.pem --key key.pem
                                  # authenticated TLS daemon for remote effects; bearer token comes
-                                 #   from FLUX_REMOTE_SYSTEM_TOKEN (or --token-env). Select it from
-                                 #   an agent command with --remote https://host:8790; omit --remote
-                                 #   to keep the default local execution mode
+                                 #   from FLUX_REMOTE_SYSTEM_TOKEN (or --token-env). Select it by
+                                 #   name with --host (below); --remote https://host:8790 remains as
+                                 #   sugar for an ephemeral unnamed binding. Omit both to keep the
+                                 #   default local execution mode
+flux host ls | show <name>       # declared [[host]] bindings: id, backend kind, address, availability
+flux host add <name> --backend remote --url https://build.internal --credential-ref env/TOKEN
+                                 # upsert one [[host]] entry in ~/.flux/config.toml; the credential is
+                                 #   a LOCATION, never a value, and an inline secret is refused
+flux host probe <name>           # backend identity check — executes nothing on the substrate
+flux host metrics <name>         # that machine's own CPU/load/memory/swap/disk/uptime/temperature
+                                 #   readings; anything unmeasurable is explicitly unavailable, not 0
+flux --host <name> run "..."     # run guarded effects on that binding. Deny by default, immutable for
+                                 #   the session, inherited by sub-agents; a sandboxed host with no
+                                 #   usable confinement refuses rather than falling back to local
 flux run app.flux                # run a multi-agent program (event bus + triggers + journeys); deny-destructive unless --yes
 flux run workflows.flux --entry triage --arg queue=new
                                  # select one named top-level flow from a multi-flow module and exit;

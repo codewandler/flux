@@ -158,20 +158,39 @@ struct Persisted {
     host: Vec<HostRecord>,
 }
 
-/// The static (no-side-effect) availability statement for a backend — what `host ls`/`show` may
-/// honestly claim without probing. `local` is the running substrate; a `remote` binding is only a
-/// declaration until `probe` verifies it; `sandboxed` (C-651) is wired but conditional on this
-/// platform having a usable confinement backend, which only a probe can answer; an `ssh` binding
-/// (C-683) claims even less than a `remote` one, because reaching it also means bootstrapping a
-/// serve on the far machine; the remaining peer backends fail closed until their selection stories
-/// wire them.
+/// The static (no-side-effect) availability statement for a backend *kind* — what `host ls`/`show`
+/// may honestly claim knowing nothing else. `local` is the running substrate; a `remote` binding is
+/// only a declaration until `probe` verifies it; `sandboxed` (C-651) is wired but conditional on
+/// this platform having a usable confinement backend, which only a probe can answer; a `microvm`
+/// binding (C-677) is wired but conditional on naming a served guest endpoint, which the kind alone
+/// cannot say — see [`binding_availability`]; an `ssh` binding (C-683) claims even less than a
+/// `remote` one, because reaching it also means bootstrapping a serve on the far machine; the
+/// remaining peer backends fail closed until their selection stories wire them.
 pub fn static_availability(backend: HostBackend) -> &'static str {
     match backend {
         HostBackend::Local => "available",
         HostBackend::Remote => "declared (verify with probe)",
         HostBackend::Sandboxed => "available if this platform can confine (verify with probe)",
+        HostBackend::Microvm => "unwired without a served guest endpoint (selection fails closed)",
         HostBackend::Ssh => "declared; bootstrapped over ssh (verify with probe)",
         HostBackend::Container | HostBackend::Kubernetes => "unwired (selection fails closed)",
+    }
+}
+
+/// The static availability of one *binding* — what `host ls`/`show` may honestly claim about it
+/// without probing. Prefer this over [`static_availability`] wherever a whole [`HostRef`] is in
+/// hand; the two agree for every kind whose answer the kind alone settles.
+///
+/// `microvm` is the kind that needs the binding, and the reason is the story's boundary rather than
+/// a special case: a microVM host *is* an endpoint some other process brought into existence
+/// (Decision 0018 rule 3, C-677). A binding that names one is a declaration a probe can verify; a
+/// binding that names none is a gap an operator closes by deploying the guest, not by retrying.
+/// Both are legal declarations, because flux never provisions the guest, and only the binding can
+/// tell them apart.
+pub fn binding_availability(host: &HostRef) -> &'static str {
+    match host.backend {
+        HostBackend::Microvm if host.url.is_some() => "declared (verify with probe)",
+        backend => static_availability(backend),
     }
 }
 
@@ -197,10 +216,10 @@ pub enum HostProbeFailure {
     CredentialUnavailable { reference: String, detail: String },
     /// The backend kind has no probe-able implementation wired yet; selection fails closed too.
     BackendUnwired { backend: String },
-    /// The backend is wired, but this platform cannot serve it — the `sandboxed` peer with no
-    /// usable confinement backend is the case (C-651). Distinct from
-    /// [`BackendUnwired`](Self::BackendUnwired): flux can do this, this machine cannot, and
-    /// `detail` says why.
+    /// The backend is wired, but nothing here can serve it — the `sandboxed` peer with no usable
+    /// confinement backend (C-651), or a `microvm` binding naming no served guest endpoint
+    /// (C-677). Distinct from [`BackendUnwired`](Self::BackendUnwired): flux can do this, the
+    /// conditions for it are absent, and `detail` says which one.
     BackendUnavailable { backend: String, detail: String },
     /// The transport-level identity check failed (unreachable, refused, handshake error).
     Connect { detail: String },
@@ -314,20 +333,31 @@ pub fn render_metric_answer(answer: &MetricAnswer) -> String {
             bytes(pool.total_bytes),
             bytes(pool.available_bytes)
         ),
-        MetricReading::Disk(mounts) => mounts
-            .iter()
-            .map(|mount| {
-                format!(
-                    "{} [{}] {} used of {} ({} available)",
-                    mount.mount_point,
-                    mount.filesystem,
-                    bytes(mount.used_bytes),
-                    bytes(mount.total_bytes),
-                    bytes(mount.available_bytes)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; "),
+        MetricReading::Disk(disk) => {
+            let mut lines: Vec<String> = disk
+                .mounts
+                .iter()
+                .map(|mount| {
+                    format!(
+                        "{} [{}] {} used of {} ({} available)",
+                        mount.mount_point,
+                        mount.filesystem,
+                        bytes(mount.used_bytes),
+                        bytes(mount.total_bytes),
+                        bytes(mount.available_bytes)
+                    )
+                })
+                .collect();
+            // C-673: an operator reading thirty-two mounts must be able to tell a machine that has
+            // thirty-two from one whose list was cut.
+            if disk.omitted_mounts > 0 {
+                lines.push(format!(
+                    "{} further mount(s) not reported",
+                    disk.omitted_mounts
+                ));
+            }
+            lines.join("; ")
+        }
         MetricReading::Uptime(uptime) => {
             let seconds = uptime.as_secs();
             format!(
@@ -403,8 +433,12 @@ pub fn metric_answer_json(answer: &MetricAnswer) -> serde_json::Value {
             "available_bytes": pool.available_bytes,
             "used_bytes": pool.used_bytes,
         }),
-        MetricReading::Disk(mounts) => serde_json::Value::Array(
-            mounts
+        // An object rather than the bare array the other list readings emit: `omitted_mounts` is
+        // part of the measurement, and a consumer that could not see it would read a capped list
+        // as a complete one.
+        MetricReading::Disk(disk) => serde_json::json!({
+            "mounts": disk
+                .mounts
                 .iter()
                 .map(|mount| {
                     serde_json::json!({
@@ -415,8 +449,9 @@ pub fn metric_answer_json(answer: &MetricAnswer) -> serde_json::Value {
                         "used_bytes": mount.used_bytes,
                     })
                 })
-                .collect(),
-        ),
+                .collect::<Vec<_>>(),
+            "omitted_mounts": disk.omitted_mounts,
+        }),
         MetricReading::Uptime(uptime) => serde_json::json!({
             "uptime_ms": uptime.as_millis() as u64,
         }),
@@ -517,6 +552,45 @@ mod tests {
         let err = reg.load().unwrap_err();
         assert!(err.to_string().contains("corrupt"), "{err}");
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// C-677: the availability answer for a `microvm` binding turns on whether it names a served
+    /// guest endpoint, because that is the one thing flux does not bring about itself. Every other
+    /// kind's answer follows from the kind alone, and must keep doing so — a per-binding refinement
+    /// that leaked into them would let `ls` claim things no probe had verified.
+    #[test]
+    fn a_microvm_binding_is_unwired_until_it_names_a_served_guest_endpoint() {
+        let planned = HostRef::declared("vm-planned", HostBackend::Microvm);
+        assert!(
+            binding_availability(&planned).contains("unwired"),
+            "{}",
+            binding_availability(&planned)
+        );
+        let served = HostRef {
+            url: Some("https://guest.internal:8443".into()),
+            ..HostRef::declared("vm-guest", HostBackend::Microvm)
+        };
+        assert_eq!(
+            binding_availability(&served),
+            static_availability(HostBackend::Remote),
+            "a served microvm binding is the remote protocol under a different word"
+        );
+
+        for backend in HostBackend::ALL {
+            if backend == HostBackend::Microvm {
+                continue;
+            }
+            let bare = HostRef::declared("b", backend);
+            let addressed = HostRef {
+                url: Some("https://elsewhere.example:8443".into()),
+                ..HostRef::declared("b", backend)
+            };
+            assert_eq!(binding_availability(&bare), static_availability(backend));
+            assert_eq!(
+                binding_availability(&addressed),
+                static_availability(backend)
+            );
+        }
     }
 
     #[test]

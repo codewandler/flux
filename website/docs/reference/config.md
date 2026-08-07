@@ -456,10 +456,11 @@ when you want the equivalent imperative surface. See [Endpoints](../agent/endpoi
 ## Host bindings (`[[host]]`)
 
 Each `[[host]]` table declares a named binding to an execution substrate. `id` and a `backend`
-kind (`local`, `sandboxed`, `container`, `kubernetes`, `ssh` or `remote`) are required; an unknown
-backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused rather
-than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a location
-(the same reference forms as endpoints), never a secret value; non-secret `labels` are optional.
+kind (`local`, `sandboxed`, `container`, `kubernetes`, `microvm`, `ssh` or `remote`) are required;
+an unknown backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused
+rather than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a
+location (the same reference forms as endpoints), never a secret value; non-secret `labels` are
+optional.
 Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
 user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
 
@@ -494,9 +495,13 @@ Four consequences are worth stating plainly before you declare one.
   is resolved once at startup, so guarded effects continue against the root it was selected with
   even after a worktree transition (`git_worktree_enter`, `fleet.isolate`) moves the native path.
   With no `--host`, nothing is pinned and the native path follows transitions as it always has.
-- **It serves no HTTP, and browser operations are hidden.** Like every selected substrate, a
-  `sandboxed` binding refuses guarded HTTP rather than sending the request from the calling process
-  behind your back, and `browser.*` / `web.crawl` are withheld while a selection is in force. Use a
+- **It serves HTTP; browser operations stay hidden.** A `sandboxed` binding makes web requests
+  through the same guarded egress path, redirect rules and private-network audit trail an
+  unselected run uses — the request is made in this process against this machine's network, which
+  is what confinement of *spawned* work already implied. A substrate that genuinely cannot make
+  requests (a remote binding, until HTTP rides the wire) still refuses rather than sending from
+  the calling process behind your back. `browser.*` and `web.crawl` remain withheld while any
+  selection is in force, because they drive a browser and a crawl frontier in this process; use a
   binding-free run for those.
 
 ```toml
@@ -508,6 +513,30 @@ credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
 grant = ["operator"]
 labels = { region = "eu" }
 ```
+
+A granted `microvm` binding is a VM or microVM guest that serves that same remote protocol: the
+same authenticated client, the same handshake, the same credential *reference*. Flux never
+creates, starts, stops or destroys a guest — the binding consumes an endpoint that already exists.
+That endpoint comes to exist through the [VM or microVM guest
+profile](../remote-system-deployment.md#vm-or-microvm-profile) — a hardened service unit, an
+idempotent install contract and a cloud-init bootstrap in
+[`deploy/vm/`](https://github.com/codewandler/flux/tree/main/deploy/vm) — whose daemon binds
+`0.0.0.0:8790` inside the guest.
+
+```toml
+[[host]]
+id = "vm-guest"
+backend = "microvm"
+url = "https://guest.internal:8790"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+grant = ["operator"]
+```
+
+Declared without a `url`, a `microvm` binding is still legal, and honestly **unwired**: `flux host
+ls` says so and selection fails closed naming the missing endpoint, because that gap is closed by
+deploying the guest rather than by retrying. With one, `flux host probe <id>` reports the
+negotiated protocol version and the guest's own substrate identity, marked as remotely reported —
+the guest measured itself; this machine did not.
 
 ### The `ssh` binding
 
