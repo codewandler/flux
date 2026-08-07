@@ -1377,6 +1377,24 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("terminates no TLS"), "{err}");
 
+        // C-683 landed a per-binding anchor for the ssh bootstrap at `[host.ssh] ca`. Two
+        // spellings of "the CA this binding trusts" would mean one of them is silently ignored,
+        // so the collision is refused and the refusal names the field that works.
+        let err = host_ref_from_parts(
+            "builder",
+            HostBackend::Ssh,
+            Some("ssh://build@builder.example"),
+            Some("env/FARM_TOKEN"),
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("[host.ssh]"),
+            "names the field that works: {err}"
+        );
+
         // A path is accepted as-is: it is not parsed as a secret ref, and it is not read here.
         let reference = host_ref_from_parts(
             "farm",
