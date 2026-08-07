@@ -4162,11 +4162,7 @@ where
                     .is_some_and(|operations| operations.open)
                 {
                     if let Some(operations) = state.operations.as_mut() {
-                        match m.kind {
-                            MouseEventKind::ScrollUp => operations.move_selection(-1),
-                            MouseEventKind::ScrollDown => operations.move_selection(1),
-                            _ => {}
-                        }
+                        operations.handle_mouse(m.kind);
                     }
                     continue;
                 }
@@ -4511,119 +4507,57 @@ where
                     .as_ref()
                     .is_some_and(|operations| operations.open)
                 {
-                    let mut decide = None;
-                    let mut refresh = false;
-                    if let Some(operations) = state.operations.as_mut() {
-                        match key.code {
-                            KeyCode::Esc if operations.confirm_decision => {
-                                operations.confirm_decision = false
-                            }
-                            KeyCode::Esc if operations.detail_open => {
-                                operations.detail_open = false;
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
-                                operations.open = false;
-                                operations.detail_open = false;
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                                let tab = operations.tab.cycle(-1);
-                                operations.select_tab(tab);
-                            }
-                            KeyCode::Tab => {
-                                let tab = operations.tab.cycle(1);
-                                operations.select_tab(tab);
-                            }
-                            KeyCode::Char('1') => {
-                                operations.select_tab(crate::operations::OperationsTab::Overview)
-                            }
-                            KeyCode::Char('2') => {
-                                operations.select_tab(crate::operations::OperationsTab::Board)
-                            }
-                            KeyCode::Char('3') => {
-                                operations.select_tab(crate::operations::OperationsTab::Workers)
-                            }
-                            KeyCode::Char('4') => {
-                                operations.select_tab(crate::operations::OperationsTab::Decisions)
-                            }
-                            KeyCode::Char('5') => {
-                                operations.select_tab(crate::operations::OperationsTab::Stats)
-                            }
-                            KeyCode::Up => operations.move_selection(-1),
-                            KeyCode::Down => operations.move_selection(1),
-                            KeyCode::PageUp => operations.move_selection(-10),
-                            KeyCode::PageDown => operations.move_selection(10),
-                            KeyCode::Left
-                                if operations.detail_open
-                                    && operations.tab
-                                        == crate::operations::OperationsTab::Decisions =>
+                    // C-623: the routing itself lives on `OperationsState`, so the read-only Board
+                    // pane can be driven by a test. Only `Decide` reaches a durable write.
+                    let command = state
+                        .operations
+                        .as_mut()
+                        .map(|operations| operations.handle_key(key))
+                        .unwrap_or_default();
+                    match command {
+                        crate::operations::OperationsCommand::Decide {
+                            decision_ref,
+                            outcome,
+                        } => {
+                            match operations_source
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Board/Fleet operations source is unavailable")
+                                })
+                                .and_then(|source| source.decide(&decision_ref, &outcome))
                             {
-                                operations.decision_option =
-                                    operations.decision_option.saturating_sub(1);
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Right
-                                if operations.detail_open
-                                    && operations.tab
-                                        == crate::operations::OperationsTab::Decisions =>
-                            {
-                                let options = operations
-                                    .selected_decision()
-                                    .map_or(0, |decision| decision.options.len());
-                                operations.decision_option =
-                                    (operations.decision_option + 1).min(options.saturating_sub(1));
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Enter
-                                if operations.detail_open
-                                    && operations.tab
-                                        == crate::operations::OperationsTab::Decisions =>
-                            {
-                                decide = operations.confirm_selected_decision();
-                            }
-                            KeyCode::Enter => operations.detail_open = true,
-                            KeyCode::Char('r') => refresh = true,
-                            _ => {}
-                        }
-                    }
-                    if let Some((decision_ref, outcome)) = decide {
-                        match operations_source
-                            .as_ref()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Board/Fleet operations source is unavailable")
-                            })
-                            .and_then(|source| source.decide(&decision_ref, &outcome))
-                        {
-                            Ok(ack) => {
-                                if let Some(operations) = state.operations.as_mut() {
-                                    operations.last_ack = Some(ack);
-                                    operations.confirm_decision = false;
-                                    operations.detail_open = false;
+                                Ok(ack) => {
+                                    if let Some(operations) = state.operations.as_mut() {
+                                        operations.last_ack = Some(ack);
+                                        operations.confirm_decision = false;
+                                        operations.detail_open = false;
+                                    }
+                                    request_operations_snapshot(
+                                        &tx,
+                                        operations_source.as_ref(),
+                                        &mut operations_refresh_in_flight,
+                                        &mut operations_force_refresh_pending,
+                                        true,
+                                    );
                                 }
-                                request_operations_snapshot(
-                                    &tx,
-                                    operations_source.as_ref(),
-                                    &mut operations_refresh_in_flight,
-                                    &mut operations_force_refresh_pending,
-                                    true,
-                                );
-                            }
-                            Err(error) => {
-                                if let Some(operations) = state.operations.as_mut() {
-                                    operations.refresh_error = Some(error.to_string());
-                                    operations.confirm_decision = false;
+                                Err(error) => {
+                                    if let Some(operations) = state.operations.as_mut() {
+                                        operations.refresh_error = Some(error.to_string());
+                                        operations.confirm_decision = false;
+                                    }
                                 }
                             }
                         }
-                    } else if refresh {
-                        request_operations_snapshot(
-                            &tx,
-                            operations_source.as_ref(),
-                            &mut operations_refresh_in_flight,
-                            &mut operations_force_refresh_pending,
-                            true,
-                        );
+                        crate::operations::OperationsCommand::Refresh => {
+                            request_operations_snapshot(
+                                &tx,
+                                operations_source.as_ref(),
+                                &mut operations_refresh_in_flight,
+                                &mut operations_force_refresh_pending,
+                                true,
+                            );
+                        }
+                        crate::operations::OperationsCommand::None => {}
                     }
                     continue;
                 }
