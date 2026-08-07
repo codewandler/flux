@@ -35,6 +35,15 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   what is missing, instead of quietly running on the local machine. Browser automation and site
   crawling still run locally, since they drive a local browser.
 
+- **Confinement is now a host you can name.** `[[host]] backend = "sandboxed"` declares a host that
+  runs guarded effects under the operating-system sandbox (bubblewrap on Linux, Seatbelt on macOS)
+  — and it fails closed: on a machine with no usable confinement, selecting it refuses at startup
+  and names the reason, instead of quietly running unconfined. A forged or stale "already confined"
+  environment marker is refused the same way. `flux host probe` reports which backend a sandboxed
+  host would use, and an autonomy posture that must not run unconfined selects it automatically for
+  named local work. `--sandbox`/`--no-sandbox` behave exactly as before, with one deliberate limit:
+  they never lower an explicitly selected sandboxed host.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.
