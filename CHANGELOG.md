@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-08-07
+
 ### Added
 
 - **Recovery and inspection became verbs instead of hand-driven procedures (C-635, C-636, C-637,

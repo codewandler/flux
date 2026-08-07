@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.59.0] - 2026-08-07
+
 ### Action needed
 
 - **Upgrade `flux system serve` daemons together with their clients.** This release changes the

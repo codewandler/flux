@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.59.0] - 2026-08-07
+
 ### Action needed
 
 - **Upgrade `flux system serve` daemons together with their clients.** This release changes the
