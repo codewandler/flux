@@ -84,6 +84,7 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-557 — Polished TUI views expose worker channels, board decisions and exact stats](C-557-board-fleet-observability-tui.md) · Core · follow-up UI — read-only peeks and native visualizations, not embedded CLI output
 - [C-565 — Every continued Fleet turn preserves its admitted capability ceiling](C-565-preserve-admitted-fleet-capabilities.md) · Core · dogfood defect — continued writer turns exposed a different operation set than the admitted template
 - [C-568 — Every agent starts under an explicit loop harness (epic)](C-568-explicit-agent-loop-harnesses-epic.md) · Core · bind behavior at agent start; configured Fleet loops add review, typed progress/yield and hierarchical budgets
+- [C-642 — fleet quiesce and resume make installing a new binary safe by construction](C-642-fleet-quiesce-and-resume-make-installing-a-new-binary-safe-by-construction.md) · Core · stopping dispatch by hand went wrong twice in one evening, once corrupting a full workspace test run
 - [D-199 — Zendesk automation — deterministic support workflows with bounded AI (epic)](D-199-zendesk-automation-epic.md) · Agent · EPIC — L-92, A-136, D-200, D-201, D-202 all closed; D-214 landed flux's half of the connector-pack interop. Open on ONE external dependency: two flux-connectors gaps (no zendesk `authority`; `{subdomain}` unresolved) that no flux change can close
 - [D-206 — JaaS / Brave Talk room backend — guest-token acquisition and refresh](D-206-jaas-brave-talk-room-backend.md) · Agent · layers vendor token acquisition on D-205's XMPP machinery: CSRF + PUT /api/v1/rooms/<room>, conference-request, 3h token refresh; ⚠ read Brave's acceptable-use before this is more than own-room use
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
@@ -142,8 +143,12 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 
 ### Fleet harness throughput
 _Wave 1 closed the confidentiality holes. This wave is about the thing the operator originally asked_
+- [C-664 — cargo test --workspace --lib never tests flux-cli](C-664-cargo-test-workspace-lib-never-tests-flux-cli.md) · Core
 - [C-618 — fleet resume must not replay the coordinator inbox into a story worker](C-618-fleet-resume-must-not-replay-the-coordinator-inbox-into-a-story-worker.md) · Core
+- [C-660 — fleet run returns as soon as workers are dispatched](C-660-fleet-run-returns-as-soon-as-workers-are-dispatched.md) · Core
 - [C-617 — Fleet reclaims wave storage and refuses to dispatch without disk headroom](C-617-fleet-reclaims-wave-storage-and-refuses-to-dispatch-without-disk-headroom.md) · Core
+- [C-662 — One colorized diff stream multiplexed across all fleet workers](C-662-one-colorized-diff-stream-multiplexed-across-all-fleet-workers.md) · Core
+- [C-663 — Workers show live token and tool-call activity as it happens](C-663-workers-show-live-token-and-tool-call-activity-as-it-happens.md) · Core
 - [C-603 — Drive the implementation loop by goal checkpoints, not a fixed model-round ceiling](C-603-implementation-loop-checkpoints-against-its-goal.md) · Core · max_rounds is an arbitrary guillotine that discards finished work; checkpoint on the assignment instead and report progress at each one
 - [C-616 — A story worker authors its own handoff instead of a third party transcribing it](C-616-a-story-worker-authors-its-own-handoff-instead-of-a-third-party-transcribing-it.md) · Core
 - [C-596 — Delegate wave integration to a dedicated agent instead of an operator-only CLI verb](C-596-delegate-wave-integration-to-a-dedicated-agent.md) · Core · integrate/apply/handoff/rework are in nobody's model-facing catalog, so a green wave can only move forward if a human types the command
@@ -194,6 +199,12 @@ _Every channel flux has is either **1:1** or **fire-and-forget**. `flux-channels
 - [D-213 — The room safety envelope — untrusted co-presence, consent, and approved publication](D-213-room-safety-envelope.md) · Agent · a room is untrusted MULTI-party input and anyone with the link can put a client in it — proven by the spike itself, which joined with no account; this story owns the invariants the rest of the epic must not break
 - [C-417 — A shared conversation has one reply channel and several audiences, so authorizing the asker is not enough](C-417-a-shared-room-has-one-reply-channel-and-many-audiences.md) · Agent · raised by the owner: a room holds an operator AND an audience. D-213 sets the floor (co-presence grants no authority) and C-408/C-416 give per-speaker identity — but every authorization decision in flux is a function of the ASKER, and a room reply is broadcast to everyone present. So an operator cannot ask anything in a room that the audience may not see
 
+### Ops Explorer
+- [C-643 — flux ops --explore: the core catalog explorer](C-643-flux-ops-explore-the-core-catalog-explorer.md) · Core · iteration 1: Google-like start screen, node-constellation pictogram, fuzzy search, category filter, docs links
+- [C-644 — Ops explorer: plugin operations stream in, with source and availability facets](C-644-ops-explorer-plugin-operations-stream-in-with-source-and-availability-facets.md) · Core · depends on C-643 landing; do not dispatch in the same wave as C-643
+- [C-645 — Ops explorer: docs in the detail pane and an /ops overlay in the chat TUI](C-645-ops-explorer-docs-in-the-detail-pane-and-an-ops-overlay-in-the-chat-tui.md) · Core · depends on C-643 landing; do not dispatch in the same wave as C-643
+- [C-646 — Ops explorer: connector-ready catalog over the effective catalogue seam](C-646-ops-explorer-connector-ready-catalog-over-the-effective-catalogue-seam.md) · Core · depends on C-643; re-scope against roadmap Milestone 1 (C-318/X-113) at pickup
+
 ### What the Pi comparison says to fix — and what to defend instead
 _`docs/reviews/single/2026-08-01-pi-flux-harness-comparison.md` is two isolated source-level reviews_
 - [C-445 — Interactive turns are deliberately exempt from OS confinement — re-take that decision with the finding in hand](C-445-interactive-confinement-posture.md) · Core · the precise remaining secure-defaults gap after C-410: unattended CLI is fail-closed, interactive is not, and `even installed plugin startup can run unconfined` (dispatch.rs:111). Deliberate is a decision that should be RE-TAKEN, not inherited
@@ -207,13 +218,15 @@ _`docs/reviews/single/2026-08-01-pi-flux-harness-comparison.md` is two isolated 
 
 ### Recovery and inspection have no CLI, so every failure is hand-driven
 _The happy path has verbs. `fleet run`, `handoff`, `integrate`, `apply`, `reclaim` each do one thing well._
+- [C-647 — Attention is a present condition, not an accumulated history](C-647-attention-is-a-present-condition-not-an-accumulated-history.md) · Core · 25 of 25 flagged workers are cancelled or failed corpses of waves long finished; the driver halts on attention_required and therefore halts forever
+- [C-657 — Split board_fleet_cmd so fleet verbs stop serialising on one file](C-657-split-board-fleet-cmd-so-fleet-verbs-stop-serialising-on-one-file.md) · Core · one 17k-line file holds all 52 FleetAction arms, so every story in the ops-CLI epic collides with every other one
+- [C-658 — fleet schedule proposes a wave-safe batch at a requested width](C-658-fleet-schedule-proposes-a-wave-safe-batch-at-a-requested-width.md) · Core · board next --independent picks the set; nothing yet asks it for a wave, and the board cannot see fleet claims
 - [C-637 — board reconcile reports stories whose work is already present](C-637-board-reconcile-reports-stories-whose-work-is-already-present.md) · Core · a story implemented in main while its status read ready was dispatched again and a worker turn reproduced committed code
 - [C-635 — fleet doctor reports runtime health, not only configuration](C-635-fleet-doctor-reports-runtime-health-not-only-configuration.md) · Core · agents recorded active whose supervisor is gone, waves wedged in a transient state, worktrees a topology names but disk lacks, items claimed by more than one live wave, branches holding nothing unique
 - [C-636 — fleet inspect gate prints a repository gate's own output, tail first](C-636-fleet-inspect-gate-prints-a-repository-gate-s-own-output-tail-first.md) · Core · a failing gate's reason is the most-wanted fact in the system and currently requires knowing the shape of state.json
 - [C-641 — fleet handoff derives the write set and the owning worker from the worktree](C-641-fleet-handoff-derives-the-write-set-and-the-owning-worker-from-the-worktree.md) · Core · both are already recorded; requiring them by hand invites a wrong write set, which is false evidence rather than a typo
 - [C-639 — fleet park and unpark make parking a recorded lifecycle state](C-639-fleet-park-and-unpark-make-parking-a-recorded-lifecycle-state.md) · Core · parking lives in a driver-owned text file, invisible to fleet status, so a parked wave was re-decided every minute and unparking meant editing text
 - [C-638 — fleet repair rebuilds structure a topology names and disk lacks](C-638-fleet-repair-rebuilds-structure-a-topology-names-and-disk-lacks.md) · Core · reclamation removed an integration worktree an unfinished wave still needed; rebuilding it took a hand-written git worktree add
-- [C-642 — fleet quiesce and resume make installing a new binary safe by construction](C-642-fleet-quiesce-and-resume-make-installing-a-new-binary-safe-by-construction.md) · Core · stopping dispatch by hand went wrong twice in one evening, once corrupting a full workspace test run
 - [C-640 — fleet land merges accepted candidates and re-gates against the canonical branch](C-640-fleet-land-merges-accepted-candidates-and-re-gates-against-the-canonical-branch.md) · Core · acceptance pins a candidate against the base it was gated on; landing is a separate act needing its own verification, and it is a bash approximation in the driver
 
 ### Remote agents — run the agent here, land the effects there
@@ -263,6 +276,7 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [C-532 — Carry both faces of a ToolResult to surfaces; yank copies canonical content](C-532-carry-both-faces-of-a-tool-result-to-surfaces.md) · Core · run_call flattens view into content at the sink boundary; yank copies line-numbered views
 
 ### Tui Board Surface
+- [C-661 — TUI /task starts a sub-agent, with @ references for files and agents](C-661-tui-task-starts-a-sub-agent-with-references-for-files-and-agents.md) · Core
 - [C-621 — Expanding a board item renders its story body as markdown in place](C-621-expanding-a-board-item-renders-its-story-body-as-markdown-in-place.md) · Core
 - [C-622 — Board item expand and collapse works by click and by keyboard alike](C-622-board-item-expand-and-collapse-works-by-click-and-by-keyboard-alike.md) · Core
 - [C-623 — The TUI board pane is read-only and cannot mutate planning state](C-623-the-tui-board-pane-is-read-only-and-cannot-mutate-planning-state.md) · Core
@@ -411,6 +425,11 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 - [A-115 — JiraBoard through Exchange-governed operations, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · re-pointed by Decision 0006: the vendor mapping is a connector board member and every write an admitted Exchange operation — the plugin path this was written over is deleted by Milestone 5; the status↔State mapping stays config, not code
 - [A-118 — GitlabBoard — a second Exchange-governed tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · re-pointed by Decision 0006 away from plugins/gitlab (Milestone 5 deletes the plugin path); deferrable — its value is the proof that WorkBoard is not 'Jira with a trait on top'
 
+### First-class hosts
+_The substrate abstraction already exists — `flux-system` owns the guarded port, `flux-codegate`_
+- [C-651 — Sandboxed is a selectable peer backend](C-651-sandboxed-is-a-selectable-peer-backend.md) · Core · Decision 0018 rule 3: confinement as a peer ExecutionSystem, not only a spawn-time modifier; codegate census entry under review
+- [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
+
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
 - [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
@@ -427,6 +446,7 @@ _Wave 1 closed the confidentiality holes. This wave is about the thing the opera
 - [C-630 — fleet integrate --only salvages the non-conflicting subset of a wave](C-630-fleet-integrate-only-salvages-the-non-conflicting-subset-of-a-wave.md) · Core · wave-346 parked whole while two of three stories were independently integrable
 - [C-631 — flux fleet drive replaces the bash autopilot](C-631-flux-fleet-drive-replaces-the-bash-autopilot.md) · Core · the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged
 - [C-632 — Every worker turn records usage, including failed turns](C-632-every-worker-turn-records-usage-including-failed-turns.md) · Core · no recent worker turn carries rounds or tokens; you cannot see how close a worker was to its round budget before it died; activity.ndjson has no timestamps, no turn id, and a proven torn write at line 556
+- [C-659 — Fleet state.json stops carrying every agent's last turn](C-659-fleet-state-json-stops-carrying-every-agent-s-last-turn.md) · Core · every fleet verb fully parses state.json; last_turn blobs accumulate per agent and nothing prunes them
 
 ### `fleet:init` interviews an operator and writes a working fleet
 _Standing up the fleet in this workspace took many hours across several sessions, and almost none of_
@@ -479,6 +499,15 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 - [C-380 — Execute examples/commit.flux in a hermetic end-to-end test](C-380-execute-examples-commit-flux-end-to-end.md) · Agent · examples_validate.rs is parse + lower against a NullProvider; rg 'commit\\.flux' finds no test that RUNS it. Nothing covers git output shapes, index refusal, approvals, commit creation or rollback
 - [C-381 — Measure first-pass capability routing and give first-party families routing hints](C-381-measure-first-pass-routing-and-add-family-hints.md) · Agent · Family.routing_signals is wired end to end but populated ONLY from KIND_TURN_INTENT matchers, which no built-in group emits — only installed plugins reach it. And edcd9dcc enriched declare_intent with no story, no CHANGELOG entry and no test
 
+### Host metrics seam
+_A host exposes nothing about itself. Dispatch-layer telemetry, substrate provenance and the usage_
+- [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
+- [C-654 — Host metrics over the remote protocol and the host surface](C-654-host-metrics-over-the-remote-protocol-and-the-host-surface.md) · Core · Decision 0018 rule 6: host.metrics bounded wire operation under a protocol version bump; flux host metrics CLI and usage-observatory projection
+- [C-655 — A Kubernetes host serves node metrics](C-655-a-kubernetes-host-serves-node-metrics.md) · Core · Decision 0018 rule 6: node/pod metrics mapped into the same closed vocabulary; follows the container/Kubernetes backend (C-397, C-480)
+
+### Hosted Single Org
+- [C-656 — SSO member login to a hosted Exchange](C-656-sso-member-login-to-a-hosted-exchange.md) · Core · Decision 0019 rule 5: browser OIDC sign-in, member token mint, token stored under the named binding credential reference; replaces the transitional env pair
+
 ### The interactive debugger — stop, inspect, change a value, continue
 _Debugging an agent today means reading a transcript after the fact and running it again. Being able to_
 - [A-142 — Inspect a paused run — read-only first, redacted, and it cannot corrupt anything](A-142-inspect-a-paused-run.md) · Agent · read-only deliberately: useful alone, cannot corrupt a run, and it is what makes the write half reviewable. ⚠ Inspection is a DISCLOSURE surface — a paused run holds tool outputs and possibly secret material, and in a demo the debugger pane is on a shared screen
@@ -497,12 +526,6 @@ _Debugging an agent today means reading a transcript after the fact and running 
 - [C-287 — Add a guarded UDP operation](C-287-add-a-guarded-udp-operation.md) · Core · Datagrams need explicit destination and reply bounds; they are not a stateless version of TCP
 - [C-288 — Add a guarded ICMP operation](C-288-add-a-guarded-icmp-operation.md) · Core · ICMP must remain fail-closed on platforms where the host cannot obtain the required privilege
 - [C-418 — Guarded network primitives — DNS, TCP, UDP and ICMP behind one egress decision (epic)](C-418-guarded-network-primitives-epic.md) · Core · tracker filed 2026-08-01 by a board audit: five stories (C-284..C-288) carried this slug with nothing stating what the initiative is. ⚠ It overlaps `execution-substrate`'s C-396 and that boundary was never written down — this tracker exists mainly to state it
-
-### Ops Explorer
-- [C-643 — flux ops --explore: the core catalog explorer](C-643-flux-ops-explore-the-core-catalog-explorer.md) · Core · iteration 1: Google-like start screen, node-constellation pictogram, fuzzy search, category filter, docs links
-- [C-644 — Ops explorer: plugin operations stream in, with source and availability facets](C-644-ops-explorer-plugin-operations-stream-in-with-source-and-availability-facets.md) · Core · depends on C-643 landing; do not dispatch in the same wave as C-643
-- [C-645 — Ops explorer: docs in the detail pane and an /ops overlay in the chat TUI](C-645-ops-explorer-docs-in-the-detail-pane-and-an-ops-overlay-in-the-chat-tui.md) · Core · depends on C-643 landing; do not dispatch in the same wave as C-643
-- [C-646 — Ops explorer: connector-ready catalog over the effective catalogue seam](C-646-ops-explorer-connector-ready-catalog-over-the-effective-catalogue-seam.md) · Core · depends on C-643; re-scope against roadmap Milestone 1 (C-318/X-113) at pickup
 
 ### Quorum Approval
 - [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
@@ -533,6 +556,14 @@ _An A2A endpoint being discoverable does not make it a trusted fleet worker. Rem
 ### Pause and resume a live run
 _Watching an agent work is only half of control. The other half is being able to say *stop* — to read_
 - [A-141 — What pause means for an effect already in flight — and saying it honestly](A-141-what-pause-means-for-an-effect-in-flight.md) · Agent · the story that makes pause trustworthy or not. A pause pressed while an HTTP request is in flight, a subprocess is running or a model is streaming cannot un-send any of it. ⚠ A pause that reports stopped while effects continue is WORSE than no pause — it invites the operator to relax at the wrong moment
+
+### Scouting makes the backlog schedulable
+_The fleet can only run wide over work whose shape it knows, and it does not know that shape._
+- [C-665 — The board records what a scout saw, and what it still owes](C-665-the-board-records-what-a-scout-saw-and-what-it-still-owes.md) · Core · 1182 stories, 471 declare areas; the other 711 are held back as an undeclared write set and no verb can fix that after creation
+- [C-666 — A scheduled scout app inspects tickets on a timer](C-666-a-scheduled-scout-app-inspects-tickets-on-a-timer.md) · Core · the schedule channel, the trigger binding and the app runner all exist and are e2e tested; nothing new is needed to make something run on a clock
+- [C-667 — Backfill the undeclared backlog and measure the width it unlocks](C-667-backfill-the-undeclared-backlog-and-measure-the-width-it-unlocks.md) · Core · measure the undeclared tail becoming batchable, NOT the workspace board's width of 3 — that one is C-657's to move
+- [C-668 — An unscouted item cannot become ready](C-668-an-unscouted-item-cannot-become-ready.md) · Core · ready already refuses without a priority; a scout stamp is one more clause in a rule that exists, not a new concept
+- [C-669 — A scout proposes a persona as a decision, never grants one](C-669-a-scout-proposes-a-persona-as-a-decision-never-grants-one.md) · Core · an agent_templates entry carries capabilities, fences and a model; a read-only scout must not be able to mint one
 
 ### Serving surface and turn outcome residuals — 2026-08-01
 - [C-369 — Serving surface and turn outcome residuals — the ingress nobody inventoried (epic)](C-369-serving-surface-and-turn-outcome-residuals-epic.md) · Core · EPIC — SRV-01/SRV-02/OUTCOME-01 are all genuinely fixed in flux-server, and all three reopen one layer out: the webhook/connector channel adapters mount a bare Router with no limits and spawn before admission, and turn_end.outcome still reports suspended/max_iter/cancelled as ok
@@ -1139,6 +1170,9 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-619 — Applying a wave must advance its Board items, or autonomy re-implements the same story forever](C-619-applying-a-wave-must-advance-its-board-items-or-autonomy-re-implements-the-same-story-forever.md) · Core
 - [C-620 — Board pane renders items as collapsed boxes grouped by status and ordered by priority](C-620-board-pane-renders-items-as-collapsed-boxes-grouped-by-status-and-ordered-by-priority.md) · Core
 - [C-624 — Fleet must not leave the worktree it hands a worker permanently dirty](C-624-fleet-must-not-leave-the-worktree-it-hands-a-worker-permanently-dirty.md) · Core
+- [C-648 — A host config table, HostRef and session registry](C-648-a-host-config-table-hostref-and-session-registry.md) · Core · Decision 0018 rules 1-2: declare named hosts the way endpoints are declared; credential references, never values
+- [C-649 — flux host CLI family and host.* operations](C-649-flux-host-cli-family-and-host-operations.md) · Core · Decision 0018 rule 1: ls/add/show/rm/probe plus an ambient-gated host.* op group, mirroring the endpoint surface
+- [C-650 — A named host binding selects the execution substrate](C-650-a-named-host-binding-selects-the-execution-substrate.md) · Core · Decision 0018 rules 2 and 4: --host NAME resolves a registered binding to the selected ExecutionSystem; --remote stays as ephemeral sugar
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

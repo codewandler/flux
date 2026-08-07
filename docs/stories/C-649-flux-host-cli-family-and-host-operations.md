@@ -2,7 +2,7 @@
 id: C-649
 title: "flux host CLI family and host.* operations"
 pillar: "Core"
-status: in-progress
+status: done
 epic: first-class-hosts
 areas: [flux-cli, flux-capabilities]
 design: first-class-hosts

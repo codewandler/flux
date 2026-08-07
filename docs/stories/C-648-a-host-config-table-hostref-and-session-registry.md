@@ -2,7 +2,7 @@
 id: C-648
 title: "A host config table, HostRef and session registry"
 pillar: "Core"
-status: in-progress
+status: done
 epic: first-class-hosts
 areas: [flux-config, flux-capabilities]
 design: first-class-hosts

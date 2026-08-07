@@ -2,7 +2,7 @@
 id: C-650
 title: "A named host binding selects the execution substrate"
 pillar: "Core"
-status: in-progress
+status: done
 epic: first-class-hosts
 areas: [flux-cli, flux-runtime]
 design: first-class-hosts
