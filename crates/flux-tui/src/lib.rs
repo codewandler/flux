@@ -1203,6 +1203,7 @@ impl ChatState {
     /// authoritative and is read back through [`crate::attach::AttachedAgent::history`].
     pub fn attached(model: String, attachment: crate::attach::Attachment) -> Self {
         let mut state = Self::for_session(model, String::new());
+        crate::attach::apply_attached_invariants(&mut state);
         state.attachment = Some(attachment);
         state
     }
@@ -3770,13 +3771,7 @@ pub fn session_state(
     // *input* history is still local, because that is this terminal's typing, not the agent's work.
     if let Some(attached) = options.attached.clone() {
         let attachment = Attachment::new(attached);
-        state.session_id.clear();
-        // The local model neither answers nor costs anything here, so claiming it in the header
-        // (or pricing a turn against it) would be a fabrication. The remote's model is its own
-        // business and the A2A card does not publish it.
-        state.model = "remote agent".to_string();
-        state.model_spec = None;
-        state.cost_model = None;
+        attach::apply_attached_invariants(&mut state);
         announce_attachment(&mut state, &attachment);
         state.attachment = Some(attachment);
         state.history = load_history(&agent.events);

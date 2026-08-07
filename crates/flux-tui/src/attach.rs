@@ -234,6 +234,27 @@ impl std::fmt::Debug for Attachment {
     }
 }
 
+/// Clear every piece of view state that would describe **this** machine while the operator is
+/// watching another one.
+///
+/// One function rather than four assignments at the call site, because each of these is a claim the
+/// header makes and every one of them would be false under an attachment:
+///
+/// - **the session id** — there is no local session; an empty id is what keeps this conversation
+///   out of `flux sessions` and `flux replay`;
+/// - **the model and its pricing** — the local model neither answers nor costs anything here, and
+///   the A2A card does not publish the remote's;
+/// - **the `auto-ok` badge** — `--yes` is a *local* posture that installs an allow-approver on this
+///   machine's engine. It does not, and must not, speak for someone else's deployment: a remote
+///   effect parked for a human is still shown and still waits.
+pub(crate) fn apply_attached_invariants(state: &mut ChatState) {
+    state.session_id.clear();
+    state.model = "remote agent".to_string();
+    state.model_spec = None;
+    state.cost_model = None;
+    state.auto_approve = false;
+}
+
 /// Fold one remote update into the view model.
 ///
 /// The one crossing point between the remote stream and [`ChatState`]. It uses the *same* mutators
@@ -882,6 +903,26 @@ mod tests {
         assert!(
             screen.contains("not in `flux sessions`"),
             "the local/remote split must be stated where the operator reads it: {screen}"
+        );
+    }
+
+    /// `--yes` is a local posture and cannot grant autonomy on someone else's deployment, so the
+    /// header must not badge `auto-ok` while remote effects still park for a human.
+    #[test]
+    fn local_auto_approve_does_not_follow_the_operator_onto_a_remote_agent() {
+        let mut state = ChatState::new("local-model".into());
+        state.auto_approve = true;
+        state.model_spec = Some("anthropic/claude-sonnet-5".into());
+        apply_attached_invariants(&mut state);
+        assert!(
+            !state.auto_approve,
+            "--yes must not claim to auto-approve a remote agent's effects"
+        );
+        assert!(state.session_id.is_empty());
+        assert_eq!(state.model, "remote agent");
+        assert!(
+            state.model_spec.is_none(),
+            "the local model neither answers nor costs anything under an attachment"
         );
     }
 
