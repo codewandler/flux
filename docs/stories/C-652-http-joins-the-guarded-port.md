@@ -30,3 +30,8 @@ versioned protocol change.
       stays `NativeSystemOnly`; the placement census test is updated deliberately.
 - [x] `RemoteSystem` answers HTTP with a typed `Unserved` naming the missing wire support rather
       than approximating.
+
+
+## Comments
+
+- Review open questions routed: sub-agent ToolContext propagation of the selected substrate is C-675 acceptance; the kind-sniffing gate in Executor::non_native_target is settled by C-651's every_admission_path_reports_the_same_non_native_kind.

@@ -28,3 +28,8 @@ rule 8's confined default can name it like any other backend.
 - [x] The existing `--sandbox`/`--no-sandbox` modifier path is byte-for-byte unchanged, and a
       posture `SandboxFloor` may force selection of the sandboxed backend.
 - [x] The peer backend's `SubstrateIdentity` reports its confinement truthfully.
+
+
+## Comments
+
+- Review round-2 residual: an SDK embedder that pins an AlreadyConfined sandbox via System::with_sandbox and calls SandboxedSystem::from_env inherits the FLUX_SANDBOXED marker without the CLI's audit disclosure (which lives in apply_sandbox_env). No in-tree caller does this; settled by an L2-side disclosure if the peer is ever exposed through flux-sdk.

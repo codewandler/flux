@@ -417,6 +417,12 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 - [A-115 — JiraBoard through Exchange-governed operations, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · re-pointed by Decision 0006: the vendor mapping is a connector board member and every write an admitted Exchange operation — the plugin path this was written over is deleted by Milestone 5; the status↔State mapping stays config, not code
 - [A-118 — GitlabBoard — a second Exchange-governed tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · re-pointed by Decision 0006 away from plugins/gitlab (Milestone 5 deletes the plugin path); deferrable — its value is the proof that WorkBoard is not 'Jira with a trait on top'
 
+### First-class hosts
+_The substrate abstraction already exists — `flux-system` owns the guarded port, `flux-codegate`_
+- [C-674 — HTTP rides the remote protocol under a version bump](C-674-http-rides-the-remote-protocol-under-a-version-bump.md) · Core · Decision 0018 rule 5's deferred wire change; C-652's review fixed the shape constraints the frame must honor before secrets ride it
+- [C-675 — A selected native substrate serves HTTP](C-675-a-selected-native-substrate-serves-http.md) · Core · C-651/C-652 interplay: a sandboxed selection answers Unserved for web effects — fail-closed, and a capability gap both implementors flagged
+- [C-676 — A kubernetes binding resolves to a served pod substrate](C-676-a-kubernetes-binding-resolves-to-a-served-pod-substrate.md) · Core · Decision 0018 rule 3: compose the delivered remote protocol with the C-480 artifacts; today HostBackend::Kubernetes is 'unwired (selection fails closed)'
+
 ### Design record: fleet coordinator foundations
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
 - [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
@@ -489,6 +495,7 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 _A host exposes nothing about itself. Dispatch-layer telemetry, substrate provenance and the usage_
 - [C-654 — Host metrics over the remote protocol and the host surface](C-654-host-metrics-over-the-remote-protocol-and-the-host-surface.md) · Core · Decision 0018 rule 6: host.metrics bounded wire operation under a protocol version bump; flux host metrics CLI and usage-observatory projection
 - [C-655 — A Kubernetes host serves node metrics](C-655-a-kubernetes-host-serves-node-metrics.md) · Core · Decision 0018 rule 6: node/pod metrics mapped into the same closed vocabulary; follows the container/Kubernetes backend (C-397, C-480)
+- [C-673 — Harden the native metrics reader against hostile mounts and pinned roots](C-673-harden-the-native-metrics-reader-against-hostile-mounts-and-pinned-roots.md) · Core · C-653 review findings: the reading is bounded at the answer, not at every seam edge; caps truncate silently and one parse path can panic
 
 ### Hosted Single Org
 - [C-656 — SSO member login to a hosted Exchange](C-656-sso-member-login-to-a-hosted-exchange.md) · Core · Decision 0019 rule 5: browser OIDC sign-in, member token mint, token stored under the named binding credential reference; replaces the transitional env pair
