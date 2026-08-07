@@ -1,21 +1,24 @@
 ---
 id: C-704
-title: "A worker's transcript and cost survive its worktree"
+title: A killed worker turn still accounts for the calls it completed
 pillar: "Core"
 status: backlog
 epic: recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven
 areas: [flux-orchestrate, flux-cli, flux-flow]
-note: "usage flushes on turn end and the store lives inside the worktree, so an unfinished turn records nothing and `fleet reclaim` deletes what did get recorded; there is no read surface for either"
+note: "usage flushes on turn end, so a turn that never emits a terminal event records nothing: wave-472-worker-9 wrote 531 insertions and recorded zero tokens. C-632 hangs usage on the turn event this failure never produces"
 ---
 
-# A worker's transcript and cost survive its worktree
+# A killed worker turn still accounts for the calls it completed
 
 ## Goal
 
-"What did that worker do, and what did it cost?" is a mechanical question about data the fleet
-already produces, and today it is unanswerable for almost every worker that has ever run. Three
-findings, measured on this workspace, and they share one root: **worker observability lives inside a
-disposable worktree and has no read surface.**
+"What did that worker cost?" is a mechanical question about data the fleet already produces, and for
+a worker whose turn did not finish the answer is always **zero** — not "unknown", not "still
+running", but a number indistinguishable from a worker that spent nothing.
+
+The findings below were measured on this workspace. Two of the three turned out to belong to
+existing stories, and the section after them says which; what is left, and what this story is now
+scoped to, is the first one.
 
 **1. Usage is flushed on turn end, so an unfinished turn records nothing.** The correlation is exact
 across every surviving session store:
@@ -60,9 +63,9 @@ stores hold 281 model calls and 28.06M billed input tokens — and the durable l
     wave.agent-turns.completed   agent=None  usage=absent
 
 So the aggregate never leaves the worktree even on the success path. Ending the turn makes the cost
-*readable*, but only in a store that reclamation is entitled to delete at any time; nothing copies it
-anywhere that outlives the worktree. That is why the acceptance below asks for the copy to happen
-before reclaim can run, and not merely for reclaim to be more careful.
+*readable*, but only in a store that reclamation is entitled to delete at any time. This half is
+[C-632](C-632-every-worker-turn-records-usage-including-failed-turns.md)'s — it is exactly the
+"every turn event carries usage" it asks for, and the measurement above is evidence for it.
 
 **3. There is no read surface.** `fleet logs <worker>` ignores its target and returns wave-level
 lifecycle events. `fleet inspect worker` returns assignment, capabilities and loop binding, but no
@@ -75,48 +78,58 @@ That works — it is a normal flux session — but it requires knowing the layou
 the worktree exists, and the session is flagged `interrupted` while live, so entering a turn on it
 would resume the worker's own killed turn. An operator surface must not be a footgun.
 
-This is the same shape as the rest of this epic: recorded truth that only a hand-written expression
-can reach. C-637 made "is this already built?" askable; this makes "what did this worker do, and
-what did it cost?" askable.
+This half belongs to [C-599](C-599-fleet-work-is-unobservable-while-it-runs.md) (the transcript
+surface) and [C-712](C-712-fleet-logs-scopes-to-the-worker-it-was-given-or-says-what-it-can-scope-to.md)
+(the CLI verb that answers a question it was not asked). The evidence is kept here because it was
+measured together, not because this story claims it.
 
-## Where the store should live
+## What this story is, after the neighbours are accounted for
 
-**Relocate it; do not copy it out.** An earlier draft of this contract asked for the usage aggregate
-to be copied into the durable record before reclamation. That is weaker than it looks: a copy step
-has a window, and the failure this story exists to fix — a turn killed before it flushed — is
-precisely a failure that lands inside such windows. If the store never lives in the worktree, there
-is no copy to miss and no window to lose it in.
+Three existing stories already own most of the surface above, and this one must not re-litigate them:
 
-**Key it by `<wave>/<worker>`, not by pid.** A pid is recycled by the OS, means nothing once the
-process exits, and the entire purpose here is reading the record *after* the worker is gone; it
-would also need a pid→wave map, which is one more thing that can be lost. `<wave>/<worker>` is
-already the identity `events.ndjson`, `state.json` and `fleet inspect worker` all use, which makes
-"what did wave-602 cost" a directory listing rather than a join.
+- [C-632](C-632-every-worker-turn-records-usage-including-failed-turns.md) puts usage on
+  `agent.turn.completed`/`failed` in the durable log. That is the cost record, and because
+  `events.ndjson` is not inside a worktree, it survives reclamation.
+- [C-599](C-599-fleet-work-is-unobservable-while-it-runs.md) stage 1 is a transcript view over the
+  worker's own `<store>/events.db`, read-only, from the Workers tab. That is the read surface.
+- [C-602](C-602-fleet-workers-report-activity-back-to-the-coordinator.md) streams a bounded activity
+  projection to the coordinator and persists it centrally. That is what makes any of it work for a
+  worker that is not on this machine.
 
-Two candidate roots, and the trade is real:
+What none of them covers is the granularity, and that is what is left for this story. **C-632 hangs
+usage on a turn event, and the failure measured here is a turn that never emits one.**
+`wave-472-worker-9` has `turn_started = 1`, `turn_ended = 0`: no completed event, no failed event,
+nothing for C-632 to attach to, 531 insertions written and zero tokens recorded. A per-turn record
+is exactly as durable as the turn, and the turns that most need accounting are the ones that die.
 
-| root | for | against |
-|---|---|---|
-| `.flux/fleet/sessions/<wave>/<worker>/` | sits beside the `events.ndjson` and `state.json` that already key by wave and worker; `reclaim` only ever removes `worktrees/`, so it is already outside the blast radius | not on the default `flux sessions` search path, so the tooling must be pointed at it |
-| `~/.flux/fleet/<workspace>/<wave>/<worker>/` | `flux sessions`/`replay`/`diff` already default to `~/.flux`, so they would find worker stores with no `--store` flag; survives deleting the workspace | must be keyed by workspace or two fleets collide, and it mixes worker sessions into the operator's own session list (already 2,266 turns) unless that list learns to filter |
+So: usage must be durable **below** the turn — flushed per model call as the calls complete — so
+that a killed, cancelled or still-running turn still accounts for what it already spent. Everything
+else in the original draft of this story belongs to C-632, C-599 or C-602 and is dropped here.
 
-The recommendation is the workspace-local root, because telemetry that outlives the fleet state
-describing it is not much more useful than telemetry that was deleted — but the second row is a
-legitimate choice if the no-flag `flux sessions` ergonomics are judged to matter more.
+### On relocating the store
 
-Whichever root is chosen, the store path must sit **outside the worker's own read fence**. Today
-each store is inside the worktree the worker can read, and confinement is incidental to the layout;
-under a shared parent it has to be deliberate, or one worker can read a sibling's transcript.
+An earlier draft of this contract proposed moving worker stores out of the worktree, and that is
+**refused** — C-602 already reasoned it through and reached the opposite conclusion for a good
+reason:
+
+> A worker is intended to become containerisable — Docker, k8s, a remote runner. A remote worker
+> cannot append to the coordinator's SQLite file at all, so "everyone writes the shared store" is a
+> design that stops working at exactly the point the isolation was for. […] The separate store is
+> justified by *location independence*, not by contention.
+
+A relocation would fix the local case and quietly design out the remote one. The durable record that
+must survive reclamation is the coordinator's, reached by C-602's projection and C-632's turn usage
+— not the worker's own store moved somewhere safer. The worker's store stays isolated and stays
+disposable; what must not be disposable is the accounting, and that is served by flushing it out as
+it is produced rather than by finding it a better home.
 
 ## Acceptance
 
-- [ ] Usage is durable per model call, not only at turn end. A worker turn that is cancelled, crashes or is still running has the usage of every call it already completed, and a killed turn is no longer indistinguishable from a free one.
-- [ ] A worker's session store does not live inside the worktree at all. It is keyed by the identity the fleet already uses everywhere else — `<wave>/<worker>` — so reclamation has nothing to destroy and no copy step can be missed. Reclaim's contract is unchanged otherwise: it still refuses a worktree holding uncommitted work.
-- [ ] `flux fleet inspect worker <id>` exposes the recorded transcript for that worker — the plan/observation/run sequence — honoring the view's `--limit` and structural byte budget the way `inspect gate` does, tail-first where that is what an operator wants. `--output json` is the automation API.
-- [ ] `flux fleet logs <worker>` either scopes to the named worker or refuses with a message naming what it can scope to. Silently returning wave-level events for a worker target is worse than an error, because it reads as "this worker produced nothing".
-- [ ] Reading a live worker is safe by construction: an inspection path never enters a turn on the worker's session, and the documented operator command cannot resurrect the worker's interrupted turn.
+- [ ] Usage is durable per model call, not only at turn end. A worker turn that is cancelled, crashes or is still running accounts for every call it already completed, and a killed turn is no longer indistinguishable from a free one.
+- [ ] The per-call record reaches somewhere that outlives the worktree, by the mechanism C-602 establishes rather than a second one invented here. If C-602 has not landed, this story states the interim path explicitly rather than assuming a copy step that reclamation could outrun.
+- [ ] `wave-472-worker-9`'s shape is covered by a test: a turn that starts, does work, and is killed without emitting a terminal turn event still accounts for the calls it completed.
 - [ ] A wave-level cost view answers "what did this wave cost" from the durable record after its worktrees are gone.
-- [ ] Failing first: a test drives a worker turn that is killed mid-flight and asserts the completed calls' usage is still readable, and a second asserts a reclaimed wave's cost survives the reclamation.
+- [ ] Failing first: a test drives a worker turn killed mid-flight and asserts the completed calls' usage is still readable — today it reads zero.
 
 ## Notes
 

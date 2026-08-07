@@ -88,3 +88,9 @@ Two things make this a defect rather than a tuning opportunity:
   convergent by design and is how config edits take effect, but it means a repeated `start`
   invalidates any concurrent `--if-revision` guard and pays the full rewrite each time. Noted here
   as context for the rewrite cost; not part of this story's Acceptance.
+- Measured again 2026-08-07, mid-`wave-602`: `.flux/fleet/state.json` is **17.1 MB**, up from the
+  12.9 MB previously recorded. It grew ~4 MB across a single two-story wave, which sets the rate:
+  every fleet verb pays a 17 MB parse before it does anything, and the document is still growing
+  monotonically because nothing prunes `last_turn`. For scale, the fleet's entire durable event log
+  (`events.ndjson`, every wave ever run) is 7.9 MB — less than half the size of the state document
+  that describes only the current one.

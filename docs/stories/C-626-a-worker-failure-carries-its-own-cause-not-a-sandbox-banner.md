@@ -24,3 +24,25 @@ error today.
 - [ ] The error recorded on agent.turn.failed carries the source parse/validation error, not only captured stderr.
 - [ ] Child stderr is reduced to its error-relevant tail (last error line or classified block), with the recurring sandbox/plugin banner blocks stripped or demoted.
 - [ ] A wave-286-shaped failure (child exits without terminal event, noisy stderr) yields an event whose error string names the real cause, covered by a test.
+
+## A benign case of the same shape — wave-602
+
+The banner problem has a quieter form worth covering by the same mechanism: a sandbox refusal that is
+**correct, expected, and harmless** but is emitted as an `error:` line inside an operation that
+succeeded.
+
+Every story-worker commit produces this:
+
+    error: Unable to create '/home/timo/projects/flux/.git/packed-refs.lock': Read-only file system
+
+That is git opportunistically packing refs against the shared primary checkout, *after* the commit
+object and the branch update have already succeeded. C-609 narrowed the writable set to the git
+subpaths a commit actually needs, so this refusal is the fence working as designed.
+
+But it is indistinguishable from a failure at a glance, and it cost real tokens: `wave-602-worker-1`
+spent a paragraph of its handoff establishing that its commit had in fact succeeded despite the line,
+citing `git_log` and a clean `git_status` as counter-evidence. A worker should not have to prove that
+an `error:` in its own tool output was not an error.
+
+So the classification this story asks for has a second job: a line the sandbox emits for a refusal
+that did not fail the operation should be demoted, not surfaced as `error:` in the worker's result.

@@ -45,3 +45,28 @@ round and a confusing refusal for nothing.
       happens only through a new session, never mid-turn.
 - [ ] Tests cover: a deny rule, an egress family with no admitted destination, a family the
       substrate does not serve, and the negative case that a prompt-only operation is still offered.
+
+## Evidence — wave-602
+
+The fleet half of this defect, measured exactly. The story-worker loop's `ai_segment` `tools:` list
+names all six operations the datasource pack registers — `search`, `get`, `list`, `relation`,
+`batch_get`, `sources` (`flux-capabilities/src/datasource/ops.rs`) — and every one of them requires
+`datasource.read`. The story worker's `capabilities = ["read", "edit", "git", "rust", "node"]` grants
+no such access, so all six are refusable before the model is ever asked.
+
+Across the three surviving worker stores, `sources` was called and denied every time it was reached:
+
+    `sources` denied by policy (datasource.read on Datasource)
+
+7 attempts, 7 denials, 0 successes. It is the model's **step-3 gather call** on a fresh logical run,
+so a worker that restarts a segment pays for it again — `wave-602-worker-1` restarted twice and
+burned it three times. The other five were never reached only because `sources` fails first; nothing
+distinguishes them.
+
+Note the shape this takes in practice: the model is not being reckless. `sources` is a sensible first
+move for "what can I read here?", it is in the catalogue it was handed, and the only way to discover
+otherwise is to spend a round finding out. That is the whole argument of this story in one call.
+
+Interim mitigation applied in the roadmap repository: the six operations were removed from
+`story-implementation.flux`'s `tools:` list (loop profile revision 9 → 10). That fixes one authored
+loop by hand. This story is what stops the next one from having the same hole.
