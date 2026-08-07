@@ -96,6 +96,12 @@ fn shell_words(line: &str) -> Vec<String> {
             (Some(expected), found) if expected == found => quote = None,
             (Some(_), found) => word.push(found),
             (None, '"' | '\'') => quote = Some(character),
+            // An unquoted `#` at the start of a word opens a shell comment, exactly as a shell would
+            // read it. The skill examples are documentation as much as they are executable, and the
+            // trailing note on `board next --independent` — that it returns a wave-safe set rather
+            // than a priority prefix — is the reason a coordinator reaches for the flag at all.
+            // Without this the example only stays runnable by being stripped of what it teaches.
+            (None, '#') if word.is_empty() => break,
             (None, found) if found.is_whitespace() => {
                 if !word.is_empty() {
                     words.push(std::mem::take(&mut word));
@@ -129,6 +135,30 @@ fn skill_examples(markdown: &str) -> Vec<Vec<String>> {
         }
     }
     examples
+}
+
+#[test]
+fn a_skill_example_may_carry_a_trailing_comment_without_becoming_unrunnable() {
+    assert_eq!(
+        shell_words("flux board next --limit 8 --independent  # a wave-safe set"),
+        vec!["flux", "board", "next", "--limit", "8", "--independent"]
+    );
+    // Only a `#` that opens a word is a comment. One inside a word, or inside quotes, is data — a
+    // reason string or an issue reference must survive intact, or the stripping would silently
+    // rewrite the very command the example promises is executable.
+    assert_eq!(
+        shell_words("flux fleet park wave-7 --reason \"blocked on #42\" --tag a#b"),
+        vec![
+            "flux",
+            "fleet",
+            "park",
+            "wave-7",
+            "--reason",
+            "blocked on #42",
+            "--tag",
+            "a#b"
+        ]
+    );
 }
 
 fn git(root: &PathBuf, args: &[&str]) -> std::process::Output {
@@ -1872,7 +1902,7 @@ fn fleet_repair_rebuilds_missing_structure_without_discarding_work() {
             .trim()
             .to_string()
     }
-    fn entry_for(repaired: &serde_json::Value, worktree: &PathBuf) -> serde_json::Value {
+    fn entry_for(repaired: &serde_json::Value, worktree: &Path) -> serde_json::Value {
         repaired["data"]["worktrees"]
             .as_array()
             .unwrap_or(&Vec::new())
