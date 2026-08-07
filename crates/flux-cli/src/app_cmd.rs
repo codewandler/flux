@@ -1040,8 +1040,17 @@ const TUI_BUILTIN_COMMANDS: &[&str] = &[
 pub(super) async fn run_tui(
     mut flags: AgentFlags,
     fleet_root: Option<std::path::PathBuf>,
+    attach: Option<AttachSelection>,
 ) -> Result<()> {
     let auto_approve = flags.yes;
+    // C-686: connect before assembling anything. An attachment that cannot be reached is a startup
+    // error the operator reads in their shell, not a blank pane inside a terminal takeover — and
+    // the local engine below is only the surface's shell, so building it first would be work done
+    // for an agent that is never going to run a turn.
+    let attached = match attach.as_ref() {
+        Some(selection) => Some(connect_attachment(selection).await?),
+        None => None,
+    };
     // C-305: the pane channel is minted HERE, before the agent exists, and that ordering is the
     // whole story. `flux_tui::run_with_options` does not create the surface until after the agent is
     // assembled, but whether the `pane.*` ops are in the catalog at all has to be decided while the
@@ -1077,6 +1086,7 @@ pub(super) async fn run_tui(
         .map(|fleet| fleet.root.as_path())
         .unwrap_or(cwd.as_path());
     let mut options = tui_options(auto_approve, model_spec, surface_cwd, panes, interactions);
+    options.attached = attached;
     if let Some(fleet) = fleet.as_ref() {
         let attached = fleet.source.attach_session(&session_id)?;
         let mut initial_snapshot = fleet.initial_snapshot.clone();

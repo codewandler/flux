@@ -747,7 +747,20 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 }
                 run_prompt(agent, prompt).await
             }
-            Some(Commands::Tui { agent, fleet }) => run_tui(agent, fleet).await,
+            Some(Commands::Tui {
+                agent,
+                fleet,
+                attach,
+                attach_token_env,
+                attach_context,
+            }) => {
+                let attach = attach.map(|target| AttachSelection {
+                    target,
+                    token_env: attach_token_env,
+                    context_id: attach_context,
+                });
+                run_tui(agent, fleet, attach).await
+            }
             Some(Commands::Fork {
                 session,
                 at,

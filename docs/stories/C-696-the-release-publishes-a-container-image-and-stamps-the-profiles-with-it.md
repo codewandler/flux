@@ -2,8 +2,7 @@
 id: C-696
 title: "The release publishes a container image and stamps the profiles with it"
 pillar: "Core"
-status: backlog
-priority: 1
+status: done
 epic: remote-agents
 areas: [release]
 design: docs/designs/operating-a-deployed-host.md
@@ -31,16 +30,21 @@ closed and structurally enforced.
 
 ## Acceptance
 
-- [ ] The release workflow builds the container image from the released binary artifact — never a
+- [x] The release workflow builds the container image from the released binary artifact — never a
       fresh source build — and publishes it to the project registry tagged with the release
       version, with provenance attestation, and `check-release-integrity.sh` passes unchanged or
       is extended deliberately with the reason recorded.
-- [ ] `cut-release.sh` restamps both kustomizations' image tag as part of the cut; the two
+- [x] `cut-release.sh` restamps both kustomizations' image tag as part of the cut; the two
       exact-string gates learn the same substitution, and a test proves a cut leaves no manifest
       referencing the previous version.
-- [ ] `newName` references the published registry path, and `deployment_artifacts` pins that the
+- [x] `newName` references the published registry path, and `deployment_artifacts` pins that the
       two profiles agree on both name and tag with each other and with the workspace version.
-- [ ] The deployment docs state what is now true: pull the published image, or build locally with
+- [x] The deployment docs state what is now true: pull the published image, or build locally with
       the documented script — with the verification command for the attestation.
-- [ ] A dry run of the cut on a scratch branch demonstrates the restamp and leaves the working tree
+- [x] A dry run of the cut on a scratch branch demonstrates the restamp and leaves the working tree
       clean; no registry push happens outside a real release.
+
+
+## Comments
+
+- In progress: dispatched to an implementor in worktree flux-c696 off base 4af5e8cf. Release-blocking pair: cut-release.sh does not restamp the two kustomizations' image tag (blocked by two exact-string gates that must learn the same substitution), and newName is a bare local name no workflow publishes. Must not weaken check-release-integrity.sh's scoping of attestations/id-token to the attesting job — report BLOCKED instead.

@@ -59,6 +59,120 @@ name and whether it streams, then:
 The `<URL>` may be a base origin (`http://host:port` targets `<origin>/a2a`) or a full JSON-RPC
 endpoint URL; the client adopts the endpoint advertised by the card when present.
 
+## Client — `flux tui --attach <URL|NAME>`
+
+The REPL above is one client; the TUI is the other. `flux tui --attach` points the full chat surface
+— panes, approval sheet, transcript, interrupt — at an agent that lives on another machine.
+
+```bash
+# Attach to a served agent by URL; the bearer token comes from $FLUX_A2A_TOKEN
+flux tui --attach https://agent.internal:8787
+
+# …from a differently-named variable
+flux tui --attach https://agent.internal:8787 --attach-token-env DEPLOY_AGENT_TOKEN
+
+# …by a named binding declared in .flux/config.toml
+flux tui --attach cluster-agent
+
+# Continue an existing remote conversation instead of starting a new one
+flux tui --attach cluster-agent --attach-context release-train
+```
+
+A named binding is an `[[endpoint.static]]` entry declaring `protocol = "a2a"`:
+
+```toml
+[[endpoint.static]]
+id = "cluster-agent"
+url = "https://agent.internal:8787"
+protocol = "a2a"
+credential_ref = "env/DEPLOY_AGENT_TOKEN"   # a location, never a value
+```
+
+The bearer credential is always a **reference**: `--attach-token-env` names an environment
+variable, and a binding's `credential_ref` names a location. There is no flag that takes the token
+itself, and a URL carrying `user:pass@` is refused, so a production credential never reaches a shell
+history, a process listing or a CI log.
+
+:::danger `--attach` is not `--remote` or `--host`
+They are opposite postures and flux refuses them together.
+
+| | `--remote <url>` / `--host <name>` | `--attach <url\|name>` |
+|---|---|---|
+| what runs on your machine | the agent — planning, model calls, approvals | a viewer |
+| what runs on the far side | the guarded effects only | **the whole agent** |
+| who approves an effect | **you, here** | the remote's posture (see below) |
+| where the session is stored | your local event store | **the remote's event store** |
+:::
+
+### What the attached surface can and cannot do
+
+On connect, the TUI probes the served agent and prints one line per affordance. Anything the far
+side does not implement is shown **disabled with its reason** rather than left inert:
+
+- **Live streaming** — on when the agent card declares `capabilities.streaming`; otherwise turns
+  arrive whole via `message/send`, and the pane says so.
+- **Interrupt (Ctrl-C)** — delivered as `tasks/cancel`, which stops the remote turn. Against an
+  agent that does not implement it (flux's reduced *embeddable* dispatch does not), Ctrl-C reports
+  that the remote turn **is still running** instead of pretending it stopped.
+- **Reattach replay** — read from the remote's `tasks/get` history.
+- **Approvals** — see below.
+- **Tool calls and results** — *not carried by the A2A wire at all.* `message/stream` emits text and
+  lifecycle status only, so an attached tool pane stays empty. The surface states this rather than
+  leaving you to infer it from an agent that appears to do nothing between paragraphs.
+
+### Approvals from an attached TUI
+
+If the served agent runs the remote-approval posture (`flux app run --serve --remote-approval`),
+parked effects are raised in the TUI's **ordinary** approval sheet and answered with the same
+`y` / `a` / `n` / `d` keys. The decision echoes the request's `fingerprint`, so it is bound to the
+effect you were shown.
+
+Four postures, each reported as itself — "nothing is parked right now" and "nobody is ever asked"
+never look the same:
+
+| what the remote answers | what the TUI shows |
+|---|---|
+| `200` | answerable here — **with the caveat that answers are attributed to the deployment's shared operator token, not to you** |
+| `501` | never raised — the agent runs a headless approver, constrained by policy, sandbox and budgets |
+| `401` / `403` | not answerable here — this credential is not admitted to the approval routes |
+| anything else | unknown, with the transport's own words |
+
+Per-principal approval authorization does not exist yet: the server refuses to combine principal
+authentication with one deployment-wide approval queue, because that would let one tenant answer
+another's effects. Until that lands, more than one human supervising one attached agent share a
+single operator identity.
+
+### Which session artifacts live on which machine
+
+This is the part that surprises people, so it is stated plainly.
+
+| artifact | attached (`--attach`) | ordinary `flux tui` |
+|---|---|---|
+| conversation history | **the remote's event store** | your `~/.flux/events.db` |
+| the plan, dispatches and evidence for a turn | **the remote's** | yours |
+| token usage and cost accounting | **the remote's** (`GET /usage` there) | yours (`flux usage`) |
+| approvals you answered | **the remote's** queue | your local approver |
+| the transcript in your terminal | in memory, for as long as the TUI is open | a rendering of your local session |
+| composer input history (what *you* typed) | local | local |
+
+Consequently **an attached conversation never appears in `flux sessions` and can never be
+`flux replay`ed on your machine.** Nothing is written locally, so there is nothing to list, and a
+local row that replayed into nothing would be worse than no row. To inspect an attached agent's
+work, run `flux sessions` / `flux replay` **on the host serving it**, or read the conversation over
+the wire with `tasks/get`.
+
+For the same reason, slash commands that act on the local engine or the local store — `/model`,
+`/compact`, `/new`, `/clear`, `/evidence`, `/sessions`, `/fork`, `/insights` — are refused by name
+while attached, rather than silently applying to an idle local engine that is producing none of the
+output you can see.
+
+### Known gaps
+
+- A `contextId` cannot be resolved to its remote task without running a turn, so a freshly started
+  process that attaches to an existing conversation replays its history only after you send
+  something. Within a session — including across a dropped stream — reattach replays immediately.
+- `GET /sessions/{id}` returns identity only (`id`, `model`, `created_at_ms`), not history.
+
 ## Server — `flux app run --serve`
 
 ```bash

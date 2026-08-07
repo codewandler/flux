@@ -116,6 +116,13 @@ pub(super) enum UiEvent {
         result: Box<Result<operations::FleetBoardSnapshot, String>>,
         refresh_token: Option<String>,
     },
+    /// C-686: one update from an agent that lives on another machine.
+    ///
+    /// Deliberately its own variant rather than being decomposed into `Text`/`Notice` at the
+    /// producer: a remote turn is not a local session event, and keeping it distinguishable all the
+    /// way to [`crate::attach::apply_attach_update`] is what stops it being folded into the local
+    /// `AgentSink` path (and, from there, into the local event store). Boxed to keep the enum small.
+    Attached(Box<crate::attach::AttachUpdate>),
     Finished,
 }
 

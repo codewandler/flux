@@ -38,10 +38,12 @@ version, and selects the agent surface with a `command:` override:
 command: [/usr/local/bin/flux, app, run]
 ```
 
-The image tag in `kustomization.yaml` is the same tag `deploy/kubernetes/kustomization.yaml` pins,
-and `crates/flux-cli/tests/deployment_artifacts.rs` derives one from the other so they cannot drift.
-A second image would be a second thing to build, attest, publish and get wrong; the provenance path
-in [deploy/README.md](../README.md) covers this profile unchanged.
+The image name and tag in `kustomization.yaml` are the same pair `deploy/kubernetes/kustomization.yaml`
+pins, and `crates/flux-cli/tests/deployment_artifacts.rs` derives one from the other so they cannot
+drift. Both name `ghcr.io/codewandler/flux-system:<version>`, which every release publishes — so a
+cluster that can reach `ghcr.io` pulls it and nothing here has to be built. A second image would be a
+second thing to build, attest, publish and get wrong; the provenance path in
+[deploy/README.md](../README.md) covers this profile unchanged.
 
 ## Create the two Secrets first
 

@@ -21,6 +21,7 @@ mod usage;
 mod a2a_cmd;
 mod app_cmd;
 mod args;
+mod attach_cmd;
 mod auth_cmd;
 mod dispatch;
 mod docs_cmd;
@@ -48,6 +49,7 @@ mod wakeup_cmd;
 use a2a_cmd::*;
 use app_cmd::*;
 use args::*;
+use attach_cmd::*;
 use auth_cmd::*;
 use board_fleet_cmd::*;
 use catalog_cmd::*;
@@ -481,12 +483,14 @@ mod tests {
             Some(Commands::Context {
                 action:
                     ContextAction::Show {
+                        layer,
                         profile,
                         tools,
                         body,
                         json,
                     },
             }) => {
+                assert_eq!(layer, None, "no positional layer was given");
                 assert_eq!(profile, ContextProfile::General);
                 assert_eq!(tools, ["read", "edit"]);
                 assert!(body);

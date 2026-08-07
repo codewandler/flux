@@ -289,6 +289,27 @@ All notable changes to this project are documented in this file. The format is b
   `probe` never does, because a probe is side-effect-free family-wide. Idempotency has no lock: the
   far side's `--bind` is the mutex, and a losing attempt exits rather than displacing the winner.
 
+- **The release publishes a container image and stamps the profiles with it (C-696).** A new
+  `publish-container-image` job repacks the *released, attested* binary artifact — never a fresh
+  source build — and pushes it to GHCR tagged with the release version, attested by digest. The
+  attestation-permission allowlist grows by exactly one job, which is the only shape that satisfies
+  the ordering at all: `publish-github-release` needs `attest`, so `attest` cannot need it back, so
+  "push only after the Release is public" is unachievable inside `attest`. The new job is pinned
+  structurally on both axes — its effective write set must equal exactly
+  `attestations`+`id-token`+`packages`, it must consume the staged assets, must not compile, must
+  attest the pushed digest unconditionally, and must `needs` host+attest+publish-github-release.
+  `cut-release.sh` now restamps both deployment profiles inside the path-limited release commit, so
+  a cut can no longer leave the manifests naming the previous version.
+
+- **The TUI attaches to an agent that lives on a host (C-686).** `flux tui --attach <url>` points
+  the chat UI at an agent served by `flux app run --serve`, refused at parse time alongside
+  `--remote`, `--host` and `--fleet` so the two remoting axes cannot be confused. A remote turn
+  never becomes a local session event: attach mode mints no local session, runs no local turn, and
+  crosses into the view model at one point with no write path to the local event store. The remote
+  is authoritative for history. Credentials are named by reference only, and a URL carrying
+  embedded credentials is refused without echoing it. Capability lines state what the protocol does
+  not carry — tool calls and results, pending C-705 — rather than leaving an unexplained empty pane.
+
 ### Performance
 
 - **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link

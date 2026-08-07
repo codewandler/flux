@@ -80,8 +80,12 @@ assert_before "$RELEASE_FLOW" 'uses: actions/setup-node@' 'working-directory: we
 assert_before "$RELEASE_FLOW" 'working-directory: website' 'name: Run the credential-free release flow'
 assert_before "$CUT" 'scripts/build-embedded-docs.sh >/dev/null' 'scripts/build-embedded-docs.sh --check >/dev/null'
 assert_before "$CUT" 'scripts/build-embedded-docs.sh --check >/dev/null' 'git commit --only "${COMMIT_PATHS[@]}"'
-grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip)' "$CUT" \
-  || fail "release commit no longer owns public-docs.zip"
+# C-696 taught this exact string the deployment-profile substitution instead of loosening it: the
+# cut restamps both kustomizations' image tag, so those two files are release files and belong in
+# the same path-limited commit as the archive.
+grep -Fq 'COMMIT_PATHS=(Cargo.toml Cargo.lock CHANGELOG.md WHATS-NEW.md website/docs/whats-new.md crates/flux-server/assets/public-docs.zip deploy/kubernetes/kustomization.yaml deploy/agent/kustomization.yaml)' "$CUT" \
+  || fail "release commit no longer owns public-docs.zip and the restamped deployment profiles"
+assert_before "$CUT" 'scripts/stamp-deployment-images.sh' 'git commit --only "${COMMIT_PATHS[@]}"'
 
 # Every contributor-facing contract states the same transaction in the same order. A workflow can
 # enforce freshness, but guidance must make the archive a deliberate member of the commit rather
