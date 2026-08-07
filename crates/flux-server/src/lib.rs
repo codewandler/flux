@@ -2028,8 +2028,8 @@ mod tests {
     use axum::routing::get;
     use flux_system::net::{BindExposure, InboundLimits, NetworkListener};
     use flux_system::port::{
-        ExecutionIdentity, ExecutionSystem, Guarded, GuardedEnv, GuardedHostFiles, GuardedNetwork,
-        GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
+        ExecutionIdentity, ExecutionSystem, Guarded, GuardedEnv, GuardedHostFiles, GuardedMetrics,
+        GuardedNetwork, GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
     };
     use tower::ServiceExt; // for `oneshot`
 
@@ -2104,6 +2104,9 @@ mod tests {
             refused("substituted bind reached")
         }
     }
+
+    // The bind probe measures nothing about itself; every metric inherits the port's `Unserved`.
+    impl GuardedMetrics for RefusingBindSystem {}
 
     impl ExecutionIdentity for RefusingBindSystem {
         fn substrate_identity(&self) -> SubstrateIdentity {

@@ -1,10 +1,12 @@
 //! Serving the guarded-IO [`port`](crate::port) by **delegating to another substrate** (C-399).
 //!
 //! [`port`](crate::port) names *"a remote executor"* among the substrates it exists for. This module
-//! is that substrate: [`RemoteSystem`] implements all five port families by handing each operation to
-//! a [`Delegate`] and turning what comes back into a `flux_core::Result`. A caller therefore runs
-//! operations somewhere other than its own process while the guarantees stay stated in exactly one
-//! place — `port.rs` — because nothing here re-states them.
+//! is that substrate: [`RemoteSystem`] implements the delegable port families by handing each
+//! operation to a [`Delegate`] and turning what comes back into a `flux_core::Result`. A caller
+//! therefore runs operations somewhere other than its own process while the guarantees stay stated
+//! in exactly one place — `port.rs` — because nothing here re-states them. Host metrics are the one
+//! family it does not delegate: that needs a wire operation under a protocol version bump (C-654),
+//! so until then it serves the port's own `Unserved` answer.
 //!
 //! **This is not a second IO path**, for the same reason the port is not: `RemoteSystem` cannot open
 //! a file or start a process. It can only ask something else to, and that something else is
@@ -108,8 +110,8 @@ use crate::net::{
     PrivateNetAllow,
 };
 use crate::port::{
-    ExecutionIdentity, Guarded, GuardedEnv, GuardedHostFiles, GuardedNetwork, GuardedProcess,
-    GuardedWorkspaceFiles, SubstrateIdentity,
+    ExecutionIdentity, Guarded, GuardedEnv, GuardedHostFiles, GuardedMetrics, GuardedNetwork,
+    GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
 };
 use crate::{ManagedChild, OutputObserver, ProcessOutput, ScopedFileRead};
 
@@ -629,6 +631,14 @@ impl GuardedNetwork for RemoteSystem {
         Box::pin(async move { settle(self.delegate.bind_udp(addr, exposure, limits, allow).await) })
     }
 }
+
+/// Deliberately empty, so every operation inherits `port.rs`'s fail-closed `Unserved` answer.
+///
+/// [`Delegate`] carries no metrics operation yet: putting host metrics on the wire is a versioned
+/// protocol change (C-654), not something a delegating backend may improvise. Until then a remote
+/// host reports that it does not serve metrics — which is the honest answer, and the one Decision
+/// 0018 rule 3 requires of a backend that cannot satisfy a guarded trait.
+impl GuardedMetrics for RemoteSystem {}
 
 impl GuardedHostFiles for RemoteSystem {
     fn host_path_identity(&self, path: &str) -> Result<String> {

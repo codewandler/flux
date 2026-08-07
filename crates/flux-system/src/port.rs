@@ -53,10 +53,10 @@
 //! `Command::new` itself. What these traits are is a *contract*, not a permission — implementing one
 //! grants no ability, it only claims to uphold the guarantees documented on each method.
 //!
-//! **The gate is in-repo only, and it enumerates all five ports.** `flux-codegate`'s
+//! **The gate is in-repo only, and it enumerates every port.** `flux-codegate`'s
 //! `no_unreviewed_guarded_port_backend_outside_system` reports every production `impl` of
-//! [`GuardedProcess`], [`GuardedHostFiles`], [`GuardedWorkspaceFiles`], [`GuardedNetwork`] and
-//! [`GuardedEnv`] — resolving renamed imports, and
+//! [`GuardedProcess`], [`GuardedHostFiles`], [`GuardedWorkspaceFiles`], [`GuardedNetwork`],
+//! [`GuardedMetrics`] and [`GuardedEnv`] — resolving renamed imports, and
 //! excusing only `#[cfg(test)]` — so a second backend for one of those cannot appear inside flux
 //! without a reviewed allowance. Its reach ends at this repo's two workspaces: it walks
 //! `crates/*/src` and `plugins/*/src` and nothing else. It says nothing about downstream
@@ -65,8 +65,9 @@
 //! `#[path]`.
 //!
 //! C-467 closed the former `GuardedWorkspaceFiles` blind spot, and C-435 adds the network family to
-//! the same census in the commit that introduces it. A sixth `Guarded*` trait now fails the census
-//! until the reviewer explicitly teaches the gate about its implementors.
+//! the same census in the commit that introduces it, as C-653 does for [`GuardedMetrics`]. A new
+//! `Guarded*` trait fails the census until the reviewer explicitly teaches the gate about its
+//! implementors.
 //!
 //! So: inside flux, "one guarded path starts every OS process" is mechanically enforced. Outside
 //! flux, a consumer that implements these traits is taking responsibility for the guarantees itself.
@@ -88,6 +89,7 @@ use std::time::Duration;
 
 pub use flux_core::{Error, GuardedIoError, GuardedIoFailure, Result};
 
+use crate::metrics::{MetricAnswer, MetricKind};
 use crate::net::{
     BindExposure, DatagramEndpoint, DialTarget, InboundLimits, NetworkListener, NetworkStream,
     PrivateNetAllow,
@@ -417,6 +419,66 @@ pub trait GuardedWorkspaceFiles: Send + Sync {
     }
 }
 
+/// Read bounded, typed measurements about the substrate **itself** — CPU, memory, disk, load,
+/// uptime, temperature and fans — as opposed to about the work flowing through it.
+///
+/// The vocabulary is closed and lives in [`crate::metrics`]; read that module for why there is no
+/// free-form string metric and what each unit is. What belongs *here* is the port's own posture,
+/// and it turns on there being **two distinct negatives**, never collapsed into one:
+///
+/// - `Err(Unserved)` — this substrate does not serve metrics at all. Every operation below defaults
+///   to it, so bringing a substrate up starts from "measures nothing" exactly as the rest of the
+///   port does.
+/// - `Ok(`[`MetricAnswer::Unavailable`]`)` — it serves the family and this machine has no such
+///   instrument: no hwmon fan tachometer, no swap area, no mounted filesystem.
+///
+/// Neither is ever a zero reading. A fabricated zero is the failure mode this trait exists to make
+/// unrepresentable: a monitoring projection cannot tell "0 °C" from "no thermometer", and an
+/// operator acting on the first when the truth is the second is acting on a measurement that was
+/// never taken.
+pub trait GuardedMetrics: Send + Sync {
+    /// The kinds this substrate can attempt at all.
+    ///
+    /// Deny-by-default: a substrate that has not opted in claims nothing, which is also what makes
+    /// [`read_metrics`](Self::read_metrics) fail closed rather than hand back an empty snapshot.
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        Vec::new()
+    }
+
+    /// One metric kind, as a typed answer.
+    ///
+    /// Fail-closed default. There is no safe degradation: the whole point of the seam is that a
+    /// consumer can trust the number, so a substrate that cannot measure says so.
+    fn read_metric(&self, kind: MetricKind) -> Guarded<'_, MetricAnswer> {
+        let _ = kind;
+        Box::pin(async { Err(deny("read a host metric")) })
+    }
+
+    /// Every kind this substrate serves, once each, in [`MetricKind::ALL`] order.
+    ///
+    /// Bounded by construction rather than by a cap the caller has to remember: the result is a
+    /// subset of a closed vocabulary, so it can never be longer than `MetricKind::ALL`. The
+    /// reduction to [`read_metric`](Self::read_metric) is the same shape the file port's text
+    /// operations use — serving one primitive earns the snapshot.
+    fn read_metrics(&self) -> Guarded<'_, Vec<MetricAnswer>> {
+        Box::pin(async move {
+            let served = self.served_metric_kinds();
+            if served.is_empty() {
+                // Not an empty `Vec`: that is the wrong answer ("this machine measured nothing"),
+                // and a caller would render it as a healthy host with no instruments.
+                return Err(deny("read host metrics"));
+            }
+            let mut answers = Vec::with_capacity(served.len().min(MetricKind::ALL.len()));
+            for kind in MetricKind::ALL {
+                if served.contains(&kind) {
+                    answers.push(self.read_metric(kind).await?);
+                }
+            }
+            Ok(answers)
+        })
+    }
+}
+
 /// The complete execution-facing guarded substrate available to a tool turn.
 ///
 /// This bundle is declared at the consumer boundary, following the same pattern as
@@ -430,6 +492,7 @@ pub trait ExecutionSystem:
     + GuardedEnv
     + GuardedWorkspaceFiles
     + GuardedNetwork
+    + GuardedMetrics
     + ExecutionIdentity
 {
 }
@@ -440,6 +503,7 @@ impl<T> ExecutionSystem for T where
         + GuardedEnv
         + GuardedWorkspaceFiles
         + GuardedNetwork
+        + GuardedMetrics
         + ExecutionIdentity
         + ?Sized
 {
@@ -577,6 +641,19 @@ impl GuardedNetwork for System {
     ) -> Guarded<'a, DatagramEndpoint> {
         let _ = self;
         Box::pin(crate::net::bind_udp(addr, exposure, limits, allow))
+    }
+}
+
+/// The native backend reads the local machine. Which kernel interfaces it reads is a value on the
+/// `System` ([`crate::metrics::MetricsRoots`]), and the parsing lives in [`crate::metrics`] — this
+/// file states the port, not the format of `/proc/meminfo`.
+impl GuardedMetrics for System {
+    fn served_metric_kinds(&self) -> Vec<MetricKind> {
+        crate::metrics::native_served_kinds()
+    }
+
+    fn read_metric(&self, kind: MetricKind) -> Guarded<'_, MetricAnswer> {
+        Box::pin(crate::metrics::read_native(self.metrics_roots(), kind))
     }
 }
 
