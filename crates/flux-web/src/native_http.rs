@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 use flux_core::{Error, Result};
 use flux_system::net::PrivateNetAllow;
-use flux_system::port::{Guarded, GuardedHttp, HttpRequest, HttpResponse};
+use flux_system::port::{Guarded, GuardedHttp, HttpRequest, HttpResponse, PrivateAdmit};
 use flux_system::secret_scope::SecretUse;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Method;
@@ -74,14 +74,53 @@ impl NativeHttp {
         }
     }
 
-    /// Emit the `PrivateNetAdmit` audit event when the guard just let a request through to a
-    /// private/internal host — i.e. the `web` grant admitted what the bare SSRF guard would refuse.
-    /// Gated on `host_resolves_private` so only genuine private admits are recorded.
-    fn audit_admit(&self, operation: &str, host: &str) {
+    /// Record a private-destination admission: on this backend's own audit sink, **and** in the
+    /// answer, returning the admit so it can travel with the response.
+    ///
+    /// Both, not either. The sink is where an unselected run's `PrivateNetAdmit` has always landed
+    /// and it stays there. Reporting the admit as well is what keeps the event visible when this
+    /// backend is on the far side of a hop (C-674): the operator reading the turn's audit trail is
+    /// not on this machine, and a security event that lands only in a daemon's sink is a security
+    /// event nobody sees. Gated on `host_resolves_private` so only genuine private admits count.
+    fn audit_admit(&self, operation: &str, host: &str) -> Option<PrivateAdmit> {
+        if !flux_system::net::host_resolves_private(host) {
+            return None;
+        }
         if let Some(audit) = &self.audit {
-            if flux_system::net::host_resolves_private(host) {
-                audit.record_private_admit(&format!("web:{operation}"), host, &self.grant_source);
-            }
+            audit.record_private_admit(&format!("web:{operation}"), host, &self.grant_source);
+        }
+        Some(PrivateAdmit {
+            host: host.to_string(),
+            grant_source: self.grant_source.clone(),
+            // This process admitted it, so there is no other substrate to name. A hop across a
+            // trust boundary stamps its own kind on the way through.
+            substrate: None,
+        })
+    }
+
+    /// Put the private-destination admissions a **remote** substrate reported onto this process's
+    /// audit sink, stamped with the substrate they happened on (C-674).
+    ///
+    /// Only the reported ones: an admit with no `substrate` happened here, and
+    /// [`audit_admit`](Self::audit_admit) already recorded it at the hop. Emitting it a second time
+    /// would double-count the security event that matters most.
+    ///
+    /// The grant is still named — it is the operator's own — with the substrate appended, so an
+    /// operator reading the trail sees both *why* an internal host was reachable and *where* the
+    /// request that reached it actually ran.
+    pub fn record_reported_admits(&self, operation: &str, admits: &[PrivateAdmit]) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        for admit in admits {
+            let Some(substrate) = &admit.substrate else {
+                continue;
+            };
+            audit.record_private_admit(
+                &format!("web:{operation}"),
+                &admit.host,
+                &format!("{} on substrate {substrate}", admit.grant_source),
+            );
         }
     }
 
@@ -93,19 +132,29 @@ impl NativeHttp {
     /// but a query-placed one is in the URL, and a `Location` that echoes the query carries it to a
     /// host the operator never named. Rather than reason per-hop about which bytes survive, the whole
     /// redirect chain has to stay inside the scope.
+    ///
+    /// Two things changed with C-674, both because the caller may now be another process:
+    ///
+    /// - What is authorized is [`HttpRequest::carried_secrets`], not the caller's `carried` list
+    ///   alone. A header whose value materializes a `$secret` says so in the header itself, so a
+    ///   credential that is physically on the request is authorized whether or not a separate list
+    ///   remembered it.
+    /// - It runs on the **first** hop as well as the redirects — see [`NativeHttp::send`].
     fn authorize_hop(
         request: &HttpRequest,
         url: &url::Url,
         destination: std::result::Result<&flux_system::secret_scope::Destination, String>,
+        what: &str,
     ) -> Result<()> {
-        if request.secrets.carried.is_empty() {
+        let carried = request.carried_secrets();
+        if carried.is_empty() {
             return Ok(());
         }
         // Only the HOST is quoted, never the hop URL: a query-placed secret lives in the URL, and a
         // `Location` the server chose can echo it back.
-        let hop = url.host_str().unwrap_or("the redirect target").to_string();
+        let hop = url.host_str().unwrap_or("an unnamed host").to_string();
         let operation = &request.operation;
-        for (name, site) in &request.secrets.carried {
+        for (name, site) in &carried {
             let use_ = SecretUse {
                 destination: destination.clone(),
                 principal: request.secrets.principal.as_deref(),
@@ -113,8 +162,8 @@ impl NativeHttp {
             };
             if let Err(refusal) = request.secrets.allowlist.authorize(name, &use_) {
                 return Err(Error::Http(format!(
-                    "{operation}: refusing the redirect to {hop} — secret env var `{name}` is out \
-                     of scope for it: {refusal}"
+                    "{operation}: refusing {what} {hop} — secret env var `{name}` is out of scope \
+                     for it: {refusal}"
                 )));
             }
         }
@@ -131,7 +180,9 @@ impl NativeHttp {
             let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                 Error::Other(format!("{operation}: invalid header name `{name}`: {e}"))
             })?;
-            let value = HeaderValue::from_str(value).map_err(|e| {
+            // `expose` is the one door out of the carriage, and this is the place that has to use
+            // it: a header value only becomes bytes where it becomes a request.
+            let value = HeaderValue::from_str(value.expose()).map_err(|e| {
                 Error::Other(format!(
                     "{operation}: invalid value for header `{name}`: {e}"
                 ))
@@ -139,6 +190,24 @@ impl NativeHttp {
             headers.insert(name, value);
         }
 
+        // The **first** hop is authorized here too, not only the redirects (C-674).
+        //
+        // Before the family crossed a process boundary this was redundant: `http.request` refuses a
+        // secret outside its grant before it ever reads the value, so a request that reached a
+        // backend had already passed. It stops being redundant the moment the caller is on another
+        // machine — the substrate that physically sends the credential must not take "the requester
+        // says this was authorized" for the check. Locally it agrees by construction, because it is
+        // the same allowlist measured against the same guard-vetted destination.
+        Self::authorize_hop(
+            request,
+            request.target.url(),
+            request.target.destination(),
+            "the request to",
+        )?;
+
+        // Collected in hop order alongside the audit sink, so the answer can carry what happened
+        // rather than leaving a caller across a link to reconstruct it from a list of hosts.
+        let mut admits: Vec<PrivateAdmit> = Vec::new();
         let response = egress::send_guarded(
             &self.http,
             egress::GuardedRequest {
@@ -161,12 +230,21 @@ impl NativeHttp {
                     destination
                         .as_ref()
                         .map_err(std::string::ToString::to_string),
+                    "the redirect to",
                 )?;
                 Ok((url, pinned))
             },
             |url| {
-                if let Some(host) = url.host_str() {
-                    self.audit_admit(operation, host);
+                let Some(admit) = url
+                    .host_str()
+                    .and_then(|host| self.audit_admit(operation, host))
+                else {
+                    return;
+                };
+                // The sink above always hears about it; the *reported* list is bounded, because a
+                // redirect chain is bounded but a caller's allocation should not depend on that.
+                if admits.len() < flux_system::port::MAX_PRIVATE_ADMITS {
+                    admits.push(admit);
                 }
             },
         )
@@ -194,11 +272,19 @@ impl NativeHttp {
             headers,
             body: capped.bytes,
             truncated: capped.truncated,
+            admits,
         })
     }
 }
 
 impl GuardedHttp for NativeHttp {
+    /// This backend exists to make HTTP requests, so it declares the family unconditionally. What a
+    /// composition site does with that answer — whether a `System` carrying it announces the frame
+    /// in a protocol handshake — is the composition site's decision, not this one's.
+    fn serves_http(&self) -> bool {
+        true
+    }
+
     fn http_request<'a>(
         &'a self,
         request: &'a HttpRequest,
@@ -306,6 +392,59 @@ mod tests {
 
         assert_eq!(response.body, b"abcd".to_vec());
         assert!(response.truncated, "a cut body must report itself cut");
+    }
+
+    /// C-674, acceptance 4 — the native backend *reports* the private admission it made, and
+    /// reports it as its own.
+    ///
+    /// The audit sink keeps working exactly as it did (C-652's behaviour, pinned by the
+    /// selected-substrate tests below). What is new is that the same admission also rides the
+    /// answer, because the process that admits is not always the process whose audit trail an
+    /// operator reads. `substrate` is `None` here and that is the load-bearing part: it is how a
+    /// caller tells an admission made in its own process from one made across a hop, which is what
+    /// stops the event being recorded twice.
+    #[tokio::test]
+    async fn a_private_admit_is_reported_in_the_answer_as_this_process_s_own() {
+        let base =
+            one_shot("HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n").await;
+        let allow = PrivateNetAllow::Any;
+        let native = NativeHttp::new(&WebOptions {
+            grant_source: Some("cli:--allow-private-net".into()),
+            ..Default::default()
+        });
+
+        let response = native
+            .http_request(&request("web.fetch", &format!("{base}/ok"), &allow), &allow)
+            .await
+            .expect("an admitted loopback target is served");
+
+        assert_eq!(
+            response
+                .admits
+                .iter()
+                .map(|admit| (
+                    admit.host.as_str(),
+                    admit.grant_source.as_str(),
+                    admit.substrate.clone()
+                ))
+                .collect::<Vec<_>>(),
+            vec![("127.0.0.1", "cli:--allow-private-net", None)],
+            "loopback is a private range, so the admit is real: {:?}",
+            response.admits
+        );
+    }
+
+    /// C-674 — a public destination is not an admission, so it reports nothing.
+    ///
+    /// The report has to mean the same thing the audit event means, or a caller would read a
+    /// routine request as a security event.
+    #[tokio::test]
+    async fn a_request_that_reaches_nothing_private_reports_no_admit() {
+        let native = NativeHttp::new(&WebOptions::default());
+        assert!(
+            native.audit_admit("web.fetch", "example.com").is_none(),
+            "a public host is not a private-network admission"
+        );
     }
 
     /// C-652 — the egress guard is on the port's path, not beside it.
