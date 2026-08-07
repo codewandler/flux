@@ -45,6 +45,117 @@ fn guarded_run(root: &Path, argv: &[String]) -> Result<flux_system::ProcessOutpu
     })
 }
 
+/// [`guarded_run`] with a document on standard input, through the same guarded boundary.
+fn guarded_run_with_stdin(
+    root: &Path,
+    argv: &[String],
+    stdin: &[u8],
+) -> Result<flux_system::ProcessOutput> {
+    if argv.is_empty() {
+        bail!("input/schema: process argv cannot be empty")
+    }
+    let system = guarded_system(root)?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(system.run_with_stdin(argv, stdin, CONTROL_PROCESS_TIMEOUT))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    })
+}
+
+/// How many bytes of blob content one `git cat-file --batch` may be asked for.
+///
+/// The guarded port caps a child's captured output at 1 MiB. Ask for more and the tail is dropped,
+/// the batch framing stops lining up, and the read falls back to one process per file — silently,
+/// which is exactly what the first version of this did: the 5.5 MB flux member never once took the
+/// fast path while the 141-story exchange member always did, so the change measured as no
+/// improvement at all. Sized well under the cap to leave room for the per-object header lines.
+const GIT_BATCH_BUDGET_BYTES: usize = 512 * 1024;
+
+/// Read many blobs from one `git cat-file --batch` instead of one `git show` per file.
+///
+/// Resolving a workspace member spawned one guarded process per story. Across this workspace's
+/// four members that is ~1,690 forks on **every** board call — including `board get`, which needs
+/// exactly one story and took eight seconds to produce 759 bytes. Every native coordinator
+/// operation pays it twice over, because each one shells out to a nested CLI that resolves the
+/// board again.
+///
+/// Returns `None` when the framing does not line up, so the caller falls back to the per-file path
+/// instead of risking mis-sliced content. The port hands back `String`, so a story that was not
+/// valid UTF-8 would be converted lossily and the declared sizes would stop matching the bytes: a
+/// framed protocol that guesses is worse than a slow one that does not.
+fn git_cat_file_batch(root: &Path, reference: &str, paths: &[&str]) -> Option<Vec<Option<String>>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let argv = ["git", "cat-file", "--batch"]
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect::<Vec<_>>();
+    let spec = paths
+        .iter()
+        .map(|path| format!("{reference}:{path}\n"))
+        .collect::<String>();
+    let output = guarded_run_with_stdin(root, &argv, spec.as_bytes()).ok()?;
+    if output.exit_code != 0 {
+        return None;
+    }
+
+    let bytes = output.stdout.as_bytes();
+    let mut cursor = 0usize;
+    let mut blobs = Vec::with_capacity(paths.len());
+    for _ in paths {
+        let newline = bytes
+            .get(cursor..)?
+            .iter()
+            .position(|byte| *byte == b'\n')?
+            + cursor;
+        let header = std::str::from_utf8(bytes.get(cursor..newline)?).ok()?;
+        cursor = newline + 1;
+        // `<input> missing` for anything unresolvable; an object line is `<oid> <type> <size>`.
+        // Read the trailer from the right, so a path containing a space cannot shift the fields.
+        if header.ends_with(" missing") {
+            blobs.push(None);
+            continue;
+        }
+        let mut trailer = header.rsplit(' ');
+        let size: usize = trailer.next()?.parse().ok()?;
+        if trailer.next()? != "blob" {
+            return None;
+        }
+        let end = cursor.checked_add(size)?;
+        let content = std::str::from_utf8(bytes.get(cursor..end)?)
+            .ok()?
+            .to_string();
+        // The batch protocol writes exactly one newline after each object.
+        cursor = end + 1;
+        blobs.push(Some(content));
+    }
+    Some(blobs)
+}
+
+/// Split `sized` into runs whose combined content stays inside [`GIT_BATCH_BUDGET_BYTES`].
+///
+/// A file larger than the whole budget gets a chunk to itself; it will overflow the cap and fail
+/// framing on its own, which the per-file fallback then handles without dragging its neighbours
+/// down with it.
+fn size_bounded_chunks<'a>(sized: &[(usize, &'a str)]) -> Vec<Vec<&'a str>> {
+    let mut chunks: Vec<Vec<&'a str>> = Vec::new();
+    let mut current: Vec<&'a str> = Vec::new();
+    let mut used = 0usize;
+    for (size, path) in sized {
+        if !current.is_empty() && used + size > GIT_BATCH_BUDGET_BYTES {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += size;
+        current.push(path);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Retain only complete newest lines within `limit` bytes.
 ///
 /// Agent stream events are one JSON object per line. Cutting bytes from the front of an oversized
@@ -9170,12 +9281,14 @@ fn read_workspace_member_stories(workspace: &Path, member: &WorkspaceMember) -> 
     if git_output(&root, &["rev-parse", "--verify", &verified]).is_none() {
         return read_stories(&root);
     }
+    // `-l` adds each blob's size, which is what lets the reads below be batched to a budget
+    // instead of one process per file.
     let listing = guarded_git(
         &root,
         &[
             "ls-tree",
             "-r",
-            "--name-only",
+            "-l",
             &member.canonical_ref,
             "--",
             "docs/stories",
@@ -9188,35 +9301,64 @@ fn read_workspace_member_stories(workspace: &Path, member: &WorkspaceMember) -> 
             member.canonical_ref
         )
     }
-    let mut paths = listing
+    // `<mode> <type> <oid> <size>\t<path>`
+    let mut sized = listing
         .stdout
         .lines()
-        .filter(|path| {
-            path.ends_with(".md")
-                && !path.ends_with("/README.md")
-                && !path.ends_with("/_TEMPLATE.md")
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            if !path.ends_with(".md")
+                || path.ends_with("/README.md")
+                || path.ends_with("/_TEMPLATE.md")
+            {
+                return None;
+            }
+            let size = meta.split_whitespace().nth(3)?.parse::<usize>().ok()?;
+            Some((size, path))
         })
         .collect::<Vec<_>>();
-    paths.sort_unstable();
-    let mut stories = Vec::new();
-    for path in paths {
-        let object = format!("{}:{path}", member.canonical_ref);
-        let output = guarded_git(&root, &["show", &object])?;
-        if output.exit_code != 0 {
-            bail!(
-                "validation/gate: cannot read workspace member {} item {} at {}",
-                member.id,
-                path,
-                member.canonical_ref
-            )
-        }
-        let file = Path::new(path)
+    sized.sort_unstable_by_key(|(_, path)| *path);
+
+    let file_name = |path: &str| {
+        Path::new(path)
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .into_owned();
-        if let Some(story) = story_from_body(file, output.stdout) {
-            stories.push(story);
+            .into_owned()
+    };
+    let unreadable = |path: &str| {
+        anyhow::anyhow!(
+            "validation/gate: cannot read workspace member {} item {} at {}",
+            member.id,
+            path,
+            member.canonical_ref
+        )
+    };
+
+    let mut stories = Vec::new();
+    for chunk in size_bounded_chunks(&sized) {
+        match git_cat_file_batch(&root, &member.canonical_ref, &chunk) {
+            Some(blobs) => {
+                for (path, blob) in chunk.iter().zip(blobs) {
+                    let body = blob.ok_or_else(|| unreadable(path))?;
+                    if let Some(story) = story_from_body(file_name(path), body) {
+                        stories.push(story);
+                    }
+                }
+            }
+            // Framing did not line up. Correctness over speed: read each object on its own.
+            None => {
+                for path in chunk {
+                    let object = format!("{}:{path}", member.canonical_ref);
+                    let output = guarded_git(&root, &["show", &object])?;
+                    if output.exit_code != 0 {
+                        return Err(unreadable(path));
+                    }
+                    if let Some(story) = story_from_body(file_name(path), output.stdout) {
+                        stories.push(story);
+                    }
+                }
+            }
         }
     }
     Ok(stories)
@@ -15074,6 +15216,66 @@ mod tests {
             schema.to_string().contains("independent"),
             "the published schema must advertise it: {schema}"
         );
+    }
+
+    /// The guarded port truncates a child's output at 1 MiB, so an unbounded batch is silently
+    /// useless: the first version of this asked for all 5.5 MB of the flux member in one go, got a
+    /// truncated stream, failed to frame it and fell back to one process per file — measuring as no
+    /// improvement whatsoever while looking like it worked.
+    #[test]
+    fn batches_stay_inside_the_guarded_output_cap() {
+        let half = GIT_BATCH_BUDGET_BYTES / 2;
+        let sized = vec![
+            (half, "a.md"),
+            (half, "b.md"),
+            (half, "c.md"),
+            (half, "d.md"),
+            (half, "e.md"),
+        ];
+
+        let chunks = size_bounded_chunks(&sized);
+
+        assert!(
+            chunks.len() > 1,
+            "five half-budget files cannot be one batch"
+        );
+        for chunk in &chunks {
+            let bytes: usize = chunk
+                .iter()
+                .map(|path| sized.iter().find(|(_, p)| p == path).unwrap().0)
+                .sum();
+            assert!(
+                bytes <= GIT_BATCH_BUDGET_BYTES,
+                "a batch asked for {bytes} bytes, over the budget"
+            );
+        }
+        let flat: Vec<&str> = chunks.iter().flatten().copied().collect();
+        assert_eq!(
+            flat,
+            vec!["a.md", "b.md", "c.md", "d.md", "e.md"],
+            "chunking must not drop or reorder files"
+        );
+    }
+
+    /// One file bigger than the whole budget still has to be requested. It gets a batch to itself,
+    /// so it fails framing alone and the per-file fallback handles it without dragging every other
+    /// story in the member onto the slow path.
+    #[test]
+    fn an_oversized_file_is_isolated_rather_than_dropped() {
+        let sized = vec![
+            (16, "small-before.md"),
+            (GIT_BATCH_BUDGET_BYTES * 3, "huge.md"),
+            (16, "small-after.md"),
+        ];
+
+        let chunks = size_bounded_chunks(&sized);
+
+        assert!(
+            chunks.iter().any(|chunk| chunk == &vec!["huge.md"]),
+            "the oversized file must sit alone: {chunks:?}"
+        );
+        let flat: Vec<&str> = chunks.iter().flatten().copied().collect();
+        assert_eq!(flat.len(), 3, "nothing may be dropped: {chunks:?}");
     }
 
     /// The width is a ceiling, not a target.

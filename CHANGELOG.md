@@ -25,6 +25,19 @@ All notable changes to this project are documented in this file. The format is b
   coordinator operation takes the same `independent` flag, because the coordinator is the caller
   that actually chooses waves — a batch selector only a human can reach is one nothing uses.
 
+### Performance
+
+- **Board and fleet operations no longer re-read every story with its own process.** Resolving a
+  workspace member ran one `git show` per story file: across this workspace's four members that is
+  roughly 1,690 guarded process spawns on *every* board call, including `board get`, which needs
+  exactly one story and took over six seconds to return 759 bytes. Every native coordinator
+  operation paid it twice over, because each one shells out to a nested CLI that resolves the board
+  again. Reads now go through `git cat-file --batch`, chunked against the guarded port's 1 MiB
+  output cap using the blob sizes `git ls-tree -l` already reports. Measured on this board,
+  interleaved: `board get` **6.32s to 0.85s**. Chunking is the load-bearing part — an unbounded
+  batch is truncated by the cap, fails to frame, and silently falls back to the per-file path, which
+  is exactly what the first attempt did on the two largest members while looking like it worked.
+
 ### Fixed
 
 - **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every
