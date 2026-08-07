@@ -2,8 +2,7 @@
 id: C-543
 title: "Select the agent's loop from the TUI with a hotkey and a visualizing overlay"
 pillar: Core
-status: ready
-priority: 31
+status: done
 epic:
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-tui, flux-cli, flux-app]
@@ -36,7 +35,7 @@ leaving the TUI.
       explicit re-admission/new-session action or refuses.
 - [x] The selector reflects the live set of loop files — a loop added while the TUI runs appears
       without restart (this is what [C-544](C-544-create-agent-loops-by-prompting.md) relies on).
-- [ ] The gate is green in both workspaces.
+- [x] The gate is green in both workspaces.
 
 ## Progress
 

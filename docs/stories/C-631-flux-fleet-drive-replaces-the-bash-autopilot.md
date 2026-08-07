@@ -63,3 +63,8 @@ accumulation, dispatch width.
 ## Comments
 
 - Code shipped in 0.59.0 through wave-602; story stays open. The remaining acceptance item is operational and lives in the roadmap repository: delete the bash autopilot once drive reaches parity and point AUTOPILOT.md at the native command. Both drivers exist in this release, which is recorded in the CHANGELOG entry rather than left for a reader to discover.
+
+
+## Comments
+
+- Autopilot removal assessed and deliberately NOT done during the 0.59.0 cut. flux fleet drive exists in source (FleetAction::Drive, implemented and tested in board_fleet_cmd.rs) but not in the installed 0.58.0 binary — it ships IN 0.59.0. Parity therefore cannot have been demonstrated, the fleet is running now, and deleting the only invokable driver before its replacement is installable would remove working capability to satisfy a checkbox. AUTOPILOT.md carries the succession note and the unblock sequence: install 0.59.0, run drive, compare a full tick, then delete autopilot.sh and test_autopilot_parks.sh and rewrite the page.
