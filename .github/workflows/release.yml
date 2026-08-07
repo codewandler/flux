@@ -649,7 +649,13 @@ jobs:
     needs:
       - plan
       - host
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    # `always()` is load-bearing, not decoration. GitHub propagates `skipped` transitively down the
+    # needs graph, so `build-local-artifacts` skipping — which is exactly what promoting a prepared
+    # candidate is supposed to do — skips every job below it that does not break the chain itself.
+    # `host` breaks it; without the same treatment here the skip flows straight through a successful
+    # `host` into this job, and the run reports success having published nothing. That is how v0.59.0
+    # "shipped": plan, resolve and host green, every publish job skipped, no Release created.
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' }}
     runs-on: "ubuntu-22.04"
     permissions:
       contents: read
@@ -675,7 +681,9 @@ jobs:
       - plan
       - host
       - attest
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    # See `attest`: the chain must be broken at every hop. Both upstreams are still required to have
+    # actually succeeded — this admits a transitively-skipped graph, never a failed or skipped one.
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.attest.result == 'success' }}
     runs-on: "ubuntu-22.04"
     permissions:
       contents: read
@@ -768,7 +776,8 @@ jobs:
       - host
       - attest
       - publish-github-release
-    if: ${{ needs.plan.outputs.publishing == 'true' }}
+    # See `attest`. The Release itself must exist before an image claims to accompany it.
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' && needs.host.result == 'success' && needs.attest.result == 'success' && needs.publish-github-release.result == 'success' }}
     runs-on: "ubuntu-22.04"
     permissions:
       contents: read
@@ -891,3 +900,31 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  # C-719: a tag build that was supposed to publish and did not must be RED. Every job above can
+  # legitimately skip on some path, and GitHub reports a run whose jobs all skipped as `success` —
+  # so without this backstop "the release workflow passed" carries no information about whether a
+  # release exists. v0.47.0 published an empty Release; v0.59.0 published none at all, both green.
+  verify-published:
+    needs:
+      - plan
+      - publish-github-release
+    if: ${{ always() && needs.plan.outputs.publishing == 'true' }}
+    runs-on: "ubuntu-22.04"
+    permissions:
+      contents: read
+    steps:
+      - name: Refuse to report success without a published Release
+        env:
+          RELEASE_RESULT: ${{ needs.publish-github-release.result }}
+        run: |
+          if [ "$RELEASE_RESULT" != "success" ]; then
+            echo "::error::this run was publishing (tag ref) but publish-github-release was '$RELEASE_RESULT'; no Release exists for this tag"
+            {
+              echo "### Release refused"
+              echo "\`publish-github-release\` was \`$RELEASE_RESULT\`, so this tag has no Release."
+              echo "A skipped publish chain is a failure here, not a pass."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "publish-github-release succeeded; a Release exists for this tag"
