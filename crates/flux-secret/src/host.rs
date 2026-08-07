@@ -322,7 +322,10 @@ mod tests {
             ..HostRef::declared("vm-guest", backend)
         };
         let json = serde_json::to_string(&reference).unwrap();
-        assert!(json.contains("\"microvm\"") && json.contains("GUEST_TOKEN"), "{json}");
+        assert!(
+            json.contains("\"microvm\"") && json.contains("GUEST_TOKEN"),
+            "{json}"
+        );
         assert_eq!(
             serde_json::from_str::<HostRef>(&json).unwrap(),
             reference,

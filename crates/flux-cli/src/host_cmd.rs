@@ -591,7 +591,9 @@ impl flux_capabilities::HostProber for CliHostProber {
                     backend: host.backend.as_str().to_string(),
                 })
             }
-            HostBackend::Remote | HostBackend::Microvm => Arc::new(self.connect_remote(host).await?),
+            HostBackend::Remote | HostBackend::Microvm => {
+                Arc::new(self.connect_remote(host).await?)
+            }
         };
 
         match GuardedMetrics::read_metrics(&*substrate).await {

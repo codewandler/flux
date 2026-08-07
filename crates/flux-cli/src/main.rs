@@ -1940,8 +1940,8 @@ mod tests {
         // With a credential, admission gets as far as the protocol handshake and no further —
         // the identity check is what admits, so an unreachable guest is a `Connect` class and
         // never a report.
-        std::env::set_var("FLUX_C677_GUEST_TOKEN", "guest-token");
-        let credential = Some(flux_secret::Ref::env("FLUX_C677_GUEST_TOKEN"));
+        std::env::set_var("C677_GUEST_TOKEN", "guest-token");
+        let credential = Some(flux_secret::Ref::env("C677_GUEST_TOKEN"));
         for backend in [microvm, HostBackend::Remote] {
             match prober
                 .probe(&served(backend, credential.clone()))
@@ -1974,7 +1974,7 @@ mod tests {
             !text.contains("no selectable implementation"),
             "the merge-base refusal must be gone: {text}"
         );
-        std::env::remove_var("FLUX_C677_GUEST_TOKEN");
+        std::env::remove_var("C677_GUEST_TOKEN");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2020,10 +2020,7 @@ mod tests {
         ));
 
         for (label, system) in [
-            (
-                "an honest guest",
-                RemoteSystem::loopback(inner.clone()),
-            ),
+            ("an honest guest", RemoteSystem::loopback(inner.clone())),
             (
                 "a guest reporting the ordinary native kind of its own machine",
                 RemoteSystem::identified(

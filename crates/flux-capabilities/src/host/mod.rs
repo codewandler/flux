@@ -568,7 +568,10 @@ mod tests {
                 ..HostRef::declared("b", backend)
             };
             assert_eq!(binding_availability(&bare), static_availability(backend));
-            assert_eq!(binding_availability(&addressed), static_availability(backend));
+            assert_eq!(
+                binding_availability(&addressed),
+                static_availability(backend)
+            );
         }
     }
 
