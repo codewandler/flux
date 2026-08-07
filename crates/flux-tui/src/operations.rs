@@ -5,6 +5,7 @@
 //! `flux board` and `flux fleet`; this crate never parses repository Markdown, shells out, reads
 //! tmux, or captures ANSI output.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::iter::Peekable;
 use std::str::Chars;
@@ -70,6 +71,10 @@ pub struct BoardItemView {
     pub dependencies: Vec<String>,
     pub design: Option<String>,
     pub epic: Option<String>,
+    /// The story's own markdown prose — Goal, Acceptance, Notes — as the projection supplies it,
+    /// already stripped of frontmatter and bounded. `None` when the source has no body to hand
+    /// over: this crate never reads the repository to find one.
+    pub body: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -307,6 +312,13 @@ pub(crate) struct OperationsState {
     pub tab: OperationsTab,
     pub selected: usize,
     pub detail_open: bool,
+    /// First body row shown inside an expanded Board box.
+    pub body_scroll: usize,
+    /// Deepest scroll the expanded body actually has, as the last frame measured it.
+    ///
+    /// Only the renderer knows the wrap width, so only it can know where the body ends; recording
+    /// it here is what keeps keyboard scrolling from running past a bottom already on screen.
+    pub body_scroll_max: Cell<usize>,
     pub decision_option: usize,
     pub confirm_decision: bool,
     pub refresh_error: Option<String>,
@@ -332,6 +344,8 @@ impl OperationsState {
             tab: OperationsTab::Overview,
             selected: 0,
             detail_open: false,
+            body_scroll: 0,
+            body_scroll_max: Cell::new(0),
             decision_option: 0,
             confirm_decision: false,
             refresh_error: None,
@@ -351,6 +365,7 @@ impl OperationsState {
         self.tab = tab;
         self.selected = 0;
         self.detail_open = false;
+        self.body_scroll = 0;
         self.confirm_decision = false;
         self.decision_option = 0;
     }
@@ -389,8 +404,31 @@ impl OperationsState {
         }
         self.selected = (self.selected as isize + delta).clamp(0, len as isize - 1) as usize;
         self.detail_open = false;
+        self.body_scroll = 0;
         self.confirm_decision = false;
         self.decision_option = 0;
+    }
+
+    /// Whether a Board box is expanded, which is when the arrows scroll its body instead of moving
+    /// the selection.
+    pub(crate) fn board_body_expanded(&self) -> bool {
+        self.detail_open && self.tab == OperationsTab::Board
+    }
+
+    /// Scroll the expanded body, clamped to the bottom the last frame measured.
+    pub(crate) fn scroll_board_body(&mut self, delta: isize) {
+        let max = self.body_scroll_max.get() as isize;
+        self.body_scroll = (self.body_scroll as isize + delta).clamp(0, max) as usize;
+    }
+
+    /// What the Board pane is focused on, for the frame about to be painted.
+    pub(crate) fn board_focus(&self) -> BoardFocus<'_> {
+        BoardFocus {
+            selected: self.selected,
+            expanded: self.detail_open,
+            body_scroll: self.body_scroll,
+            bottom: &self.body_scroll_max,
+        }
     }
 
     pub(crate) fn selected_decision(&self) -> Option<&BoardDecisionView> {
@@ -446,6 +484,13 @@ impl OperationsState {
             KeyCode::Char('3') => self.select_tab(OperationsTab::Workers),
             KeyCode::Char('4') => self.select_tab(OperationsTab::Decisions),
             KeyCode::Char('5') => self.select_tab(OperationsTab::Stats),
+            // C-621: while a Board box is expanded the arrows scroll the story body inside it, so a
+            // long body never pushes the rest of the board away. These arms must precede the plain
+            // movement arms below — a guard only wins by being matched first.
+            KeyCode::Up if self.board_body_expanded() => self.scroll_board_body(-1),
+            KeyCode::Down if self.board_body_expanded() => self.scroll_board_body(1),
+            KeyCode::PageUp if self.board_body_expanded() => self.scroll_board_body(-10),
+            KeyCode::PageDown if self.board_body_expanded() => self.scroll_board_body(10),
             KeyCode::Up => self.move_selection(-1),
             KeyCode::Down => self.move_selection(1),
             KeyCode::PageUp => self.move_selection(-10),
@@ -469,7 +514,14 @@ impl OperationsState {
                     };
                 }
             }
-            KeyCode::Enter => self.detail_open = true,
+            KeyCode::Enter => {
+                // Expanding always starts at the top of the body, so a box reopened after being
+                // scrolled does not come back mid-paragraph.
+                if !self.detail_open {
+                    self.body_scroll = 0;
+                }
+                self.detail_open = true;
+            }
             KeyCode::Char('r') => return OperationsCommand::Refresh,
             _ => {}
         }
@@ -508,6 +560,32 @@ pub(crate) enum OperationsCommand {
 
 /// Terminal rows one collapsed Board box occupies: top border, one content row, bottom border.
 pub(crate) const BOARD_BOX_ROWS: usize = 3;
+
+/// Rows an expanded box spends on structure rather than story text: both borders, the title row,
+/// and the one metadata row.
+pub(crate) const BOARD_EXPANDED_CHROME_ROWS: usize = 4;
+
+/// Most body rows an expanded box shows at once. A story body is unbounded; the box is not, so a
+/// long body scrolls inside it instead of pushing the rest of the board off screen.
+pub(crate) const BOARD_EXPANDED_BODY_ROWS: usize = 14;
+
+/// What the Board pane is showing: which box is selected, whether it is expanded, and how far its
+/// body is scrolled. `bottom` is an out-parameter — the renderer records the deepest scroll the
+/// body has, because the wrap width it needs to know that exists only during rendering.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BoardFocus<'a> {
+    pub selected: usize,
+    pub expanded: bool,
+    pub body_scroll: usize,
+    pub bottom: &'a Cell<usize>,
+}
+
+/// Body rows an expanded box may claim in a viewport `height` rows tall.
+fn expanded_body_rows(height: usize) -> usize {
+    BOARD_EXPANDED_BODY_ROWS
+        .min(height.saturating_sub(BOARD_EXPANDED_CHROME_ROWS))
+        .max(1)
+}
 
 /// One status group of the Board pane, as a span over [`BoardPane`]'s ordering.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -567,6 +645,7 @@ impl<'a> BoardPane<'a> {
     }
 
     /// The item at `position` in board order, not in snapshot order.
+    #[cfg(test)]
     pub(crate) fn item(&self, position: usize) -> Option<&'a BoardItemView> {
         self.order.get(position).map(|index| &self.items[*index])
     }
@@ -581,21 +660,34 @@ impl<'a> BoardPane<'a> {
         headings + position * BOARD_BOX_ROWS
     }
 
-    /// Scroll so the selected box is fully visible; selection is the only paging state the pane
-    /// needs, so a refresh cannot leave the viewport somewhere the operator never scrolled to.
-    fn first_visible_row(&self, selected: usize, height: usize) -> usize {
-        if selected >= self.order.len() {
-            return 0;
+    /// Rows the box at `position` occupies — three when collapsed, chrome plus the bounded body
+    /// window when it is the expanded one.
+    fn box_rows(&self, position: usize, focus: &BoardFocus<'_>, height: usize) -> usize {
+        if focus.expanded && position == focus.selected {
+            BOARD_EXPANDED_CHROME_ROWS + expanded_body_rows(height)
+        } else {
+            BOARD_BOX_ROWS
         }
-        let bottom = self.row_of(selected) + BOARD_BOX_ROWS;
-        bottom.saturating_sub(height)
     }
 
-    /// Render at most `height` rows: group headings plus the collapsed boxes that intersect the
-    /// viewport. Items above or below it cost index arithmetic only.
+    /// Scroll so the selected box is fully visible; selection is the only paging state the pane
+    /// needs, so a refresh cannot leave the viewport somewhere the operator never scrolled to. An
+    /// expanded box keeps its top row on screen even when it claims the whole viewport — its body
+    /// scrolls inside it, so the header must never be the part that goes.
+    fn first_visible_row(&self, focus: &BoardFocus<'_>, height: usize) -> usize {
+        if focus.selected >= self.order.len() {
+            return 0;
+        }
+        let top = self.row_of(focus.selected);
+        let bottom = top + self.box_rows(focus.selected, focus, height);
+        top.min(bottom.saturating_sub(height))
+    }
+
+    /// Render at most `height` rows: group headings plus the boxes that intersect the viewport.
+    /// Items above or below it cost index arithmetic only.
     pub(crate) fn window_lines(
         &self,
-        selected: usize,
+        focus: &BoardFocus<'_>,
         snapshot: &FleetBoardSnapshot,
         theme: &Theme,
         width: usize,
@@ -605,7 +697,7 @@ impl<'a> BoardPane<'a> {
         if width == 0 || height == 0 {
             return lines;
         }
-        let first = self.first_visible_row(selected, height);
+        let first = self.first_visible_row(focus, height);
         let mut row = 0usize;
         'groups: for group in &self.groups {
             if row >= first {
@@ -626,12 +718,23 @@ impl<'a> BoardPane<'a> {
                     break 'groups;
                 }
                 let top = row;
-                row += BOARD_BOX_ROWS;
+                row += self.box_rows(position, focus, height);
                 let item = &self.items[self.order[position]];
                 let wave = fleet_wave_in_flight(snapshot, &item.board_ref);
-                let collapsed =
-                    collapsed_box(item, wave.as_deref(), position == selected, theme, width);
-                for (offset, line) in collapsed.into_iter().enumerate() {
+                let selected = position == focus.selected;
+                let painted = if selected && focus.expanded {
+                    expanded_box(
+                        item,
+                        wave.as_deref(),
+                        theme,
+                        width,
+                        expanded_body_rows(height),
+                        focus,
+                    )
+                } else {
+                    collapsed_box(item, wave.as_deref(), selected, theme, width)
+                };
+                for (offset, line) in painted.into_iter().enumerate() {
                     if top + offset < first {
                         continue;
                     }
@@ -735,10 +838,7 @@ fn collapsed_box(
     width: usize,
 ) -> Vec<Line<'static>> {
     let inner = width.saturating_sub(2);
-    let selected_style = Style::default()
-        .fg(theme.accent)
-        .bg(theme.sel_bg)
-        .add_modifier(Modifier::BOLD);
+    let selected_style = selected_box_style(theme);
     let border = if selected {
         selected_style
     } else {
@@ -760,6 +860,123 @@ fn collapsed_box(
         theme.warn_style()
     };
 
+    vec![
+        box_top_line(item, wave, border, head, flight, inner),
+        box_row(
+            vec![Span::styled(
+                truncate(&item.title, inner.saturating_sub(2)),
+                body,
+            )],
+            border,
+            body,
+            inner,
+        ),
+        box_bottom_line(None, border, border, inner),
+    ]
+}
+
+/// One expanded item: the collapsed chrome, the item's own planning metadata, and the story body
+/// rendered as markdown inside the box. The body window is bounded and scrolls in place, so the
+/// rest of the board keeps its rows.
+fn expanded_box(
+    item: &BoardItemView,
+    wave: Option<&str>,
+    theme: &Theme,
+    width: usize,
+    body_rows: usize,
+    focus: &BoardFocus<'_>,
+) -> Vec<Line<'static>> {
+    let inner = width.saturating_sub(2);
+    let text = inner.saturating_sub(2);
+    let border = selected_box_style(theme);
+    let pad = theme.panel_style();
+
+    let mut lines = vec![
+        box_top_line(item, wave, border, border, border, inner),
+        box_row(
+            vec![Span::styled(truncate(&item.title, text), border)],
+            border,
+            border,
+            inner,
+        ),
+        box_row(
+            vec![Span::styled(
+                truncate(
+                    &format!(
+                        "epic {} · design {} · depends on {}",
+                        item.epic.as_deref().unwrap_or("—"),
+                        item.design.as_deref().unwrap_or("—"),
+                        display_list(&item.dependencies)
+                    ),
+                    text,
+                ),
+                theme.muted_style(),
+            )],
+            border,
+            pad,
+            inner,
+        ),
+    ];
+    // Width-aware by construction. The story markdown wraps to the *text* column — the pane less
+    // both borders and both gutters — and a hard wrap catches what the layout could not break, such
+    // as a URL longer than the box. Wrapping to the pane width, or to the box interior, is exactly
+    // the `area_width`-versus-usable-columns off-by-one the transcript carried: it costs one
+    // character at every row boundary.
+    let rendered = match item
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        Some(body) => crate::wrap_styled_lines(
+            crate::markdown::render(body, inner as u16).lines,
+            inner as u16,
+        ),
+        None => vec![Line::styled(
+            truncate("this projection carries no story body", text),
+            theme.muted_style(),
+        )],
+    };
+    // The box is bounded; the body is not. Everything past the window scrolls in place, and the
+    // renderer is the only party that knows the wrap width, so it reports the bottom back.
+    let deepest = rendered.len().saturating_sub(body_rows);
+    focus.bottom.set(deepest);
+    let start = focus.body_scroll.min(deepest);
+    for line in rendered.iter().skip(start).take(body_rows) {
+        lines.push(box_row(line.spans.clone(), border, pad, inner));
+    }
+    for _ in rendered.len().saturating_sub(start)..body_rows {
+        lines.push(box_row(Vec::new(), border, pad, inner));
+    }
+    let hint = (deepest > 0).then(|| {
+        format!(
+            " rows {}–{} of {} ",
+            start + 1,
+            (start + body_rows).min(rendered.len()),
+            rendered.len()
+        )
+    });
+    lines.push(box_bottom_line(hint, border, theme.muted_style(), inner));
+    lines
+}
+
+fn selected_box_style(theme: &Theme) -> Style {
+    Style::default()
+        .fg(theme.accent)
+        .bg(theme.sel_bg)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The bordered top of a box: `id · status · priority` on the left, the Fleet in-flight marker
+/// flush right, box rule between them.
+fn box_top_line(
+    item: &BoardItemView,
+    wave: Option<&str>,
+    border: Style,
+    head: Style,
+    flight: Style,
+    inner: usize,
+) -> Line<'static> {
     let label = truncate(
         &format!(
             " {} · {} · {} ",
@@ -785,22 +1002,46 @@ fn collapsed_box(
         top.push(Span::styled(marker, flight));
     }
     top.push(Span::styled("┐", border));
+    Line::from(top)
+}
 
-    let title = truncate(&item.title, inner.saturating_sub(2));
-    let pad = inner.saturating_sub(title.width() + 1);
-    vec![
-        Line::from(top),
-        Line::from(vec![
-            Span::styled("│", border),
-            Span::styled(format!(" {title}{}", " ".repeat(pad)), body),
-            Span::styled("│", border),
-        ]),
-        Line::from(vec![
-            Span::styled("└", border),
-            Span::styled("─".repeat(inner), border),
-            Span::styled("┘", border),
-        ]),
-    ]
+/// One bordered content row: `spans` padded to the box's inner width, with a space of gutter on
+/// each side so no glyph ever touches a border. Every row a box paints is exactly `width` columns,
+/// which is what keeps a wrapped body from overflowing the pane.
+fn box_row(spans: Vec<Span<'static>>, border: Style, pad: Style, inner: usize) -> Line<'static> {
+    let used: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let fill = inner.saturating_sub(2).saturating_sub(used);
+    let mut row = vec![Span::styled("│", border), Span::styled(" ", pad)];
+    row.extend(spans);
+    row.push(Span::styled(" ".repeat(fill + 1), pad));
+    row.push(Span::styled("│", border));
+    Line::from(row)
+}
+
+/// The bordered bottom of a box, optionally carrying a right-aligned hint (the expanded body's
+/// position in a body too long to show at once).
+fn box_bottom_line(
+    hint: Option<String>,
+    border: Style,
+    hint_style: Style,
+    inner: usize,
+) -> Line<'static> {
+    let hint = hint
+        .map(|hint| truncate(&hint, inner))
+        .filter(|hint| !hint.is_empty());
+    let fill = inner.saturating_sub(hint.as_deref().map_or(0, UnicodeWidthStr::width));
+    let mut row = vec![Span::styled("└", border)];
+    if fill > 0 {
+        row.push(Span::styled("─".repeat(fill), border));
+    }
+    if let Some(hint) = hint {
+        row.push(Span::styled(hint, hint_style));
+    }
+    row.push(Span::styled("┘", border));
+    Line::from(row)
 }
 
 pub(crate) fn split_chat_area(area: Rect, state: &ChatState) -> (Rect, Option<Rect>) {
@@ -1076,7 +1317,9 @@ fn overlay_lines(
         }
         return lines;
     }
-    if ops.detail_open {
+    // C-621: the Board expands in place, inside the selected box, so it never leaves the list for
+    // a full-pane detail view the way the other tabs do.
+    if ops.detail_open && !ops.board_body_expanded() {
         return detail_lines(ops, theme, width);
     }
     let selected_style = Style::default()
@@ -1089,7 +1332,7 @@ fn overlay_lines(
     let mut rows = match ops.tab {
         OperationsTab::Overview => overview_lines(ops, theme, width),
         OperationsTab::Board => BoardPane::new(&ops.snapshot.items).window_lines(
-            ops.selected,
+            &ops.board_focus(),
             &ops.snapshot,
             theme,
             width,
@@ -1356,48 +1599,8 @@ fn detail_lines(ops: &OperationsState, theme: &Theme, width: usize) -> Vec<Line<
     ];
     match ops.tab {
         OperationsTab::Overview => return overview_lines(ops, theme, width),
-        OperationsTab::Board => {
-            // Detail resolves through the same board order the pane paints, so Enter opens the
-            // box the operator selected rather than a snapshot-order neighbour.
-            let pane = BoardPane::new(&ops.snapshot.items);
-            let Some(item) = pane.item(ops.selected) else {
-                return lines;
-            };
-            lines.extend([
-                Line::styled(item.board_ref.clone(), theme.accent_style()),
-                Line::styled(item.title.clone(), theme.panel_style()),
-                Line::styled(format!("status  {}", item.status), theme.panel_style()),
-                Line::styled(
-                    format!(
-                        "priority  {}",
-                        item.priority.map_or("—".into(), |v| v.to_string())
-                    ),
-                    theme.panel_style(),
-                ),
-                Line::styled(
-                    format!("dependencies  {}", display_list(&item.dependencies)),
-                    theme.panel_style(),
-                ),
-                Line::styled(
-                    format!("epic  {}", item.epic.as_deref().unwrap_or("—")),
-                    theme.panel_style(),
-                ),
-                Line::styled(
-                    format!("design  {}", item.design.as_deref().unwrap_or("—")),
-                    theme.panel_style(),
-                ),
-            ]);
-            if !item.dependencies.is_empty() {
-                lines.push(Line::raw(""));
-                lines.push(Line::styled("dependency graph", theme.accent_style()));
-                for dependency in &item.dependencies {
-                    lines.push(Line::styled(
-                        truncate(&format!("  {dependency} → {}", item.board_ref), width),
-                        theme.panel_style(),
-                    ));
-                }
-            }
-        }
+        // C-621: the Board's detail is its expanded box, painted in place by [`BoardPane`].
+        OperationsTab::Board => return lines,
         OperationsTab::Workers => {
             let Some(worker) = ops.snapshot.workers.get(ops.selected) else {
                 return lines;
@@ -1756,6 +1959,7 @@ mod tests {
             dependencies: Vec::new(),
             design: Some("board-fleet-tui".into()),
             epic: Some("board-fleet-tui".into()),
+            body: None,
         }];
         value.items_total = 1;
         value.decisions = vec![BoardDecisionView {
@@ -1858,6 +2062,7 @@ mod tests {
                 dependencies: Vec::new(),
                 design: None,
                 epic: None,
+                body: None,
             }
         }
         let mut value = snapshot();
@@ -1971,12 +2176,18 @@ mod tests {
                 dependencies: Vec::new(),
                 design: None,
                 epic: None,
+                body: None,
             })
             .collect();
         value.items_total = value.items.len();
         let state = ChatState::new("mock".into());
         let pane = BoardPane::new(&value.items);
         assert_eq!(pane.order.len(), 1_200);
+        // Board order, not snapshot order: the lowest-priority ready item leads.
+        assert_eq!(
+            pane.item(0).map(|item| item.board_ref.as_str()),
+            Some("flux/C-0")
+        );
         assert_eq!(
             pane.groups
                 .iter()
@@ -1986,14 +2197,15 @@ mod tests {
         );
 
         // A 24-row viewport builds 24 rows, not 1200 boxes.
-        let head = pane.window_lines(0, &value, &state.theme, 80, 24);
+        let bottom = Cell::new(0);
+        let head = pane.window_lines(&focus(0, false, 0, &bottom), &value, &state.theme, 80, 24);
         assert_eq!(head.len(), 24, "the viewport bounds the rows built");
         let head_text = pane_text(&head);
         assert!(head_text.contains("item 0000"), "{head_text}");
         assert!(!head_text.contains("item 0100"), "{head_text}");
 
         // Selecting deep into the board pages to it rather than materializing everything above.
-        let deep = pane.window_lines(400, &value, &state.theme, 80, 24);
+        let deep = pane.window_lines(&focus(400, false, 0, &bottom), &value, &state.theme, 80, 24);
         assert_eq!(deep.len(), 24);
         let deep_text = pane_text(&deep);
         assert!(deep_text.contains("item 0800"), "{deep_text}");
@@ -2128,5 +2340,213 @@ mod tests {
                 outcome: "strict".into(),
             }
         );
+    }
+
+    /// The pane focus for one rendering, with the scroll bottom the renderer writes back.
+    fn focus(
+        selected: usize,
+        expanded: bool,
+        body_scroll: usize,
+        bottom: &Cell<usize>,
+    ) -> BoardFocus<'_> {
+        BoardFocus {
+            selected,
+            expanded,
+            body_scroll,
+            bottom,
+        }
+    }
+
+    /// One item carrying a story body, which is the only thing the expanded box renders.
+    fn item_with_body(board_ref: &str, body: &str) -> BoardItemView {
+        BoardItemView {
+            board_ref: board_ref.into(),
+            title: format!("story {board_ref}"),
+            status: "ready".into(),
+            priority: Some(21),
+            dependencies: vec!["flux/C-620".into()],
+            design: Some("docs/designs/tui-board-surface.md".into()),
+            epic: Some("tui-board-surface".into()),
+            body: Some(body.into()),
+        }
+    }
+
+    /// Display columns one painted row occupies.
+    fn row_width(line: &Line<'_>) -> usize {
+        line.spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum()
+    }
+
+    /// A box row's text, borders and gutters removed.
+    fn box_text(line: &Line<'_>) -> Option<String> {
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let inner = text.strip_prefix('│')?.strip_suffix('│')?;
+        Some(inner.trim().to_string())
+    }
+
+    /// Failing first (C-621): a body whose wrapped rows land *exactly* on the box's usable width is
+    /// where the transcript's `area_width`-versus-usable-columns off-by-one dropped one character
+    /// per row. Sixteen six-column words wrap to two rows of exactly 55 columns inside a 59-column
+    /// pane, so any confusion between the pane width, the box interior and the text column loses a
+    /// character at the row boundary or overflows the border.
+    #[test]
+    fn an_expanded_body_wraps_on_the_box_boundary_without_losing_a_character() {
+        const WIDTH: usize = 59;
+        let words: Vec<String> = (0..16).map(|index| format!("w{index:05}")).collect();
+        let body = words.join(" ");
+        let mut value = snapshot();
+        value.items = vec![item_with_body("flux/C-621", &body)];
+        value.items_total = 1;
+        let state = ChatState::new("mock".into());
+        let pane = BoardPane::new(&value.items);
+        let bottom = Cell::new(0);
+        let lines = pane.window_lines(&focus(0, true, 0, &bottom), &value, &state.theme, WIDTH, 24);
+
+        // No horizontal overflow and no short row: every row the box paints is exactly the pane.
+        for line in &lines {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            if text.starts_with(['┌', '│', '└']) {
+                assert_eq!(
+                    row_width(line),
+                    WIDTH,
+                    "box row is the pane width: {text:?}"
+                );
+            }
+        }
+
+        // Continuity across the row boundary: the words survive in order, none clipped or dropped.
+        let flowed = lines
+            .iter()
+            .filter_map(box_text)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flowed.contains(&body),
+            "the wrapped body is continuous across rows:\n{flowed}"
+        );
+    }
+
+    #[test]
+    fn an_expanded_body_renders_headings_lists_checkboxes_and_code_as_markdown() {
+        let body = "## Goal\n\nplain prose sentence\n\n## Acceptance\n\n- [x] first is done\n- [ ] second is open\n\n```text\nfenced code\n```\n";
+        let mut value = snapshot();
+        value.items = vec![item_with_body("flux/C-621", body)];
+        value.items_total = 1;
+        let state = ChatState::new("mock".into());
+        let pane = BoardPane::new(&value.items);
+        let bottom = Cell::new(0);
+        let lines = pane.window_lines(&focus(0, true, 0, &bottom), &value, &state.theme, 72, 30);
+        let text = pane_text(&lines);
+
+        // Acceptance checkboxes keep the state that decides whether the story is complete.
+        assert!(text.contains("[x] first is done"), "{text}");
+        assert!(text.contains("[ ] second is open"), "{text}");
+        // Fenced code keeps its gutter, so it is visually distinct from prose.
+        assert!(text.contains("▎"), "{text}");
+
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .find(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap_or_else(|| panic!("{needle} missing from\n{text}"))
+        };
+        // The style of a row's first story glyph — past the border and its gutter.
+        let content_style = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .find(|span| !span.content.contains('│') && !span.content.trim().is_empty())
+                .map(|span| span.style)
+                .unwrap()
+        };
+        // A heading is styled, prose is not: the body reads as structure rather than as a wall.
+        let heading = content_style(row("Goal"));
+        let prose = content_style(row("plain prose sentence"));
+        assert_ne!(heading, prose, "heading and prose share a style\n{text}");
+        assert!(
+            heading.add_modifier.contains(Modifier::BOLD),
+            "heading is emphasized\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_long_expanded_body_scrolls_inside_the_box_instead_of_pushing_the_board_off_screen() {
+        let body = (0..80)
+            .map(|index| format!("line {index:03} of the story body"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut value = snapshot();
+        value.items = vec![
+            item_with_body("flux/C-621", &body),
+            item_with_body("flux/C-622", "the next story"),
+        ];
+        value.items_total = 2;
+        let state = ChatState::new("mock".into());
+        let pane = BoardPane::new(&value.items);
+        let bottom = Cell::new(0);
+        let top = pane.window_lines(&focus(0, true, 0, &bottom), &value, &state.theme, 72, 26);
+        let top_text = pane_text(&top);
+
+        // The box is bounded: the item below the expanded one still has its rows.
+        assert!(top.len() <= 26, "the viewport bounds the rows built");
+        assert!(top_text.contains("flux/C-622"), "{top_text}");
+        assert!(top_text.contains("line 000"), "{top_text}");
+        assert!(!top_text.contains("line 079"), "{top_text}");
+
+        // The renderer reports a real bottom, and scrolling moves the window inside the box only.
+        assert!(
+            bottom.get() > 0,
+            "a longer body than the box records a bottom"
+        );
+        let scrolled = pane.window_lines(
+            &focus(0, true, bottom.get(), &bottom),
+            &value,
+            &state.theme,
+            72,
+            26,
+        );
+        let scrolled_text = pane_text(&scrolled);
+        assert_eq!(scrolled.len(), top.len(), "the box keeps its height");
+        assert!(scrolled_text.contains("line 079"), "{scrolled_text}");
+        assert!(!scrolled_text.contains("line 000"), "{scrolled_text}");
+        assert!(scrolled_text.contains("flux/C-622"), "{scrolled_text}");
+    }
+
+    #[test]
+    fn scrolling_an_expanded_body_stops_at_the_bottom_the_last_frame_measured() {
+        let mut state = OperationsState::new(attention_snapshot());
+        state.select_tab(OperationsTab::Board);
+        state.detail_open = true;
+        assert!(state.board_body_expanded());
+
+        state.body_scroll_max.set(3);
+        state.scroll_board_body(10);
+        assert_eq!(
+            state.body_scroll, 3,
+            "scrolling stops at the measured bottom"
+        );
+        state.scroll_board_body(-10);
+        assert_eq!(state.body_scroll, 0, "and at the top");
+
+        // Moving the selection collapses the box and rewinds its body.
+        state.body_scroll = 2;
+        state.move_selection(1);
+        assert!(!state.detail_open);
+        assert_eq!(state.body_scroll, 0);
     }
 }

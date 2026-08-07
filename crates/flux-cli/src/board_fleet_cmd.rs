@@ -2667,6 +2667,9 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         const MAX_GOALS: usize = 100;
         const MAX_HISTORY_DAYS: usize = 120;
         const MAX_ITEM_LINKS: usize = 50;
+        /// Story prose the TUI may render inside one expanded box. A story body is a page, not a
+        /// document; this keeps a projection of 200 items bounded.
+        const MAX_ITEM_BODY: usize = 4_000;
         const MAX_DECISION_OPTIONS: usize = 20;
 
         let state = read_fleet_state(&self.root)?;
@@ -2764,6 +2767,11 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                     .as_deref()
                     .map(|value| bounded_text(value, 500)),
                 epic: story.epic.as_deref().map(|value| bounded_text(value, 500)),
+                // C-621: the expanded box renders this as markdown. The frontmatter is dropped —
+                // the box header already carries id, status and priority — and the prose is
+                // bounded like every other projected field.
+                body: Some(bounded_text(story_prose(&story.body), MAX_ITEM_BODY))
+                    .filter(|body| !body.trim().is_empty()),
             })
             .collect::<Vec<_>>();
         items.sort_by(|left, right| {
@@ -6478,6 +6486,25 @@ fn story_from_body(file: String, body: String) -> Option<Story> {
         dependencies: parse_list(fm.get("depends_on").or_else(|| fm.get("dependencies"))),
         body,
     })
+}
+
+/// A story's prose, without the frontmatter block above it.
+///
+/// The expanded Board box renders this as markdown; frontmatter is metadata the box header already
+/// carries, and rendering it as a `---` thematic break would be noise.
+fn story_prose(body: &str) -> &str {
+    let mut lines = body.split_inclusive('\n');
+    let mut offset = match lines.next() {
+        Some(first) if first.trim() == "---" => first.len(),
+        _ => return body,
+    };
+    for line in lines {
+        offset += line.len();
+        if line.trim() == "---" {
+            return body[offset..].trim_start();
+        }
+    }
+    body
 }
 
 fn parse_frontmatter(text: &str) -> BTreeMap<String, String> {
@@ -18522,6 +18549,20 @@ mod tests {
             .any(|worker| worker.activity.first().map(String::as_str)
                 == Some("tool_result · read · ok")));
         assert_eq!(snapshot.items_total, 2);
+        // C-621: the projection hands the TUI the story's own prose, frontmatter dropped, so an
+        // expanded box renders the contract rather than the metadata its header already carries.
+        let active = snapshot
+            .items
+            .iter()
+            .find(|item| item.board_ref.ends_with("C-1"))
+            .expect("the active story is projected");
+        let body = active.body.as_deref().expect("its story body is projected");
+        assert!(body.starts_with("# Active story"), "{body}");
+        assert!(body.contains("- [ ] visible"), "{body}");
+        assert!(
+            !body.contains("id: C-1"),
+            "frontmatter is not prose: {body}"
+        );
         assert_eq!(snapshot.blocked_items, 1);
         assert_eq!(snapshot.decisions_total, 1);
         assert_eq!(snapshot.decisions[0].decision_ref, "workspace/D-1");
