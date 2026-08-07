@@ -27,25 +27,10 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Performance
 
-- **Fleet workers share one compilation cache instead of each compiling the same graph from
-  scratch.** Every worker in a wave branches from the same pinned base, so at width eight they
-  compile a near-identical dependency graph eight times. The sharing cannot be a common
-  `CARGO_TARGET_DIR` — cargo locks one exclusively, turning the wave back into a queue — nor a
-  copied warm target directory, which costs real bytes on a filesystem without reflink support. A
-  worker now runs under `sccache` against a fleet-owned cache with separate target directories, so
-  identical `rustc` invocations are served rather than repeated. Worker builds also drop to
-  `line-tables-only` debug info, which attacks what the cache cannot: sccache caches compilation
-  but never linking, and full debug info dominates both link time and the on-disk size that
-  actually caps how many workers fit. Both are set through the per-worker environment, so an
-  operator's own rebuilds keep incremental compilation, full debug info and no wrapper. A missing
-  `sccache` degrades instead of failing, and records `worker.build-cache.unavailable` — a silently
-  disabled fast path is indistinguishable from a working one.
-  The cache is also warmed once per wave, before any worker is dispatched: every worktree in a
-  wave sits on the same base commit, so one compile in the base-pinned `verify` checkout populates
-  the cache for all of them. Otherwise the first worker pays the whole cold cost while its siblings
-  duplicate it in parallel, contending for the same cores — the wave's slowest possible shape.
-  Warming is best-effort and records `wave.build-cache.warmed`; a warm that fails is reported and
-  ignored, because an optimisation that can stop a wave is a liability.
+- **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
+  time and the on-disk size that actually caps how many workers fit, and a worker's build output
+  exists only to explain a failing test — file and line in a panic is all of it that is ever read.
+  Set through the per-worker environment, so an operator's own rebuilds keep full debug info.
 
 - **Board and fleet operations no longer re-read every story with its own process.** Resolving a
   workspace member ran one `git show` per story file: across this workspace's four members that is
