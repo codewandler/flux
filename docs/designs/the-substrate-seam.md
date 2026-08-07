@@ -66,6 +66,35 @@ family→backend mapping instead; and composing two separately granted bindings 
 authority neither grant intended — a sandboxed locus with host egress is exactly the hole the
 sandbox was meant to close. That decision belongs in the roadmap repository beside 0018.
 
+## Endpoints and datasources across the boundary
+
+A host says *where* an effect happens. An endpoint says *what service, and where its credential
+lives*. A datasource is the governed read over such a service. The three compose, and the
+composition is missing exactly one thing at each joint.
+
+Discovery itself is already brokered and pluggable — `EndpointBroker` fans an `endpoint.discover`
+query across provider plugins, the kubernetes provider already returns Services, Ingresses and
+crossplane/RDS-derived database endpoints as weak references with `kubernetes/<ns>/<secret>/<key>`
+credential locations, and `flux endpoint import --from-json` persists one. So discover → import →
+use is a closed loop today. What the loop drops is **locality**.
+
+- **`EndpointRef` records no host.** `postgres://db.default.svc.cluster.local:5432` is meaningless
+  on a laptop and exactly right inside the cluster, and the record cannot tell them apart — so the
+  guard resolves the name on the wrong machine, the private-network grant that admits it is
+  caller-wide rather than the binding's, and an imported record is no more useful than a typed
+  URL. **C-709.**
+- **Discovery has no vantage.** A query answers "what can be discovered", implicitly from wherever
+  the provider ran. A host binding *is* a vantage point, and scoping a query to one makes "what
+  does my dev cluster see" askable and its answer attributable. **C-715.**
+- **A datasource has no locality.** `LiveDatasource` receives a `ToolContext` that carries the
+  selected substrate and is required to do its IO through guarded surfaces, so the machinery
+  exists — but nothing ties the connection to the substrate its endpoint is reachable from.
+  **C-716.**
+
+Together they make one sentence true: the host is where the connection is made from, the endpoint
+is what is connected to, and the grant is who may. Each of the three is small on its own and none
+of them is coherent without the others.
+
 ## Candidate families not yet filed
 
 Verified absent from the tree, listed so the next reader does not re-derive them: a **PTY /
