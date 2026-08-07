@@ -1,10 +1,12 @@
-//! The agent-facing host ops over the session [`HostRegistry`] (Decision 0018 / C-649):
-//! `host.list` / `host.info` / `host.probe`.
+//! The agent-facing host ops over the session [`HostRegistry`] (Decision 0018 / C-649, C-654):
+//! `host.list` / `host.info` / `host.probe` / `host.metrics`.
 //!
 //! `list` and `info` are read-only views of the registered bindings; `probe` performs the
-//! backend's side-effect-free identity check through the injected [`HostProber`]. Everything the
-//! agent sees is a weak reference — backend kind, bare address, labels and a credential
-//! *presence* marker, never a value. The pack registers at
+//! backend's side-effect-free identity check and `metrics` its bounded self-measurement, both
+//! through the injected [`HostProber`]. Everything the agent sees of a *binding* is a weak
+//! reference — backend kind, bare address, labels and a credential *presence* marker, never a
+//! value; what it sees of a *substrate* is typed readings, where a metric that substrate cannot
+//! measure is explicitly unavailable rather than zero. The pack registers at
 //! [`OperationPlacement::LocalControlPlane`]: host bindings are session substrate state the local
 //! coordinator owns, and they must stay operable precisely when a non-native substrate is
 //! selected (hiding them there would make the selected binding uninspectable).
@@ -21,23 +23,24 @@ use flux_runtime::{
 use flux_secret::host::HostRecord;
 use flux_spec::{AccessKind, ToolSpec};
 
-use super::{static_availability, HostProber, HostRegistry};
+use super::{render_metric_answer, static_availability, HostMetrics, HostProber, HostRegistry};
 
-/// The group all three host ops belong to (surfaced by the session-ambient `host` signal the CLI
+/// The group every host op belongs to (surfaced by the session-ambient `host` signal the CLI
 /// injects when bindings are declared). Shared so the op specs and the group manifest can't drift.
 pub const HOST_GROUP: &str = "host";
 
-/// The three host ops over `hosts` + `prober`, as a tool vec (the form a surface registers into
-/// an agent/app registry).
+/// The host ops over `hosts` + `prober`, as a tool vec (the form a surface registers into an
+/// agent/app registry).
 pub fn host_tools(hosts: Arc<HostRegistry>, prober: Arc<dyn HostProber>) -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(ListOp(hosts.clone())) as Arc<dyn Tool>,
         Arc::new(InfoOp(hosts.clone())),
-        Arc::new(ProbeOp(hosts, prober)),
+        Arc::new(ProbeOp(hosts.clone(), prober.clone())),
+        Arc::new(MetricsOp(hosts, prober)),
     ]
 }
 
-/// Register all three host ops into `registry`.
+/// Register every host op into `registry`.
 pub fn register_host_ops(
     registry: &mut ToolRegistry,
     hosts: Arc<HostRegistry>,
@@ -266,6 +269,95 @@ impl Tool for ProbeOp {
     }
 }
 
+/// `host.metrics` — the binding's bounded read of its **own** substrate (Decision 0018 rule 6).
+///
+/// Same placement as the rest of the pack, and for a reason worth stating: this describes a
+/// *binding*, not the substrate the current turn is executing on. An agent must be able to ask how
+/// the build farm is doing while its own effects are landing somewhere else entirely, which is
+/// precisely what `LocalControlPlane` preserves.
+struct MetricsOp(Arc<HostRegistry>, Arc<dyn HostProber>);
+
+#[async_trait]
+impl Tool for MetricsOp {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::read_only(
+            "host.metrics",
+            "Read one named host binding's own condition: CPU, load, memory, swap, disk, uptime, \
+             temperature and fans, measured by that substrate about itself. Values are typed and \
+             unit-bearing; a metric the substrate cannot measure is reported as explicitly \
+             unavailable with a reason, never as zero. A remote binding's readings are marked as \
+             remotely reported.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "Binding name to measure"}
+                },
+                "required": ["id"]
+            }),
+        )
+        // Reaching a remote binding is network egress, and reading a local one touches this
+        // machine — the same pair `host.probe` declares, for the same two reasons.
+        .with_access(vec![AccessKind::Network, AccessKind::LocalSystem])
+        .with_group(HOST_GROUP)
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        params
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_default()
+    }
+
+    fn authority_requirements(
+        &self,
+        params: &Value,
+        _subjects: &[String],
+    ) -> Result<Vec<AuthorityRequirement>> {
+        let subject = host_subject(params);
+        Ok(vec![
+            AuthorityRequirement::network_fetch(subject.clone()),
+            AuthorityRequirement::host_read(subject),
+        ])
+    }
+
+    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+        let id = req_str("host.metrics", &params, "id")?;
+        let Some(record) = self.0.get(&id) else {
+            let known = self.0.known_names();
+            return Ok(ToolResult::ok(if known.is_empty() {
+                format!("no host binding `{id}` (none declared)")
+            } else {
+                format!("no host binding `{id}`; known: {}", known.join(", "))
+            }));
+        };
+        match self.1.read_metrics(&record.host).await {
+            Ok(HostMetrics::Served {
+                remotely_reported,
+                answers,
+            }) => {
+                let mut lines = vec![format!(
+                    "{id}: {} reading(s){}",
+                    answers.len(),
+                    if remotely_reported {
+                        " (remotely reported by the serving substrate)"
+                    } else {
+                        " (observed locally)"
+                    }
+                )];
+                lines.extend(answers.iter().map(render_metric_answer));
+                Ok(ToolResult::ok(lines.join("\n")))
+            }
+            // The two negatives stay apart all the way out to the model: "serves nothing" is not
+            // "has no instrument", and neither is a zero.
+            Ok(HostMetrics::Unserved { detail }) => Ok(ToolResult::ok(format!(
+                "{id}: this substrate does not serve host metrics — {detail}"
+            ))),
+            Err(failure) => Ok(ToolResult::ok(format!("{id}: metrics failed — {failure}"))),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +466,114 @@ mod tests {
             .await
             .unwrap();
         assert!(out.content.contains("known: build-farm"), "{}", out.content);
+    }
+
+    /// C-654, acceptance 3: the metrics read joins the ambient-gated `host.*` group, and it carries
+    /// the same deliberate `LocalControlPlane` placement as the rest of the pack — a binding has to
+    /// stay measurable precisely when the turn's effects are landing on a different substrate.
+    #[test]
+    fn the_host_group_carries_the_metrics_read_at_the_packs_placement() {
+        let hosts = Arc::new(HostRegistry::new());
+        let prober = Arc::new(StaticProber(Ok(ok_report())));
+        let names: Vec<String> = host_tools(hosts.clone(), prober.clone())
+            .iter()
+            .map(|tool| tool.spec().name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "host.metrics"),
+            "the host pack must expose the metrics seam: {names:?}"
+        );
+
+        let mut registry = ToolRegistry::new();
+        try_register_host_ops(&mut registry, hosts, prober).expect("the pack registers");
+        assert_eq!(
+            registry.declared_placement("host.metrics"),
+            Some(OperationPlacement::LocalControlPlane),
+            "the metrics read describes a *binding*, not the selected substrate"
+        );
+    }
+
+    /// C-654, acceptance 2 and 3: the op renders typed readings, marks the readings a remote
+    /// binding reported as such, and renders an instrument this machine lacks as explicitly
+    /// unavailable — never as a zero a reader would take for a measurement.
+    #[tokio::test]
+    async fn the_metrics_op_renders_typed_readings_and_explicit_unavailability() {
+        use flux_system::metrics::{
+            MemoryUsage, MetricAnswer, MetricKind, MetricReading, MetricSnapshot, MetricUnavailable,
+        };
+
+        struct Measuring;
+        #[async_trait]
+        impl HostProber for Measuring {
+            async fn probe(
+                &self,
+                _host: &HostRef,
+            ) -> std::result::Result<HostProbeReport, HostProbeFailure> {
+                unreachable!("this prober is only asked for metrics")
+            }
+
+            async fn read_metrics(
+                &self,
+                _host: &HostRef,
+            ) -> std::result::Result<HostMetrics, HostProbeFailure> {
+                Ok(HostMetrics::Served {
+                    remotely_reported: true,
+                    answers: vec![
+                        MetricAnswer::Served(MetricSnapshot {
+                            sampled_at: std::time::UNIX_EPOCH
+                                + std::time::Duration::from_millis(1_700_000_000_000),
+                            reading: MetricReading::Memory(MemoryUsage {
+                                total_bytes: 16 * 1024 * 1024 * 1024,
+                                available_bytes: 4 * 1024 * 1024 * 1024,
+                                used_bytes: 12 * 1024 * 1024 * 1024,
+                            }),
+                            remotely_reported: true,
+                        }),
+                        MetricAnswer::unavailable_for(
+                            MetricKind::FanSpeed,
+                            MetricUnavailable::NoInstrument,
+                        ),
+                    ],
+                })
+            }
+        }
+
+        let tools = host_tools(registry(), Arc::new(Measuring));
+        let metrics = tools
+            .iter()
+            .find(|tool| tool.spec().name == "host.metrics")
+            .expect("the metrics op is registered");
+        let text = metrics
+            .execute(&ctx(), json!({"id": "build-farm"}))
+            .await
+            .unwrap()
+            .content;
+
+        assert!(text.contains("memory: 12.0 GiB used of 16.0 GiB"), "{text}");
+        assert!(
+            text.contains("remotely reported"),
+            "a remote binding's readings must carry their provenance: {text}"
+        );
+        assert!(
+            text.contains("fan: unavailable — this substrate has no such instrument"),
+            "an absent instrument must say so rather than render as a measurement: {text}"
+        );
+        assert!(
+            !text.contains("fan: 0"),
+            "an absent instrument must never render as zero: {text}"
+        );
+
+        // A substrate that serves no metrics at all is the *other* negative, and stays distinct.
+        let bare = host_tools(registry(), Arc::new(StaticProber(Ok(ok_report()))));
+        let text = bare
+            .iter()
+            .find(|tool| tool.spec().name == "host.metrics")
+            .unwrap()
+            .execute(&ctx(), json!({"id": "build-farm"}))
+            .await
+            .unwrap()
+            .content;
+        assert!(text.contains("does not serve host metrics"), "{text}");
     }
 
     #[test]

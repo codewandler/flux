@@ -314,6 +314,7 @@ availability and a credential *presence* marker — never a value.
 | `host.list` | | List the session's named execution-substrate bindings |
 | `host.info` | `id` | Inspect one host binding: backend kind, address, availability, labels |
 | `host.probe` | `id` | Side-effect-free identity check: substrate identity and, for a remote backend, the negotiated protocol version |
+| `host.metrics` | `id` | The binding's own condition — CPU, load, memory, swap, disk, uptime, temperature, fans — as typed readings; an unmeasurable metric is explicitly unavailable, never zero |
 
 ## Agent-invoked commands and skills
 

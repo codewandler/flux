@@ -98,6 +98,7 @@ optional arguments are in `[brackets]`.
 | `host.list` | | Low | The named execution-substrate bindings registered this session (`[[host]]` config + hosts store): backend kind, address, availability — weak references only |
 | `host.info` | `id` | Low | One host binding in full by name: backend kind, address, availability, labels and a credential *presence* marker; never a value |
 | `host.probe` | `id` | Low | The backend's side-effect-free identity check: substrate identity (kind, workspace, confinement, remotely_reported) and, for a remote backend, the negotiated protocol version — nothing executes on the substrate |
+| `host.metrics` | `id` | Low | One binding's own condition, measured by that substrate about itself: CPU, load, memory, swap, disk, uptime, temperature, fans. Typed and unit-bearing; a metric it cannot measure is explicitly unavailable with a reason, never zero; a remote binding's readings are marked remotely reported |
 | `flux_reload` | | High | **`--dev` only**: recompile `flux-cli` in place. The new binary lands on disk but this session keeps the old one, so it returns instructions to exit and re-run with `--resume`; it never replaces the running process (C-57) |
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,

@@ -3990,9 +3990,23 @@ impl Exec for Double {}
                 "GuardedNetwork",
                 "RemoteSystem",
             ),
-            // C-653: an empty impl, so every metrics operation inherits `port.rs`'s `Unserved`
-            // denial. A delegating backend may not improvise a wire operation; C-654 is where the
-            // protocol gains one, and that commit replaces this entry with a delegating impl.
+            // C-654: metrics now delegate, under the protocol version bump C-653 said they would
+            // need. Reviewable on the same grounds as the families above — the backend measures
+            // nothing itself, it asks the far side and relays the answer — plus two obligations
+            // this family alone carries, both of which are about *not trusting the reporter*:
+            //
+            // - The reading is re-bounded through `metrics::bounded_reading` on the way out. The
+            //   caps on labels, mounts and sensors are a construction-site convention over public
+            //   fields, not a type invariant, so a delegate could otherwise hand back a reading no
+            //   local reader would produce. The HTTPS decoder bounds too; that is depth, not a
+            //   substitute, because `Delegate` is implementable by anyone.
+            // - `remotely_reported` is stamped here rather than read off the answer. A far side
+            //   that could set it to `false` would be asserting that this process observed the
+            //   number — the exact substitution `SubstrateIdentity` exists to prevent.
+            //
+            // What must not drift: the two negatives stay distinct (`Unserved` = serves no metrics
+            // at all; `Unavailable` = serves the family, no such instrument), and neither ever
+            // becomes a zero.
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedMetrics",

@@ -1387,6 +1387,125 @@ mod tests {
         assert_eq!(reg.known_names(), ["build-farm", "here"]);
     }
 
+    /// C-654, acceptance 2: `flux host metrics <name>` is a real command, and JSON is its
+    /// automation API rather than a scrape of the human rendering.
+    #[test]
+    fn host_metrics_is_a_command_whose_json_output_is_the_automation_api() {
+        use super::{AgentOutput, Cli, Commands, HostAction};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["flux", "host", "metrics", "build-farm"])
+            .expect("`flux host metrics <name>` parses");
+        match cli.command {
+            Some(Commands::Host {
+                action: HostAction::Metrics { id, output },
+            }) => {
+                assert_eq!(id, "build-farm");
+                assert!(matches!(output, AgentOutput::Human));
+            }
+            other => panic!("expected the host metrics action, got {other:?}"),
+        }
+        Cli::try_parse_from(["flux", "host", "metrics", "build-farm", "--output", "json"])
+            .expect("`--output json` is the automation API");
+    }
+
+    /// C-654, acceptance 2 and 4: the command renders what the substrate measured, keeps an
+    /// instrument this machine lacks explicitly unavailable rather than zero, and marks a remote
+    /// binding's readings as remotely reported. The JSON face is checked as *data* — raw numbers in
+    /// their declared units — because that is what an automation consumer parses.
+    #[test]
+    fn host_metrics_render_typed_readings_and_never_a_fabricated_zero() {
+        use flux_capabilities::{metric_answer_json, render_metric_answer};
+        use flux_system::metrics::{
+            FanSensor, MetricAnswer, MetricKind, MetricReading, MetricSnapshot, MetricUnavailable,
+        };
+
+        let served = MetricAnswer::Served(MetricSnapshot {
+            sampled_at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000),
+            reading: MetricReading::FanSpeed(vec![FanSensor {
+                label: "coretemp/fan1".into(),
+                rpm: 1200,
+            }]),
+            remotely_reported: true,
+        });
+        assert_eq!(
+            render_metric_answer(&served),
+            "fan: coretemp/fan1 1200 rpm",
+            "a served reading renders its unit-bearing value"
+        );
+        let document = metric_answer_json(&served);
+        assert_eq!(document["status"], "served");
+        assert_eq!(document["remotely_reported"], true);
+        assert_eq!(document["sampled_at_ms"], 1_700_000_000_000u64);
+        assert_eq!(
+            document["reading"][0]["rpm"], 1200,
+            "automation reads the number, not the rendered line: {document}"
+        );
+
+        let absent =
+            MetricAnswer::unavailable_for(MetricKind::Swap, MetricUnavailable::NoInstrument);
+        let line = render_metric_answer(&absent);
+        assert!(line.contains("swap: unavailable"), "{line}");
+        assert!(
+            !line.contains('0'),
+            "an absent instrument must not render any number at all: {line}"
+        );
+        let document = metric_answer_json(&absent);
+        assert_eq!(document["status"], "unavailable");
+        assert_eq!(document["reason"], "no_instrument");
+        assert!(
+            document.get("reading").is_none(),
+            "there is no reading to report: {document}"
+        );
+    }
+
+    /// C-654: the running local substrate answers `flux host metrics` about itself, and says so —
+    /// nothing it measured on this machine may claim remote provenance.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_metrics_measure_a_local_binding_and_mark_it_locally_observed() {
+        use flux_capabilities::{HostMetrics, HostProber};
+        use flux_secret::host::{HostBackend, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+
+        match prober
+            .read_metrics(&HostRef::declared("here", HostBackend::Local))
+            .await
+            .expect("the local substrate measures itself")
+        {
+            HostMetrics::Served {
+                remotely_reported,
+                answers,
+            } => {
+                assert!(!remotely_reported, "this machine read itself");
+                assert!(!answers.is_empty());
+                for answer in &answers {
+                    if let Some(snapshot) = answer.served() {
+                        assert!(!snapshot.remotely_reported, "{:?}", snapshot.kind());
+                    }
+                }
+            }
+            other => panic!("a native Linux host serves metrics, got {other:?}"),
+        }
+
+        // An unwired backend is typed, exactly as it is for `probe`.
+        match prober
+            .read_metrics(&HostRef::declared("box", HostBackend::Container))
+            .await
+        {
+            Err(flux_capabilities::HostProbeFailure::BackendUnwired { backend }) => {
+                assert_eq!(backend, "container")
+            }
+            other => panic!("expected BackendUnwired, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// C-649: the host group manifest gates every registered host op — the manifest is what
     /// config-based reassignment edits, so the explicit list must stay complete — and each op
     /// self-declares the group.
