@@ -12,7 +12,10 @@
 //!   are bounded identities naming *which instrument* answered.
 //! - **Readings are bounded.** A mount table, a sensor list and an instrument label all have hard
 //!   caps ([`MAX_MOUNTS`], [`MAX_SENSORS`], [`MAX_LABEL_BYTES`]), so a hostile or merely unusual
-//!   machine cannot turn one metrics read into an unbounded allocation.
+//!   machine cannot turn one metrics read into an unbounded allocation. A bound bites while a
+//!   listing is *collected* rather than after it is finished, and where one drops something the
+//!   answer says so ([`DiskUsage::omitted_mounts`]): a cap that truncates silently reports a
+//!   machine with a hundred filesystems as a machine with thirty-two.
 //! - **Unsupported is explicitly unavailable, never zero.** There are two distinct negatives and
 //!   they are never collapsed: `Err(Unserved)` means *this substrate does not serve metrics at
 //!   all* (the fail-closed default on [`crate::port::GuardedMetrics`]), while
@@ -177,6 +180,26 @@ pub struct MountUsage {
     pub used_bytes: u64,
 }
 
+/// Every mounted filesystem a substrate reports capacity for, and how many it left out.
+///
+/// The count exists because [`MAX_MOUNTS`] is a real cap on a real machine: a container host or a
+/// build agent routinely mounts more filesystems than a bounded reading can carry. Dropping the
+/// excess and saying nothing produces an answer indistinguishable from a machine that genuinely has
+/// thirty-two — the same class of lie as reporting zero for an instrument that does not exist, and
+/// the one the `Unavailable`/zero distinction exists to refuse one level up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiskUsage {
+    /// The mounts this reading carries, at most [`MAX_MOUNTS`] of them.
+    pub mounts: Vec<MountUsage>,
+    /// How many mounted filesystems this reading does **not** carry: those the cap dropped, and
+    /// those the substrate listed but could not measure at sample time.
+    ///
+    /// Zero means the list is complete — not "unknown". Filesystems that are not disk capacity at
+    /// all (`proc`, `tmpfs`, a network mount) are outside the family and are not counted here;
+    /// they were never candidates for the list.
+    pub omitted_mounts: u32,
+}
+
 /// One temperature instrument.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TemperatureSensor {
@@ -209,8 +232,8 @@ pub enum MetricReading {
     Memory(MemoryUsage),
     /// Swap, see [`MemoryUsage`].
     Swap(MemoryUsage),
-    /// Per-mount capacity, at most [`MAX_MOUNTS`] entries.
-    Disk(Vec<MountUsage>),
+    /// Per-mount capacity, at most [`MAX_MOUNTS`] entries, plus what the cap left out.
+    Disk(DiskUsage),
     /// How long the substrate has been up.
     Uptime(Duration),
     /// Temperature instruments, at most [`MAX_SENSORS`] entries.
@@ -456,18 +479,24 @@ pub(crate) async fn read_native(roots: &MetricsRoots, kind: MetricKind) -> Resul
 /// backend that did not do the measuring re-bounds rather than re-derives, through this one
 /// function — the same reason [`bounded_label`] is public.
 ///
-/// Truncation is deliberately silent. A reading is a measurement, not a message: refusing the whole
+/// Truncation never *refuses*. A reading is a measurement, not a message: rejecting the whole
 /// snapshot because a machine has 40 mounts would turn a cosmetic excess into an outage, and the
-/// caps are already the documented contract every consumer renders against.
+/// caps are already the documented contract every consumer renders against. It is not silent
+/// either — what the mount cap drops here is added to [`DiskUsage::omitted_mounts`], so a far side
+/// that over-reports is still described accurately after the re-bounding.
 pub fn bounded_reading(reading: MetricReading) -> MetricReading {
     match reading {
-        MetricReading::Disk(mut mounts) => {
-            mounts.truncate(MAX_MOUNTS);
-            for mount in &mut mounts {
-                mount.mount_point = bounded_label(&mount.mount_point);
+        MetricReading::Disk(mut disk) => {
+            let dropped = disk.mounts.len().saturating_sub(MAX_MOUNTS);
+            disk.omitted_mounts = disk
+                .omitted_mounts
+                .saturating_add(u32::try_from(dropped).unwrap_or(u32::MAX));
+            disk.mounts.truncate(MAX_MOUNTS);
+            for mount in &mut disk.mounts {
+                mount.mount_point = bounded_mount_point(&mount.mount_point);
                 mount.filesystem = bounded_label(&mount.filesystem);
             }
-            MetricReading::Disk(mounts)
+            MetricReading::Disk(disk)
         }
         MetricReading::Temperature(mut sensors) => {
             sensors.truncate(MAX_SENSORS);
@@ -501,19 +530,76 @@ pub fn bounded_reading(reading: MetricReading) -> MetricReading {
 /// Kubernetes node listing — has to honour the same bound, and it should do so through the same
 /// code rather than by re-deriving it.
 pub fn bounded_label(raw: &str) -> String {
-    let cleaned: String = raw
-        .trim()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_LABEL_BYTES)
-        .collect();
-    match cleaned
-        .char_indices()
-        .find(|(index, c)| index + c.len_utf8() > MAX_LABEL_BYTES)
-    {
-        Some((index, _)) => cleaned[..index].to_string(),
-        None => cleaned,
+    bounded_prefix(raw, MAX_LABEL_BYTES)
+}
+
+/// Reduce a mount point to a bounded identity that stays **distinct** from its siblings.
+///
+/// A mount point is a path, not a chip name, and paths agree for a long time before they differ:
+/// `/var/lib/docker/overlay2/<64 hex>/merged` and the container next to it share their first ninety
+/// bytes. Cutting both at [`MAX_LABEL_BYTES`] the way an instrument label is cut reports one
+/// mount's capacity under another's name — two rows a consumer cannot tell apart, which is worse
+/// than one row, because it still looks like data.
+///
+/// So a mount point that does not fit spends the tail of its budget on a digest of the *whole*
+/// path instead of on more of a prefix its sibling also has. The digest is a disambiguator, not an
+/// identifier: it says that two readings are about different filesystems, never what either path
+/// was. The result is at most [`MAX_LABEL_BYTES`] and is idempotent, so re-bounding a reading that
+/// already crossed this seam leaves it alone.
+pub fn bounded_mount_point(raw: &str) -> String {
+    // A label budget too small to hold the disambiguator would make the identity a bare digest,
+    // which is bounded but tells an operator nothing. Fail at compile time rather than there.
+    const { assert!(MAX_LABEL_BYTES > MOUNT_POINT_DIGEST_BYTES * 2) };
+    // Measured rather than collected: `raw` may be a megabyte from a decoder, and nothing here may
+    // allocate proportionally to it.
+    let length: usize = sanitised(raw).map(char::len_utf8).sum();
+    if length <= MAX_LABEL_BYTES {
+        return bounded_prefix(raw, MAX_LABEL_BYTES);
     }
+    let head = bounded_prefix(raw, MAX_LABEL_BYTES - MOUNT_POINT_DIGEST_BYTES);
+    format!("{head}~{:016x}", path_digest(raw))
+}
+
+/// The bytes a truncated mount point spends on its disambiguator: `~` and sixteen hex digits.
+const MOUNT_POINT_DIGEST_BYTES: usize = 17;
+
+/// A label's characters with the noise removed: surrounding whitespace, and control characters
+/// that are an injection into an operator's terminal rather than part of an identity.
+fn sanitised(raw: &str) -> impl Iterator<Item = char> + '_ {
+    raw.trim().chars().filter(|c| !c.is_control())
+}
+
+/// The longest run of [`sanitised`] characters fitting in `max` bytes, cut on a character boundary
+/// rather than mid-codepoint.
+fn bounded_prefix(raw: &str, max: usize) -> String {
+    let mut out = String::with_capacity(max);
+    for c in sanitised(raw) {
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// FNV-1a over a whole sanitised path, for the disambiguator [`bounded_mount_point`] appends.
+///
+/// Spelled out rather than reached for. This is not a hash *table*, so `DefaultHasher` — whose
+/// output is explicitly not stable between toolchains — would make the same mount read differently
+/// after a compiler upgrade, and an operator comparing two readings could not tell that from two
+/// different filesystems. It is not a security boundary either, so a cryptographic digest would be
+/// a dependency bought for sixty-four bits of "these two differ".
+fn path_digest(raw: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut digest = OFFSET;
+    let mut buffer = [0u8; 4];
+    for c in sanitised(raw) {
+        for byte in c.encode_utf8(&mut buffer).as_bytes() {
+            digest = (digest ^ u64::from(*byte)).wrapping_mul(PRIME);
+        }
+    }
+    digest
 }
 
 #[cfg(target_os = "linux")]
@@ -543,19 +629,23 @@ mod linux {
     /// network mounts. The network entries are excluded for a second reason — `statvfs` on a dead
     /// NFS or CIFS mount blocks, and a metrics read must not hang on one.
     const NON_DISK_FILESYSTEMS: &[&str] = &[
+        "9p",
         "autofs",
         "bpf",
         "binfmt_misc",
+        "ceph",
         "cgroup",
         "cgroup2",
         "cifs",
         "configfs",
+        "davfs",
         "debugfs",
         "devpts",
         "devtmpfs",
         "efivarfs",
-        "fuse.sshfs",
+        "fuse",
         "fusectl",
+        "glusterfs",
         "hugetlbfs",
         "mqueue",
         "nfs",
@@ -571,6 +661,20 @@ mod linux {
         "tracefs",
         "tmpfs",
     ];
+
+    /// Whether a mount is outside the disk-capacity family.
+    ///
+    /// `fuse.*` is a *family*, not a name. The list used to hold `fuse.sshfs` alone, which named
+    /// one member of an open set: `fuse.rclone`, `fuse.s3fs` and whatever a machine mounts next
+    /// week all answer `statvfs` through a userspace process that can simply stop answering — the
+    /// same hazard as the network filesystems beside them, and the reason those are excluded is
+    /// that a metrics read must not hang, not that the numbers would be wrong.
+    ///
+    /// `fuseblk` is deliberately absent: it is a block device with a userspace driver, so it is
+    /// real local capacity an operator asked about.
+    fn is_non_disk_filesystem(filesystem: &str) -> bool {
+        filesystem.starts_with("fuse.") || NON_DISK_FILESYSTEMS.contains(&filesystem)
+    }
 
     /// One metric kind, read from `roots`.
     pub(super) async fn read(roots: &MetricsRoots, kind: MetricKind) -> Result<MetricAnswer> {
@@ -711,10 +815,15 @@ mod linux {
             .next()
             .and_then(|field| field.parse().ok())
             .ok_or(MetricUnavailable::ReadFailed)?;
-        if !seconds.is_finite() || seconds < 0.0 {
-            return Err(MetricUnavailable::ReadFailed);
-        }
-        Ok(MetricReading::Uptime(Duration::from_secs_f64(seconds)))
+        // `Duration::from_secs_f64` *panics* on a value it cannot represent, and this number came
+        // out of a file this process was handed rather than one it computed — reachable through
+        // `MetricsRoots::pinned`, which the docs offer to any substrate whose kernel interfaces are
+        // mounted elsewhere. A finite `1e300` is as much an unreadable instrument as `NaN` is, and
+        // this module answers unreadable instruments; it does not abort the caller. The negative,
+        // infinite and NaN cases fall out of the same conversion, so one call decides all four.
+        Duration::try_from_secs_f64(seconds)
+            .map(MetricReading::Uptime)
+            .map_err(|_| MetricUnavailable::ReadFailed)
     }
 
     // -- memory and swap ------------------------------------------------------------------------
@@ -806,9 +915,20 @@ mod linux {
         out
     }
 
-    /// `(mount point, filesystem type)` for every mount that is real disk capacity.
-    fn parse_mounts(text: &str) -> Vec<(String, String)> {
-        let mut mounts: Vec<(String, String)> = Vec::new();
+    /// `(mount point, filesystem type)` for every mount that is real disk capacity, and how many
+    /// the cap left out.
+    ///
+    /// The cap is applied to the map as it is built rather than to a finished `Vec`: `mounts` is
+    /// the one procfs file that grows with the machine, and sorting a hostile one before
+    /// truncating it would already have paid for every entry.
+    ///
+    /// Keyed by mount point, last entry winning, because that is what the kernel means: a mount
+    /// stacked over an earlier one shadows it, and `statvfs` on the path answers about the
+    /// *visible* filesystem. Pairing those numbers with the shadowed entry's type would label a
+    /// reading with a filesystem it does not describe.
+    fn parse_mounts(text: &str) -> (Vec<(String, String)>, u32) {
+        let mut mounts: BTreeMap<String, String> = BTreeMap::new();
+        let mut omitted = 0u32;
         for line in text.lines() {
             let mut fields = line.split_whitespace();
             let (Some(_device), Some(point), Some(filesystem)) =
@@ -816,18 +936,19 @@ mod linux {
             else {
                 continue;
             };
-            if NON_DISK_FILESYSTEMS.contains(&filesystem) {
+            if is_non_disk_filesystem(filesystem) {
                 continue;
             }
-            mounts.push((
+            mounts.insert(
                 unescape_mount_field(point),
                 bounded_label(&unescape_mount_field(filesystem)),
-            ));
+            );
+            if mounts.len() > MAX_MOUNTS {
+                mounts.pop_last();
+                omitted = omitted.saturating_add(1);
+            }
         }
-        mounts.sort();
-        mounts.dedup_by(|a, b| a.0 == b.0);
-        mounts.truncate(MAX_MOUNTS);
-        mounts
+        (mounts.into_iter().collect(), omitted)
     }
 
     /// Widen a libc counter. The concrete widths differ by target, so this is a conversion rather
@@ -856,7 +977,9 @@ mod linux {
             return None;
         }
         Some(MountUsage {
-            mount_point: bounded_label(point),
+            // Bounded *after* the syscall: `point` is the real path `statvfs` was asked about, and
+            // the bounded form is only the identity the answer carries.
+            mount_point: bounded_mount_point(point),
             filesystem: filesystem.to_string(),
             total_bytes: blocks.saturating_mul(frsize),
             available_bytes: widen(stat.f_bavail).saturating_mul(frsize),
@@ -868,21 +991,37 @@ mod linux {
 
     fn read_disk(roots: &MetricsRoots) -> std::result::Result<MetricReading, MetricUnavailable> {
         let text = read_proc(roots, "mounts")?;
-        let mounts: Vec<MountUsage> = parse_mounts(&text)
-            .into_iter()
-            .filter_map(|(point, filesystem)| mount_usage(&point, &filesystem))
-            .collect();
+        let (listed, capped) = parse_mounts(&text);
+        let mut mounts = Vec::with_capacity(listed.len());
+        let mut omitted_mounts = capped;
+        for (point, filesystem) in listed {
+            match mount_usage(&point, &filesystem) {
+                Some(usage) => mounts.push(usage),
+                // A filesystem the kernel lists but `statvfs` will not answer for is still a mount
+                // this reading does not carry, and the count is the only place that can say so.
+                None => omitted_mounts = omitted_mounts.saturating_add(1),
+            }
+        }
         if mounts.is_empty() {
             return Err(MetricUnavailable::NoInstrument);
         }
-        Ok(MetricReading::Disk(mounts))
+        Ok(MetricReading::Disk(DiskUsage {
+            mounts,
+            omitted_mounts,
+        }))
     }
 
     // -- hwmon ----------------------------------------------------------------------------------
 
     /// `(index, chip label prefix, value text)` for every `<prefix><N>_input` in one hwmon chip,
     /// ordered by index so the reported list is stable across reads.
-    fn chip_inputs(chip: &Path, prefix: &str) -> Vec<(u32, String, String)> {
+    ///
+    /// Bounded to the [`MAX_SENSORS`] lowest indices **as it is collected**. The callers already
+    /// stop pushing at the cap, but that is a bound on the answer, not on this walk: a sysfs tree
+    /// with a hundred thousand `temp<N>_input` files would build a hundred thousand entries and a
+    /// hundred thousand labels before any of them were discarded. Keeping the lowest indices is
+    /// what the sorted-then-capped listing reported anyway, so the bound is not a reordering.
+    pub(super) fn chip_inputs(chip: &Path, prefix: &str) -> Vec<(u32, String, String)> {
         let Ok(entries) = std::fs::read_dir(chip) else {
             return Vec::new();
         };
@@ -895,7 +1034,7 @@ mod linux {
             })
             .unwrap_or_else(|| "hwmon".to_string());
 
-        let mut inputs = Vec::new();
+        let mut inputs: BTreeMap<u32, (String, String)> = BTreeMap::new();
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let Some(name) = file_name.to_str() else {
@@ -908,6 +1047,15 @@ mod linux {
             else {
                 continue;
             };
+            // An index above everything already held cannot earn a slot in a full listing, and
+            // finding that out afterwards would cost two sysfs reads per hostile file.
+            if inputs.len() == MAX_SENSORS
+                && inputs
+                    .last_key_value()
+                    .is_some_and(|(last, _)| *last < index)
+            {
+                continue;
+            }
             let Some(value) = read_capped(&entry.path(), SYSFS_FILE_CAP) else {
                 continue;
             };
@@ -915,20 +1063,38 @@ mod linux {
                 .map(|label| label.trim().to_string())
                 .filter(|label| !label.is_empty())
                 .unwrap_or_else(|| format!("{prefix}{index}"));
-            inputs.push((index, bounded_label(&format!("{chip_name}/{label}")), value));
+            inputs.insert(
+                index,
+                (bounded_label(&format!("{chip_name}/{label}")), value),
+            );
+            if inputs.len() > MAX_SENSORS {
+                inputs.pop_last();
+            }
         }
-        inputs.sort_by_key(|(index, _, _)| *index);
         inputs
+            .into_iter()
+            .map(|(index, (label, value))| (index, label, value))
+            .collect()
     }
 
-    /// Every hwmon chip directory, in a stable order.
-    fn chips(roots: &MetricsRoots) -> Vec<PathBuf> {
+    /// Every hwmon chip directory, in a stable order and bounded as the directory is walked.
+    ///
+    /// [`MAX_SENSORS`] chips, because a listing is an allocation and `class/hwmon` is a directory
+    /// a substrate controls. The trade is explicit: a machine exposing more than sixty-four hwmon
+    /// chips has its later ones ignored in path order, where the alternative is a walk whose cost
+    /// is whatever that directory holds. Real machines expose a handful.
+    pub(super) fn chips(roots: &MetricsRoots) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(roots.sys_root().join("class/hwmon")) else {
             return Vec::new();
         };
-        let mut chips: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
-        chips.sort();
-        chips
+        let mut chips: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+        for entry in entries.flatten() {
+            chips.insert(entry.path());
+            if chips.len() > MAX_SENSORS {
+                chips.pop_last();
+            }
+        }
+        chips.into_iter().collect()
     }
 
     fn read_temperature(
@@ -936,6 +1102,11 @@ mod linux {
     ) -> std::result::Result<MetricReading, MetricUnavailable> {
         let mut sensors = Vec::new();
         for chip in chips(roots) {
+            // Stop walking chips once the answer is full, rather than listing each remaining one
+            // and discarding it.
+            if sensors.len() == MAX_SENSORS {
+                break;
+            }
             for (_, label, value) in chip_inputs(&chip, "temp") {
                 if sensors.len() == MAX_SENSORS {
                     break;
@@ -959,6 +1130,9 @@ mod linux {
     fn read_fan(roots: &MetricsRoots) -> std::result::Result<MetricReading, MetricUnavailable> {
         let mut sensors = Vec::new();
         for chip in chips(roots) {
+            if sensors.len() == MAX_SENSORS {
+                break;
+            }
             for (_, label, value) in chip_inputs(&chip, "fan") {
                 if sensors.len() == MAX_SENSORS {
                     break;
@@ -1131,14 +1305,22 @@ SwapFree:        1024000 kB
 
         let disk = served(port.read_metric(MetricKind::Disk).await.unwrap());
         match &disk.reading {
-            MetricReading::Disk(mounts) => {
+            MetricReading::Disk(reading) => {
+                let mounts = &reading.mounts;
                 assert_eq!(
                     mounts.len(),
                     1,
                     "the pseudo filesystems beside the real one must be dropped: {mounts:?}"
                 );
+                assert_eq!(reading.omitted_mounts, 0, "nothing was left out here");
                 assert_eq!(mounts[0].filesystem, "ext4");
-                assert_eq!(mounts[0].mount_point, root.display().to_string());
+                // Compared through the bound rather than against the raw path: a fixture root under
+                // a long `TMPDIR` is itself longer than the bound, and asserting the raw path would
+                // make this test pass or fail on the developer's temporary directory.
+                assert_eq!(
+                    mounts[0].mount_point,
+                    bounded_mount_point(&root.display().to_string())
+                );
                 assert!(mounts[0].total_bytes > 0, "statvfs answered nothing");
                 assert!(mounts[0].used_bytes <= mounts[0].total_bytes);
             }
@@ -1332,7 +1514,7 @@ SwapFree:        1024000 kB
         let port: &dyn GuardedMetrics = &system;
 
         match served(port.read_metric(MetricKind::Disk).await.unwrap()).reading {
-            MetricReading::Disk(mounts) => assert_eq!(mounts.len(), MAX_MOUNTS),
+            MetricReading::Disk(disk) => assert_eq!(disk.mounts.len(), MAX_MOUNTS),
             other => panic!("disk answered {other:?}"),
         }
         match served(port.read_metric(MetricKind::Temperature).await.unwrap()).reading {
@@ -1356,6 +1538,269 @@ SwapFree:        1024000 kB
                 }
             }
             other => panic!("fan answered {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-673, acceptance 1: `/proc/uptime` is a file a substrate hands us, and
+    /// [`MetricsRoots::pinned`] is documented for a kernel whose interfaces are mounted elsewhere.
+    /// A finite value too large for a `Duration` is therefore reachable input, and this module's
+    /// own contract says every failure here is an *answer*.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_finite_but_oversized_uptime_answers_read_failed_rather_than_panicking() {
+        for value in ["1e300", "18446744073709551616", "3.4e38"] {
+            let root = sandbox::fixture_dir("metrics-uptime-oversized");
+            let proc = write_procfs(&root, MEMINFO);
+            std::fs::write(proc.join("uptime"), format!("{value} {value}\n")).unwrap();
+
+            let system = fixture_system(&root);
+            let port: &dyn GuardedMetrics = &system;
+            assert_eq!(
+                port.read_metric(MetricKind::Uptime).await.unwrap(),
+                MetricAnswer::Unavailable {
+                    kind: MetricKind::Uptime,
+                    reason: MetricUnavailable::ReadFailed,
+                },
+                "`{value}` seconds of uptime must be an answer, never a panic"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+    }
+
+    /// C-673, acceptance 2 (identity half): two sibling mounts whose paths agree for longer than
+    /// the label bound must stay two readings.
+    ///
+    /// The shared parent is longer than [`MAX_LABEL_BYTES`] on its own, so the collision is a
+    /// property of the fixture rather than of however long this machine's `TMPDIR` happens to be —
+    /// the assertion below pins that premise before the reader is asked anything.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn long_mount_points_keep_distinct_identities_rather_than_colliding() {
+        let root = sandbox::fixture_dir("metrics-mount-identity");
+        let proc = write_procfs(&root, MEMINFO);
+
+        // The shape of a container overlay: a shared parent, the part that tells the two apart,
+        // and a common leaf.
+        let shared = root.join(format!("overlay2-{}", "0".repeat(MAX_LABEL_BYTES)));
+        let first = shared.join("a".repeat(64)).join("merged");
+        let second = shared.join("b".repeat(64)).join("merged");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let first = first.display().to_string();
+        let second = second.display().to_string();
+        assert_eq!(
+            bounded_label(&first),
+            bounded_label(&second),
+            "the fixture must really collide under the instrument-label bound, or this test \
+             passes for the wrong reason"
+        );
+
+        std::fs::write(
+            proc.join("mounts"),
+            format!("/dev/first {first} ext4 rw 0 0\n/dev/second {second} ext4 rw 0 0\n"),
+        )
+        .unwrap();
+
+        let system = fixture_system(&root);
+        let port: &dyn GuardedMetrics = &system;
+        match served(port.read_metric(MetricKind::Disk).await.unwrap()).reading {
+            MetricReading::Disk(disk) => {
+                let mounts = &disk.mounts;
+                assert_eq!(mounts.len(), 2, "two mounts were listed: {mounts:?}");
+                assert_eq!(disk.omitted_mounts, 0, "both mounts fit");
+                assert_ne!(
+                    mounts[0].mount_point, mounts[1].mount_point,
+                    "two sibling mounts collapsed into one identity: {mounts:?}"
+                );
+                for mount in mounts {
+                    assert!(
+                        mount.mount_point.len() <= MAX_LABEL_BYTES,
+                        "unbounded mount point: {mount:?}"
+                    );
+                }
+                // Re-bounding an already-bounded identity must not move it: the same reading
+                // crosses `bounded_reading` again on every remote hop.
+                for mount in mounts {
+                    assert_eq!(
+                        bounded_mount_point(&mount.mount_point),
+                        mount.mount_point,
+                        "the bounded identity is not idempotent"
+                    );
+                }
+            }
+            other => panic!("disk answered {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-673, acceptance 2 (cap half): a machine with more mounts than [`MAX_MOUNTS`] must say so
+    /// in the answer. Dropping the excess silently reads, to every consumer, as a machine that
+    /// simply has thirty-two filesystems.
+    ///
+    /// Built from the same overlay-length fixture as the identity half and equally independent of
+    /// `TMPDIR`: the count is a property of the mount table this test writes.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn exceeding_the_mount_cap_is_visible_in_the_answer() {
+        let root = sandbox::fixture_dir("metrics-mount-cap");
+        let proc = write_procfs(&root, MEMINFO);
+
+        // `aa-` sorts before `zz-`, so the two overlay siblings survive the cap and the filler is
+        // what gets dropped — which makes the omitted count exact rather than incidental.
+        let shared = root.join(format!("aa-overlay2-{}", "0".repeat(MAX_LABEL_BYTES)));
+        let mut table = String::new();
+        for leaf in ["a", "b"] {
+            let point = shared.join(leaf.repeat(64)).join("merged");
+            std::fs::create_dir_all(&point).unwrap();
+            table.push_str(&format!("/dev/{leaf} {} ext4 rw 0 0\n", point.display()));
+        }
+        const EXCESS: usize = 8;
+        for index in 0..(MAX_MOUNTS + EXCESS) {
+            let point = root.join(format!("zz-mount{index:03}"));
+            std::fs::create_dir_all(&point).unwrap();
+            table.push_str(&format!(
+                "/dev/filler{index} {} ext4 rw 0 0\n",
+                point.display()
+            ));
+        }
+        std::fs::write(proc.join("mounts"), &table).unwrap();
+
+        let system = fixture_system(&root);
+        let port: &dyn GuardedMetrics = &system;
+        match served(port.read_metric(MetricKind::Disk).await.unwrap()).reading {
+            MetricReading::Disk(disk) => {
+                assert_eq!(disk.mounts.len(), MAX_MOUNTS, "the cap still binds");
+                assert_eq!(
+                    disk.omitted_mounts,
+                    (EXCESS + 2) as u32,
+                    "the mounts the cap dropped must be countable from the answer alone"
+                );
+                assert_ne!(
+                    disk.mounts[0].mount_point,
+                    disk.mounts[1].mount_point,
+                    "the two overlay siblings kept their identities: {:?}",
+                    &disk.mounts[..2]
+                );
+            }
+            other => panic!("disk answered {other:?}"),
+        }
+
+        // A machine whose mounts all fit says so with a zero, not with an absent field.
+        let complete = sandbox::fixture_dir("metrics-mount-cap-complete");
+        write_procfs(&complete, MEMINFO);
+        let port: &dyn GuardedMetrics = &fixture_system(&complete);
+        match served(port.read_metric(MetricKind::Disk).await.unwrap()).reading {
+            MetricReading::Disk(disk) => assert_eq!(disk.omitted_mounts, 0),
+            other => panic!("disk answered {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&complete).ok();
+    }
+
+    /// C-673, acceptance 3: the hwmon walk bounds what it *collects*, not only what it answers.
+    ///
+    /// The answer-side cap in [`read_temperature`](linux::read_temperature) is applied after
+    /// `chip_inputs` has already built a `Vec` per chip and `chips` a `Vec` of every chip
+    /// directory, so a sysfs tree with a million entries is a million allocations before any bound
+    /// bites. Asserted on the collections themselves because it is invisible in the answer: both
+    /// orderings report the same first [`MAX_SENSORS`].
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_hwmon_walk_bounds_its_intermediate_listing_not_only_its_answer() {
+        let root = sandbox::fixture_dir("metrics-hwmon-intermediate");
+        let class = root.join("sys/class/hwmon");
+        for chip in 0..(MAX_SENSORS + 24) {
+            std::fs::create_dir_all(class.join(format!("hwmon{chip:03}"))).unwrap();
+        }
+        let chip = class.join("hwmon000");
+        std::fs::write(chip.join("name"), "coretemp\n").unwrap();
+        for index in 1..=(MAX_SENSORS + 24) {
+            std::fs::write(chip.join(format!("temp{index}_input")), "30000\n").unwrap();
+            std::fs::write(chip.join(format!("fan{index}_input")), "900\n").unwrap();
+        }
+
+        let roots = MetricsRoots::pinned(root.join("proc"), root.join("sys"));
+        let listed = super::linux::chips(&roots);
+        assert!(
+            listed.len() <= MAX_SENSORS,
+            "the chip listing is unbounded: {} entries",
+            listed.len()
+        );
+        for prefix in ["temp", "fan"] {
+            let inputs = super::linux::chip_inputs(&chip, prefix);
+            assert!(
+                inputs.len() <= MAX_SENSORS,
+                "the `{prefix}` listing is unbounded: {} entries",
+                inputs.len()
+            );
+            // Bounded by keeping the *lowest* indices, so the answer is the same list it always
+            // was — the bound must not become a reordering.
+            let indices: Vec<u32> = inputs.iter().map(|(index, _, _)| *index).collect();
+            let mut sorted = indices.clone();
+            sorted.sort_unstable();
+            assert_eq!(indices, sorted, "the bounded listing lost its index order");
+            assert_eq!(
+                indices.first(),
+                Some(&1),
+                "the bound dropped the low indices"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-673, acceptance 3: a filesystem whose `statvfs` can block — every `fuse.*` driver, and the
+    /// network filesystems the exclusion list did not name — must be dropped before the
+    /// synchronous call. The fixture points each of them at a directory that really exists, so a
+    /// reader that let one through would report it rather than fail.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn network_and_userspace_filesystems_never_reach_the_statvfs_guard() {
+        let root = sandbox::fixture_dir("metrics-non-disk");
+        let proc = write_procfs(&root, MEMINFO);
+        let real = root.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+
+        let mut mounts = format!("/dev/fixture {} ext4 rw 0 0\n", real.display());
+        for filesystem in [
+            "fuse.sshfs",
+            "fuse.rclone",
+            "fuse.s3fs",
+            "9p",
+            "ceph",
+            "glusterfs",
+            "davfs",
+        ] {
+            let point = root.join(format!("via-{filesystem}"));
+            std::fs::create_dir_all(&point).unwrap();
+            mounts.push_str(&format!("remote {} {filesystem} rw 0 0\n", point.display()));
+        }
+        std::fs::write(proc.join("mounts"), &mounts).unwrap();
+
+        let system = fixture_system(&root);
+        let port: &dyn GuardedMetrics = &system;
+        match served(port.read_metric(MetricKind::Disk).await.unwrap()).reading {
+            MetricReading::Disk(disk) => {
+                let reported: Vec<&str> = disk
+                    .mounts
+                    .iter()
+                    .map(|mount| mount.filesystem.as_str())
+                    .collect();
+                assert_eq!(
+                    reported,
+                    vec!["ext4"],
+                    "a filesystem whose `statvfs` can block reached it: {:?}",
+                    disk.mounts
+                );
+                // Excluded filesystems are outside the disk family, not mounts left out of it.
+                assert_eq!(disk.omitted_mounts, 0);
+            }
+            other => panic!("disk answered {other:?}"),
         }
 
         std::fs::remove_dir_all(&root).ok();
@@ -1413,7 +1858,7 @@ SwapFree:        1024000 kB
                 available_bytes: 1,
                 used_bytes: 0,
             }),
-            MetricReading::Disk(Vec::new()),
+            MetricReading::Disk(DiskUsage::default()),
             MetricReading::Uptime(Duration::ZERO),
             MetricReading::Temperature(Vec::new()),
             MetricReading::FanSpeed(Vec::new()),
@@ -1463,17 +1908,34 @@ SwapFree:        1024000 kB
                 used_bytes: 0,
             })
             .collect();
-        match bounded_reading(MetricReading::Disk(mounts)) {
-            MetricReading::Disk(mounts) => {
+        match bounded_reading(MetricReading::Disk(DiskUsage {
+            mounts,
+            omitted_mounts: 0,
+        })) {
+            MetricReading::Disk(disk) => {
                 assert_eq!(
-                    mounts.len(),
+                    disk.mounts.len(),
                     MAX_MOUNTS,
                     "the mount table must be re-capped"
                 );
-                for mount in &mounts {
+                // C-673: what the re-cap dropped is counted, not swallowed. A far side that
+                // over-reports is still described accurately after re-bounding.
+                assert_eq!(disk.omitted_mounts, 40);
+                for mount in &disk.mounts {
                     assert!(mount.mount_point.len() <= MAX_LABEL_BYTES, "{mount:?}");
                     assert!(mount.filesystem.len() <= MAX_LABEL_BYTES, "{mount:?}");
                 }
+                let identities: std::collections::BTreeSet<&str> = disk
+                    .mounts
+                    .iter()
+                    .map(|mount| mount.mount_point.as_str())
+                    .collect();
+                assert_eq!(
+                    identities.len(),
+                    disk.mounts.len(),
+                    "re-bounding collapsed distinct mount points into one identity: {:?}",
+                    disk.mounts
+                );
             }
             other => panic!("disk re-bounded into {other:?}"),
         }

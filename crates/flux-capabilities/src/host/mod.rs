@@ -311,20 +311,31 @@ pub fn render_metric_answer(answer: &MetricAnswer) -> String {
             bytes(pool.total_bytes),
             bytes(pool.available_bytes)
         ),
-        MetricReading::Disk(mounts) => mounts
-            .iter()
-            .map(|mount| {
-                format!(
-                    "{} [{}] {} used of {} ({} available)",
-                    mount.mount_point,
-                    mount.filesystem,
-                    bytes(mount.used_bytes),
-                    bytes(mount.total_bytes),
-                    bytes(mount.available_bytes)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; "),
+        MetricReading::Disk(disk) => {
+            let mut lines: Vec<String> = disk
+                .mounts
+                .iter()
+                .map(|mount| {
+                    format!(
+                        "{} [{}] {} used of {} ({} available)",
+                        mount.mount_point,
+                        mount.filesystem,
+                        bytes(mount.used_bytes),
+                        bytes(mount.total_bytes),
+                        bytes(mount.available_bytes)
+                    )
+                })
+                .collect();
+            // C-673: an operator reading thirty-two mounts must be able to tell a machine that has
+            // thirty-two from one whose list was cut.
+            if disk.omitted_mounts > 0 {
+                lines.push(format!(
+                    "{} further mount(s) not reported",
+                    disk.omitted_mounts
+                ));
+            }
+            lines.join("; ")
+        }
         MetricReading::Uptime(uptime) => {
             let seconds = uptime.as_secs();
             format!(
@@ -400,8 +411,12 @@ pub fn metric_answer_json(answer: &MetricAnswer) -> serde_json::Value {
             "available_bytes": pool.available_bytes,
             "used_bytes": pool.used_bytes,
         }),
-        MetricReading::Disk(mounts) => serde_json::Value::Array(
-            mounts
+        // An object rather than the bare array the other list readings emit: `omitted_mounts` is
+        // part of the measurement, and a consumer that could not see it would read a capped list
+        // as a complete one.
+        MetricReading::Disk(disk) => serde_json::json!({
+            "mounts": disk
+                .mounts
                 .iter()
                 .map(|mount| {
                     serde_json::json!({
@@ -412,8 +427,9 @@ pub fn metric_answer_json(answer: &MetricAnswer) -> serde_json::Value {
                         "used_bytes": mount.used_bytes,
                     })
                 })
-                .collect(),
-        ),
+                .collect::<Vec<_>>(),
+            "omitted_mounts": disk.omitted_mounts,
+        }),
         MetricReading::Uptime(uptime) => serde_json::json!({
             "uptime_ms": uptime.as_millis() as u64,
         }),

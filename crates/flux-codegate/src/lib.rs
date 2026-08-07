@@ -3959,11 +3959,23 @@ impl Exec for Double {}
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
             ("crates/flux-system/src/port.rs", "GuardedNetwork", "System"),
             // C-653. Read-only and measurement-only: the native metrics backend opens no file
-            // outside `/proc` and `/sys` (the roots are a value on the `System`, so a caller can
-            // narrow them but never widen them into the workspace), starts no process, and writes
-            // nothing. What the review is actually about is the *answer* shape — an unsupported
-            // metric must stay explicitly unavailable rather than becoming a zero a projection
-            // would read as a measurement.
+            // outside the roots it is given, starts no process, and writes nothing.
+            //
+            // Which roots those are is the reviewable part, and C-673 narrowed the claim to what
+            // the code actually enforces. `MetricsRoots::pinned` accepts *any* pair of paths —
+            // nothing type-level keeps it inside `/proc` and `/sys`, and the earlier note claiming
+            // a caller could only ever narrow them was describing a containment nothing enforces.
+            // What is true, and grep-provable, is narrower: every production entry
+            // point constructs `MetricsRoots::native()`, and the one setter that can replace them,
+            // `System::with_metrics_roots`, has no caller anywhere outside a test — no operation,
+            // no CLI flag and no wire field reaches it.
+            // `the_metrics_roots_allowance_note_states_only_what_the_code_enforces` is the check
+            // that fails if either half stops holding.
+            //
+            // What the review is actually about is the *answer* shape — an unsupported metric must
+            // stay explicitly unavailable rather than becoming a zero a projection would read as a
+            // measurement, and (C-673) a cap that drops mounts must say so in the answer rather
+            // than report a truncated list as a complete one.
             ("crates/flux-system/src/port.rs", "GuardedMetrics", "System"),
             (
                 "crates/flux-system/src/remote.rs",
@@ -4162,6 +4174,68 @@ impl Exec for Double {}
             violations.is_empty(),
             "guarded-IO port implemented outside the reviewed native backend:\n  {}",
             violations.join("\n  ")
+        );
+    }
+
+    /// C-673: the metrics allowance note must claim only the property the code enforces.
+    ///
+    /// The note reviewed with C-653 said a caller "can narrow but never widen" the metric roots.
+    /// Nothing enforces that: [`MetricsRoots::pinned`] takes any two paths, and `with_metrics_roots`
+    /// is a plain setter. The property that *is* true is narrower and grep-provable — every
+    /// production entry point takes the native `/proc` + `/sys` roots, and the only caller of the
+    /// setter anywhere in the tree is a test. This pins both halves: the wording, and the fact it
+    /// rests on.
+    #[test]
+    fn the_metrics_roots_allowance_note_states_only_what_the_code_enforces() {
+        const SETTER: &str = "with_metrics_roots";
+        const ENTRY: &str = "\"crates/flux-system/src/port.rs\", \"GuardedMetrics\", \"System\"";
+
+        // The note is the run of comment lines immediately above the allowance entry, so this
+        // reads what a reviewer reads rather than the whole file.
+        let lines: Vec<&str> = include_str!("lib.rs").lines().collect();
+        let entry = lines
+            .iter()
+            .position(|line| line.contains(ENTRY))
+            .expect("the `GuardedMetrics`/`System` allowance entry");
+        let start = lines[..entry]
+            .iter()
+            .rposition(|line| !line.trim_start().starts_with("//"))
+            .map_or(0, |last| last + 1);
+        let note = lines[start..entry].join("\n");
+        assert!(
+            !note.contains("never widen"),
+            "the metrics allowance still claims a containment nothing enforces — \
+             `MetricsRoots::pinned` accepts any pair of paths:\n{note}"
+        );
+        assert!(
+            note.contains(SETTER),
+            "the allowance must name `{SETTER}`, the fact its narrower claim rests on:\n{note}"
+        );
+
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let mut callers = Vec::new();
+        for file in workspace_source_files(repo_root) {
+            let source = std::fs::read_to_string(&file).unwrap();
+            let first_test = source
+                .lines()
+                .position(|line| line.trim_start().starts_with("#[cfg(test)]"))
+                .unwrap_or(usize::MAX);
+            for (index, line) in source.lines().enumerate() {
+                if !line.contains(SETTER)
+                    || line.contains(&format!("fn {SETTER}"))
+                    || index > first_test
+                {
+                    continue;
+                }
+                let rel = file.strip_prefix(repo_root).unwrap_or(&file);
+                callers.push(format!("{}:{}: {}", rel.display(), index + 1, line.trim()));
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "the allowance says only tests reach `{SETTER}`, but production code calls it:\n  {}",
+            callers.join("\n  ")
         );
     }
 
