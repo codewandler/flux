@@ -210,12 +210,54 @@ pub struct StaticResolver {
     /// [`System`](flux_system::System) coerces into it at every call site.
     system: Arc<dyn GuardedEnv>,
     bindings: HashMap<String, EndpointRef>,
+    /// The `[[host]]` binding this session selected, if any (C-709). `None` is the native local
+    /// position — an unselected session is *here*, which is not "anywhere".
+    selected_host: Option<String>,
 }
 
 impl StaticResolver {
     /// `bindings` maps a named reference (`"sql.endpoint"`) to its config-bound [`EndpointRef`].
     pub fn new(system: Arc<dyn GuardedEnv>, bindings: HashMap<String, EndpointRef>) -> Self {
-        Self { system, bindings }
+        Self {
+            system,
+            bindings,
+            selected_host: None,
+        }
+    }
+
+    /// Record the `[[host]]` binding this session selected, so a host-bound endpoint resolves only
+    /// from the substrate it is reachable through (C-709). Left unset, only unbound endpoints
+    /// resolve — which is exactly the pre-C-709 population.
+    pub fn with_selected_host(mut self, selected: Option<String>) -> Self {
+        self.selected_host = selected;
+        self
+    }
+
+    /// Refuse a host-bound endpoint whose binding is not the one this session selected, naming
+    /// both. A cluster-internal name resolves to something else entirely from another position, so
+    /// dialling it from here is never a fallback — it is a different destination. Resolution and
+    /// private-network scoping *through* the selected binding land with C-689 and C-694; this is
+    /// the refusal that keeps the wrong-position dial from happening in the meantime.
+    fn check_locality(
+        &self,
+        reference: &str,
+        endpoint: &EndpointRef,
+    ) -> std::result::Result<(), String> {
+        let Some(required) = endpoint.host.as_deref() else {
+            return Ok(()); // Unbound: reachable from wherever the caller is, exactly as before.
+        };
+        if self.selected_host.as_deref() == Some(required) {
+            return Ok(());
+        }
+        let position = match self.selected_host.as_deref() {
+            Some(selected) => format!("this session selected `{selected}`"),
+            None => "this session selected no host binding (it runs on the local machine)".into(),
+        };
+        Err(format!(
+            "endpoint `{reference}` is reachable through host binding `{required}`, but {position}; \
+             select it with `--host {required}` — its address resolves differently from here, so it \
+             is not dialled from this position"
+        ))
     }
 
     // Wire-seam: feeds the `ReferenceResolver` impl below, whose signature is fixed by the
@@ -255,6 +297,9 @@ impl ReferenceResolver for StaticResolver {
             .get(reference)
             .filter(|e| e.source == SourceKind::Config)
             .ok_or_else(|| format!("no config binding for endpoint `{reference}`"))?;
+        // Locality is checked before any credential is materialized: a wrong-position dial must not
+        // read a secret on its way to being refused.
+        self.check_locality(reference, ep)?;
         let mut resolved = ResolvedEndpoint::new(reference, &ep.url);
         if let Some(cred) = &ep.credential_ref {
             let material = self.materialize(cred)?;
@@ -434,5 +479,66 @@ mod tests {
             .resolve_credential(&Ref::kubernetes("ns", "name", "key"))
             .await
             .is_err());
+    }
+
+    /// C-709: a host-bound endpoint is reachable *through that binding*, so dialling it from
+    /// anywhere else is a refusal naming both — never a silent dial from here. The whole point of
+    /// the field is that `db.default.svc.cluster.local` resolves to something else on a laptop, so
+    /// a wrong-position dial must fail closed rather than resolve wherever the caller happens to be.
+    #[tokio::test]
+    async fn a_host_bound_endpoint_is_refused_from_a_session_that_did_not_select_that_host() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "pg-cluster".to_string(),
+            EndpointRef {
+                host: Some("k8s-dev".into()),
+                ..EndpointRef::named(
+                    "pg-cluster",
+                    "postgres://db.default.svc.cluster.local:5432/app",
+                )
+            },
+        );
+
+        // No binding selected: the session is on the local machine, the endpoint is not.
+        let here = StaticResolver::new(test_system(), bindings.clone());
+        let err = here.resolve_endpoint("pg-cluster").await.unwrap_err();
+        assert!(err.contains("pg-cluster"), "names the endpoint: {err}");
+        assert!(err.contains("k8s-dev"), "names the binding: {err}");
+
+        // A *different* selected binding is just as wrong, and says which one is selected.
+        let elsewhere = StaticResolver::new(test_system(), bindings.clone())
+            .with_selected_host(Some("build-farm".to_string()));
+        let err = elsewhere.resolve_endpoint("pg-cluster").await.unwrap_err();
+        assert!(
+            err.contains("pg-cluster") && err.contains("k8s-dev") && err.contains("build-farm"),
+            "names the endpoint, its binding and the selected one: {err}"
+        );
+
+        // Selecting the binding the endpoint is reachable through resolves it.
+        let there = StaticResolver::new(test_system(), bindings)
+            .with_selected_host(Some("k8s-dev".to_string()));
+        let resolved = there.resolve_endpoint("pg-cluster").await.unwrap();
+        assert_eq!(
+            resolved.url,
+            "postgres://db.default.svc.cluster.local:5432/app"
+        );
+    }
+
+    /// C-709 acceptance 4: an endpoint with no host binding behaves exactly as today — it resolves
+    /// whether or not the session selected a host. Locality is added where it is known, never
+    /// required where it is not.
+    #[tokio::test]
+    async fn an_unbound_endpoint_resolves_from_anywhere_exactly_as_before() {
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            "pg-public".to_string(),
+            EndpointRef::named("pg-public", "postgres://db.example.com:5432/app"),
+        );
+        for selected in [None, Some("k8s-dev".to_string())] {
+            let resolver =
+                StaticResolver::new(test_system(), bindings.clone()).with_selected_host(selected);
+            let resolved = resolver.resolve_endpoint("pg-public").await.unwrap();
+            assert_eq!(resolved.url, "postgres://db.example.com:5432/app");
+        }
     }
 }
