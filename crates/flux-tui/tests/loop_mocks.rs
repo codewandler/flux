@@ -6,7 +6,7 @@
 //! inside its bounds, and naming whatever it hides.
 
 use flux_tui::loopmock::{
-    self, Axes, Depth, LoadCase, Mock, Shape, Viewport, AXIS_SPACE, LOAD_CASES, MOCKS,
+    self, Axes, Condense, Depth, LoadCase, Mock, Shape, Viewport, AXIS_SPACE, LOAD_CASES, MOCKS,
 };
 use flux_tui::theme::Theme;
 
@@ -146,7 +146,15 @@ fn the_axes_reach_the_split_only_with_one_root_or_too_few_rows() {
                 if split.steps_drawn() == fx.step_count() {
                     continue;
                 }
-                let matched = axes_matching_the_split(case, vp, &theme);
+                // ⚠ A-137 added a third condensing setting, `TopLevel`, which *is* the rail's rule —
+                // fold every non-focused top-level step, keep the focused one whole. It reaches the
+                // split where the one-bit flag never could, so it is excluded here and measured on
+                // its own in `top_level_condensing_reaches_the_split_only_on_a_run_without_a_failure`.
+                // A-146's claim is about the three axes it built, and stays true of them.
+                let matched: Vec<String> = axes_matching_the_split(case, vp, &theme)
+                    .into_iter()
+                    .filter(|label| !label.contains("top-level"))
+                    .collect();
                 assert!(
                     matched.is_empty(),
                     "{} / {cols}x{rows}: the split draws its whole rail, withholds {} of {} \
@@ -205,7 +213,7 @@ fn composing_the_axes_reproduces_the_nested_tree_exactly() {
     let theme = Theme::MONO;
     let axes = Axes {
         depth: Depth::Levels(6),
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     };
     for case in LOAD_CASES {
@@ -242,7 +250,7 @@ fn the_flat_thread_and_the_nested_tree_are_one_point_in_the_axis_space() {
     let vp = loopmock::WIDE;
     let unlimited = Axes {
         depth: Depth::All,
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     };
     for case in LOAD_CASES {
@@ -283,7 +291,7 @@ fn each_axis_moves_the_drawing_on_its_own() {
     let vp = loopmock::WIDE;
     let base = Axes {
         depth: Depth::All,
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     };
     for case in LOAD_CASES {
@@ -299,7 +307,7 @@ fn each_axis_moves_the_drawing_on_its_own() {
             (
                 "condense",
                 Axes {
-                    condense: true,
+                    condense: Condense::Uniform,
                     ..base
                 },
             ),
@@ -401,11 +409,11 @@ fn condensing_never_swallows_the_recorded_failure() {
         "the recorded turn is supposed to contain exactly one real failure",
     );
 
-    for axes in AXIS_SPACE.iter().filter(|a| a.condense) {
+    for axes in AXIS_SPACE.iter().filter(|a| a.condense != Condense::Off) {
         // Held against the same configuration with condensing off: condensing is not allowed to be
         // the reason a failure left the screen.
         let off = Axes {
-            condense: false,
+            condense: Condense::Off,
             ..*axes
         };
         let with = loopmock::render_axes(*axes, case, loopmock::WIDE, &theme);
@@ -435,7 +443,7 @@ fn on_a_long_run_condensing_is_what_makes_the_failure_visible() {
     let vp = loopmock::WIDE;
     let base = Axes {
         depth: Depth::All,
-        condense: false,
+        condense: Condense::Off,
         pane: false,
     };
     let failure = "✗ → git_stage";
@@ -448,7 +456,7 @@ fn on_a_long_run_condensing_is_what_makes_the_failure_visible() {
     assert!(
         loopmock::render_axes(
             Axes {
-                condense: true,
+                condense: Condense::Uniform,
                 ..base
             },
             case,
@@ -574,7 +582,9 @@ fn every_axis_default_is_the_setting_that_withholds_least() {
     let theme = Theme::MONO;
     // The defaults themselves, so a change to them has to come through this test's reasoning.
     const { assert!(matches!(Axes::DEFAULT.depth, Depth::All)) };
-    const { assert!(Axes::DEFAULT.condense) };
+    // ⚠ Uniform, not top-level. Both fold finished work, but top-level withholds every
+    // non-focused turn's interior, and this test is about the setting that withholds least.
+    const { assert!(matches!(Axes::DEFAULT.condense, Condense::Uniform)) };
     const { assert!(!Axes::DEFAULT.pane) };
 
     for case in LOAD_CASES {
@@ -1033,4 +1043,119 @@ fn the_snapshot_set_matches_the_renderers() {
         committed, generated,
         "the committed mock snapshots are stale — regenerate with {VAR}=1",
     );
+}
+
+/// A-137's fourth decision, as a test rather than an argument.
+///
+/// A-146 measured that a one-bit `condense` cannot express what the owner wanted: folding uniformly
+/// gives every turn's shape at one row per phase, folding only at the top level gives mock 3's rail.
+/// This pins that the two settings are genuinely different drawings on a run with more than one root
+/// — which is exactly the case where A-146 found the rail and condensing stop coinciding.
+#[test]
+fn top_level_condensing_is_a_different_drawing_from_uniform() {
+    let theme = Theme::MONO;
+    let uniform = Axes {
+        depth: Depth::All,
+        condense: Condense::Uniform,
+        pane: false,
+    };
+    let top_level = Axes {
+        condense: Condense::TopLevel,
+        ..uniform
+    };
+
+    // The recorded nine-turn session. With one root the two rules coincide by construction, so a
+    // multi-root case is the only place the distinction is observable.
+    let many = loopmock::render_axes(uniform, LoadCase::LongRun, loopmock::WIDE, &theme);
+    let rail = loopmock::render_axes(top_level, LoadCase::LongRun, loopmock::WIDE, &theme);
+    assert_ne!(
+        many.to_plain(),
+        rail.to_plain(),
+        "top-level and uniform condensing must not be the same drawing on a multi-turn run",
+    );
+
+    // And the distinction is the one claimed: top-level withholds MORE, because a finished turn's
+    // whole interior folds rather than one row per phase within it.
+    assert!(
+        rail.steps_drawn() <= many.steps_drawn(),
+        "top-level folds whole turns, so it cannot represent more steps than uniform: {} vs {}",
+        rail.steps_drawn(),
+        many.steps_drawn(),
+    );
+}
+
+/// ⚠ **A-137's third condensing setting closes A-146's gap — but only on a run with no failure.**
+///
+/// A-146 measured that the split was not a point in the axis space, and named the structural reason:
+/// the rail discriminates on **focus**, condensing on **status**. `Condense::TopLevel` is the rail's
+/// rule written as an axis, so it reaches the split where the one-bit flag never could. Measured over
+/// the same envelope:
+///
+/// | case | eligible viewports | reproduced by top-level | failures in the run |
+/// |---|---|---|---|
+/// | fan-out (hand-authored) | 42 | **36** | 0 |
+/// | long run (recorded, 9 turns) | 24 | **0** | 1 |
+///
+/// ⚠ **The salient difference is the recorded failure, and the causal claim is NOT proven here.**
+/// `condensable` refuses to fold a subtree holding a failure, so the one root that holds the real
+/// `git_stage` error stays expanded while the split's rail folds it to a row — which would explain
+/// zero matches. That is the leading candidate, not a measured cause: this test pins the *numbers*,
+/// and anyone who needs the mechanism should isolate it rather than inherit this comment as fact.
+///
+/// The useful reading either way: on **recorded** load the acceptance criterion "condensing never
+/// swallows a failure" and the split's rail are in tension, and the acceptance wins.
+#[test]
+fn top_level_condensing_reaches_the_split_only_on_a_run_without_a_failure() {
+    let theme = Theme::MONO;
+    for case in LOAD_CASES {
+        let fx = loopmock::fixture(case);
+        if fx.steps.len() < 2 {
+            continue;
+        }
+        let failures = fx
+            .flatten()
+            .iter()
+            .filter(|f| f.step.status == loopmock::Status::Failed)
+            .count();
+        let (mut eligible, mut reached) = (0usize, 0usize);
+        for cols in COLS {
+            for rows in ROWS {
+                let vp = Viewport { cols, rows };
+                if !split_can_express_its_rule(case, vp, &theme) {
+                    continue;
+                }
+                if loopmock::render(Mock::Split, case, vp, &theme).steps_drawn() == fx.step_count()
+                {
+                    continue;
+                }
+                eligible += 1;
+                if axes_matching_the_split(case, vp, &theme)
+                    .iter()
+                    .any(|label| label.contains("top-level"))
+                {
+                    reached += 1;
+                }
+            }
+        }
+        if eligible == 0 {
+            continue;
+        }
+        if failures == 0 {
+            assert!(
+                reached > 0,
+                "{}: with no failure to protect, top-level condensing should reach the split \
+                 somewhere in {eligible} eligible viewports — it reached none",
+                case.name(),
+            );
+        } else {
+            assert_eq!(
+                reached,
+                0,
+                "{}: this run holds {failures} recorded failure(s); if top-level condensing now \
+                 reproduces the split here, the failure rule has stopped keeping that root open \
+                 and THAT is the regression — check `condensable` before updating this number",
+                case.name(),
+            );
+        }
+    }
 }
