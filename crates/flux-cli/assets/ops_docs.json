@@ -91,7 +91,8 @@
     "language/ops"
   ],
   "fleet.isolate": [
-    "language/ops"
+    "language/ops",
+    "reference/config"
   ],
   "gaps": [
     "language/ops",
@@ -139,7 +140,8 @@
     "language/ops"
   ],
   "git_worktree_enter": [
-    "language/ops"
+    "language/ops",
+    "reference/config"
   ],
   "git_worktree_leave": [
     "language/ops"
@@ -177,6 +179,7 @@
     "channels/overview",
     "language/tooling",
     "reference/config",
+    "remote-system-deployment",
     "security/credentials",
     "whats-new"
   ],
@@ -305,6 +308,7 @@
   ],
   "web.crawl": [
     "language/ops",
+    "reference/config",
     "whats-new"
   ],
   "web.fetch": [
@@ -312,6 +316,7 @@
     "agent/skills-and-roles",
     "language/pure-data",
     "reference/config",
+    "remote-system-deployment",
     "whats-new"
   ],
   "write": [
