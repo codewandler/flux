@@ -391,6 +391,24 @@ because a withhold is invisible from the outside, `drive` records how long each 
 `flux fleet doctor` reports any ready item withheld across five consecutive ticks as
 `item-withheld-persistently`, so a permanent withhold cannot masquerade as an empty queue.
 
+Dispatch reads `waves[].eligible`, so a `[[waves]]` entry used to be the only way an item could be
+seen at all: an item the milestone program marked eligible and no wave named reached no dispatch and
+no withhold either, which made an operator's hand-written wave a precondition for scheduling any
+story. The schedule now composes the leftovers itself. Eligible items no `[[waves]]` entry names are
+grouped into a synthesized unit under the same bounds a configured wave carries — one repository,
+at most `max_wave` stories — reported with `"synthesized": true` so the view never credits an
+operator with a wave they did not write. A configured wave still decides every item it names,
+whatever state it is in; this widens what dispatch can see, it does not reinterpret a wave somebody
+composed.
+
+Whatever a wave cannot carry appears under `unschedulable` with the reason — `wave-capacity`,
+`wave-dependencies`, `wave-done`, or `repository-unconfigured` for an item whose repository has no
+`[[repositories]]` entry to cut a worktree in — and the tick turns each into an ordinary `withheld`
+record. Every eligible item a tick sees is therefore dispatched or explained. `drive` also counts,
+per item, how many consecutive ticks sent nothing at all, and `flux fleet doctor` reports a run of
+five as `item-never-dispatched`: that count comes from the eligible pool minus what dispatch sent,
+so it still fires for an item nothing ever explained.
+
 `--loop` runs under a durable single-instance guard, so a second driver refuses and names the pid
 holding it; a lock naming a process that is gone is not a lock and needs no hand cleanup. The loop
 is stopped by durable facts rather than a signal: `flux fleet stop` and `flux fleet quiesce` both

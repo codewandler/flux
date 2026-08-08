@@ -1408,6 +1408,16 @@ struct DriveRecord {
     /// withheld rather than accumulated: a map that only grows is how one state file reached 12.9MB.
     #[serde(default)]
     withheld: BTreeMap<String, DriveWithhold>,
+    /// C-728: how long each eligible item has gone undispatched, keyed by item.
+    ///
+    /// Deliberately independent of [`DriveRecord::withheld`]: that map only holds items a tick
+    /// judged and named, and the failure this answers is an item no tick judged at all. Counting
+    /// what dispatch did NOT send is the one measure that cannot be fooled by an accounting gap,
+    /// because it is derived from the eligible pool rather than from the reasons about it. Pruned
+    /// to the current pool for the same reason `withheld` is: a map that only grows is how one
+    /// state file reached 12.9MB.
+    #[serde(default)]
+    undispatched: BTreeMap<String, DriveUndispatched>,
 }
 
 /// C-723: one ready item's unbroken run of withheld ticks.
@@ -1416,6 +1426,23 @@ struct DriveWithhold {
     /// The reason the most recent tick gave. A different reason starts a new run.
     reason: String,
     /// Consecutive ticks withheld on that reason.
+    ticks: u64,
+    /// The tick the run started at, so a reader can date it against the journal.
+    since_tick: u64,
+}
+
+/// C-728: one eligible item's unbroken run of ticks that did not dispatch it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct DriveUndispatched {
+    /// The reason the most recent tick recorded, when it recorded one at all.
+    ///
+    /// `None` is the whole signature of this story's defect: the item was eligible, it was not
+    /// sent, and no tick said why.
+    #[serde(default)]
+    reason: Option<String>,
+    /// Consecutive ticks the item was eligible and went unsent. A reason that changes does not
+    /// restart it — the question here is whether anything ever dispatched the item, not whether
+    /// one judgement about it held.
     ticks: u64,
     /// The tick the run started at, so a reader can date it against the journal.
     since_tick: u64,
@@ -12906,7 +12933,7 @@ fn wave_worktrees(wave: &Value) -> Vec<WaveWorktree> {
 }
 
 /// The runtime questions `fleet doctor` answers, in report order.
-const FLEET_RUNTIME_CHECKS: [&str; 10] = [
+const FLEET_RUNTIME_CHECKS: [&str; 11] = [
     "agent-supervisor-gone",
     "claim-without-supervisor",
     "wave-wedged",
@@ -12916,6 +12943,9 @@ const FLEET_RUNTIME_CHECKS: [&str; 10] = [
     // prescription, and only one of the two may reach the operator.
     "story-worktree-holds-uncommitted-work",
     "item-withheld-persistently",
+    // C-728, and deliberately behind the withhold check for the same reason: an item that already
+    // carries a named withhold is reported with that reason and its prescription, not twice.
+    "item-never-dispatched",
     "branch-without-unique-work",
     "applied-without-delivery",
     "applied-without-green-gate",
@@ -13125,6 +13155,52 @@ fn persistent_withhold_findings(state: &FleetState) -> Vec<Value> {
                 ),
                 "flux fleet drive --tick --dry-run --output json (the tick names the evidence \
                  behind every withhold)"
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// C-728: eligible items that no tick has dispatched, run after run.
+///
+/// The backstop for the failure C-723 could not see. That check reads the withhold map, so it can
+/// only report an item some tick judged and named; the defect here is an item that reached no wave
+/// at all, was therefore never judged, and left the schedulable pool without a record — which from
+/// the outside is indistinguishable from an empty queue. This one counts what dispatch did NOT
+/// send, so a permanently invisible item becomes a question even when nothing explains it.
+///
+/// `reported` is the withhold findings this same run already produced. An item they name is left to
+/// them: they carry the specific reason and its prescription, and two findings for one item spend
+/// the operator's attention twice on the same story.
+fn never_dispatched_findings(state: &FleetState, reported: &[Value]) -> Vec<Value> {
+    let Some(drive) = state.drive.as_ref() else {
+        return Vec::new();
+    };
+    let named = reported
+        .iter()
+        .filter_map(|finding| finding["subject"].as_str())
+        .collect::<BTreeSet<_>>();
+    drive
+        .undispatched
+        .iter()
+        .filter(|(item, held)| {
+            held.ticks >= DRIVE_WITHHOLD_STREAK_LIMIT && !named.contains(item.as_str())
+        })
+        .map(|(item, held)| {
+            runtime_finding(
+                "item-never-dispatched",
+                item,
+                format!(
+                    "eligible for dispatch and unsent on {} consecutive tick(s) since tick {}; {}",
+                    held.ticks,
+                    held.since_tick,
+                    match held.reason.as_deref() {
+                        Some(reason) => format!("the last tick recorded `{reason}`"),
+                        None => "no tick recorded a reason".to_string(),
+                    }
+                ),
+                "flux fleet schedule --output json (`unschedulable` names why each eligible item \
+                 reaches no wave; `waves[].eligible` is what dispatch reads)"
                     .to_string(),
             )
         })
@@ -13607,7 +13683,12 @@ fn fleet_runtime_health(state: &FleetState) -> Value {
     findings.extend(missing_worktree_findings(state));
     findings.extend(double_claimed_findings(state));
     findings.extend(uncommitted_work_findings(&holding));
-    findings.extend(persistent_withhold_findings(state));
+    // C-728: the never-dispatched check defers to the withhold check, so the withhold findings are
+    // computed first and handed to it rather than recomputed from the same predicate twice.
+    let withheld = persistent_withhold_findings(state);
+    let never_dispatched = never_dispatched_findings(state, &withheld);
+    findings.extend(withheld);
+    findings.extend(never_dispatched);
     findings.extend(undelivered_applied_findings(state, git_delivery_probe));
     findings.extend(applied_without_green_gate_findings(state));
     findings.extend(without_branches_holding_uncommitted_work(
@@ -16805,6 +16886,153 @@ fn open_decisions(root: &Path) -> Result<Value> {
     Ok(json!(decisions))
 }
 
+/// The repository half of a `BOARD/ITEM` ref.
+fn item_repository(item: &str) -> &str {
+    item.split_once('/')
+        .map_or(item, |(repository, _)| repository)
+}
+
+/// C-728: the repositories this fleet can actually cut a worktree in.
+///
+/// `prepare_wave_worktrees` refuses every other id, so a wave synthesized over one of them would be
+/// a dispatch that dies at the worktree rather than a schedule. `None` when the fleet configuration
+/// could not be read at all: an unanswerable question is not evidence that a repository is
+/// undispatchable, and this resolves toward dispatching for the same reason every other uncertainty
+/// on this path does.
+fn dispatchable_repositories(config: Option<&FleetConfig>) -> Option<BTreeSet<String>> {
+    let config = config?;
+    if config.repositories.is_empty() {
+        // The single implicit repository `prepare_wave_worktrees` accepts when none is declared.
+        return Some(BTreeSet::from(["default".to_string()]));
+    }
+    Some(
+        config
+            .repositories
+            .iter()
+            .map(|repository| repository.id.clone())
+            .collect(),
+    )
+}
+
+/// C-728: one dispatchable unit per repository for the eligible items no `[[waves]]` entry names.
+///
+/// Dispatch consumes `schedule["waves"][…]["eligible"]`, so until now an operator had to hand-write
+/// a wave for every story before the fleet could see it — three items were `eligible: true` in the
+/// milestone program and invisible to the driver, and because they never reached the withhold logic
+/// the tick recorded no reason for them either. A synthesized wave carries exactly the bounds a
+/// configured one does: one repository, at most `max_wave` stories. This widens what dispatch can
+/// SEE; it does not widen what dispatch may do, and it never touches an item an operator placed in
+/// a wave of their own.
+fn unplanned_waves(
+    unplanned: &[String],
+    dispatchable: Option<&BTreeSet<String>>,
+    max_wave: usize,
+    taken: &BTreeSet<String>,
+) -> Vec<Value> {
+    let mut grouped: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for item in unplanned {
+        let repository = item_repository(item);
+        if dispatchable.is_some_and(|allowed| !allowed.contains(repository)) {
+            continue;
+        }
+        grouped.entry(repository).or_default().push(item.clone());
+    }
+    grouped
+        .into_iter()
+        .map(|(repository, items)| {
+            let mut id = format!("unplanned-{repository}");
+            let mut suffix = 2;
+            while taken.contains(&id) {
+                id = format!("unplanned-{repository}-{suffix}");
+                suffix += 1;
+            }
+            let eligible = items.iter().take(max_wave).cloned().collect::<Vec<_>>();
+            json!({
+                "id": id,
+                "state": "active",
+                "repository": repository,
+                "items": items,
+                "eligible": eligible,
+                "depends_on": [],
+                "dependencies_done": true,
+                "synthesized": true
+            })
+        })
+        .collect()
+}
+
+/// C-728: every eligible item no wave will carry this tick, and why it will not.
+///
+/// Derived from the waves that were actually built rather than from the reasoning that built them,
+/// so what the schedule reports and what dispatch reads cannot drift apart. Silence is the defect
+/// this answers: an item that reaches no wave's `eligible` list leaves the schedulable pool looking
+/// exactly like an item the pool never held.
+fn schedule_unschedulable(
+    pool: &[String],
+    waves: &[Value],
+    dispatchable: Option<&BTreeSet<String>>,
+) -> Vec<Value> {
+    let scheduled = waves
+        .iter()
+        .flat_map(|wave| value_strings(&wave["eligible"]))
+        .collect::<BTreeSet<_>>();
+    pool.iter()
+        .filter(|item| !scheduled.contains(item.as_str()))
+        .map(|item| {
+            let holder = waves.iter().find(|wave| {
+                value_strings(&wave["items"])
+                    .iter()
+                    .any(|named| named == item)
+            });
+            let (reason, detail) = match holder {
+                Some(wave) => {
+                    let id = wave["id"].as_str().unwrap_or("unknown");
+                    if wave["state"].as_str() == Some("done") {
+                        (
+                            "wave-done",
+                            format!(
+                                "wave {id} names this item and is recorded `done`; a wave an \
+                                 operator composed is not reinterpreted"
+                            ),
+                        )
+                    } else if wave["dependencies_done"] == json!(false) {
+                        (
+                            "wave-dependencies",
+                            format!(
+                                "wave {id} holds this item and waits on wave(s) that are not \
+                                 complete: {}",
+                                value_strings(&wave["depends_on"]).join(", ")
+                            ),
+                        )
+                    } else {
+                        (
+                            "wave-capacity",
+                            format!("wave {id} is already carrying its maximum stories this tick"),
+                        )
+                    }
+                }
+                None if dispatchable
+                    .is_some_and(|allowed| !allowed.contains(item_repository(item))) =>
+                {
+                    (
+                        "repository-unconfigured",
+                        format!(
+                            "no `[[repositories]]` entry in .flux/fleet.toml declares {}, so this \
+                             fleet can cut no worktree for it",
+                            item_repository(item)
+                        ),
+                    )
+                }
+                None => (
+                    "unscheduled",
+                    "no configured or synthesized wave carries this eligible item".to_string(),
+                ),
+            };
+            json!({"item": item, "reason": reason, "detail": detail})
+        })
+        .collect()
+}
+
 fn fleet_schedule(root: &Path) -> Result<Value> {
     let fleet_config = read_fleet_config(root).ok();
     let board_config = if root.join(".flux/board.toml").is_file() {
@@ -16813,6 +17041,7 @@ fn fleet_schedule(root: &Path) -> Result<Value> {
         None
     };
     let max_wave = fleet_config.as_ref().map_or(10, |value| value.max_wave);
+    let dispatchable = dispatchable_repositories(fleet_config.as_ref());
     let (active_milestone, program_items, program, waves) = if let Some(config) = &board_config {
         let stories = workspace_stories(root)?;
         let states = stories
@@ -16856,7 +17085,11 @@ fn fleet_schedule(root: &Path) -> Result<Value> {
             .map(|wave| wave.id.as_str())
             .collect::<BTreeSet<_>>();
         let waves = if config.waves.is_empty() && config.program.is_empty() {
-            vec![json!({"id": "ready", "state": "active", "items": ready_refs})]
+            // C-728: `eligible` is what dispatch reads. Without it this wave named every ready item
+            // and offered dispatch none of them.
+            vec![json!({
+                "id": "ready", "state": "active", "items": ready_refs, "eligible": ready_refs
+            })]
         } else {
             config
                 .waves
@@ -16925,13 +17158,52 @@ fn fleet_schedule(root: &Path) -> Result<Value> {
             None,
             ready_refs.clone(),
             Vec::new(),
-            vec![json!({"id": "ready", "state": "active", "items": ready_refs})],
+            // C-728: `eligible` is what dispatch reads, and a single-repository fleet's only wave
+            // did not carry it — every ready story was named here and offered to dispatch nowhere.
+            vec![json!({
+                "id": "ready", "state": "active", "items": ready_refs, "eligible": ready_refs
+            })],
         )
     };
+    // C-728. An item an operator deliberately placed in a `[[waves]]` entry stays that wave's to
+    // schedule, whatever state the wave is in — this widens dispatch, it does not reinterpret a
+    // wave somebody composed. Everything else eligible becomes a synthesized unit, one per
+    // repository.
+    let unplanned = board_config
+        .as_ref()
+        .map(|config| {
+            let planned = config
+                .waves
+                .iter()
+                .flat_map(|wave| wave.items.iter().map(String::as_str))
+                .collect::<BTreeSet<_>>();
+            let already = waves
+                .iter()
+                .flat_map(|wave| value_strings(&wave["eligible"]))
+                .collect::<BTreeSet<_>>();
+            let taken = waves
+                .iter()
+                .filter_map(|wave| wave["id"].as_str().map(str::to_string))
+                .collect::<BTreeSet<_>>();
+            let outside = program_items
+                .iter()
+                .filter(|item| !planned.contains(item.as_str()) && !already.contains(item.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            unplanned_waves(&outside, dispatchable.as_ref(), max_wave, &taken)
+        })
+        .unwrap_or_default();
+    let waves = [waves, unplanned].concat();
+    // And whatever still reaches no wave is named rather than dropped. Derived from the waves that
+    // were actually built, so what the schedule reports and what dispatch reads cannot drift apart.
+    let unschedulable = schedule_unschedulable(&program_items, &waves, dispatchable.as_ref());
     let human_decisions = open_decisions(root)?;
     Ok(json!({
         "schema": "flux.fleet-schedule/v1", "active_milestone": active_milestone,
         "program_items": program_items, "program": program, "waves": waves, "max_wave": max_wave,
+        // C-728: the eligible items no wave carries this tick, each with the reason. Read by
+        // `drive_tick_plan`, which turns them into the same `withheld` records C-723 established.
+        "unschedulable": unschedulable,
         "human_decisions": human_decisions,
         "attention_required": !human_decisions.as_array().is_none_or(Vec::is_empty)
     }))
@@ -17681,6 +17953,52 @@ fn drive_withhold_streaks(
     next
 }
 
+/// C-728: carry each eligible-but-unsent item's streak forward by one tick.
+///
+/// Computed from the eligible pool minus what this tick dispatched, so it holds even for an item no
+/// reason was recorded about — which is the whole point, and the one thing [`drive_withhold_streaks`]
+/// structurally cannot see. `width` is NOT excluded here: capacity resolves itself in a fleet that
+/// is making progress, and an item that has waited on capacity for five consecutive ticks is one
+/// nothing is dispatching, which is exactly the question `fleet doctor` should be able to answer.
+/// Only items in the current pool survive, so a run ends the moment the item ships or stops being
+/// eligible.
+///
+/// `blocked` is the tick's own refusal, and it stands in for a per-item reason when the whole
+/// dispatch phase never ran. Recording `None` there would tell an operator no tick said why about a
+/// tick that said exactly why — and "no reason recorded" is the one signal this check must keep
+/// meaning what it says.
+fn drive_undispatched_streaks(
+    previous: &BTreeMap<String, DriveUndispatched>,
+    pool: &[String],
+    dispatch: &[String],
+    withheld: &[Value],
+    blocked: Option<&str>,
+    tick: u64,
+) -> BTreeMap<String, DriveUndispatched> {
+    let sent = dispatch.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut next = BTreeMap::new();
+    for item in pool {
+        if sent.contains(item.as_str()) {
+            continue;
+        }
+        let run = previous.get(item);
+        next.insert(
+            item.clone(),
+            DriveUndispatched {
+                reason: withheld
+                    .iter()
+                    .find(|entry| entry["item"].as_str() == Some(item.as_str()))
+                    .and_then(|entry| entry["reason"].as_str())
+                    .map(str::to_string)
+                    .or_else(|| blocked.map(str::to_string)),
+                ticks: run.map_or(1, |held| held.ticks.saturating_add(1)),
+                since_tick: run.map_or(tick, |held| held.since_tick),
+            },
+        );
+    }
+    next
+}
+
 /// Compute one tick's decisions. Pure: every input is already-read durable state.
 ///
 /// `reconcile` is `None` when `board reconcile` could not be read, and that case **fails closed**:
@@ -17806,6 +18124,33 @@ fn drive_tick_plan(
                 continue;
             }
             plan.dispatch.push(item);
+        }
+    }
+    // C-728: an eligible item the schedule could put in no wave used to leave the pool in silence.
+    // The tick reported a smaller dispatch count and nothing else, which reads exactly like a pool
+    // that never held it — C-723 made a withhold state its evidence, and this is the path that
+    // produced no withhold to state. Carried in the same `withheld` shape, so a reason that never
+    // ends still becomes a `fleet doctor` finding rather than a number nobody can question.
+    for entry in schedule["unschedulable"].as_array().into_iter().flatten() {
+        let Some(item) = entry["item"].as_str() else {
+            continue;
+        };
+        if seen.insert(item.to_string()) {
+            plan.withheld.push(entry.clone());
+        }
+    }
+    // The backstop, and deliberately not conditional on the schedule having reasoned correctly:
+    // whatever it failed to account for, the tick still names. Silence is the defect this story
+    // removes, so "every eligible item is dispatched or carries a reason" is enforced HERE, where
+    // dispatch is decided, rather than trusted to the code that computed the schedule.
+    for item in value_strings(&schedule["program_items"]) {
+        if seen.insert(item.clone()) {
+            plan.withheld.push(json!({
+                "item": item,
+                "reason": "unscheduled",
+                "detail": "no wave carried this eligible item and the schedule recorded no reason \
+                           for it; it is reported rather than dropped",
+            }));
         }
     }
     plan
@@ -18133,6 +18478,12 @@ fn drive_one_tick(
         "blocked": plan.blocked,
     });
     let withheld = plan.withheld.clone();
+    // C-728: the pool a tick is answerable for, what it decided to send out of it, and the refusal
+    // that stands in for a reason when the dispatch phase never ran. Read here rather than inside
+    // the delta so a retry recomputes the same run from the same facts.
+    let pool = value_strings(&schedule["program_items"]);
+    let dispatched = plan.dispatch.clone();
+    let blocked = plan.blocked.clone();
     persist_delta_mutation(
         command,
         root,
@@ -18197,6 +18548,17 @@ fn drive_one_tick(
             // C-723: a withhold is invisible from the outside, so its run is recorded here and
             // `fleet doctor` reports the ones that never end.
             record.withheld = drive_withhold_streaks(&record.withheld, &withheld, record.ticks);
+            // C-728: and the run of an item nothing dispatched, whether or not anything explained
+            // it. The withhold map cannot hold an item no tick judged, which is precisely the item
+            // this story exists to stop losing.
+            record.undispatched = drive_undispatched_streaks(
+                &record.undispatched,
+                &pool,
+                &dispatched,
+                &withheld,
+                blocked.as_deref(),
+                record.ticks,
+            );
             Ok(())
         },
     )?;
@@ -18767,6 +19129,10 @@ fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
                 "item_count": wave["items"].as_array().map_or(0, Vec::len),
                 "eligible_count": wave["eligible"].as_array().map_or(0, Vec::len),
                 "dependencies_done": wave["dependencies_done"].as_bool(),
+                // C-728: a unit the schedule composed for items no `[[waves]]` entry names is
+                // reported as such, so this view never credits an operator with a wave they did
+                // not write.
+                "synthesized": wave["synthesized"].as_bool().unwrap_or(false),
             })
         })
         .collect::<Vec<_>>();
@@ -29423,6 +29789,513 @@ mod tests {
         // The run ends the moment the item ships, so the finding cannot outlive the problem.
         let cleared = drive_withhold_streaks(&streaks, &[], DRIVE_WITHHOLD_STREAK_LIMIT + 1);
         assert!(cleared.is_empty(), "{cleared:?}");
+    }
+
+    /// C-728: the `[[program]]` lanes one milestone needs, written in dispatch order.
+    fn program_lanes(items: &[&str]) -> String {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                format!(
+                    "\n[[program]]\nid = \"lane-{}\"\nitem = \"{item}\"\nmilestone = \"m1\"\n\
+                     order = {}\n",
+                    item.replace('/', "-"),
+                    (index + 1) * 10
+                )
+            })
+            .collect()
+    }
+
+    /// C-728: a workspace board whose milestone program IS the schedulable pool.
+    ///
+    /// Every named story is written `ready` with no dependency, so what reaches dispatch is decided
+    /// by the program and the `[[waves]]` entries alone — which is the exact question this story
+    /// asks. No git: `read_workspace_member_stories` falls back to the filesystem when a member's
+    /// `canonical_ref` does not resolve, so the fixture stays a directory tree.
+    fn program_workspace(
+        label: &str,
+        members: &[(&str, &[&str])],
+        board: &str,
+        fleet: &str,
+    ) -> PathBuf {
+        let root = reclaim_test_dir(label);
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(root.join(".flux")).expect("flux dir");
+        fs::create_dir_all(root.join("decisions")).expect("decisions dir");
+        for (member, stories) in members {
+            let dir = root.join("members").join(member).join("docs/stories");
+            fs::create_dir_all(&dir).expect("stories dir");
+            for id in *stories {
+                fs::write(
+                    dir.join(format!("{id}-fixture.md")),
+                    format!(
+                        "---\nid: {id}\ntitle: Fixture {id}\nstatus: ready\npriority: 1\n---\n\n\
+                         # Fixture {id}\n\n## Acceptance\n\n- [ ] Unbuilt.\n"
+                    ),
+                )
+                .expect("story");
+            }
+        }
+        fs::write(root.join(".flux/board.toml"), board).expect("board config");
+        fs::write(root.join(".flux/fleet.toml"), fleet).expect("fleet config");
+        root
+    }
+
+    /// A workspace board: one `[[members]]` entry per member, the milestone program, then `waves`.
+    fn workspace_board(members: &[&str], items: &[&str], waves: &str) -> String {
+        let members = members
+            .iter()
+            .map(|member| {
+                format!(
+                    "\n[[members]]\nid = \"{member}\"\nroot = \"members/{member}\"\n\
+                     board = \"{member}\"\ncanonical_ref = \"HEAD\"\n"
+                )
+            })
+            .collect::<String>();
+        format!(
+            "schema = \"flux.board-workspace/v1\"\nid = \"program\"\ndefault = true\n\
+             active_milestone = \"m1\"\ndecisions = \"decisions\"\n{members}{}\n{waves}",
+            program_lanes(items)
+        )
+    }
+
+    /// A fleet that can cut a worktree in exactly the named repositories and nowhere else.
+    fn workspace_fleet(max_workers: usize, max_wave: usize, repositories: &[&str]) -> String {
+        let repositories = repositories
+            .iter()
+            .map(|repository| {
+                format!(
+                    "\n[[repositories]]\nid = \"{repository}\"\nroot = \"members/{repository}\"\n\
+                     board = \"{repository}\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n"
+                )
+            })
+            .collect::<String>();
+        format!(
+            "schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\n\
+             max_rework = 2\n{repositories}"
+        )
+    }
+
+    /// Every eligible item this tick either sent or named a reason for.
+    fn accounted_for(plan: &DrivePlan) -> BTreeSet<String> {
+        plan.dispatch
+            .iter()
+            .cloned()
+            .chain(
+                plan.withheld
+                    .iter()
+                    .filter_map(|entry| entry["item"].as_str().map(str::to_string)),
+            )
+            .collect()
+    }
+
+    /// C-728 (the story's own regression, failing first): the live tick, reproduced.
+    ///
+    /// Eight free slots, eight program-eligible dependency-satisfied items, and a hand-written
+    /// `[[waves]]` entry naming five of them. `flux/C-600`, `flux/C-601` and `flux/C-622` were
+    /// `eligible: true` in the milestone program and reached no wave at all, so dispatch — which
+    /// draws from `schedule["waves"][…]["eligible"]` — never saw them and the withhold logic never
+    /// got the chance to say why. The tick planned five dispatches and recorded nothing about the
+    /// other three, which from the outside is indistinguishable from a pool that never held them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_dispatches_a_program_eligible_item_that_no_configured_wave_names() {
+        let items = [
+            "flux/C-595",
+            "flux/C-596",
+            "flux/C-597",
+            "flux/C-598",
+            "flux/C-599",
+            "flux/C-600",
+            "flux/C-601",
+            "flux/C-622",
+        ];
+        let root = program_workspace(
+            "unplanned-dispatch",
+            &[(
+                "flux",
+                &[
+                    "C-595", "C-596", "C-597", "C-598", "C-599", "C-600", "C-601", "C-622",
+                ],
+            )],
+            &workspace_board(
+                &["flux"],
+                &items,
+                "\n[[waves]]\nid = \"flux-core\"\nstate = \"active\"\nrepository = \"flux\"\n\
+                 items = [\"flux/C-595\", \"flux/C-596\", \"flux/C-597\", \"flux/C-598\", \
+                 \"flux/C-599\"]\n",
+            ),
+            &workspace_fleet(8, 10, &["flux"]),
+        );
+
+        let schedule = fleet_schedule(&root).expect("a schedule");
+        let pool = value_strings(&schedule["program_items"]);
+        assert_eq!(pool.len(), 8, "the milestone program holds eight: {pool:?}");
+
+        let plan = drive_tick_plan(
+            &drive_fixture_state(),
+            &schedule,
+            Some(&json!({"findings": []})),
+            8,
+        );
+
+        assert_eq!(plan.width, 8, "eight workers are free");
+        for item in ["flux/C-600", "flux/C-601", "flux/C-622"] {
+            assert!(
+                plan.dispatch.contains(&item.to_string()),
+                "{item} is program-eligible and named by no wave, so it dispatches: {:?} / {:?}",
+                plan.dispatch,
+                plan.withheld
+            );
+        }
+        assert_eq!(
+            plan.dispatch.len(),
+            8,
+            "eight free slots and eight eligible items fill every slot: {:?}",
+            plan.dispatch
+        );
+
+        let accounted = accounted_for(&plan);
+        for item in &pool {
+            assert!(
+                accounted.contains(item),
+                "{item} left the schedulable pool with no record: {:?} / {:?}",
+                plan.dispatch,
+                plan.withheld
+            );
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-728: the unit composed for unplanned items obeys the bounds a configured wave obeys, and
+    /// every item it cannot carry is named rather than dropped.
+    ///
+    /// One repository per wave, at most `max_wave` stories. `web` has an eligible item and no
+    /// `[[repositories]]` entry, so this fleet could cut it no worktree — that is a reason to
+    /// report, not a reason to synthesize a wave that would die at `prepare_wave_worktrees`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unplanned_dispatch_unit_holds_one_repository_and_at_most_max_wave_stories() {
+        let root = program_workspace(
+            "unplanned-bounds",
+            &[("flux", &["C-600", "C-601", "C-622"]), ("web", &["C-700"])],
+            &workspace_board(
+                &["flux", "web"],
+                &["flux/C-600", "flux/C-601", "flux/C-622", "web/C-700"],
+                "",
+            ),
+            &workspace_fleet(8, 2, &["flux"]),
+        );
+
+        let schedule = fleet_schedule(&root).expect("a schedule");
+        let synthesized = schedule["waves"]
+            .as_array()
+            .expect("waves")
+            .iter()
+            .filter(|wave| wave["synthesized"] == json!(true))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            synthesized.len(),
+            1,
+            "one unit per dispatchable repository, and `web` is not one: {synthesized:?}"
+        );
+        assert_eq!(synthesized[0]["repository"], "flux");
+        assert!(
+            value_strings(&synthesized[0]["items"])
+                .iter()
+                .all(|item| item_repository(item) == "flux"),
+            "a wave names exactly one repository: {synthesized:?}"
+        );
+        assert_eq!(
+            value_strings(&synthesized[0]["eligible"]),
+            vec!["flux/C-600".to_string(), "flux/C-601".to_string()],
+            "max_wave is 2, so the third waits: {synthesized:?}"
+        );
+
+        let plan = drive_tick_plan(
+            &drive_fixture_state(),
+            &schedule,
+            Some(&json!({"findings": []})),
+            8,
+        );
+
+        assert_eq!(
+            plan.dispatch,
+            vec!["flux/C-600".to_string(), "flux/C-601".to_string()],
+            "{:?}",
+            plan.withheld
+        );
+        let reason = |item: &str| {
+            plan.withheld
+                .iter()
+                .find(|entry| entry["item"] == json!(item))
+                .and_then(|entry| entry["reason"].as_str())
+                .map(str::to_string)
+        };
+        assert_eq!(reason("flux/C-622").as_deref(), Some("wave-capacity"));
+        assert_eq!(
+            reason("web/C-700").as_deref(),
+            Some("repository-unconfigured"),
+            "an item this fleet cannot cut a worktree for is named, not dropped: {:?}",
+            plan.withheld
+        );
+        assert!(
+            plan.withheld
+                .iter()
+                .all(|entry| entry["detail"].as_str().is_some_and(|it| !it.is_empty())),
+            "every withhold states its reason: {:?}",
+            plan.withheld
+        );
+        let accounted = accounted_for(&plan);
+        for item in value_strings(&schedule["program_items"]) {
+            assert!(accounted.contains(&item), "{item} left no record");
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-728: a synthesized unit is bounded by the configured worker width like any other.
+    ///
+    /// Widening what dispatch can SEE must not widen what it may do. Six free slots, eight eligible
+    /// items, and the two that do not fit wait on capacity — a fact about the fleet that resolves
+    /// itself — rather than dispatching over the worker ceiling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unplanned_item_still_waits_for_a_free_worker_slot() {
+        let items = [
+            "flux/C-595",
+            "flux/C-596",
+            "flux/C-597",
+            "flux/C-598",
+            "flux/C-599",
+            "flux/C-600",
+            "flux/C-601",
+            "flux/C-622",
+        ];
+        let root = program_workspace(
+            "unplanned-width",
+            &[(
+                "flux",
+                &[
+                    "C-595", "C-596", "C-597", "C-598", "C-599", "C-600", "C-601", "C-622",
+                ],
+            )],
+            &workspace_board(
+                &["flux"],
+                &items,
+                "\n[[waves]]\nid = \"flux-core\"\nstate = \"active\"\nrepository = \"flux\"\n\
+                 items = [\"flux/C-595\", \"flux/C-596\", \"flux/C-597\", \"flux/C-598\", \
+                 \"flux/C-599\"]\n",
+            ),
+            &workspace_fleet(6, 10, &["flux"]),
+        );
+
+        let schedule = fleet_schedule(&root).expect("a schedule");
+        let plan = drive_tick_plan(
+            &drive_fixture_state(),
+            &schedule,
+            Some(&json!({"findings": []})),
+            6,
+        );
+
+        assert_eq!(plan.width, 6);
+        assert_eq!(plan.dispatch.len(), 6, "{:?}", plan.dispatch);
+        assert_eq!(
+            plan.withheld
+                .iter()
+                .filter(|entry| entry["reason"] == json!("width"))
+                .count(),
+            2,
+            "the overflow waits on capacity, and says so: {:?}",
+            plan.withheld
+        );
+        let accounted = accounted_for(&plan);
+        for item in value_strings(&schedule["program_items"]) {
+            assert!(accounted.contains(&item), "{item} left no record");
+        }
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-728: this widens dispatch; it does not reinterpret a wave an operator composed.
+    ///
+    /// A `done` wave still owns the items it names, so they are not swept into a synthesized unit
+    /// behind the operator's back. The item is reported with the wave that holds it — which is the
+    /// difference between a deliberate decision and the silence this story removes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hand_configured_wave_still_decides_the_items_it_names() {
+        let root = program_workspace(
+            "unplanned-configured-wins",
+            &[("flux", &["C-600", "C-601"])],
+            &workspace_board(
+                &["flux"],
+                &["flux/C-600", "flux/C-601"],
+                "\n[[waves]]\nid = \"flux-retired\"\nstate = \"done\"\nrepository = \"flux\"\n\
+                 items = [\"flux/C-600\"]\n",
+            ),
+            &workspace_fleet(8, 10, &["flux"]),
+        );
+
+        let schedule = fleet_schedule(&root).expect("a schedule");
+        assert!(
+            schedule["waves"]
+                .as_array()
+                .expect("waves")
+                .iter()
+                .filter(|wave| wave["synthesized"] == json!(true))
+                .all(|wave| !value_strings(&wave["items"]).contains(&"flux/C-600".to_string())),
+            "an item a configured wave names is never re-scheduled elsewhere: {:?}",
+            schedule["waves"]
+        );
+
+        let plan = drive_tick_plan(
+            &drive_fixture_state(),
+            &schedule,
+            Some(&json!({"findings": []})),
+            8,
+        );
+
+        assert_eq!(plan.dispatch, vec!["flux/C-601".to_string()]);
+        assert_eq!(plan.withheld.len(), 1, "{:?}", plan.withheld);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-600");
+        assert_eq!(plan.withheld[0]["reason"], "wave-done");
+        assert!(
+            plan.withheld[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("flux-retired")),
+            "the record names the wave that holds it: {:?}",
+            plan.withheld
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-728: an eligible item nothing dispatches, tick after tick, becomes a `fleet doctor`
+    /// question — even when no tick ever said why.
+    ///
+    /// C-723's check reads the withhold map, so it can only report an item some tick judged. The
+    /// failure this story fixes produced no judgement at all, so the run is counted from the
+    /// eligible pool minus what dispatch sent, which no accounting gap can hide.
+    #[test]
+    fn an_eligible_item_no_tick_dispatches_becomes_a_doctor_finding() {
+        let pool = [
+            "flux/C-1".to_string(),
+            "flux/C-2".to_string(),
+            "flux/C-3".to_string(),
+        ];
+        let dispatch = ["flux/C-1".to_string()];
+        let withheld = [json!({
+            "item": "flux/C-2", "reason": "already-built", "detail": "verified"
+        })];
+        let mut streaks = BTreeMap::new();
+        for tick in 1..DRIVE_WITHHOLD_STREAK_LIMIT {
+            streaks = drive_undispatched_streaks(&streaks, &pool, &dispatch, &withheld, None, tick);
+        }
+        let mut state = drive_fixture_state();
+        state.drive = Some(DriveRecord {
+            ticks: DRIVE_WITHHOLD_STREAK_LIMIT - 1,
+            undispatched: streaks.clone(),
+            ..DriveRecord::default()
+        });
+        assert!(
+            never_dispatched_findings(&state, &[]).is_empty(),
+            "one tick under the limit is still allowed to be transient: {streaks:?}"
+        );
+
+        streaks = drive_undispatched_streaks(
+            &streaks,
+            &pool,
+            &dispatch,
+            &withheld,
+            None,
+            DRIVE_WITHHOLD_STREAK_LIMIT,
+        );
+        assert!(
+            !streaks.contains_key("flux/C-1"),
+            "a dispatched item has no run: {streaks:?}"
+        );
+        assert_eq!(streaks["flux/C-3"].ticks, DRIVE_WITHHOLD_STREAK_LIMIT);
+        assert_eq!(streaks["flux/C-3"].since_tick, 1);
+        assert_eq!(
+            streaks["flux/C-3"].reason, None,
+            "eligible, unsent and unexplained is the signature this check exists for: {streaks:?}"
+        );
+        assert_eq!(
+            streaks["flux/C-2"].reason.as_deref(),
+            Some("already-built"),
+            "{streaks:?}"
+        );
+
+        state.drive = Some(DriveRecord {
+            ticks: DRIVE_WITHHOLD_STREAK_LIMIT,
+            withheld: BTreeMap::from([(
+                "flux/C-2".to_string(),
+                DriveWithhold {
+                    reason: "already-built".to_string(),
+                    ticks: DRIVE_WITHHOLD_STREAK_LIMIT,
+                    since_tick: 1,
+                },
+            )]),
+            undispatched: streaks.clone(),
+            ..DriveRecord::default()
+        });
+        let health = fleet_runtime_health(&state);
+        assert!(
+            value_strings(&health["checks"]).contains(&"item-never-dispatched".to_string()),
+            "the check is declared: {:?}",
+            health["checks"]
+        );
+        let checks_for = |subject: &str| {
+            health["findings"]
+                .as_array()
+                .expect("findings")
+                .iter()
+                .filter(|finding| finding["subject"] == json!(subject))
+                .filter_map(|finding| finding["check"].as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            checks_for("flux/C-2"),
+            vec!["item-withheld-persistently".to_string()],
+            "an item with a named withhold is reported once, with its reason: {:?}",
+            health["findings"]
+        );
+        assert_eq!(
+            checks_for("flux/C-3"),
+            vec!["item-never-dispatched".to_string()],
+            "{:?}",
+            health["findings"]
+        );
+        let detail = health["findings"]
+            .as_array()
+            .expect("findings")
+            .iter()
+            .find(|finding| finding["check"] == json!("item-never-dispatched"))
+            .and_then(|finding| finding["detail"].as_str())
+            .expect("a detail");
+        assert!(detail.contains("no tick recorded a reason"), "{detail}");
+
+        // The run ends the moment the item ships, so the finding cannot outlive the problem.
+        let cleared = drive_undispatched_streaks(
+            &streaks,
+            &pool,
+            &["flux/C-3".to_string()],
+            &[],
+            None,
+            DRIVE_WITHHOLD_STREAK_LIMIT + 1,
+        );
+        assert!(!cleared.contains_key("flux/C-3"), "{cleared:?}");
+
+        // A tick that refused outright DID say why. Recording `None` there would report a silence
+        // that never happened, and silence is the only thing this check is meant to name.
+        let refused = drive_undispatched_streaks(
+            &BTreeMap::new(),
+            &pool,
+            &[],
+            &[],
+            Some("fleet is stopped; `flux fleet start` before dispatching"),
+            1,
+        );
+        assert_eq!(
+            refused["flux/C-1"].reason.as_deref(),
+            Some("fleet is stopped; `flux fleet start` before dispatching"),
+            "{refused:?}"
+        );
     }
 
     /// One tick under the limit is not yet a finding: a withhold is allowed to be transient.
