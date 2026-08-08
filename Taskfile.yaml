@@ -7,6 +7,13 @@ vars:
   PYTHON: '{{default "" .PYTHON}}'
 
 tasks:
+  # `--lib --bins`, never `--lib` alone. `--lib` is a filter, and at workspace scope a filter that
+  # matches no target in a package is silently skipped rather than refused — so `--lib` ran ZERO
+  # tests in `flux-cli`, a binary crate with no library target that holds the whole board and fleet
+  # implementation, and 11 more in `flux-lang`'s `src/bin/fluxlang.rs`. `cargo test -p flux-cli
+  # --lib` fails loudly with "no library targets found"; the workspace form never said a word.
+  # `flux-codegate`'s `declared_test_gate_reaches_every_workspace_crate_that_carries_tests` reads
+  # these four command lines and fails if one of them stops reaching a test-carrying target (C-664).
   test:
     desc: Run the workspace unit tests
     dir: '{{.TASKFILE_DIR}}'
@@ -18,13 +25,13 @@ tasks:
     internal: true
     platforms: [linux, darwin]
     cmds:
-      - 'FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}" -- cargo test --workspace --lib'
+      - 'FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}" -- cargo test --workspace --lib --bins'
 
   _test-owned-windows:
     internal: true
     platforms: [windows]
     cmds:
-      - 'set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}" -- cargo test --workspace --lib'
+      - 'set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared --workspace-root "{{.TASKFILE_DIR}}" -- cargo test --workspace --lib --bins'
 
   install:
     desc: Run unit tests, then install the flux binary and the flux-lsp language server
@@ -41,7 +48,7 @@ tasks:
       - >-
         FLUX_PYTHON="{{.PYTHON}}" scripts/run-python3.sh scripts/build_ownership.py shared
         --workspace-root "{{.TASKFILE_DIR}}" -- sh -c
-        'cargo fetch --locked && cargo test --workspace --lib && cargo install --path crates/flux-cli --force && cargo install --path crates/flux-lsp --force'
+        'cargo fetch --locked && cargo test --workspace --lib --bins && cargo install --path crates/flux-cli --force && cargo install --path crates/flux-lsp --force'
 
   _install-owned-windows:
     internal: true
@@ -50,7 +57,7 @@ tasks:
       - >-
         set "FLUX_PYTHON={{.PYTHON}}" && scripts\run-python3.cmd scripts\build_ownership.py shared
         --workspace-root "{{.TASKFILE_DIR}}" -- cmd /d /s /c
-        "cargo fetch --locked && cargo test --workspace --lib && cargo install --path crates/flux-cli --force && cargo install --path crates/flux-lsp --force"
+        "cargo fetch --locked && cargo test --workspace --lib --bins && cargo install --path crates/flux-cli --force && cargo install --path crates/flux-lsp --force"
 
   clean:
     desc: Clean the selected root-workspace Cargo target after all active builds finish

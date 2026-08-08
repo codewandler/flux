@@ -59,8 +59,9 @@ After each coherent code change:
    A worker recorded `failed` can still hold a complete commit.
 3. Stop the TUI: `tmux respawn-pane -k -t flux:fleet -c <fleet root> 'fish'`. Confirm no
    `flux tui` process survives.
-4. Run `task install` from the Flux source root (it runs `cargo test --workspace --lib` first). If it
-   fails, inspect and fix it; do not restart onto an unverified binary.
+4. Run `task install` from the Flux source root (it runs `cargo test --workspace --lib --bins`
+   first — `--bins` is what reaches `flux-cli`, and therefore the board and fleet tests; see C-664).
+   If it fails, inspect and fix it; do not restart onto an unverified binary.
 5. Respawn the pane on the installed command:
 
 ```bash
