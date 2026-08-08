@@ -21,6 +21,39 @@
   display — spinners, per-step lines, and timers — so a scripted run prints nothing but the final
   result, plus any errors or approval prompts. Great for wrappers and CI logs.
 
+- **Stories carry a real contract, and the tools check it.** A story now has to say what it delivers
+  and how you will know it is done before it can be worked on, and the board refuses one that does
+  not. Acceptance items can carry their own id and name the command that proves them, so "half done"
+  is something the board can actually show you.
+- **Epics are real things now.** An epic has its own page, its own success and exit criteria, and a
+  completion figure worked out from its stories rather than typed in by hand.
+- **The fleet picks up work without being told twice.** Ready work no longer has to be listed in a
+  hand-written batch before the fleet can see it, and anything it decides not to start now says why.
+- **Release notes write themselves.** Assembling a batch of finished work now drafts the changelog
+  entry from the stories in it, so a release can no longer be cut with nothing to say.
+
+## [0.59.3] - 2026-08-08
+
+### New
+
+- **The fleet finishes a job on its own.** Work now goes all the way from "a worker finished" to
+  "it is on your main branch" without anyone stepping in between: the finished turn hands off with
+  its evidence, a second agent that did not write the code reviews it, and the result is merged and
+  re-checked before it lands.
+- **Write an agent loop by describing it.** In the TUI, `/loop <what it should do>` writes the loop
+  file for you and drops it into the loop picker, ready to run. If what it generates is not valid it
+  tells you why and saves nothing.
+- **Board items expand and collapse** with a click or a keypress, whichever you reach for.
+- **Cancelling actually shows you it is cancelling,** and sub-agents now stop on a wall clock rather
+  than running indefinitely.
+- **Long-running work reports progress from further down.** Steps nested inside other steps can now
+  report back, so a long run stops looking stalled.
+
+### Fixed
+
+- **Reviews are no longer shown a shortened diff.** A change that had been collapsed for display was
+  being reviewed as though that were the whole change.
+
 ## [0.59.2] - 2026-08-08
 
 ### New

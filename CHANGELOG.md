@@ -14,6 +14,94 @@ All notable changes to this project are documented in this file. The format is b
   approval warning, halt reports, sandbox posture disclosures, and the flow result on stdout
   untouched. Complements `flux review --progress off`; wrapper scripts no longer need to filter the
   progress stream to get a clean terminal.
+- **A story's contract is validated (C-736, C-737).** `flux board check` now opens a story's body: a
+  story needs a non-empty `## Goal` and at least one acceptance criterion, and may not carry the
+  `create` placeholder as one. Severity follows status — an error for `ready`, `in-progress` and
+  `done`, a warning while drafting. The acceptance heading match also stopped being exact, so
+  `## Acceptance (for the epic)` is read as the Acceptance section; that alone recovered **53
+  criteria** that existed on disk and no tool could see. `board done` no longer treats zero criteria
+  as "nothing remaining".
+- **Acceptance criteria are addressable (C-739).** A criterion may carry an `AC-n` id and an
+  indented `verify:` handle naming the command, test or artifact that proves it. `flux fleet
+  coverage BOARD/ITEM` reports per criterion: its status, its handle, and every claim against it
+  with the wave, worker, commit and argv. Additive — a story declaring neither parses exactly as
+  before.
+- **An epic is one entity (C-742).** `docs/epics/<slug>.md`, with `epic:` resolving the way
+  `design:` always has, and completion derived from its members rather than declared. 137 epic
+  documents; 28 slugs previously resolved to no document at all.
+- **A story declares its kind (C-741)** — `feature | enabler | spike | bug` — and is validated as
+  that kind, so a spike is not judged against "behaviour implemented".
+- **`flux board create` generates from `docs/stories/_TEMPLATE.md` (C-738)**, with `--goal` and
+  `--criterion` to author a contract at creation, and refuses `--status ready` for a document that
+  has none.
+- **A delivery glossary (C-744).** `docs/glossary.md`, 54 terms, each carrying the distinction it is
+  most often confused with, named by `AGENTS.md` in the work contract. A lint refuses a story that
+  renames a defined concept, and refuses an anchor that no longer resolves.
+
+### Changed
+
+- **Dispatch no longer requires a hand-written wave (C-728).** A program-eligible,
+  dependency-satisfied item that no `[[waves]]` entry names is gathered into a synthesized dispatch
+  unit and sent, under the same bounds a configured wave has. Nothing leaves the schedulable pool
+  without a recorded reason, and `flux fleet doctor` reports an item no tick has dispatched.
+- **An unresolved question blocks the `ready` transition (C-740).** `[NEEDS CLARIFICATION: ...]`
+  anywhere in a story refuses promotion to `ready` and only that transition; `--override-reason`
+  records a reasoned exception in frontmatter.
+- **`fleet integrate` composes the `[Unreleased]` changelog entry (C-743)** from the accepted
+  stories' own goals, on the assembled candidate, and verifies it landed by re-reading it.
+
+### Fixed
+
+- **A tag build that publishes nothing is red (C-719).** `scripts/check-publish-chain.sh` models
+  GitHub's transitive `skipped` propagation over the `needs` closure and schedules the committed
+  `release.yml` through it, executes `verify-published`'s real step script, and simulates 216
+  publishing runs. Replayed against the workflow as it stood for v0.59.0 it reproduces that run's
+  conclusions job-for-job and exits non-zero.
+- **The install gate runs `flux-cli`'s tests (C-664).** `cargo test --workspace --lib` selected zero
+  of them — `flux-cli` has no library target, so the filter skipped the package in silence while
+  `cargo test -p flux-cli --lib` fails loudly. 500 unit tests were outside the gate. `flux-codegate`
+  now asserts that no test-carrying crate falls out of a declared gate command.
+
+## [0.59.3] - 2026-08-08
+
+Backfilled after the fact, for the same reason `[0.59.2]` was: the cut rolls `## [Unreleased]` into
+the version heading, and `[Unreleased]` was empty. C-743 landed the fix — `fleet integrate` now
+composes the entry — but it landed *after* this tag was cut, so this section is written from
+`git log v0.59.2..v0.59.3`. 29 commits, ~11,000 insertions.
+
+### Added
+
+- **The Fleet's delivery chain closed end to end.** Four links that previously needed an operator
+  verb between them:
+  - **A finished worker turn becomes a verified handoff (C-730).** The turn records its exact
+    commit, write set and targeted validation evidence, and a ready wave gets its integrator without
+    anyone asking for one.
+  - **Every candidate is examined by an agent that is not its writer (C-587),** which records a
+    typed verdict. A candidate with no acceptance contract is refused review rather than waved
+    through.
+  - **Accepted work lands on every member's local canonical branch (C-681).** `flux fleet promote`
+    accumulates each member's accepted candidates, gates them in a throwaway worktree against the
+    canonical ref, and lands by compare-and-swap `update-ref`.
+  - **The drive tick calls promotion itself (C-732),** so a delivered wave reaches `main` with no
+    operator in the loop.
+- **Author an agent loop by describing it (C-544).** The TUI's `/loop <what it should do>` generates
+  a valid `*.flux` loop file, admits it through the same validation a hand-written loop passes, and
+  drops it into the C-543 selector one `Enter` from running. An invalid generation is refused with
+  its error surfaced and nothing is written.
+- **Expand and collapse a board item by click and by key alike (C-556)** in the TUI board surface.
+- **Cancellation has a visible state, and sub-agents a wall-clock bound (C-542).**
+- **Child-authored progress reports cross the task boundary (C-570),** with a cooperative yield
+  contract in core and nested/concurrent progress covered by tests.
+- **One shared cross-harness usage timeline (C-519).**
+- **The coordinator's operator transcript has a rollover lifecycle,** so it stops growing without
+  bound.
+
+### Fixed
+
+- **A diff the redactor collapsed is not a diff a reviewer read.** Review was being handed elided
+  content and judging it as though it were the change.
+- Two `format!` calls in usage accounting that interpolated nothing.
+
 
 ## [0.59.2] - 2026-08-08
 
