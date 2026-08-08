@@ -628,6 +628,11 @@ fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
             "ready",
             "--priority",
             "7",
+            // C-738: a ready story is born with a contract or it is not born ready.
+            "--goal",
+            "Authoring defers, and exactly one verb commits.",
+            "--criterion",
+            "Creation authors the document.",
             "--output",
             "json",
         ],
@@ -673,9 +678,10 @@ fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
 
     // The meaningful edit — the one that used to arrive after the commit — lands first.
     let story = root.join(&file);
-    let authored = fs::read_to_string(&story)
-        .unwrap()
-        .replace("- [ ] Define acceptance.", "- [ ] The verb commits.");
+    let authored = fs::read_to_string(&story).unwrap().replace(
+        "- [ ] Creation authors the document.",
+        "- [ ] The verb commits.",
+    );
     fs::write(&story, authored).unwrap();
 
     let committed = board_json(
@@ -5126,6 +5132,196 @@ fn fleet_quiesce_stops_dispatch_and_refuses_to_confirm_while_a_worker_is_in_flig
         "dispatch stayed refused after resume: stdout={} stderr={}",
         String::from_utf8_lossy(&redispatched.stdout),
         String::from_utf8_lossy(&redispatched.stderr)
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// The repository's own story template, as the binary embeds it. Reading the same bytes here is what
+/// makes the assertions below a drift check rather than a restatement of the generator.
+const REPO_STORY_TEMPLATE: &str = include_str!("../../../docs/stories/_TEMPLATE.md");
+
+/// Every `## ` section heading, in order — a document's shape with its prose removed.
+fn section_headings(document: &str) -> Vec<String> {
+    document
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// C-738, failing first: creation generates the template, and a story is not born dispatchable and
+/// empty.
+///
+/// `create` used to write a hardcoded body — an empty `## Goal`, `- [ ] Define acceptance.` and
+/// nothing else — while `docs/stories/_TEMPLATE.md` sat unread beside it. Two definitions of a
+/// story's shape had already drifted: the template has `## Progress` and `## Notes`, the generated
+/// body had neither. Worse, `--status ready` made that body dispatchable, so a story could reach a
+/// worker whose definition of done read "Define acceptance."
+#[test]
+fn creation_generates_the_template_and_refuses_a_ready_story_with_no_contract() {
+    let root = fixture("create-from-template");
+    // The board carries the template; the binary must follow it rather than a second shape of its
+    // own.
+    fs::write(root.join("docs/stories/_TEMPLATE.md"), REPO_STORY_TEMPLATE).unwrap();
+
+    // Drafting stays possible: a backlog story is generated with the template's shape and may carry
+    // the template's placeholders.
+    let drafted = board_json(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Draft it first",
+            "--output",
+            "json",
+        ],
+    );
+    let drafted_file = PathBuf::from(drafted["data"]["file"].as_str().unwrap());
+    let drafted_body = fs::read_to_string(&drafted_file).unwrap();
+    assert_eq!(
+        section_headings(&drafted_body),
+        section_headings(REPO_STORY_TEMPLATE),
+        "the generated body must have the template's shape: {drafted_body}"
+    );
+    assert!(
+        drafted_body.contains("\n# Draft it first\n"),
+        "the generated body carries the real title: {drafted_body}"
+    );
+    assert!(
+        drafted_body.contains("\nstatus: backlog\n"),
+        "the generated frontmatter is the requested one, not the template's: {drafted_body}"
+    );
+    assert!(
+        !drafted_body.contains("id: X-NN"),
+        "the template's frontmatter placeholders must not survive generation: {drafted_body}"
+    );
+    assert!(
+        !drafted_body.contains("- [ ] Define acceptance."),
+        "the drifted second shape is gone: {drafted_body}"
+    );
+
+    // A story cannot be born dispatchable and empty.
+    let refused = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Born ready",
+            "--status",
+            "ready",
+            "--priority",
+            "1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a ready story with no contract must be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["class"], "input/schema", "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Goal") && message.contains("Acceptance"),
+        "the refusal must name what is missing: {refused}"
+    );
+    assert!(
+        !root.join("docs/stories/C-2-born-ready.md").exists(),
+        "a refused creation must not leave the document behind"
+    );
+
+    // An authored contract is the last thing that should vanish quietly, so an empty one is refused
+    // rather than written as an empty section.
+    let empty = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Empty contract",
+            "--goal",
+            "   ",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !empty.status.success(),
+        "an empty --goal must be refused: {}",
+        String::from_utf8_lossy(&empty.stdout)
+    );
+
+    // …but a ready story born with a contract is allowed, because the rule is about the contract
+    // rather than about the status.
+    let born = board_json(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Born ready",
+            "--status",
+            "ready",
+            "--priority",
+            "1",
+            "--goal",
+            "Creation refuses a contract nobody could implement against.",
+            "--criterion",
+            "`board create --status ready` with no criteria exits 2.",
+            "--output",
+            "json",
+        ],
+    );
+    let born_body =
+        fs::read_to_string(PathBuf::from(born["data"]["file"].as_str().unwrap())).unwrap();
+    assert_eq!(
+        section_headings(&born_body),
+        section_headings(REPO_STORY_TEMPLATE),
+        "a contract fills the template's sections rather than replacing its shape: {born_body}"
+    );
+    assert!(
+        born_body.contains("Creation refuses a contract nobody could implement against.")
+            && born_body.contains("- [ ] `board create --status ready` with no criteria exits 2."),
+        "the authored contract is what the document carries: {born_body}"
+    );
+
+    // And the template is the *one* definition: a section added to it appears in the next story
+    // without touching the binary.
+    fs::write(
+        root.join("docs/stories/_TEMPLATE.md"),
+        format!("{REPO_STORY_TEMPLATE}\n## Risks\n- (what to watch if this breaks)\n"),
+    )
+    .unwrap();
+    let extended = board_json(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Follows the template",
+            "--output",
+            "json",
+        ],
+    );
+    let extended_body =
+        fs::read_to_string(PathBuf::from(extended["data"]["file"].as_str().unwrap())).unwrap();
+    assert!(
+        extended_body.contains("\n## Risks\n"),
+        "generation follows the template, so a template edit needs no code change: {extended_body}"
     );
     fs::remove_dir_all(root).ok();
 }
