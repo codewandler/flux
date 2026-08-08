@@ -65,7 +65,7 @@ flux-policy = { package = "codewandler-flux-policy", version = "2", path = "crat
 # `1.2`, not `1`: `flux-plugin`'s credential boundary (C-312) calls `Redactor::credential_shape` and
 # the now-public `names_a_secret`/`is_opaque_material`, which do not exist before 1.2.0. A bare `1`
 # lets a downstream consumer resolve 1.0.x and fail to compile the published crate.
-flux-secret = { package = "codewandler-flux-secret", version = "1.2", path = "crates/flux-secret" }
+flux-secret = { package = "codewandler-flux-secret", version = "1.4", path = "crates/flux-secret" }
 flux-spec = { package = "codewandler-flux-spec", version = "1", path = "crates/flux-spec" }
 flux-config = { package = "codewandler-flux-config", version = "0.59.1", path = "crates/flux-config" }
 flux-system = { package = "codewandler-flux-system", version = "0.59.1", path = "crates/flux-system" }
