@@ -330,6 +330,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
         "operations pane · also /fleet:restart, /fleet:refresh",
     ),
     ("board", "open Board work and decisions"),
+    (
+        "loop",
+        "select the agent's loop · `/loop <description>` authors one",
+    ),
     ("theme", "show or switch the color theme"),
 ];
 
@@ -5546,6 +5550,24 @@ async fn handle_command(
                 sev: Sev::Info,
             }),
         },
+        "loop" if args.is_empty() => state.open_loop_selector(),
+        // C-544: describing a loop authors it. The surface writes the `*.flux` file only after the
+        // generated program passes the same load-time validation a hand-written loop passes, and
+        // the selector reopens with it under the cursor. It does not switch a running agent.
+        "loop" => match state.create_loop_from_prompt(args) {
+            Ok(entry) => state.push(Entry::Notice {
+                text: format!(
+                    "authored loop {} at {} · F3 or /loop to select it",
+                    entry.label(),
+                    entry.origin()
+                ),
+                sev: Sev::Info,
+            }),
+            Err(reason) => state.push(Entry::Notice {
+                text: format!("author loop: {reason}"),
+                sev: Sev::Err,
+            }),
+        },
         "shell" => {
             let was_on = flux_runtime::shell_opt_in();
             flux_runtime::set_shell_opt_in(!was_on);
@@ -5837,6 +5859,8 @@ fn command_is_read_only(name: &str, args: &str) -> bool {
         "help" | "tools" | "evidence" | "session" | "queue" | "theme" | "fleet" | "board"
     ) || (name == "sessions" && args != "--prune")
         || (name == "effort" && args.is_empty())
+        // `/loop` alone only opens the selector; `/loop <description>` authors a file.
+        || (name == "loop" && args.is_empty())
 }
 
 fn compaction_notice(outcome: flux_flow::engine::CompactionOutcome) -> (String, Sev) {
@@ -10584,6 +10608,9 @@ mod tests {
         assert!(command_is_read_only("evidence", ""));
         assert!(!command_is_read_only("model", "mock"));
         assert!(!command_is_read_only("shell", ""));
+        // C-544: opening the loop selector reads; authoring a loop writes a file.
+        assert!(command_is_read_only("loop", ""));
+        assert!(!command_is_read_only("loop", "triage inbound support mail"));
     }
 
     #[test]
