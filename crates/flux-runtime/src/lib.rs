@@ -31,6 +31,13 @@ pub use fn_tool::{tool_fn, FnTool};
 mod agent_runtime;
 pub use agent_runtime::{AgentRuntime, Worker, WorkerSpec, WorkerState, WorkerStatus};
 
+mod agent_report_channel;
+pub use agent_report_channel::{
+    agent_report_from_observation, agent_report_observation, agent_report_refusal_observation,
+    AgentReportDraft, AgentReportReporter, AgentReportSink, KIND_AGENT_REPORT,
+    KIND_AGENT_REPORT_REFUSED,
+};
+
 mod limits;
 pub use limits::{
     AgentCensusRefusal, AgentSlot, ConcurrencyRefusal, ResourceLimits,

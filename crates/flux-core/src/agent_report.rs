@@ -217,6 +217,21 @@ impl AgentReport {
         }
     }
 
+    /// Admit this record for relay across the correlated child boundary owned by `session_id`.
+    ///
+    /// A relay knows one thing the record cannot assert for itself: which child session actually
+    /// authored the observation it arrived on. A report naming another session is not this child's
+    /// to speak for, so it is refused here before it can reach a parent surface.
+    pub fn admit_from_session(&self, session_id: &str) -> Result<(), AgentReportRejection> {
+        if self.identity.session_id != session_id {
+            return Err(AgentReportRejection::WrongSession {
+                expected: bounded(session_id),
+                found: bounded(&self.identity.session_id),
+            });
+        }
+        self.validate()
+    }
+
     /// Check schema, bounds and authority. Diagnostics name the field and the cap, never the
     /// payload, so a refusal can be logged without leaking what was refused.
     pub fn validate(&self) -> Result<(), AgentReportRejection> {

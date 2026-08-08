@@ -1088,6 +1088,21 @@ impl AgentSink for TextCollector {
             }
             return;
         }
+        // C-570: a child-authored progress report crosses this boundary as itself rather than as
+        // opaque observation data, so a parent can project it while the terminal result is still
+        // being awaited. It is relayed only for the session that authored it and only when it is
+        // admissible; anything else is elided with a bounded diagnostic naming the refusal.
+        if let Some(mut report) = flux_runtime::agent_report_from_observation(observation) {
+            report.redact_with(&|text| self.redactor.redact(text));
+            let relayed = match report.admit_from_session(&self.child_session_id) {
+                Ok(()) => flux_runtime::agent_report_observation(&report),
+                Err(rejection) => flux_runtime::agent_report_refusal_observation(&rejection),
+            };
+            self.emit(SpawnActivityEvent::Observation {
+                observation: relayed,
+            });
+            return;
+        }
         if observation.kind == "turn.cancelled" {
             self.cancelled = true;
         }
@@ -1445,6 +1460,106 @@ mod tests {
         try_parse_role(content, name_fallback).unwrap()
     }
 
+    /// C-570: a child-authored report reaches the parent through the correlated child boundary
+    /// while the parent is still awaiting the terminal result — and only for the child that owns
+    /// the session it claims.
+    #[test]
+    fn a_child_progress_report_crosses_the_correlated_boundary_redacted() {
+        use flux_core::{
+            AgentLoopBindingMetadata, AgentLoopRunnerKind, AgentReport, AgentReportIdentity,
+            AgentReportState,
+        };
+
+        struct Capture(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for Capture {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
+        let identity = |session: &str| AgentReportIdentity {
+            agent_id: "writer-1".into(),
+            session_id: session.into(),
+            parent_session: Some("s_parent".into()),
+            assignment: "flux/C-570".into(),
+            loop_binding: AgentLoopBindingMetadata {
+                schema: AgentLoopBindingMetadata::SCHEMA.into(),
+                profile: "implementation".into(),
+                revision: "1".into(),
+                runner: AgentLoopRunnerKind::NativeFlux,
+                source_ref: "profile:implementation@1".into(),
+                source_sha256: "a".repeat(64),
+                entry_point: "work".into(),
+                required_operations: vec!["read".into()],
+                required_runtime_features: vec![],
+            },
+        };
+
+        let sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret("canary boundary value");
+        let mut collector = TextCollector::new(
+            Some(sink.clone() as Arc<dyn SpawnActivitySink>),
+            7,
+            "writer".to_string(),
+            "s_child".to_string(),
+            Some("s_parent".to_string()),
+            1,
+            redactor,
+        );
+
+        collector.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_1",
+            1,
+            identity("s_child"),
+            "establish-evidence",
+            AgentReportState::Active,
+            "red test established using canary boundary value",
+        )));
+        // A record claiming another agent's session is not this child's to relay.
+        collector.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_2",
+            2,
+            identity("s_somebody_else"),
+            "implement",
+            AgentReportState::Active,
+            "not mine to report",
+        )));
+        // Neither is an inadmissible one.
+        collector.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_3",
+            3,
+            identity("s_child"),
+            "implement",
+            AgentReportState::HandoffReady,
+            "I am done",
+        )));
+
+        let relayed: Vec<AgentReport> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|activity| match &activity.event {
+                SpawnActivityEvent::Observation { observation } => {
+                    assert_eq!(activity.child_session_id, "s_child");
+                    assert_eq!(activity.depth, 1);
+                    assert_eq!(activity.spawn_id, 7);
+                    flux_runtime::agent_report_from_observation(observation)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(relayed.len(), 1, "{relayed:?}");
+        assert_eq!(relayed[0].report_id, "r_1");
+        assert_eq!(relayed[0].identity.assignment, "flux/C-570");
+        assert!(
+            !relayed[0].summary.contains("canary boundary value"),
+            "{:?}",
+            relayed[0].summary
+        );
+    }
     fn request_has_tool(request: &Request, name: &str) -> bool {
         request.tools.iter().any(|tool| tool.name == name)
     }
