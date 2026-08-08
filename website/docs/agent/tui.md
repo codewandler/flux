@@ -55,6 +55,13 @@ structure, and the choice takes effect on the next start. A session that has alr
 admitted its loop: the selector then refuses and names the new-session/re-admission path instead of
 switching a running agent.
 
+Describing a loop authors one: `/loop <what it should do>` generates the `*.flux` file under
+`.flux/loops`, and the selector reopens with the new loop under the cursor, ready to select. The
+generated program passes the same load-time validation a hand-written loop passes before it is
+offered — an invalid generation is refused with its error rather than saved, and an existing loop
+file is never overwritten. Authoring is not an admission: it does not change the loop a running
+agent already runs, and it does not authorize the profile for a Fleet task kind.
+
 ## Board and Fleet operations
 
 Ordinary `flux tui` remains a standalone chat and says so in the header. Fleet attachment is always
@@ -213,6 +220,7 @@ These are the TUI's built-ins. A command file discovered from `.flux/commands`, 
 | `/model [spec]` | Show the active model, or switch mid-session (`/model opus`) |
 | `/effort [low\|medium\|high\|xhigh\|max\|off]` | Show or set reasoning effort; takes effect from the next turn |
 | `/theme [name]` | List the palettes and the current one, or switch (see [Themes](#themes)) |
+| `/loop [description]` | Open the loop selector, or author a new `*.flux` loop from a description and offer it immediately |
 | `/tools` | List the operations registered for this session |
 | `/shell` | Toggle the optional `bash` op group from the next turn |
 | `/evidence` | Show the session's durable evidence trail |
