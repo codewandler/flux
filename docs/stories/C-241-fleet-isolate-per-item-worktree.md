@@ -62,9 +62,10 @@ isolation it does not have.
 `fleet.isolate` lands in `crates/flux-tools/src/lib.rs` (the `fleet.isolate (C-241)` section, after
 the `git_worktree_*` ops it is built beside), registered in `try_register_builtins` and joined to the
 `fleet` group in `groups.rs`. Input is `{item}`; the host owns the naming (`impl/<item>`) and the
-directory (`flux_system::allocate_worktree_dir`, a fresh 0700 parent per call — that allocation is
-what makes two concurrent calls disjoint with no coordination). Every git invocation goes through
-`run_git` on `ctx.system()`, so there is no second `Command::new`.
+directory (`flux_system::allocate_worktree_dir`, a fresh 0700 parent per call). The paths are
+disjoint; a process-local asynchronous lock serializes the branch-free check and `git worktree add`
+because both calls still mutate the repository's shared `.git/worktrees` administration. Every git
+invocation goes through `run_git` on `ctx.system()`, so there is no second `Command::new`.
 
 Preflights, each a recoverable `ToolResult::error` naming what was wrong: item id shape (one
 component of `[A-Za-z0-9._-]`, so an option/path/revision-suffix can never reach argv), no nesting

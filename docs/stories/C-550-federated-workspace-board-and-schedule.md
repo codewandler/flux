@@ -42,3 +42,6 @@ all authority and mutations back to the owning repository.
 ## Notes
 
 - Depends on C-549 for Track members and A-134 for concrete `BoardRef` routing.
+- 2026-08-05 corrective audit: the delivered workspace path remained coupled to Fleet config and
+  did not carry the real program schedule. C-588 owns the independent Board configuration and actual
+  roadmap adoption without rewriting this historical completion record.

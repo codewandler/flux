@@ -23,6 +23,7 @@ const sidebars = {
       ],
     },
     'whats-new',
+    'concepts',
     {
       type: 'category',
       label: 'Coding / AI-assisted development',
@@ -36,7 +37,7 @@ const sidebars = {
     {
       type: 'category',
       label: 'Fundamentals',
-      items: ['concepts', 'ecosystem', 'infrastructure', 'topologies', 'remote-system-deployment'],
+      items: ['ecosystem', 'infrastructure', 'topologies', 'remote-system-deployment'],
     },
     {
       type: 'category',

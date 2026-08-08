@@ -52,6 +52,10 @@ on:
         description: "Plain X.Y.Z workspace version to prepare from release-candidates/vX.Y.Z"
         required: true
         type: string
+      gate_run:
+        description: "Successful exact cut ci.yml workflow_dispatch run ID"
+        required: true
+        type: string
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
@@ -77,6 +81,7 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+          fetch-depth: 2
       - name: Validate release-candidate request
         if: ${{ github.event_name == 'workflow_dispatch' }}
         env:
@@ -93,35 +98,49 @@ jobs:
             echo "::error::candidate version $CANDIDATE_VERSION does not match workspace version $workspace_version"
             exit 1
           fi
-      # The candidate ref already points at cut-release.sh's committed transaction. Rebuild the
-      # public website from its lockfile and prove that exact commit owns the matching server
-      # archive before spending release-build time or permitting a candidate receipt.
-      - name: Install pinned website toolchain for the exact candidate
+      # The controller already ran the full repository CI on the exact deterministic cut. Bind this
+      # artifact build to that immutable run instead of rebuilding/testing the workspace a third
+      # time. The final candidate is the two-parent main integration whose second parent is that cut.
+      - name: Verify the successful exact cut CI
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: website/package-lock.json
-      - name: Install pinned website dependencies
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: npm ci
-        working-directory: website
-      - name: Embedded documentation matches the exact candidate SHA
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: scripts/build-embedded-docs.sh --check
-      - name: Install pinned release-gate toolchain
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
-        with:
-          toolchain: "1.97.0"
-          components: rustfmt, clippy
-      - name: Cache release-gate cargo state
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      - name: Mandatory full gate for the exact candidate SHA
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: scripts/release-full-gate.sh "$GITHUB_SHA"
+        env:
+          CANDIDATE_VERSION: ${{ inputs.version }}
+          GATE_RUN_ID: ${{ inputs.gate_run }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$GATE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || {
+            echo "::error::gate_run must be a positive Actions run ID"
+            exit 1
+          }
+          read -r -a candidate_record <<<"$(git rev-list --parents -n1 "$GITHUB_SHA")"
+          [ "${candidate_record[0]}" = "$GITHUB_SHA" ] || exit 1
+          case "${#candidate_record[@]}" in
+            2)
+              cut_sha=$GITHUB_SHA
+              gate_branch=$GITHUB_REF_NAME
+              ;;
+            3)
+              cut_sha=${candidate_record[2]}
+              gate_branch="release-cuts/v$CANDIDATE_VERSION"
+              ;;
+            *)
+              echo "::error::candidate $GITHUB_SHA is neither a direct cut nor a two-parent cut integration"
+              exit 1
+              ;;
+          esac
+          verdict=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GATE_RUN_ID")
+          jq -e --arg branch "$gate_branch" --arg sha "$cut_sha" '
+            .path == ".github/workflows/ci.yml"
+            and .event == "workflow_dispatch"
+            and .head_branch == $branch
+            and .head_sha == $sha
+            and .status == "completed"
+            and .conclusion == "success"
+          ' <<<"$verdict" >/dev/null || {
+            echo "::error::gate run $GATE_RUN_ID is not successful exact cut CI for $cut_sha"
+            exit 1
+          }
       # C-354: the plan job does not read RELEASE_TOKEN, not even to test that it is configured.
       # `secrets.RELEASE_TOKEN != ''` is still a reference to the credential from a job that plans,
       # builds and holds the model-visible manifest — and its absence is reported by the one job

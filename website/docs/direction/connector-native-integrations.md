@@ -72,7 +72,7 @@ Exchange and is built by the connector/Exchange pipeline.
 - [Topologies](../topologies.md) — core Flux, remote effects, workers, and Exchange execution without
   conflating Docker/Kubernetes management with official integration placement.
 - [Cross-repository roadmap](https://github.com/codewandler/flux-roadmap) — the source of truth for
-  architecture, dependency order, milestones, and the active tranche.
+  architecture, dependency order, milestones, and the native cross-repository Board programme.
 - [Flux roadmap](https://github.com/codewandler/flux/blob/main/docs/roadmap.md#connector-native-integrations--one-catalogue-across-every-runtime-epic--in-progress-c-500)
   — C-500…C-506: documentation, embedded HTTP client, later lifecycle, per-adapter proof/deletion,
   and unconditional plugin-infrastructure removal.

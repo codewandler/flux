@@ -218,7 +218,8 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // The `left`/`right` slots carve columns off the transcript ROW only. With no side pane
     // resolved this returns the row unchanged, so `transcript_area` is the same `Rect` as before.
     let pane_areas = panes::split_transcript(state, frame.area(), transcript_row);
-    let transcript_area = pane_areas.transcript;
+    let (transcript_area, operations_rail) =
+        crate::operations::split_chat_area(pane_areas.transcript, state);
 
     frame.render_widget(
         Paragraph::new(state.header_line(header_area.width)),
@@ -273,6 +274,9 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // pane's border, mark and title come from the `Theme` and its payload can draw neither: see
     // `crate::trust`.
     panes::render_panes(frame, state, &pane_areas, bottom_area);
+    if let Some(area) = operations_rail {
+        crate::operations::render_attention_rail(frame, state, area);
+    }
 
     if !queued.is_empty() && !narrow {
         let mut rows: Vec<Line> = queued
@@ -400,6 +404,7 @@ pub fn render(frame: &mut Frame, state: &ChatState) {
     // shape. It draws BEFORE the surface's own overlays below (and, like them, before the approval
     // sheet), so surface-owned chrome always paints over an agent pane and never under it.
     panes::render_overlay_pane(frame, state);
+    crate::operations::render_overlay(frame, state);
 
     if state.queue_open && !queued.is_empty() {
         let (start, visible) = overlay_window(state.queue_sel, queued.len(), 10);

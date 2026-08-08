@@ -47,3 +47,6 @@ custom schedule, worker-control, context, activity, progress or visualization sc
 
 - Depends on A-117, C-242, C-244, C-245 and C-550. Helper deletion is the last step, never the proof
   mechanism.
+- 2026-08-05 corrective audit: the helper deletion and static no-reference acceptance did not happen
+  in the real roadmap despite this done state. C-588 reopens the adoption boundary as a new explicit
+  story and proves it from the actual four-repository fixture.

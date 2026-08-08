@@ -9,10 +9,11 @@ only repository policy that must be known before acting. Product documentation s
 - Serve the newest user request first. Do not select backlog work unless the user explicitly asks;
   when they do, use [docs/stories/README.md](docs/stories/README.md).
 - For work named by the sibling `flux-roadmap` repository, that repository owns cross-repository
-  architecture, dependency order, milestone assignment, and the active tranche. It normally lives
-  at `../flux-roadmap`; from a linked worktree, locate it beside the primary Flux checkout. The local
-  story's Goal and Acceptance still define done. If they contradict the cross-repository decision,
-  amend or supersede the story before implementation instead of treating roadmap prose as acceptance.
+  architecture and its native `.flux/board.toml` owns milestone assignment, ordered program lanes
+  and configured waves. It normally lives at `../flux-roadmap`; from a linked worktree, locate it
+  beside the primary Flux checkout. The local story's Goal and Acceptance still define done. If they
+  contradict the cross-repository decision, amend or supersede the story before implementation
+  instead of treating roadmap prose as acceptance.
 - Begin with `git status --short --branch`. Treat existing changes as user-owned. Do not reset,
   discard, rebase, rewrite history, force-push, create a branch/worktree, or commit unless the user
   explicitly asks.

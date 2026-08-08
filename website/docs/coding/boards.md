@@ -58,6 +58,71 @@ cross-repository dependency readiness, and detects missing references and cycles
 file remains in its owning repository. The workspace may own program-level vision, roadmap,
 decisions, and designs; those do not shadow member documents.
 
+When `.flux/board.toml` declares `default = true`, plain `flux board ...` selects that workspace.
+The Board is independent of Fleet: it can list, validate and schedule the program without a
+`.flux/fleet.toml`, a running supervisor, or scheduling instructions in README/AGENTS files.
+
+```toml title=".flux/board.toml"
+schema = "flux.board-workspace/v1"
+id = "product"
+default = true
+active_milestone = "m1"
+vision = "VISION.md"
+roadmap = "ROADMAP.md"
+decisions = "decisions"
+designs = "docs/designs"
+
+[[members]]
+id = "api"
+root = "../api"
+board = "default"
+canonical_ref = "origin/main"
+
+[[members]]
+id = "web"
+root = "../web"
+board = "default"
+canonical_ref = "origin/main"
+
+[[program]]
+id = "api-contract"
+item = "api/C-41"
+milestone = "m1"
+order = 1
+depends_on = []
+outcome = "Publish the accepted API contract."
+
+[[waves]]
+id = "api-m1-1"
+state = "active"
+repository = "api"
+items = ["api/C-41"]
+depends_on = []
+```
+
+## Domain model
+
+These terms have deliberately narrow meanings:
+
+| Entity | Meaning | Durable authority |
+|---|---|---|
+| Workspace Board | Cross-repository catalogue and program view; it references member work but does not copy it. | `.flux/board.toml` |
+| Member Board | One repository's authoritative work and state machine. | That repository's story files/backend |
+| `BoardRef` | Globally unambiguous `MEMBER/ITEM` address, for example `api/C-41`. | Member id plus item id |
+| Epic | A larger outcome grouping related stories. It is useful for rollups, but is not itself dispatched. | Member Board epic/design metadata |
+| Story | The smallest schedulable implementation contract: Goal, Acceptance, state, dependencies and evidence. | Exactly one member Board |
+| Dependency | A prerequisite `BoardRef`. Repository and program dependencies are combined; program configuration cannot remove story dependencies. | Story frontmatter and/or program lane |
+| Milestone | A named program horizon. Exactly one workspace milestone is active for `next` and Fleet scheduling. | `active_milestone` and program lanes |
+| Program lane | An ordered reference to one story in one milestone. It adds cross-repository ordering/outcome context but has no copied status. | `[[program]]` |
+| Configured wave | An ordered, repository-local group of at most ten program stories that may be dispatched together. This is a plan template, not a running job. | `[[waves]]` in Board configuration |
+| Decision | A question/outcome record. Only a genuinely `open` structured decision asks for attention and blocks its linked stories. | Workspace or member decision document |
+| Design | The accepted technical approach linked from stories/epics. It has no queue state. | Workspace or member design document |
+
+`board next` selects explicit `ready` stories in the active milestone, combines both dependency
+sources, and preserves program order. If a program catalogue exists, an unrelated ready member
+story is not silently admitted. Fleet consumes this same projection; it does not maintain a second
+schedule.
+
 ## Profile: general, planning, or execution
 
 All profiles expose the common operations `list`, `get`, `query`, `create`, `transition`, `comment`,
@@ -71,6 +136,20 @@ All profiles expose the common operations `list`, `get`, `query`, `create`, `tra
 
 The execution profile keeps the existing eleven-operation WorkBoard surface. Planning does not
 pretend a story is a worker run, and execution does not invent priorities or roadmap status.
+
+For the planning profile, the ordinary story path is intentionally small:
+
+```text
+backlog ──→ ready ──→ in-progress ──→ done
+                         │
+                         └──────────→ blocked
+                                         │
+                                         └──→ ready
+```
+
+`ready` is an explicit authorization, not a synonym for “mentioned in a roadmap.” `done` means the
+story's Goal and Acceptance are satisfied in the owning repository; a Fleet worker finishing a turn
+does not close it by itself.
 
 ## Planning documents are not queue items
 
@@ -102,6 +181,12 @@ An open decision is an explicit human-attention queue, not a reason to stop the 
 records the question, structured options/trade-offs, recommendation, and linked stories. Only those
 stories become blocked; unrelated ready work remains eligible. Deciding records outcome/rationale
 and restores each linked story's prior state and priority.
+
+When `flux tui` is explicitly attached with `--fleet[=ROOT]`, `F2` (or `/board`) opens the same
+planning data as bounded native views. Observation stays read-only. Choosing an open decision is the
+one Board write available there and requires two Enter presses: one to review the selected option,
+one to confirm it. The [TUI operations guide](../agent/tui.md#board-and-fleet-operations) documents
+the full navigation and acknowledgement behavior; JSON CLI output remains the automation API.
 
 Before changing a story, an AI coding agent should read the vision, roadmap, applicable accepted
 decisions, the story's Goal and Acceptance, and its linked design. `flux board skill` gives the same
@@ -225,7 +310,7 @@ Every ratio uses `{done, remaining, total, percent}` for:
 
 The cube also includes the profile-state histogram; vision/roadmap presence; open/decided/
 superseded decisions; total and story-linked designs; canonical commit facts; and, for a federated
-program, program stories, tranche lanes, waves, groups, members, and aggregates. `--history`
+program, program stories, active milestone lanes, configured waves, members, and aggregates. `--history`
 reconstructs canonical end-of-day Git snapshots and adds concrete `scope_added`, `scope_removed`,
 and `completed` counts plus item ids.
 

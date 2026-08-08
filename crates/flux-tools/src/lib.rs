@@ -4258,6 +4258,12 @@ impl Tool for GitWorktreeLeaveTool {
 // the only copy of that work. `fleet.integrate` (C-242) and the caller decide when it goes.
 // ---------------------------------------------------------------------------
 
+// `fleet.isolate` calls allocate disjoint directories, but `git worktree add` also mutates the
+// repository's shared `.git/worktrees` administration. Git does not make two concurrent adds to
+// that area safe: one can observe the other's partially written `commondir`. Keep the asynchronous
+// callers in flight while serializing only the shared Git mutation and its branch-free preflight.
+static FLEET_ISOLATE_GIT_MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The branch `fleet.isolate` creates for `item` — the one place the naming is decided.
 fn isolate_branch(item: &str) -> String {
     format!("impl/{item}")
@@ -4383,6 +4389,11 @@ impl Tool for FleetIsolateTool {
                 "fleet.isolate: not inside a git repository: {body}"
             )));
         }
+        // The allocated checkout paths are independent, but the repository administration they
+        // register in is shared. Keep this guard through the branch check and worktree add so two
+        // calls cannot race through a partially written `.git/worktrees/<name>` entry.
+        let git_worktree_guard = FLEET_ISOLATE_GIT_MUTATION.lock().await;
+
         // Preflight 3: the branch is free. `git worktree add -b` would fail anyway, but only after
         // a directory has been allocated, and its message names neither the item nor the caller.
         // Asked as `refs/heads/…` rather than as a bare name, so the refusal below is a statement
@@ -4447,6 +4458,7 @@ impl Tool for FleetIsolateTool {
                 "fleet.isolate: git worktree add failed for {branch}: {add_out}"
             )));
         }
+        drop(git_worktree_guard);
 
         let result = serde_json::json!({
             "isolated": true,

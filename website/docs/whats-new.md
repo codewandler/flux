@@ -14,6 +14,32 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain
+  `flux board` selects the configured workspace, validates every repository story and dependency,
+  and reports the active milestone, ordered work and configured waves. `flux fleet schedule` reads
+  that same plan instead of keeping another schedule. Board configuration, Fleet configuration and
+  live Fleet state remain separate files with separate owners.
+
+- **The terminal UI can supervise the Fleet main coordinator and its Board.** Launch
+  `flux tui --fleet` in a Fleet root, or use `--fleet=ROOT`, to resume the exact durable main
+  conversation. `F2`, `/fleet`, or `/board` opens bounded native views of active workers, work,
+  decisions, failures, planning documents, and exact progress statistics; wide terminals also keep
+  an attention rail beside the chat. Requirements show accepted, delivered, and completed/failed
+  acknowledgement across restart. Viewing is read-only, and deciding an open question requires a
+  second explicit confirmation. Ordinary `flux tui` remains a labelled standalone chat, and the
+  operations view cannot push, release, deploy, apply a Fleet candidate, or clean worktrees.
+
+### Improved
+
+- **Board and Fleet terminology is documented from planning through release.** The guides explain
+  epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
+  review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
+  eligibility, worktree, rework and publication boundaries.
+
+## [0.56.0] - 2026-08-05
+
+### New
+
 - **Flux now has one durable board-and-fleet workflow for AI-assisted development.** `flux board`
   manages a session checklist, one repository's Track stories, or a cross-repository workspace,
   including vision, roadmap, decisions, designs, exact progress statistics, and current/history

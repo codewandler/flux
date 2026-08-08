@@ -6,7 +6,8 @@ status: backlog
 priority:
 epic: monetary-budgets
 design:
-note: "EPIC — cost is observed (usage events, pricing, OpenRouter reported cost) but never enforced; add [budget] config with per-session/per-agent/rolling-per-day currency caps: soft threshold warns into context, hard cap stops before the next model call with a resumable suspension; per-principal caps for A2A/serve; distinct from token turn-budgets (A-10/A-26)"
+depends_on: [C-571]
+note: "extend C-571's hierarchical ledger with currency and rolling per-principal caps; unknown price is never treated as zero"
 ---
 
 # Monetary budgets & quotas — hard spend enforcement (epic)
@@ -36,3 +37,6 @@ deployments multi-tenant-safe.
 ## Notes
 - Distinct from token-based turn budgets (A-10/A-26): this is currency, cross-turn, enforced.
 - Spend accounting already deduplicates sub-agent usage (C-23) — reuse those rollups.
+- C-571 establishes durable hierarchical reservation/settlement first; this story adds the currency
+  dimension and rolling per-principal windows to that ledger rather than growing another budget
+  subsystem.

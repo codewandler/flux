@@ -157,6 +157,8 @@ pub struct ChatState {
     /// so every test can pin the clock, which is the same reason [`crate::fleet`] takes `now` as a
     /// parameter throughout instead of reading it.
     pub(super) fleet_rows: Vec<crate::fleet::WorkerRow>,
+    /// Attached Board/Fleet operations projection. `None` is an explicitly standalone chat.
+    pub(super) operations: Option<crate::operations::OperationsState>,
 }
 
 /// One model call of the turn in progress, as the `/usage` overlay renders it (C-140). Sourced from

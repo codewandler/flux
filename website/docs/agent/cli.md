@@ -29,7 +29,7 @@ and [Safety & approvals](./safety.md).
 | `flux run "…"` | run an adaptive turn (`--posture` selects the [autonomy posture](#autonomy-posture---posture); `-c` continues the last session) |
 | `flux run <module.flux> --entry <flow>` | select one top-level flow from a multi-flow module, execute it once with `--inputs` / repeatable `--arg`, and exit |
 | `flux` | interactive REPL |
-| `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet |
+| `flux tui` | the full-screen [chat UI](./tui.md) with an in-UI approval sheet; `--fleet[=ROOT]` explicitly attaches the durable Fleet-main operations surface |
 | `flux system serve …` | serve one canonical workspace as an authenticated TLS [remote execution system](../topologies.md#local-runtime-remote-system) |
 | `flux a2a <URL>` | drive a remote [A2A](./a2a.md) agent |
 | `flux app run <prog.flux>` | run a [multi-agent program](./programs.md); `--serve <addr>` exposes HTTP/A2A |

@@ -1,36 +1,38 @@
 ---
 id: C-542
-title: "Granular time and token budgets with limits, visible in the TUI during execution"
+title: "One time/token budget vocabulary with hard limits and live projections"
 pillar: Core
 status: ready
 priority: 30
-epic:
-design:
+epic: agent-loop-harnesses
+design: docs/designs/agent-loop-harnesses.md
 areas: [flux-lang, flux-flow, flux-tui, flux-cli]
-note: "budget = declared spend target, limit = hard stop; both per run and per granular unit, surfaced live in the TUI"
+note: "foundation for C-571 — budget target versus hard limit, common envelope/usage events and live TUI projection"
 ---
 
-# Granular time and token budgets with limits, visible in the TUI during execution
+# Use one budget vocabulary from runtime to screen
 
 ## Goal
 
-An execution can declare granular budgets — wall-clock time and token spend — with hard limits at
-both the whole-run and per-unit level (agent, step, or tool dispatch), and the TUI shows live
-consumption against those budgets while the run executes, so an operator sees overrun risk before
-the limit trips rather than after.
+Define one typed target-versus-hard-limit vocabulary for wall-clock time, model calls and token spend,
+with attributed usage events and live projections that C-571 can allocate hierarchically across a
+Fleet.
 
 ## Acceptance
 
-- [ ] A run accepts a declared time budget and token budget with an optional hard limit for each;
-      granularity covers at least the whole run and one sub-unit level (per agent or per step).
-      *(First pass — confirm the exact granularity levels.)*
-- [ ] Hitting a hard limit stops the affected scope cleanly: in-flight work is terminated at a safe
-      boundary, the result names which budget tripped, and a failing-first test proves the stop.
+- [ ] A typed budget envelope distinguishes a soft target from a hard limit and carries wall time,
+      model calls plus input/output/total tokens. Usage events name run, agent/session, turn and
+      loop-segment attribution without double-counting child rollups.
+- [ ] A run and at least one child/segment scope accept the envelope. Hitting a hard limit stops at a
+      documented safe boundary with a typed scope/dimension/spent/limit result; a failing-first test
+      proves the stop and an in-flight effect is never reported stopped when it is still finishing.
 - [ ] Budget consumption (spent vs declared, for both time and tokens) is visible in the TUI while
       the run executes, updating as spend accrues; a failing-first test proves the TUI surface
       renders the budget state.
-- [ ] Exceeding a *budget* without a *limit* warns visibly but does not stop execution; the
-      distinction is tested.
+- [ ] Exceeding a target without a hard limit warns visibly but does not stop execution; the
+      distinction and one-warning behavior are tested.
+- [ ] The JSON/event contract is the single source for CLI/TUI projections and for C-571's durable
+      Fleet reservation/settlement ledger; no surface recalculates totals independently.
 - [ ] The gate is green in both workspaces.
 
 ## Progress
@@ -39,8 +41,5 @@ the limit trips rather than after.
 
 ## Notes
 
-- Filed 2026-08-05 via /track:story from the roadmap coordinator session; Goal/Acceptance are a
-  first-pass draft from the title — refine granularity levels and the TUI presentation before
-  dispatch.
-- Likely touchpoints: dispatch/budget accounting in flux-lang/flux-flow, TUI rendering beside the
-  usage observatory (see C-531's tool-sink pairing for the event-attribution precedent).
+- 2026-08-05 — reconciled with C-568/C-571. This story owns the shared local vocabulary and live
+  projection; C-571 owns cross-worker reservation/settlement and C-130 adds currency/rolling quotas.

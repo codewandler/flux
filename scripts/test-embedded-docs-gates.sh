@@ -47,15 +47,17 @@ assert_before "$CI" 'working-directory: website' 'run: scripts/build-embedded-do
 grep -Fq 'node-version: 22' "$CI" || fail "ci does not pin the website Node major"
 grep -Fq 'run: npm ci' "$CI" || fail "ci does not install website/package-lock.json"
 
-# Candidate preparation is the exact-SHA publication gate. The archive proof must happen after the
-# release commit has been checked out, but before the full gate, dist planning/builds, or a receipt.
-assert_before "$RELEASE" 'uses: actions/setup-node@' 'working-directory: website'
-assert_before "$RELEASE" 'working-directory: website' 'run: scripts/build-embedded-docs.sh --check'
-assert_before "$RELEASE" 'run: scripts/build-embedded-docs.sh --check' 'run: scripts/release-full-gate.sh "$GITHUB_SHA"'
-assert_before "$RELEASE" 'run: scripts/build-embedded-docs.sh --check' 'run: scripts/install-release-tooling.sh'
-assert_before "$RELEASE" 'run: scripts/build-embedded-docs.sh --check' 'scripts/release-candidate.sh write release-candidate.txt'
-grep -Fq 'node-version: 22' "$RELEASE" || fail "candidate gate does not pin the website Node major"
-grep -Fq 'run: npm ci' "$RELEASE" || fail "candidate gate does not install website/package-lock.json"
+# Exact cut CI owns the complete repository gate, including the embedded archive proof above.
+# Candidate preparation must verify that immutable successful run before dist planning or a receipt;
+# it must not install Node and rebuild the same archive a second time.
+assert_before "$RELEASE" 'name: Verify the successful exact cut CI' 'run: scripts/install-release-tooling.sh'
+assert_before "$RELEASE" 'name: Verify the successful exact cut CI' 'scripts/release-candidate.sh write release-candidate.txt'
+grep -Fq '.path == ".github/workflows/ci.yml"' "$RELEASE" \
+  || fail "candidate workflow does not bind its gate to ci.yml"
+grep -Fq '.head_sha == $sha' "$RELEASE" \
+  || fail "candidate workflow does not bind its gate to the exact cut SHA"
+grep -Fq '.conclusion == "success"' "$RELEASE" \
+  || fail "candidate workflow does not require successful exact cut CI"
 
 # The website workflow may build PRs but may upload/deploy only publication events. Every applicable
 # event checks the same committed archive before an artifact can cross the upload boundary.

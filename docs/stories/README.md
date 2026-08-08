@@ -80,14 +80,16 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [C-435 — The port has no network trait — and no guarded inbound primitive at all](C-435-a-guarded-network-port.md) · Core · ⚠ measured 2026-08-01: port.rs declares FOUR traits — GuardedEnv, GuardedProcess, GuardedHostFiles, GuardedWorkspaceFiles — and NONE for network. Egress guarding lives in net.rs as free functions; inbound binding is scattered (flux-server's guard_open_bind, and C-409 found the adapters that bind their own listeners got none of its hardening). The prerequisite for embedding any protocol stack under flux's guard
 - [C-500 — Connector-native integrations replace the official plugin fleet (epic)](C-500-connector-native-integrations-epic.md) · Core · EPIC — Flux embeds one Exchange client while all official integrations execute in Exchange; the Flux release ends with no plugin artifacts or fallback
 - [C-535 — Per-tool call/summary polish: web.fetch, proc.run, task, grep/glob rows](C-535-per-tool-call-and-summary-polish.md) · Core · No common op should fall to the k=v dump or a raw first-line summary
+- [C-556 — The fleet TUI is centered on the one main coordinator conversation](C-556-fleet-main-agent-tui-shell.md) · Core · follow-up UI — conversational main surface plus attention rail; CLI remains automation API
+- [C-557 — Polished TUI views expose worker channels, board decisions and exact stats](C-557-board-fleet-observability-tui.md) · Core · follow-up UI — read-only peeks and native visualizations, not embedded CLI output
 - [C-565 — Every continued Fleet turn preserves its admitted capability ceiling](C-565-preserve-admitted-fleet-capabilities.md) · Core · dogfood defect — continued writer turns exposed a different operation set than the admitted template
+- [C-568 — Every agent starts under an explicit loop harness (epic)](C-568-explicit-agent-loop-harnesses-epic.md) · Core · bind behavior at agent start; Fleet adds workhorse/reviewer loops, typed progress/yield and hierarchical budgets
 - [D-199 — Zendesk automation — deterministic support workflows with bounded AI (epic)](D-199-zendesk-automation-epic.md) · Agent · EPIC — L-92, A-136, D-200, D-201, D-202 all closed; D-214 landed flux's half of the connector-pack interop. Open on ONE external dependency: two flux-connectors gaps (no zendesk `authority`; `{subdomain}` unresolved) that no flux change can close
 - [D-206 — JaaS / Brave Talk room backend — guest-token acquisition and refresh](D-206-jaas-brave-talk-room-backend.md) · Agent · layers vendor token acquisition on D-205's XMPP machinery: CSRF + PUT /api/v1/rooms/<room>, conference-request, 3h token refresh; ⚠ read Brave's acceptable-use before this is more than own-room use
 - [L-94 — Flux notation workbench — one AST, several readable projections (epic)](L-94-flux-notation-workbench-epic.md) · Language · EPIC — Railflux output first; canonical named-option headers plus Glyph, Tape, S-Flux, and a deliberately deferred Railflux reader
 
 ## Next (ready — take the top one unless the user named a story)
-- [C-542 — Granular time and token budgets with limits, visible in the TUI during execution](C-542-granular-time-token-budgets-visible-in-tui.md) · Core · budget = declared spend target, limit = hard stop; both per run and per granular unit, surfaced live in the TUI
-- [C-543 — Select the agent's loop from the TUI with a hotkey and a visualizing overlay](C-543-tui-loop-selector-with-visualizing-overlay.md) · Core · current loop name always visible; a hotkey opens a selector; choosing a loop shows a short overlay that visualizes the outer loop and renders its description
+- [C-543 — Select the agent's loop from the TUI with a hotkey and a visualizing overlay](C-543-tui-loop-selector-with-visualizing-overlay.md) · Core · display/switch the resolved binding, not an ambient filename; admitted Fleet workers change only through explicit re-admission
 - [C-544 — Create a new agent loop by prompting, available in the loop selector](C-544-create-agent-loops-by-prompting.md) · Core · \"create this <...> loop for me\" -> flux writes the *.flux file; the new loop then appears in the C-543 selector
 - [C-546 — Generalized provider credits/usage/subscription introspection, callable by the model and shown in the TUI](C-546-provider-credits-usage-introspection.md) · Core · a capability-gated Provider op returns credits, usage against limits (session/weekly windows) and subscription identity; exposed as a model-callable op and a TUI surface
 
@@ -100,6 +102,11 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 - [A-124 — DockerRuntime — an agent as a container](A-124-docker-runtime.md) · Agent · flux ships no Dockerfile today — this story owns the image contract as well as the runtime
 - [A-125 — KubernetesRuntime — an agent as a pod, over the existing kubernetes plugin](A-125-kubernetes-runtime.md) · Agent · the k8s plugin and its endpoint provider (D-28) already exist — this rides them rather than adding a second cluster client
 - [A-126 — Fleet discovery — agents as a product of the endpoint broker that already exists](A-126-fleet-discovery-over-endpoint-broker.md) · Agent · C-243's ExternalRuntime exists but is not CLI-wired; project endpoint-broker agent refs into that shipped worker vocabulary rather than inventing flux-fleet/AgentAddress
+
+### explicit agent-loop harnesses, progress and hierarchical budgets
+- [C-569 — Every agent start resolves and snapshots an explicit loop binding](C-569-resolve-loop-binding-at-every-agent-start.md) · Core · general omission resolves to builtin adaptive; task/Fleet/backend starts carry a versioned binding and never inherit a parent's loop implicitly
+- [C-567 — Fleet workers use assignment-selected authored workhorse loops](C-567-run-codex-fleet-writers-as-fresh-workhorses.md) · Core · five-writer dogfood stop-line — select a native workhorse loop by explicit task kind instead of adding a Codex-specific runner
+- [C-542 — One time/token budget vocabulary with hard limits and live projections](C-542-granular-time-token-budgets-visible-in-tui.md) · Core · foundation for C-571 — budget target versus hard limit, common envelope/usage events and live TUI projection
 
 ### Watch the agent think — the loop as a live thread, expandable down to the graph
 _flux's central claim is that **the LLM is not the runtime** — authored control flow and a deterministic_
@@ -131,7 +138,6 @@ _Ask an agent: *"go to site X, log in, then test the happy path of module U."* I
 - [C-431 — `e<N>` refs mean nothing in a fresh session — freezing must re-anchor them to role and name](C-431-durable-locators.md) · Core · ⚠ VERIFIED, not suspected: RefMap (crates/flux-web/src/digest.rs:53-72) keys on backendDOMNodeId and assigns `next += 1` in first-encounter order WITHIN one live session. `e17` is stable while exploring and meaningless in a new session. The fix material is in the same data — every ref carries an AX role and name (digest.rs:180)
 
 ### Design record: host-enforced fleet loop
-- [C-567 — Codex Fleet writers run as fresh bounded workhorses](C-567-run-codex-fleet-writers-as-fresh-workhorses.md) · Core · five-writer dogfood stop-line — the recursive adaptive explorer exhausted 50 calls or 512 KiB in every implementation lane before any commit
 - [C-561 — A failed Fleet worker can resume its exact durable turn](C-561-resume-a-failed-fleet-worker.md) · Core · dogfood stop-line — resume currently routes through the availability check that rejects failed workers
 - [C-562 — Fleet status stays small and tells the operational truth](C-562-bound-fleet-status-projections.md) · Core · dogfood stop-line — status reached 2,694,752 bytes by embedding historical turn events and tool payloads
 - [C-563 — An operator can start, talk to and watch a Fleet from the public guide](C-563-document-the-fleet-operator-journey.md) · Core · public-doc gap — commands exist, but the first working main-agent conversation and watch loop are not taught as one journey
@@ -213,6 +219,11 @@ _Demos, docs and blog posts need to *show* flux working. Today the only way to g
 - [C-422 — Rebuild a session's visual timeline from the durable log — and say honestly what cannot be rebuilt](C-422-the-render-projection.md) · Core · the epic's real work and its real risk. The TUI's durable→screen path is 100 lines handling FIVE observation kinds (crates/flux-tui/src/projection.rs) against TWENTY-SIX live UiEvent variants. The data is largely on disk; the projection is not. Gates C-423
 - [C-424 — A cast leaves the machine — redact the rendered frames, not just the recorded payloads](C-424-a-cast-is-a-publishing-act.md) · Core · the epic's safety story, deliberately NOT folded into C-423. `flux replay`'s output stays local; a cast's whole purpose is to be published, and C-339 already found redaction failing OPEN in this codebase. Rendering is a second chance to leak: a secret can be absent from a payload and present in a wrapped, ANSI-styled frame reassembled from it
 
+### Session Truth
+- [C-589 — Agents and operators can inspect the durable truth of a session (epic)](C-589-session-truth-and-self-inspection-epic.md) · Core · s_2013 executed a real task-child uninstall, then later turns falsely denied it because chat context omitted execution provenance
+- [C-590 — Query and inspect one session through CLI and agent operations](C-590-session-query-cli-and-operations.md) · Core · one redacted bounded projection backs --id/--json, flux session inspect and session.list/session.inspect
+- [C-591 — Preserve verified execution provenance across turns](C-591-preserve-verified-execution-provenance-across-turns.md) · Core · a later turn must not infer 'nothing ran' from conversational context that omitted task-child events
+
 ### The SIP channel — flux answers the phone, and places calls
 _A phone call is the oldest and widest channel there is. Giving flux an inbound number — it answers,_
 - [D-225 — One SIP channel, two localities — the same program runs against a local process or a hosted exchange](D-225-one-sip-channel-two-localities.md) · Agent · the seam, and it is NOT blocked. ⚠ Neither locality may become mandatory — ecosystem.md: `flux must never require flux-exchange`; C-399: `flux must be able to do this locally as dev without depending on a service — that is the local-first principle, not a convenience`. Rooms already prove the pattern: one `room` channel, three backends
@@ -278,9 +289,24 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [A-127 — Roles carry an address — one delegation vocabulary, local or remote](A-127-roles-carry-an-address.md) · Agent · ⚠ cap_scope is enforced by constructing the child registry IN-PROCESS; across the wire it becomes a request, not an enforcement — that divergence must be surfaced, never silently trusted
 - [A-128 — Fleet monitor journey over the shipped worker lifecycle](A-128-fleet-lifecycle-ops-and-monitor.md) · Agent · C-243 shipped fleet.start/worker_status/stop; the remaining headline proof joins discovery, dispatch/task status and worker liveness in one offline monitor journey
 
+### explicit agent-loop harnesses, progress and hierarchical budgets
+- [C-570 — Agents report typed progress and cooperatively yield upstream](C-570-agent-progress-and-cooperative-yield.md) · Core · SpawnActivity is host telemetry; add durable child-authored reports, acknowledgement and a resumable safe-checkpoint yield
+- [C-571 — Fleet budgets reserve and settle across fleet, wave, task, agent and loop](C-571-hierarchical-fleet-budget-ledger.md) · Core · narrow-only hierarchical targets/limits with durable reservation, idempotent settlement, warnings and resumable exhaustion
+- [C-572 — Fleet review and rework run under explicit reviewer and repair loops](C-572-fleet-review-and-rework-loops.md) · Core · fresh tool-free review over story contract + exact diff; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling
+- [C-573 — Live Fleet metrics drive bounded model, effort and concurrency policy](C-573-metrics-driven-fleet-policy-controller.md) · Core · closed-loop optimization inside authorized caps: freshness-labelled metrics, allowlisted actuators, safe-boundary changes, hysteresis and durable decisions
+- [C-583 — Scale Fleet worker capacity through one operation and CLI contract](C-583-live-fleet-capacity-control.md) · Core · one Fleet worker is one admitted agent; revisioned desired capacity scales assignment-bound workers up and drains down, while nested task children stay separate
+- [C-587 — Every Fleet candidate produces independent review and structured reflection before handoff](C-587-mandatory-fleet-review-reflection.md) · Improve · after implementation freezes, async tool-free review(story+diff) and reflection(request+transcript+outcome) are mandatory; reflections feed a central improvement corpus
+
 ### Watch the agent think — the loop as a live thread, expandable down to the graph
 _flux's central claim is that **the LLM is not the runtime** — authored control flow and a deterministic_
 - [A-139 — The loop view must not become the bottleneck or the liar — bounded redraw, honest elision](A-139-the-loop-view-under-load.md) · Agent · a fast loop emits events faster than a terminal can usefully redraw, and sub-agent fan-out multiplies it. ⚠ The failure mode is a view that silently drops steps — which in a demo reads as flux doing less than it did
+
+### Agent-native Flux documentation
+_`flux docs` already serves the documentation bundled with the running binary, and generated Flux_
+- [C-578 — Agent-native Flux documentation — release-matched answers through a datasource (epic)](C-578-agent-native-flux-documentation-epic.md) · Core · EPIC — Flux questions activate a bounded built-in docs datasource instead of relying on model memory, arbitrary checkout reads or web search
+- [C-579 — Build the release-matched Flux documentation datasource](C-579-build-the-release-matched-flux-docs-datasource.md) · Core · derive deterministic topic/page/section records from the same committed public-doc source and bind them to the Flux release and corpus digest
+- [C-580 — Expose bounded Flux documentation retrieval through datasource operations](C-580-expose-bounded-flux-docs-retrieval-operations.md) · Core · register flux-docs in complete agent assemblies and reuse sources/search/get/list/relation/batch_get; topic overview is a projection, not a second backend
+- [C-581 — Surface Flux documentation for questions about Flux itself](C-581-surface-flux-docs-for-self-directed-questions.md) · Agent · intent-aware activation for Flux commands, configuration, Agent-Loop, Flux-Lang, Board/Fleet, SDK and safety without polluting unrelated turns
 
 ### Approval Distillation
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
@@ -295,10 +321,11 @@ _flux's central claim is that **the LLM is not the runtime** — authored contro
 - [C-361 — Add a coverage-guided fuzz lane with a persistent corpus](C-361-add-a-coverage-guided-fuzz-lane.md) · Core · no fuzz/ dir, no cargo-fuzz, no arbitrary, no seed corpora — the 'adversarial corpus' is a seeded deterministic generator over committed fixtures and keeps nothing it finds
 - [C-362 — Add a sanitizer lane over the unsafe-adjacent seams](C-362-add-a-sanitizer-lane.md) · Core · no -Zsanitizer flags anywhere in the repo; ASan/TSan/MSan is the other limb of ASURE-01 that no addition has touched
 
-### The board and fleet operations TUI
-_The CLI is the automation API, but a human supervising autopilot needs a calm view of the main_
-- [C-556 — The fleet TUI is centered on the one main coordinator conversation](C-556-fleet-main-agent-tui-shell.md) · Core · follow-up UI — conversational main surface plus attention rail; CLI remains automation API
-- [C-557 — Polished TUI views expose worker channels, board decisions and exact stats](C-557-board-fleet-observability-tui.md) · Core · follow-up UI — read-only peeks and native visualizations, not embedded CLI output
+### Batched inputs for repeatable observation operations
+_An agent often asks the same read-only operation about several independent inputs. If the operation_
+- [C-584 — Batched operation inputs — fewer calls for repeatable observations (epic)](C-584-batched-operation-inputs-epic.md) · Core · EPIC — let measured read-only operations accept bounded arrays when one call preserves semantics; never batch writes by schema accident
+- [C-585 — Let git_diff inspect multiple paths in one operation call](C-585-git-diff-accepts-multiple-paths.md) · Core · make path a bounded string-or-array and invoke one fixed git diff argv with exact per-path permission subjects
+- [C-586 — Mine Flux operation history for safe array-input candidates](C-586-mine-operation-history-for-batchable-inputs.md) · Improve · content-free SQLite census of repeated call shapes, live schemas and operation semantics; distinguish missing batching from unused batching
 
 ### Connector-backed storage — one registry, two safe facades
 _The hosted connectors platform needs ordinary customer storage and credential storage to be_
@@ -408,7 +435,7 @@ _Debugging an agent today means reading a transcript after the fact and running 
 - [D-193 — MCP interop — consume and expose Model Context Protocol (epic)](D-193-mcp-interop-epic.md) · Agent · EPIC — mount MCP servers as guarded tool sources through the existing envelope/schema/surfacing pipeline, and expose flux ops/flows as an MCP server; completes the interop dialect the Claude epic (D-186..D-192) started
 
 ### Monetary Budgets
-- [C-130 — Monetary budgets & quotas — hard spend enforcement (epic)](C-130-monetary-budgets-epic.md) · Core · EPIC — cost is observed (usage events, pricing, OpenRouter reported cost) but never enforced; add [budget] config with per-session/per-agent/rolling-per-day currency caps: soft threshold warns into context, hard cap stops before the next model call with a resumable suspension; per-principal caps for A2A/serve; distinct from token turn-budgets (A-10/A-26)
+- [C-130 — Monetary budgets & quotas — hard spend enforcement (epic)](C-130-monetary-budgets-epic.md) · Core · extend C-571's hierarchical ledger with currency and rolling per-principal caps; unknown price is never treated as zero
 
 ### Guarded network primitives — design questions
 - [C-284 — Design guarded network primitives](C-284-design-guarded-network-primitives.md) · Core · Protocol families need different authority, addressing, lifecycle, and result contracts; do not flatten them into a generic socket escape hatch
@@ -437,6 +464,12 @@ _Running an agent on your own machine means your machine is what it touches. Som
 _An A2A endpoint being discoverable does not make it a trusted fleet worker. Remote membership needs_
 - [C-554 — Remote agents join a fleet only through authenticated admission and leases](C-554-remote-fleet-admission-and-leases.md) · Core · follow-up remote boundary — invite, authenticated hello/capabilities, coordinator admission, expiry
 - [C-555 — An admitted A2A agent executes through the generic task-agent backend](C-555-a2a-task-agent-backend.md) · Core · follow-up remote execution — membership is C-554; exact artifacts still cross host verification
+
+### causal resource receipts and result cost
+- [C-574 — Every result carries a realistic attributable resource bill (epic)](C-574-resource-accounting-epic.md) · Core · measure physical usage and money provenance once; attribute causally to request/story; roll up without double-counting
+- [C-575 — Record immutable causal resource-usage receipts](C-575-causal-resource-usage-receipts.md) · Core · one span tree for tokens/calls, wall/CPU, network time/bytes, process/tool/artifact resources and validation
+- [C-576 — Attribute resource usage to requests, results and Board work](C-576-attribute-resource-usage-to-board-work.md) · Core · explicit causal BoardRef/assignment links; exclusive/inclusive totals; shared overhead stays visible or uses a versioned allocation policy
+- [C-577 — Expose resource bills and rollups from result through Fleet](C-577-resource-bills-and-rollups.md) · Core · bounded bills by request/story/epic/worker/wave/repository/Fleet with physical usage, money basis, coverage and Board evidence links
 
 ### Pause and resume a live run
 _Watching an agent work is only half of control. The other half is being able to say *stop* — to read_
@@ -471,8 +504,8 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 
 ### Task-agent backends and CLI harness adapters
 _Fleet membership and task execution are separate concerns. The V1 fleet can admit and coordinate_
-- [C-552 — One TaskAgentBackend separates agent execution from fleet membership](C-552-task-agent-backend-contract.md) · Core · follow-up after local V1 — lifecycle/steering/receipts are generic; fleet remains backend-agnostic
-- [C-553 — Codex, Claude, Hermes and Pi run through typed local task-agent adapters](C-553-cli-agent-harness-adapters.md) · Core · follow-up adapters — local harness CLIs are task backends, not special fleet coordinators
+- [C-552 — One TaskAgentBackend separates agent execution from fleet membership](C-552-task-agent-backend-contract.md) · Core · follow-up after native loop/report contracts — lifecycle stays generic and advertises which harness and budget semantics a backend can uphold
+- [C-553 — Codex, Claude, Hermes and Pi run through typed local task-agent adapters](C-553-cli-agent-harness-adapters.md) · Core · local harness CLIs are task backends; each maps only loop/report/yield/budget behavior it can prove and refuses the rest
 
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
 _Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
@@ -1024,6 +1057,8 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-559 — Release Flux without dedicated App or environment settings](C-559-release-without-app-settings.md) · Core · user-directed v0.56.0 unblock — use existing repository tokens at their real authority boundaries; remove PROMOTION_APP and release environment configuration
 - [C-560 — Bound oversized Fleet agent events at their source](C-560-bound-oversized-fleet-agent-events-at-their-source.md) · Agent · Research why a read-only three-repository Fleet task produced a 1.23 MB model request/event; define per-event and accumulated context bounds before optimizing transport
 - [C-566 — Every Fleet story worker starts with assignment-only context](C-566-start-fleet-workers-with-assignment-only-context.md) · Core · dogfood stop-line — fresh writers must not inherit the main conversation, global goal dump or another worker session
+- [C-582 — The operations TUI makes Fleet main, workers and Boards one supervisable surface (epic)](C-582-board-fleet-operations-tui-epic.md) · Core · Decision 0010 follow-up epic — explicit Fleet-main attachment, coordinator-first conversation and bounded typed Board/Fleet views
+- [C-588 — The real roadmap runs from the native workspace Board without legacy coordination glue](C-588-native-workspace-board-cutover.md) · Core · corrective adoption after the roadmap fixture exposed zero program/wave metrics, false open decisions and continued README/AGENTS/script dependence
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

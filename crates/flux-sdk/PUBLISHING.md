@@ -194,8 +194,8 @@ refs before the first remote mutation, and then:
    fast-forward push advances `main`; a concurrent main move is rejected rather than overwritten;
 3. stages the resulting merged canonical-`main` SHA at `refs/heads/release-candidates/vX.Y.Z`;
 4. dispatches `.github/workflows/release.yml` from that exact ref; that workflow verifies its
-   checked-out SHA, runs `scripts/release-full-gate.sh` once, and only then builds all five
-   cargo-dist targets;
+   checked-out SHA and the controller's successful exact cut `ci.yml` run, then builds all five
+   cargo-dist targets without rebuilding, testing, linting and formatting the workspace again;
 5. verifies the candidate's version/SHA/run receipt, including the
    `mandatory-full-v1` gate marker and gated commit SHA;
 6. creates and pushes the annotated tag at that merged SHA with the PAT, so both tag workflows run; and
@@ -312,12 +312,27 @@ tag=vX.Y.Z
 sha=$(git rev-list -n1 "$tag^{}")
 candidate="release-candidates/$tag"
 repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+gate_baseline=$(gh run list --workflow ci.yml --limit 100 \
+  --json databaseId --jq '([.[].databaseId] | max) // 0')
 baseline=$(gh run list --workflow release.yml --limit 100 \
   --json databaseId --jq '([.[].databaseId] | max) // 0')
 
 # Make the exact cut commit addressable without moving main.
 git push origin "HEAD:refs/heads/$candidate"
-gh workflow run release.yml --ref "$candidate" -f version=X.Y.Z
+gh workflow run ci.yml --ref "$candidate"
+
+# Wait for the one newly dispatched full CI run at the exact candidate ref and SHA.
+gate_run=
+until [ -n "$gate_run" ]; do
+  gate_run=$(gh run list --workflow ci.yml --event workflow_dispatch \
+    --branch "$candidate" --commit "$sha" --limit 20 \
+    --json databaseId,event,headBranch,headSha \
+    --jq ".[] | select(.databaseId > $gate_baseline and .event == \"workflow_dispatch\" and .headBranch == \"$candidate\" and .headSha == \"$sha\") | .databaseId" \
+    | sort -n | head -1)
+  [ -n "$gate_run" ] || sleep 5
+done
+gh run watch "$gate_run" --exit-status
+gh workflow run release.yml --ref "$candidate" -f version=X.Y.Z -f gate_run="$gate_run"
 
 # Wait for the newly dispatched exact-ref/exact-SHA run. The baseline excludes an older run or retry
 # while GitHub is still registering this dispatch.

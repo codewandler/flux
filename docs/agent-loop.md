@@ -203,6 +203,16 @@ Custom loops are ordinary validated Flux-Lang. They may combine deterministic op
 `detect_intent`, `explore`, `approve_batch`, `execute_batch`, `present_results`, `ai_segment`,
 `observe`, and `await`. Unknown operations fail validation before a turn starts.
 
+The current selector is resolved at each agent-start boundary. The planned C-568 contract records a
+versioned binding even when an ordinary omitted selector resolves to the adaptive preset. Sub-agents
+and Fleet workers do not implicitly inherit a parent's loop or conversation: a role/task resolves its
+own allowed profile, and Fleet maps explicit task kinds to workhorse, reviewer, research or decision
+profiles. See [agent-loop-harnesses.md](designs/agent-loop-harnesses.md).
+
+`subagent.activity` already carries correlated host-observed tool/lifecycle telemetry upstream. It is
+not a worker-authored status protocol. C-570 adds acknowledged bounded progress and cooperative yield
+at a declared loop checkpoint; operator pause remains the separate A-140/A-141 run-control contract.
+
 ## Flow versus journey
 
 A **flow** is a reusable deterministic computation: typed inputs, explicit operations and control

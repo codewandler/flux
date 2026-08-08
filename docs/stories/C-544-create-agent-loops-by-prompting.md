@@ -5,8 +5,9 @@ pillar: Core
 status: ready
 priority: 32
 epic:
-design:
+design: docs/designs/agent-loop-harnesses.md
 areas: [flux-tui, flux-lang, flux-agent]
+depends_on: [C-543, C-569]
 note: "\"create this <...> loop for me\" -> flux writes the *.flux file; the new loop then appears in the C-543 selector"
 ---
 
@@ -32,6 +33,8 @@ flux source.
       selector immediately after creation and can be selected and run.
 - [ ] The generated loop carries a description (used by the C-543 overlay) derived from the
       operator's prompt.
+- [ ] The saved loop has stable profile/revision/source-digest metadata for C-569 resolution. Creating
+      it does not automatically authorize it for Fleet task kinds or alter an admitted worker.
 - [ ] The gate is green in both workspaces.
 
 ## Progress
@@ -44,5 +47,5 @@ flux source.
   title — refine the entry point and the generation contract (model-assisted vs template) before
   dispatch.
 - Depends on [C-543](C-543-tui-loop-selector-with-visualizing-overlay.md) (the selector and its
-  live-refresh acceptance). Dispatch serialized after it or in the same wave starting from its
-  integrated prerequisite.
+  live-refresh acceptance) plus C-569's binding validation. Dispatch serialized after them or in the
+  same wave starting from their integrated prerequisite.

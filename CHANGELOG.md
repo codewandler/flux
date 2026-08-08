@@ -8,6 +8,48 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **A native workspace Board is now the complete cross-repository program authority** (C-588).
+  A default `.flux/board.toml` binds member repositories and canonical refs, active milestone,
+  ordered program lanes, cross-repository dependencies, configured waves and planning documents.
+  Plain `flux board` auto-selects it; `board next` and `fleet schedule` consume the same validated
+  projection and never admit an unrelated ready story when a program catalogue exists. Board
+  planning config, Fleet execution config and mutable Fleet state now have disjoint schemas and
+  ownership, accepted decisions no longer surface as open attention, and workspace metrics report
+  real program stories, milestone lanes, waves and members instead of legacy placeholders.
+
+- **`flux tui --fleet[=ROOT]` is a native Board/Fleet operations surface** (C-556, C-557, C-582).
+  Explicit attachment validates one Fleet root, opens the reserved main coordinator's isolated
+  store and exact recorded session, and journals conversation intake through accepted, delivered,
+  and completed/failed acknowledgements. A typed in-process projection supplies a responsive
+  attention rail plus bounded Overview, Board, Workers, Decisions, and Stats views from the same
+  durable readers and exact `flux.board-stats/v1` cube as the CLI; it does not capture ANSI, scrape
+  tmux, or spawn CLI subprocesses. Refresh keeps the last-good snapshot on failure. Only explicit
+  intake and a twice-confirmed open-decision choice may mutate state; push, release, deploy,
+  Fleet-apply, cleanup, and capacity changes remain outside the TUI. Desired/draining capacity is
+  shown as unavailable until canonical Fleet state carries it.
+
+### Changed
+
+- **Board and Fleet public docs now define the complete domain model.** Concepts appears before
+  Coding, and the guides distinguish epics, stories, milestones, program lanes, configured waves,
+  dispatched wave instances, workers, handoffs, review, gates, apply and release. Compact diagrams
+  show story states, eligibility, isolated worktrees, review/rework and the separate publication
+  boundary.
+
+### Fixed
+
+- Concurrent `fleet.isolate` calls now serialize Git's shared worktree-administration mutation
+  while retaining disjoint checkout allocation, preventing partially written `.git/worktrees`
+  metadata from breaking a parallel Board/Fleet wave.
+- Release checksum verification accepts cargo-dist sidecars with trailing blank lines while still
+  requiring one exact lowercase digest/filename record and at least one newline terminator.
+- Candidate artifact preparation now verifies and reuses the controller's successful exact cut-CI
+  run instead of rebuilding, testing, linting and formatting the same release a third time.
+
+## [0.56.0] - 2026-08-05
+
+### Added
+
 - **Boards and the local coding fleet are now first-class agent automation surfaces** (Decision
   0010; C-547, A-134, L-130, C-548–C-551, C-242, C-244, C-245, A-117). `flux board` exposes
   session, repository and workspace scopes; general, planning and execution profiles; Track,
@@ -106,7 +148,9 @@ All notable changes to this project are documented in this file. The format is b
   `[Unreleased]` notes already in the repository, and preserves the exact version, protocol,
   transaction, candidate-receipt and publication gates. Model selection, Anthropic/OpenRouter/OpenAI
   credentials and live-provider smoke are absent from the automatic path, and the parsed authority
-  policy rejects their reintroduction.
+  policy rejects their reintroduction. The candidate gate also fetches the complete locked
+  dependency graph before its offline architecture checks, including packages used only by other
+  compilation targets.
 
 - **The v0.56.0 release path now runs from the repository's existing Actions secrets without a
   dedicated GitHub App, release Environments, rulesets or branch protection** (C-559; supersedes the

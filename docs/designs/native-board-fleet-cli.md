@@ -5,6 +5,9 @@
 [C-239](../stories/C-239-fleet-loop-epic.md) · **CLI contract:**
 [C-547](../stories/C-547-versioned-board-fleet-agent-cli-contract.md)
 
+The corrective independent workspace configuration and real roadmap cutover are specified in
+[native-workspace-board-cutover.md](native-workspace-board-cutover.md) under Decision 0013/C-588.
+
 ## Outcome
 
 `flux board` and `flux fleet` are the supported automation API for a human, Claude or Codex. A
@@ -92,14 +95,15 @@ names missing items without rewriting authored prose.
 `{done, remaining, total, percent}`. Planning boards report epics, stories, optional tasks,
 acceptance criteria and headline implementation plus the profile-state histogram; documents report
 vision/roadmap presence, decisions by lifecycle and designs. Git-backed boards add canonical commit
-totals. Federated scheduled boards add program stories, tranche lanes, waves and program groups and
+totals. Federated scheduled boards add program stories, active milestone lanes and configured waves and
 return both per-member and aggregate values. `--history --since YYYY-MM-DD` reconstructs daily
 canonical snapshots and reports `scope_added`, `scope_removed` and `completed` deltas. A missing
 dimension is `{schema: "absent", done: null, remaining: null, total: null, percent: null}`. HTML/SVG/
 TSV reports are pure renderings of this JSON, never independent calculations.
 
 Every fleet has exactly one reserved durable `main` coordinator. All user requirements, tasks and
-agent follow-ups enter through its intake; only it maintains the active roadmap/schedule. It plans
+agent follow-ups enter through its intake; it orchestrates execution against the Board-owned active
+roadmap/schedule. It plans
 against revisioned goals scoped to values, company, workspace, project and repository. Worker
 membership is explicit: `main` admits a worker and records parent, role, session, transport,
 capabilities, mode, fences and lease. Merely appearing in configuration or on a transport is not
@@ -127,12 +131,28 @@ existing worker from its snapshot. Status and receipts expose only a bounded
 `flux.fleet-capability-set/v1` digest manifest and counts, never the full operation catalogue,
 paths, prompt or instruction body.
 
-`.flux/fleet.toml` declares main instructions/model, named reusable agent templates, whether ad-hoc
-agents are allowed, repository ids/paths, canonical refs, planning-board bindings, gates, ledger
-fences, concurrency and schedule groupings. The coordinator may instantiate a template or admit an
+Worker admission also resolves one explicit versioned agent-loop binding under
+[agent-loop-harnesses.md](agent-loop-harnesses.md). General agents may resolve an omitted selector to
+the adaptive preset, but Fleet writer/reviewer/decision roles must name a policy-selected profile.
+The binding's profile, revision, source digest and entry point are snapshotted beside capabilities;
+continuation cannot drift to an edited file or backend default. Task kind is explicit dispatch
+metadata and may be mapped by any Board backend without making Board a datasource or loop runner.
+
+Host-observed `SpawnActivity` remains telemetry. A worker-authored progress/yield record uses C-570's
+bounded acknowledged channel and cannot mutate Board or Fleet state. C-542/C-571 budget envelopes are
+reserved from Fleet through assignment and agent scopes and settled from typed usage; exhaustion is
+an inspectable resumable terminal rather than an unstructured failed answer.
+
+`.flux/board.toml` independently declares workspace members, document roots, the active milestone,
+ordered program lanes and configured waves. `.flux/fleet.toml` declares main instructions/model,
+named reusable agent templates, whether ad-hoc agents are allowed, repository ids/paths, canonical
+refs, planning-board bindings, gates, ledger fences and concurrency. Neither configuration file is
+runtime state; dispatched wave instances live only in the Fleet state/event journal. The
+coordinator may instantiate a template or admit an
 ephemeral agent with temporary instructions/model/mode/capabilities/fences at dispatch time; both
 paths obey the same limits and can never create a second coordinator. A workspace fleet run selects
-the highest-priority dependency-satisfied wave unless the caller supplies explicit `BoardRef`s.
+from the Board's ordered, active-milestone, dependency-satisfied projection unless the caller
+supplies explicit `BoardRef`s.
 The durable wave manifest pins source commits, proposed and observed write sets, worktrees,
 sessions, attempts, evidence, reviews, gates and local candidate branches.
 
@@ -144,6 +164,11 @@ rounds; dependency-ordered child-commit integration; and one unskippable full ga
 integration tree. Red preserves the candidate and cannot transition planning items to done. Green
 leaves local `fleet/<wave>` branches. Only `flux fleet apply` revalidates and merges them, without
 pushing.
+
+The writer workhorse reports `handoff_ready`, after which the host starts a distinct fresh read-only
+reviewer under its own reviewer loop. That loop composes the shipped strict-review flow and returns
+typed PASS/REWORK/PARK. REWORK enters the original writer's explicit repair entry point; C-245's
+two-round host ceiling remains authoritative. The writer never reviews itself.
 
 Open decisions block only their linked work; other ready items continue. Human mode surfaces the
 structured choices and recommendation. Auto mode creates a fresh adversarial decision agent with
@@ -172,6 +197,10 @@ Board wave: C-547 (machine CLI contract), A-134 (registry/profile core), L-130 (
 
 Fleet wave: C-244 (typed handoff), C-245 (same-session rework), C-242 (integration and explicit
 apply), A-117 (durable supervisor and fleet CLI), C-551 (inspection, reporting and roadmap parity).
+
+Fleet dogfood hardening: C-569 (resolved loop binding), C-567 (workhorse task-kind policy), C-570
+(progress/yield), C-572 (review/repair loops), C-542/C-571 (local and hierarchical budgets), then
+C-565's five-writer proof.
 
 Generic task-agent backends and Codex/Claude/Hermes/Pi CLI harness adapters, authenticated remote
 A2A fleet members, a polished board/fleet TUI, vendor boards, containers, automatic publication and
