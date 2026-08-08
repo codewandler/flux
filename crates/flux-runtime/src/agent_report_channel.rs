@@ -175,6 +175,7 @@ impl std::fmt::Debug for AgentReportReporter {
 mod tests {
     use super::*;
     use flux_core::{AgentLoopBindingMetadata, AgentLoopRunnerKind, AgentReportLedger};
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     fn identity() -> AgentReportIdentity {
@@ -197,6 +198,14 @@ mod tests {
         }
     }
 
+    /// One admitted worker of a concurrent wave: the same assignment shape, its own session.
+    fn worker_identity(session: &str) -> AgentReportIdentity {
+        AgentReportIdentity {
+            agent_id: format!("writer-{session}"),
+            session_id: session.to_string(),
+            ..identity()
+        }
+    }
     struct LedgerSink(Mutex<AgentReportLedger>);
 
     impl AgentReportSink for LedgerSink {
@@ -268,5 +277,78 @@ mod tests {
             .is_none(),
             "an unrelated observation is not a report"
         );
+    }
+
+    /// Five writers reporting at once is the shape the dogfood failure had. Each keeps its own
+    /// monotonic sequence, none is admitted against another's ledger, and admission never waits.
+    #[test]
+    fn five_concurrent_workers_report_through_one_sink_without_cross_talk() {
+        struct FleetSink(Mutex<BTreeMap<String, AgentReportLedger>>);
+
+        impl AgentReportSink for FleetSink {
+            fn report(&self, report: AgentReport) -> Result<AgentReportAck, AgentReportRejection> {
+                let mut ledgers = self.0.lock().unwrap();
+                ledgers
+                    .get_mut(&report.identity.session_id)
+                    .expect("an admitted worker")
+                    .admit(report)
+            }
+        }
+
+        let sessions: Vec<String> = (1..=5).map(|i| format!("s_worker_{i}")).collect();
+        let sink = Arc::new(FleetSink(Mutex::new(
+            sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.clone(),
+                        AgentReportLedger::new(worker_identity(session)),
+                    )
+                })
+                .collect(),
+        )));
+
+        std::thread::scope(|scope| {
+            for session in &sessions {
+                let sink = sink.clone();
+                scope.spawn(move || {
+                    let reporter =
+                        AgentReportReporter::new(worker_identity(session), Redactor::new(), sink);
+                    for phase in ["establish-evidence", "implement", "validate"] {
+                        let ack = reporter
+                            .report(AgentReportDraft::new(
+                                phase,
+                                AgentReportState::Active,
+                                format!("{session} reached {phase}"),
+                            ))
+                            .expect("a worker reports on its own channel");
+                        assert!(!ack.duplicate);
+                    }
+                });
+            }
+        });
+
+        let ledgers = sink.0.lock().unwrap();
+        assert_eq!(ledgers.len(), 5);
+        for session in &sessions {
+            let ledger = &ledgers[session];
+            assert_eq!(ledger.records().len(), 3, "{session}");
+            assert_eq!(
+                ledger
+                    .records()
+                    .iter()
+                    .map(|record| record.sequence)
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3],
+                "{session} keeps its own monotonic sequence"
+            );
+            assert!(
+                ledger
+                    .records()
+                    .iter()
+                    .all(|record| &record.identity.session_id == session),
+                "{session} admitted another worker's record"
+            );
+        }
     }
 }
