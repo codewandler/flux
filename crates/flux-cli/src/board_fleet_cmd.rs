@@ -11638,7 +11638,70 @@ fn fleet_runtime_health(state: &FleetState) -> Value {
     })
 }
 
+/// Does this branch hold a commit the wave did not start from?
+///
+/// The same question `stale_branch_findings` asks, deliberately: a branch still sitting at its pinned
+/// base holds nothing of its own, and the two must never disagree about that. Doctor reports such a
+/// branch and prescribes reclamation, so reclamation has to recognise exactly the branch doctor named
+/// or the fix it prescribes cannot work.
+///
+/// `None` when the question cannot be answered — the branch is already gone, the repository is
+/// unreadable, or the wave recorded no base. An unanswered question is never a licence to delete.
+fn branch_is_at_pinned_base(source: &Path, branch: &str, base: Option<&str>) -> Option<bool> {
+    let base = base?;
+    let head = guarded_git(source, &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .ok()
+        .filter(|output| output.exit_code == 0)?;
+    Some(head.stdout.trim() == base)
+}
+
+/// Prune a wave's branch, and say what happened either way.
+///
+/// `git branch -d` alone is not enough here and never was. It deletes only what is merged into the
+/// deleting repository's HEAD, and a wave's `source_root` is a detached linked worktree pinned to
+/// whatever commit that wave started from — so `-d` refuses nearly every branch doctor flags, and the
+/// refusal used to be discarded by `let _ =`. Where the branch is provably still at its pinned base it
+/// holds no commit to lose, and the ref is deleted directly. Everything else is left alone WITH ITS
+/// REASON RECORDED, because a branch that has moved is delivered work.
+fn prune_wave_branch(source: &Path, branch: &str, base: Option<&str>, dry_run: bool) -> Value {
+    match branch_is_at_pinned_base(source, branch, base) {
+        Some(true) => {
+            if dry_run {
+                return json!({"branch": branch, "deleted": false, "would_delete": true});
+            }
+            let reference = format!("refs/heads/{branch}");
+            match guarded_git(source, &["update-ref", "-d", &reference]) {
+                Ok(output) if output.exit_code == 0 => json!({"branch": branch, "deleted": true}),
+                Ok(output) => json!({
+                    "branch": branch,
+                    "deleted": false,
+                    "reason": format!("git refused to delete the ref: {}", output.stderr.trim()),
+                }),
+                Err(error) => json!({
+                    "branch": branch,
+                    "deleted": false,
+                    "reason": format!("could not delete the ref: {error:#}"),
+                }),
+            }
+        }
+        Some(false) => json!({
+            "branch": branch,
+            "deleted": false,
+            "reason": "it has moved past its pinned base, so it holds commits of its own",
+        }),
+        None => json!({
+            "branch": branch,
+            "deleted": false,
+            "reason": "its head could not be resolved, so nothing can be concluded about its contents",
+        }),
+    }
+}
+
 fn reclaim_wave_storage(wave: &Value) -> Value {
+    reclaim_wave_storage_inner(wave, false)
+}
+
+fn reclaim_wave_storage_inner(wave: &Value, dry_run: bool) -> Value {
     // Removing a worktree needs a stronger justification than removing build output.
     //
     // Build output is regenerable, so it always goes. A worktree is STRUCTURE the wave may still need, and
@@ -11654,6 +11717,11 @@ fn reclaim_wave_storage(wave: &Value) -> Value {
     let mut freed_dirs = Vec::new();
     let mut removed = Vec::new();
     let mut retained = Vec::new();
+    // A worktree the topology names and disk no longer has is neither removed nor retained. It used to
+    // be neither reported: the loop skipped it before it could count, so a run over waves whose
+    // checkouts were already gone reported them as reclaimed while doing nothing at all.
+    let mut absent = Vec::new();
+    let mut branches = Vec::new();
     // Each worktree carries its branch: removing the checkout without removing the ref leaves the ref
     // forever. Forty empty `fleet/wave-*` branches had accumulated in one repository, one set per wave
     // ever dispatched, which makes `git branch` useless as a view of real work — the same absent-owner
@@ -11663,62 +11731,106 @@ fn reclaim_wave_storage(wave: &Value) -> Value {
         branch,
         source,
         canonical_ref,
+        base_commit,
         ..
     } in wave_worktrees(wave)
     {
         let canonical = canonical_ref.as_str();
-        if !worktree.is_dir() {
-            continue;
-        }
-        for name in RECLAIMABLE_BUILD_DIRS {
-            for found in build_dirs_under(&worktree, name) {
-                if std::fs::remove_dir_all(&found).is_ok() {
-                    freed_dirs.push(display_path(&found));
+        let present = worktree.is_dir();
+        if present {
+            for name in RECLAIMABLE_BUILD_DIRS {
+                for found in build_dirs_under(&worktree, name) {
+                    if dry_run {
+                        freed_dirs.push(display_path(&found));
+                    } else if std::fs::remove_dir_all(&found).is_ok() {
+                        freed_dirs.push(display_path(&found));
+                    }
                 }
             }
         }
         if !terminal {
-            retained.push(json!({
-                "worktree": display_path(&worktree),
-                "reason": "the wave is not finished, so its worktrees are still structure it needs",
-            }));
+            if present {
+                retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": "the wave is not finished, so its worktrees are still structure it needs",
+                }));
+            }
             continue;
         }
-        match worktree_holds_work(&worktree, &source, canonical) {
-            Ok(false) => {
-                let path = worktree.display().to_string();
-                let removal = guarded_git(&source, &["worktree", "remove", "--force", &path])
-                    .is_ok_and(|output| output.exit_code == 0);
-                if removal || !worktree.is_dir() {
-                    // `-d`, never `-D`: git refuses to delete a branch holding commits that are not
-                    // reachable elsewhere, so this can prune the empty scaffolding and cannot spend
-                    // delivered work. A refusal is the correct outcome and is left unrecorded noise-free.
-                    if let Some(branch) = branch.as_deref() {
-                        let _ = guarded_git(&source, &["branch", "-d", branch]);
+        // Whether the checkout is gone by the end of this iteration, however it got that way. Only then
+        // is the branch scaffolding rather than the sole reference to a checkout somebody is using.
+        let mut checkout_gone = !present;
+        if present {
+            match worktree_holds_work(&worktree, &source, canonical) {
+                Ok(false) => {
+                    let path = worktree.display().to_string();
+                    let removal = dry_run
+                        || guarded_git(&source, &["worktree", "remove", "--force", &path])
+                            .is_ok_and(|output| output.exit_code == 0);
+                    if removal || !worktree.is_dir() {
+                        removed.push(display_path(&worktree));
+                        checkout_gone = true;
+                    } else {
+                        retained.push(json!({
+                            "worktree": display_path(&worktree),
+                            "reason": "git declined to remove the worktree",
+                        }));
                     }
-                    removed.push(display_path(&worktree));
-                } else {
-                    retained.push(json!({
-                        "worktree": display_path(&worktree),
-                        "reason": "git declined to remove the worktree",
-                    }));
                 }
+                Ok(true) => retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": "holds uncommitted changes or commits absent from the canonical ref",
+                })),
+                Err(error) => retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": format!("could not be inspected, so it was left alone: {error:#}"),
+                })),
             }
-            Ok(true) => retained.push(json!({
-                "worktree": display_path(&worktree),
-                "reason": "holds uncommitted changes or commits absent from the canonical ref",
-            })),
-            Err(error) => retained.push(json!({
-                "worktree": display_path(&worktree),
-                "reason": format!("could not be inspected, so it was left alone: {error:#}"),
-            })),
+        } else {
+            absent.push(display_path(&worktree));
+        }
+        // The branch is pruned on its own evidence, not on whether this run happened to find a
+        // directory. A wave reclaimed once already has no checkouts left, and it was exactly those
+        // waves whose branches survived forever: the old loop reached this only through the removal
+        // arm it could no longer enter.
+        if checkout_gone {
+            if let Some(branch) = branch.as_deref() {
+                branches.push(prune_wave_branch(
+                    &source,
+                    branch,
+                    base_commit.as_deref(),
+                    dry_run,
+                ));
+            }
         }
     }
     json!({
         "build_dirs_removed": freed_dirs,
         "worktrees_removed": removed,
         "worktrees_retained": retained,
+        "worktrees_absent": absent,
+        "branches": branches,
     })
+}
+
+/// How much a reclamation outcome actually changed.
+///
+/// The count reported to the operator is derived from this and nothing else. `outcomes_len` used to
+/// count candidates, so a sweep that removed nothing still announced every wave it had considered —
+/// which is precisely how a feature that had been inert for nineteen runs kept reporting success.
+fn reclaimed_effects(reclaimed: &Value) -> (usize, usize, usize) {
+    let len = |key: &str| reclaimed[key].as_array().map_or(0, Vec::len);
+    let deleted = reclaimed["branches"]
+        .as_array()
+        .map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry["deleted"] == json!(true) || entry["would_delete"] == json!(true)
+                })
+                .count()
+        });
+    (len("build_dirs_removed"), len("worktrees_removed"), deleted)
 }
 
 /// Locate reclaimable build directories at or just below a worktree root.
@@ -13496,6 +13608,69 @@ fn wave_is_reclaimable(status: &str) -> bool {
     )
 }
 
+/// Wave directories on disk that no recorded wave claims.
+///
+/// Every reclamation path iterates `state.waves`, so a wave that never reached state is invisible to
+/// all of them. That is not hypothetical: wave-665 created four worktrees and ran a 112-second build
+/// warm, then lost the compare-and-set that would have recorded it — and its 15GB sat unreferenced
+/// while the disk it was on ran to 93%. Disk is what caps fleet width, and the largest consumer on it
+/// was the one thing the fleet could not name.
+fn orphaned_wave_dirs(root: &Path, state: &FleetState) -> Vec<PathBuf> {
+    let Ok(config) = read_fleet_config(root) else {
+        return Vec::new();
+    };
+    let worktree_root = if config.worktree_root.is_absolute() {
+        config.worktree_root.clone()
+    } else {
+        root.join(&config.worktree_root)
+    };
+    let Ok(entries) = std::fs::read_dir(&worktree_root) else {
+        return Vec::new();
+    };
+    let mut orphans: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !state.waves.contains_key(name))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    orphans.sort();
+    orphans
+}
+
+/// Is every checkout beneath this directory free of uncommitted work?
+///
+/// Commits are not at risk here — they are reachable from the branches this never touches — so the
+/// only question is whether a turn left something it never committed. Unreadable counts as holding
+/// work, the same asymmetry `worktree_holds_work` keeps: the cost of retaining a dead directory is
+/// disk, and the cost of the other mistake is somebody's uncommitted afternoon.
+fn orphan_holds_no_work(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        // A linked worktree carries a `.git` file. Stop here rather than descending: below this point
+        // is the checkout's own content, including the build output that makes these directories big.
+        if path.join(".git").exists() {
+            match git_output(&path, &["status", "--porcelain", "-uall"]) {
+                Some(status) if status.trim().is_empty() => continue,
+                _ => return false,
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    true
+}
+
 fn reclaim_finished_waves(
     command: &FleetCommand,
     root: &Path,
@@ -13527,6 +13702,10 @@ fn reclaim_finished_waves(
             .collect(),
     };
     let mut outcomes = Vec::new();
+    let mut freed_dirs = 0usize;
+    let mut freed_trees = 0usize;
+    let mut freed_refs = 0usize;
+    let mut changed = 0usize;
     for wave in &waves {
         let Some(record) = state.waves.get(wave) else {
             continue;
@@ -13534,28 +13713,82 @@ fn reclaim_finished_waves(
         if !record["topology"].is_object() {
             continue;
         }
-        let reclaimed = if command.dry_run {
-            json!({"preview": true})
-        } else {
-            reclaim_wave_storage(record)
-        };
+        // A dry run performs the same inspection and withholds only the writes. It used to short-circuit
+        // to `{"preview": true}`, which is why the documented `--dry-run --output json # what would be
+        // freed` could never report what would be freed.
+        let reclaimed = reclaim_wave_storage_inner(record, command.dry_run);
+        let (dirs, trees, refs) = reclaimed_effects(&reclaimed);
+        freed_dirs += dirs;
+        freed_trees += trees;
+        freed_refs += refs;
+        if dirs + trees + refs > 0 {
+            changed += 1;
+        }
         outcomes.push(json!({"wave": wave, "reclaimed": reclaimed}));
     }
+    let considered = outcomes.len();
+    // Only a full sweep looks for orphans. A named target is a question about one wave, and answering
+    // it by deleting directories the operator did not name would be its own kind of dishonesty.
+    let mut orphans_removed = Vec::new();
+    let mut orphans_retained = Vec::new();
+    if target.is_none() {
+        for dir in orphaned_wave_dirs(root, &state) {
+            if !orphan_holds_no_work(&dir) {
+                orphans_retained.push(json!({
+                    "path": display_path(&dir),
+                    "reason": "a checkout beneath it holds uncommitted work, or could not be read",
+                }));
+                continue;
+            }
+            if command.dry_run {
+                orphans_removed.push(display_path(&dir));
+                changed += 1;
+                continue;
+            }
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    orphans_removed.push(display_path(&dir));
+                    changed += 1;
+                }
+                Err(error) => orphans_retained.push(json!({
+                    "path": display_path(&dir),
+                    "reason": format!("could not be removed: {error}"),
+                })),
+            }
+        }
+    }
+    let orphan_count = orphans_removed.len();
+    let data = json!({
+        "waves": outcomes,
+        "dry_run": command.dry_run,
+        "orphans_removed": orphans_removed,
+        "orphans_retained": orphans_retained,
+    });
     // Record what was freed. Reclamation is the one maintenance action whose effect is invisible in the
     // state it mutates, so an unjournalled run leaves no way to tell it from a no-op.
-    state.revision += 1;
-    let data = json!({"waves": outcomes, "dry_run": command.dry_run});
-    persist_fleet_mutation(command, root, &state, "wave.reclaimed", data.clone())?;
+    //
+    // A sweep that freed nothing is not a mutation, and treating it as one was not free: it bumped the
+    // revision and rewrote a 21MB state file on every inert run, so nineteen consecutive no-ops each
+    // left a journal entry indistinguishable from progress.
+    if changed > 0 && !command.dry_run {
+        state.revision += 1;
+        persist_fleet_mutation(command, root, &state, "wave.reclaimed", data.clone())?;
+    }
+    let verb = if command.dry_run {
+        "would reclaim"
+    } else {
+        "reclaimed"
+    };
     Ok((
-        format!("reclaimed {} wave(s)", outcomes_len(&data)),
+        format!(
+            "{verb} {changed} of {considered} wave(s): {freed_dirs} build dir(s), \
+             {freed_trees} worktree(s), {freed_refs} branch(es), \
+             {orphan_count} unrecorded wave director(ies)"
+        ),
         data,
         vec![],
         state.revision,
     ))
-}
-
-fn outcomes_len(data: &Value) -> usize {
-    data["waves"].as_array().map_or(0, Vec::len)
 }
 
 /// The status a wave parked without a park record returns to.
@@ -18657,6 +18890,102 @@ mod tests {
         ] {
             assert!(wave_is_reclaimable(status), "{status} has finished");
         }
+    }
+
+    /// C-720: the defect that made reclamation inert for nineteen consecutive runs.
+    ///
+    /// A wave reclaimed once has no checkouts left — and the loop skipped every absent directory
+    /// before it could do anything, which is also where branch pruning lived. So the branches doctor
+    /// flagged survived forever while the command it prescribed reported success. The count came from
+    /// the candidate list, so "reclaimed 39 wave(s)" was printed over zero effects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_whose_checkouts_are_gone_still_loses_the_branches_it_left_behind() {
+        let root = reclaim_test_dir("reclaim-absent-checkout");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        std::fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add base");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+        guarded_git(&root, &["branch", "fleet/wave-9/story"]).expect("branch at base");
+        guarded_git(&root, &["branch", "fleet/wave-9/delivered"]).expect("branch to move");
+        guarded_git(&root, &["checkout", "fleet/wave-9/delivered"]).expect("checkout");
+        std::fs::write(root.join("delivered.rs"), "// delivered\n").expect("write delivered");
+        guarded_git(&root, &["add", "."]).expect("add delivered");
+        guarded_git(&root, &["commit", "-m", "deliver"]).expect("commit delivered");
+        guarded_git(&root, &["checkout", "main"]).expect("back to main");
+
+        // The whole point of the fixture: neither checkout exists any more.
+        let absent = root.join("worktrees").join("story");
+        let delivered_tree = root.join("worktrees").join("delivered");
+        assert!(!absent.is_dir() && !delivered_tree.is_dir());
+
+        let wave = json!({
+            "id": "wave-9",
+            "status": "cancelled",
+            "topology": {"repositories": [{
+                "id": "flux",
+                "source_root": root.display().to_string(),
+                "canonical_ref": "main",
+                "base_commit": base,
+                "stories": [
+                    {
+                        "board_ref": "flux/C-1",
+                        "branch": "fleet/wave-9/story",
+                        "worktree": absent.display().to_string(),
+                    },
+                    {
+                        "board_ref": "flux/C-2",
+                        "branch": "fleet/wave-9/delivered",
+                        "worktree": delivered_tree.display().to_string(),
+                    },
+                ],
+            }]},
+        });
+
+        let reclaimed = reclaim_wave_storage(&wave);
+        assert_eq!(
+            reclaimed["worktrees_absent"].as_array().map(Vec::len),
+            Some(2),
+            "an absent checkout is a reported outcome, not a silent skip"
+        );
+
+        let branches = reclaimed["branches"].as_array().expect("branches recorded");
+        let deleted: Vec<&str> = branches
+            .iter()
+            .filter(|entry| entry["deleted"] == json!(true))
+            .filter_map(|entry| entry["branch"].as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["fleet/wave-9/story"],
+            "the branch still at its pinned base is pruned; the one holding a commit is not"
+        );
+        assert!(
+            git_output(&root, &["rev-parse", "--verify", "refs/heads/fleet/wave-9/story"])
+                .is_none(),
+            "the ref must actually be gone, not merely reported gone"
+        );
+        assert!(
+            git_output(
+                &root,
+                &["rev-parse", "--verify", "refs/heads/fleet/wave-9/delivered"]
+            )
+            .is_some(),
+            "a branch that moved past its base holds delivered work and must survive"
+        );
+        assert_eq!(
+            reclaimed_effects(&reclaimed),
+            (0, 0, 1),
+            "the reported count is derived from verified effects, never from candidates"
+        );
     }
 
     fn repair_facts<'a>(
