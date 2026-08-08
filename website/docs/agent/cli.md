@@ -53,6 +53,7 @@ and [Safety & approvals](./safety.md).
 | `flux context show` | inspect the ordered, body-free harness/profile/project context manifest (`--json`; add `--body` explicitly to print content, `--profile` / `--tool` to model conditional layers) |
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
+| `flux ops --explore` | browse every operation flux can run — a searchable catalogue showing each operation's parameters, risk and documentation links |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
 | `flux host …` | declare/inspect/probe named execution-substrate bindings (`[[host]]`) |
 | `flux exchange local start\|status\|stop` | enter the managed local Exchange lifecycle surface; until the signed release/lifecycle contract ships, each verb makes no change and returns a typed `unsupported` refusal. The final lifecycle runs only on the two Linux GNU targets; every other target keeps the command and refuses before effects (`--json` for one machine-readable result). |

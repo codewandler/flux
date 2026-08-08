@@ -62,6 +62,12 @@ flux board schema --output json
 flux fleet schema --output json
 ```
 
+Every operation flux can run is browsable from the terminal:
+
+```bash
+flux ops --explore               # searchable catalogue: parameters, risk, doc links
+```
+
 See the public board and fleet guides for the complete operation catalog and safe dispatch loop.
 
 ## Interactive session (REPL)
