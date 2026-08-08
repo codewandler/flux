@@ -5238,3 +5238,248 @@ fn a_qualified_acceptance_heading_is_still_the_acceptance_section() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// A wave over one story whose Acceptance criteria are addressable and carry their own handles.
+///
+/// Deliberately a separate fixture from `one_story_wave` rather than a parameter on it: every other
+/// test in this file asserts against the anonymous-bullet story that predates C-739, and that shape
+/// has to keep passing untouched.
+fn criteria_story_wave(name: &str) -> (PathBuf, PathBuf) {
+    let root = fixture(name);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n\
+         ## Acceptance\n\n\
+         - [ ] `AC-1` The result lands in the tree.\n      verify: `test -f result.txt`\n\
+         - [ ] `AC-2` The result says what it was supposed to say.\n      verify: `grep -q shipped result.txt`\n\
+         - [ ] `AC-3` Nobody claims this one.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    install_test_fleet_loops(&root);
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&dispatched.stderr)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let story = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    (root, story)
+}
+
+/// C-739, failing first: a worker cites the criterion it claims, and a declared verification that
+/// did not run is reported as unproven rather than counted as satisfied.
+///
+/// The whole point of a per-criterion handle is that "I did it" stops being the evidence. This
+/// handoff runs `test -f result.txt` — exactly `AC-1`'s declared handle and nothing else — while
+/// claiming both `AC-1` and `AC-2`. `AC-2` names a different command, so its claim is recorded and
+/// its status is `unproven`: the fleet holds a claim for it and no proof, which is a state the
+/// anonymous-bullet contract could not represent at all. `AC-3` is nobody's claim.
+///
+/// A citation of an id the story does not declare is refused rather than recorded, because a
+/// citation that silently resolves to nothing is how a renumber would erase evidence.
+#[test]
+fn a_handoff_cites_a_criterion_and_an_undischarged_handle_is_reported_unproven() {
+    let (root, story) = criteria_story_wave("criterion-coverage");
+    let commit = commit_result(&story, "shipped");
+
+    let unknown = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--criterion",
+            "AC-9",
+            "--summary",
+            "Claims a criterion the story never declared",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !unknown.status.success(),
+        "an unresolvable citation was accepted: {}",
+        String::from_utf8_lossy(&unknown.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&unknown.stdout).contains("AC-9")
+            || String::from_utf8_lossy(&unknown.stderr).contains("AC-9"),
+        "the refusal has to name the criterion: stdout={} stderr={}",
+        String::from_utf8_lossy(&unknown.stdout),
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--criterion",
+            "AC-1",
+            "--criterion",
+            "AC-2",
+            "--summary",
+            "Implemented the reviewed contract",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    let claims = handoff["data"]["criteria"]
+        .as_array()
+        .expect("the handoff records what it claimed")
+        .clone();
+    assert_eq!(claims.len(), 2, "{handoff}");
+    assert_eq!(claims[0]["id"], "AC-1");
+    assert_eq!(claims[0]["proven"], true, "{handoff}");
+    assert_eq!(claims[1]["id"], "AC-2");
+    assert_eq!(
+        claims[1]["proven"], false,
+        "a handle that never ran cannot prove anything: {handoff}"
+    );
+
+    let coverage = flux(
+        &root,
+        &["fleet", "coverage", "repo/C-1", "--output", "json"],
+    );
+    assert!(
+        coverage.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&coverage.stdout),
+        String::from_utf8_lossy(&coverage.stderr)
+    );
+    let coverage: serde_json::Value = serde_json::from_slice(&coverage.stdout).unwrap();
+    let criteria = coverage["data"]["criteria"]
+        .as_array()
+        .expect("coverage is per criterion")
+        .clone();
+    assert_eq!(criteria.len(), 3, "{coverage}");
+    assert_eq!(criteria[0]["id"], "AC-1");
+    assert_eq!(criteria[0]["status"], "proven");
+    assert_eq!(criteria[0]["claims"][0]["commit"], commit);
+    assert_eq!(criteria[1]["id"], "AC-2");
+    assert_eq!(
+        criteria[1]["status"], "unproven",
+        "a claimed criterion whose handle never ran is not satisfied: {coverage}"
+    );
+    assert_eq!(criteria[1]["claims"][0]["commit"], commit);
+    assert_eq!(criteria[2]["id"], "AC-3");
+    assert_eq!(criteria[2]["status"], "unclaimed");
+    assert_eq!(coverage["data"]["summary"]["proven"], 1, "{coverage}");
+    assert_eq!(coverage["data"]["summary"]["unproven"], 1, "{coverage}");
+    assert_eq!(coverage["data"]["summary"]["unclaimed"], 1, "{coverage}");
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-739: the additive half, at the surface a reader actually consults.
+///
+/// 1,260 stories on this board declare no criterion ids, and `one_story_wave`'s `- [ ] ship` is
+/// exactly their shape. Coverage answers for them rather than refusing: every criterion is
+/// `unaddressable` — nothing can cite it, which is a description of the story, not a defect in it —
+/// and a warning says so instead of an error. Nothing else about the item changes.
+#[test]
+fn coverage_answers_for_a_story_whose_criteria_carry_no_ids() {
+    let (root, _story) = one_story_wave("criterion-coverage-anonymous");
+
+    let coverage = flux(
+        &root,
+        &["fleet", "coverage", "repo/C-1", "--output", "json"],
+    );
+    assert!(
+        coverage.status.success(),
+        "a story that predates ids is not an error: stdout={} stderr={}",
+        String::from_utf8_lossy(&coverage.stdout),
+        String::from_utf8_lossy(&coverage.stderr)
+    );
+    let coverage: serde_json::Value = serde_json::from_slice(&coverage.stdout).unwrap();
+    assert_eq!(coverage["data"]["summary"]["total"], 1, "{coverage}");
+    assert_eq!(
+        coverage["data"]["summary"]["unaddressable"], 1,
+        "{coverage}"
+    );
+    assert_eq!(
+        coverage["data"]["criteria"][0]["id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(coverage["data"]["criteria"][0]["status"], "unaddressable");
+    assert!(
+        coverage["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("declares no criterion ids")),
+        "{coverage}"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
