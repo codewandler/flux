@@ -84,15 +84,15 @@ fn write_codex(home: &Path) {
     let day = home.join("sessions").join("2026").join("07").join("08");
     fs::create_dir_all(&day).unwrap();
     let lines = [
-        format!(
-            r#"{{"timestamp":"2026-07-08T12:00:00Z","type":"turn_context","payload":{{"model":"gpt-5.5","cwd":"/w"}}}}"#
-        ),
+        // No interpolation in this line, so it is a plain literal with real braces rather than a
+        // `format!` with doubled ones — clippy's `useless_format` refuses the latter under -D warnings.
+        r#"{"timestamp":"2026-07-08T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/w"}}"#
+            .to_string(),
         format!(
             r#"{{"timestamp":"2026-07-08T12:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"{SENTINEL}"}}}}"#
         ),
-        format!(
-            r#"{{"timestamp":"2026-07-08T12:00:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"cached_input_tokens":40,"output_tokens":12,"reasoning_output_tokens":3}}}}}}}}"#
-        ),
+        r#"{"timestamp":"2026-07-08T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":12,"reasoning_output_tokens":3}}}}"#
+            .to_string(),
         format!(
             r#"{{"timestamp":"2026-07-08T12:00:03Z","type":"event_msg","payload":{{"type":"agent_message","message":"{SENTINEL}"}}}}"#
         ),
