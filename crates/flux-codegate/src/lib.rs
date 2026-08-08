@@ -1240,12 +1240,19 @@ const GUARDED_PORT_TRAITS: &[&str] = &[
     "GuardedHttp",
 ];
 
+/// The contracts a live datasource / work board backend declares itself by (C-716).
+///
+/// Scanned with the same machinery as [`GUARDED_PORT_TRAITS`] and for the same reason: the trait is
+/// where a type *claims* to be a backend, and a claim nobody enumerates is a claim nobody reviews.
+const LIVE_BACKEND_TRAITS: &[&str] = &["LiveDatasource", "WorkBoard"];
+
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct GuardedPortImpl {
     pub line: usize,
-    /// The **canonical** port trait name (`GuardedProcess`), whatever local spelling reached it.
-    /// Allowances match on this, so a rename cannot mint a fresh unreviewed identity.
+    /// The **canonical** contract name (`GuardedProcess`, `LiveDatasource`), whatever local
+    /// spelling reached it. Allowances match on this, so a rename cannot mint a fresh unreviewed
+    /// identity.
     pub port: String,
     /// The implementing type's final path segment (`System`), or `<generic>` for a blanket impl.
     pub backend: String,
@@ -1259,12 +1266,9 @@ pub struct GuardedPortImpl {
 /// import, it is the same trait, and a gate that demanded the full path would miss the short spellings
 /// that are actually idiomatic. Over-reporting an unrelated same-named trait is the safe direction for
 /// a security gate — that costs a reviewed allowance, whereas under-reporting costs the invariant.
-fn direct_port_trait(segments: &[String]) -> Option<&'static str> {
+fn direct_port_trait(segments: &[String], table: &'static [&'static str]) -> Option<&'static str> {
     let last = segments.last()?;
-    GUARDED_PORT_TRAITS
-        .iter()
-        .find(|port| *port == last)
-        .copied()
+    table.iter().find(|port| *port == last).copied()
 }
 
 /// Local names that reach a guarded-IO port trait, so a renamed import cannot hide a backend.
@@ -1272,8 +1276,11 @@ fn direct_port_trait(segments: &[String]) -> Option<&'static str> {
 /// This mirrors [`ProcessAliases`], which already resolves `use std::process::Command as Exec` for
 /// `no_raw_process_command_outside_system` — without the same treatment here the newer gate would be
 /// weaker than its sibling against the identical evasion.
-#[derive(Default)]
 struct PortAliases {
+    /// The canonical contract names this scan is about — [`GUARDED_PORT_TRAITS`] or
+    /// [`LIVE_BACKEND_TRAITS`]. One table per scan so the two censuses cannot report each other's
+    /// hits under each other's allowances.
+    table: &'static [&'static str],
     /// Local trait name → canonical port trait. Seeded with the identity mapping for every port
     /// trait, so unaliased spellings resolve through the same table as renamed ones.
     traits: HashMap<String, &'static str>,
@@ -1285,9 +1292,13 @@ struct PortAliases {
 }
 
 impl PortAliases {
-    fn new() -> Self {
-        let mut aliases = Self::default();
-        for port in GUARDED_PORT_TRAITS {
+    fn new(table: &'static [&'static str]) -> Self {
+        let mut aliases = Self {
+            table,
+            traits: HashMap::new(),
+            renames: Vec::new(),
+        };
+        for port in table {
             aliases.traits.insert((*port).to_string(), *port);
         }
         aliases
@@ -1308,14 +1319,14 @@ impl PortAliases {
             }
             syn::UseTree::Name(name) => {
                 prefix.push(name.ident.to_string());
-                if let Some(port) = direct_port_trait(prefix) {
+                if let Some(port) = direct_port_trait(prefix, self.table) {
                     self.traits.insert(name.ident.to_string(), port);
                 }
                 prefix.pop();
             }
             syn::UseTree::Rename(rename) => {
                 prefix.push(rename.ident.to_string());
-                match direct_port_trait(prefix) {
+                match direct_port_trait(prefix, self.table) {
                     Some(port) => {
                         self.traits.insert(rename.rename.to_string(), port);
                     }
@@ -1432,8 +1443,22 @@ impl<'ast> Visit<'ast> for PortImplVisitor<'_> {
 /// impl Exec for Rogue {}` reports as `GuardedProcess`. Only `#[cfg(test)]` is skipped — a
 /// `#[cfg(feature = "…")]` impl is production code and is reported.
 pub fn guarded_port_impls(src: &str) -> syn::Result<Vec<GuardedPortImpl>> {
+    contract_impls(src, GUARDED_PORT_TRAITS)
+}
+
+/// Every production implementation of a live datasource / work board contract in `src` (C-716),
+/// `#[cfg(test)]` ones excluded.
+///
+/// The same scan as [`guarded_port_impls`] over a different contract table, so an aliased or
+/// fully-qualified `impl` is seen here exactly as it is there. [`GuardedPortImpl::port`] carries the
+/// canonical contract name (`LiveDatasource`, `WorkBoard`).
+pub fn live_backend_impls(src: &str) -> syn::Result<Vec<GuardedPortImpl>> {
+    contract_impls(src, LIVE_BACKEND_TRAITS)
+}
+
+fn contract_impls(src: &str, table: &'static [&'static str]) -> syn::Result<Vec<GuardedPortImpl>> {
     let file = syn::parse_file(src)?;
-    let mut aliases = PortAliases::new();
+    let mut aliases = PortAliases::new(table);
     PortAliasCollector(&mut aliases).visit_file(&file);
     aliases.resolve_renames();
     let mut visitor = PortImplVisitor {
@@ -3015,6 +3040,27 @@ mod tests {
         files
     }
 
+    /// The sources the live-backend census reads: every crate's `src` **and** `examples` (C-716).
+    ///
+    /// Examples are in scope here where they are not for [`workspace_source_files`], because an SDK
+    /// example backend is the shape integrators copy. One that built its own client would teach the
+    /// exact thing the census exists to prevent.
+    fn live_backend_source_files(repo_root: &Path) -> Vec<PathBuf> {
+        let mut files = workspace_source_files(repo_root);
+        for workspace_dir in [repo_root.join("crates"), repo_root.join("plugins")] {
+            let Ok(entries) = std::fs::read_dir(workspace_dir) else {
+                continue;
+            };
+            for entry in entries {
+                let dir = entry.unwrap().path();
+                if dir.is_dir() {
+                    collect_rs(&dir.join("examples"), &mut files);
+                }
+            }
+        }
+        files
+    }
+
     /// Build the layer graph from Cargo's resolved package metadata. Dependency keys are never
     /// consulted: `Dependency::name` is the actual package identity, so `package =` renames cannot
     /// hide an edge. Cargo reports normal/build/dev kind and target predicates independently; the
@@ -4253,6 +4299,177 @@ impl Exec for Double {}
         assert!(
             violations.is_empty(),
             "guarded-IO port implemented outside the reviewed native backend:\n  {}",
+            violations.join("\n  ")
+        );
+    }
+
+    /// C-716's scanner pins. A live backend is found by the same alias-resolving machinery the
+    /// guarded-port census uses, and a backend that constructs its own client is *reported* rather
+    /// than left to a reviewer's eye.
+    #[test]
+    fn live_backend_scanner_finds_production_backends_and_ignores_test_doubles() {
+        let raw = r#"
+use codewandler_flux_capabilities::LiveDatasource as Live;
+
+impl Live for RogueBackend {}
+impl codewandler_flux_capabilities::WorkBoard for Board {}
+impl SomeOtherTrait for RogueBackend {}
+
+#[cfg(test)]
+impl LiveDatasource for Double {}
+"#;
+        let hits = live_backend_impls(raw).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(
+            hits.iter().any(|hit| hit.port == "LiveDatasource"
+                && hit.backend == "RogueBackend"
+                && hit.spelled_as.as_deref() == Some("Live")),
+            "a renamed contract import must resolve to the canonical name: {hits:?}"
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.port == "WorkBoard" && hit.backend == "Board"),
+            "a fully-qualified contract path must resolve by its last segment: {hits:?}"
+        );
+    }
+
+    /// The C-716 census (acceptance 3). **Every production live-datasource / work-board backend is
+    /// enumerated here, and none of them constructs its own client.**
+    ///
+    /// The trait doc has said since the contract shipped that an implementation "must perform real
+    /// IO through flux's guarded host surfaces", and a `LiveAccess` declaration names which guarded
+    /// surface that is. Nothing checked it: a backend that dialled its own socket or built its own
+    /// HTTP client satisfied the trait, advertised exact `network.fetch`/`connection.dial`
+    /// authority, and would then ignore a host selection entirely — the connection would leave the
+    /// coordinator no matter which substrate the operator selected. That is precisely the class the
+    /// guarded-port census exists to make loud, so this is its sibling and not a new idea.
+    ///
+    /// Two claims, both census-shaped:
+    ///
+    /// 1. the set of types claiming to *be* a live backend is enumerated, so a new one is a review;
+    /// 2. no file declaring one constructs an HTTP client, a database connection or a socket —
+    ///    **and unlike [`no_unreviewed_direct_io_in_model_facing_operation_crates`], a
+    ///    `flux-allow-direct-io` annotation does not excuse it here.** An annotation answers "is
+    ///    this IO reviewed"; the question here is "does this connection follow the selection", and
+    ///    no annotation can make a self-built client do that.
+    ///
+    /// Filesystem calls are deliberately *not* included: a board backed by markdown files reads
+    /// them through the workspace guard, and that family is already the direct-I/O gate's job.
+    #[test]
+    fn no_live_datasource_backend_builds_its_own_client() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        // The reviewed live backends. Adding one is a review of *how it connects*: read
+        // `crates/flux-capabilities/src/datasource/live.rs` — specifically `live_connection_system`,
+        // which is how a backend reaches the substrate its declared locality names — before
+        // extending this list.
+        //
+        // All three are in-process today: two markdown/in-memory boards and the SDK's hermetic
+        // example. None opens a connection at all, which is why the second half of this census
+        // currently has nothing to report and why it must stay armed — the first backend that does
+        // connect is exactly the one that has to route through the guarded surface it declares.
+        const ALLOW: &[(&str, &str, &str)] = &[
+            (
+                "crates/flux-capabilities/src/datasource/markdown_board.rs",
+                "WorkBoard",
+                "MarkdownBoard",
+            ),
+            (
+                "crates/flux-capabilities/src/datasource/memory_board.rs",
+                "WorkBoard",
+                "MemoryBoard",
+            ),
+            (
+                "crates/flux-sdk/examples/support/live_datasource.rs",
+                "LiveDatasource",
+                "SupportBackend",
+            ),
+        ];
+        let mut allowance_use = vec![0usize; ALLOW.len()];
+
+        let files = live_backend_source_files(repo_root);
+        assert!(
+            files.len() > 20,
+            "expected to scan a representative set of source files, found {}",
+            files.len()
+        );
+
+        let mut violations = Vec::new();
+        let mut backends = 0usize;
+        for file in &files {
+            let rel = file
+                .strip_prefix(repo_root)
+                .unwrap_or(file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = std::fs::read_to_string(file).unwrap();
+            let hits = live_backend_impls(&src).unwrap_or_else(|error| {
+                panic!("parse {} for the live-backend census: {error}", rel)
+            });
+            if hits.is_empty() {
+                continue;
+            }
+            backends += hits.len();
+            for hit in hits {
+                if let Some((index, _)) = ALLOW.iter().enumerate().find(|(_, allowed)| {
+                    allowed.0 == rel && allowed.1 == hit.port && allowed.2 == hit.backend
+                }) {
+                    allowance_use[index] += 1;
+                    if allowance_use[index] > 1 {
+                        violations.push(format!(
+                            "{rel}:{}: duplicate use of single-use allowance for {} on {}",
+                            hit.line, hit.port, hit.backend
+                        ));
+                    }
+                } else {
+                    let via = match &hit.spelled_as {
+                        Some(alias) => format!(" (written as `{alias}`)"),
+                        None => String::new(),
+                    };
+                    violations.push(format!(
+                        "{rel}:{}: unreviewed live backend — {} implemented for {}{via}",
+                        hit.line, hit.port, hit.backend
+                    ));
+                }
+            }
+            for call in raw_direct_io_calls(&src)
+                .unwrap_or_else(|error| panic!("parse {rel} for the live-backend census: {error}"))
+            {
+                if matches!(
+                    call.api,
+                    DirectIoApi::Http | DirectIoApi::Database | DirectIoApi::Socket
+                ) {
+                    violations.push(format!(
+                        "{rel}:{}: a live backend builds its own {:?} client in {} — the \
+                         connection must be made through the guarded surface its `LiveAccess` \
+                         declares, so it follows the session's selected host",
+                        call.line, call.api, call.function
+                    ));
+                }
+            }
+        }
+
+        for (index, count) in allowance_use.into_iter().enumerate() {
+            if count != 1 {
+                violations.push(format!(
+                    "reviewed live-backend allowance {:?} was used {count} times (expected exactly once)",
+                    ALLOW[index]
+                ));
+            }
+        }
+
+        // Anti-vacuity: a census that found no backends would pass while pinning nothing.
+        assert_eq!(
+            backends,
+            ALLOW.len(),
+            "the live-backend census found {backends} backend(s) — they have moved, been renamed, \
+             or the scan roots no longer reach them"
+        );
+        assert!(
+            violations.is_empty(),
+            "a live datasource / work board backend does not route through its declared guarded \
+             surface (C-716):\n  {}",
             violations.join("\n  ")
         );
     }

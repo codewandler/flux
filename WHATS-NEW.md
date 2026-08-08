@@ -15,7 +15,15 @@
 
 ## [Unreleased]
 
+## [0.59.1] - 2026-08-08
+
 ### New
+
+- **`flux ops --explore` browses every operation flux can run.** Operations are the things flux actually
+  does — read a file, commit, fetch a page, run a test. Until now there was no way to see the full list.
+  `flux ops --explore` opens a search box: start typing and you get a ranked list on the left and, on the
+  right, what the selected operation does, the parameters it takes, how risky it is, and links to its
+  documentation. Tab cycles a category filter, `Ctrl-Y` copies the doc link, and `Esc` steps back out.
 
 - **Say which machine an endpoint is reachable from.** A service that only answers inside your
   cluster and one that answers from anywhere used to look identical once written down, so flux

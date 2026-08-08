@@ -34,4 +34,4 @@ labels:
 images:
   - name: flux-system
     newName: ghcr.io/codewandler/flux-system
-    newTag: 0.59.0
+    newTag: 0.59.1

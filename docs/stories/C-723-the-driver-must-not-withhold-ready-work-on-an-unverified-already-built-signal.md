@@ -2,8 +2,7 @@
 id: C-723
 title: "The driver must not withhold ready work on an unverified already-built signal"
 pillar: "Core"
-status: backlog
-priority: 1
+status: done
 epic: delivery-is-verified
 areas: [flux-orchestrate]
 note: "A dry-run tick with 8 free slots and 9 ready items dispatched 1. C-570 and C-544 were withheld as already-built on board reconcile's say-so, yet AgentReport and safe_checkpoint do not exist in any crate, the flux-tui skill doc states the C-570 operation is unbuilt, and every C-544 hit in Rust is a doc comment forward-referencing the id. C-718 already establishes reconcile matches a mention, not an implementation; the driver consumes it as a hard block"
@@ -25,19 +24,39 @@ schedulable pool silently — so it is the last place a heuristic belongs.
 
 ## Acceptance
 
-- [ ] `already-built` never withholds on a mention. A withhold on that reason requires evidence
+- [x] `already-built` never withholds on a mention. A withhold on that reason requires evidence
       tied to the story's own acceptance — the symbols, files or behaviour it names — not the
       presence of its id in prose or a doc comment.
-- [ ] `C-570` and `C-544` are the fixtures, and both must dispatch. `AgentReport` and
+- [x] `C-570` and `C-544` are the fixtures, and both must dispatch. `AgentReport` and
       `safe_checkpoint` exist nowhere in `crates/`; `.agents/skills/flux-tui/SKILL.md` states the
       C-570 lifecycle report operation is unbuilt; every `C-544` hit in Rust is a doc comment in
       another module forward-referencing the id.
-- [ ] A withheld item reports the concrete evidence that justified withholding it, so a wrong
+- [x] A withheld item reports the concrete evidence that justified withholding it, so a wrong
       withhold is visible in the tick output rather than inferred from a shrinking dispatch count.
-- [ ] When the signal is uncertain, the driver dispatches and lets the worker discover the work is
+- [x] When the signal is uncertain, the driver dispatches and lets the worker discover the work is
       done — a redundant turn is recoverable, a silently skipped story is not. Any reason that
       removes an item from the pool without human review fails closed toward dispatching.
-- [ ] `flux fleet doctor` reports a ready item withheld across N consecutive ticks, so a permanent
+- [x] `flux fleet doctor` reports a ready item withheld across N consecutive ticks, so a permanent
       silent withhold cannot masquerade as an empty queue.
-- [ ] Regression test: a tick with free slots, ready items, and a reconcile signal asserting
+- [x] Regression test: a tick with free slots, ready items, and a reconcile signal asserting
       `implementation-landed` for a story whose named symbols are absent dispatches that story.
+
+## Progress
+
+Implemented and gated on `impl/C-723`, integrated as part of the `delivery-is-verified` wave.
+
+- Four gates decide a withhold, in cost order: a wholly unticked Acceptance outranks a commit that
+  merely names the id (no IO, and it settles both live fixtures); every symbol and path the story's
+  own Acceptance names must be present outside Markdown and comments; an artifact the tree could not
+  be asked about has not said yes; and a finding with neither artifact nor reviewer behind it is a
+  guess, so it dispatches.
+- Verification visits only findings the schedule could dispatch. Reconcile reports on every
+  outstanding board item, and a tick that greps the tree for all of them is one nobody leaves
+  running.
+- A released signal is reported under `released` with the evidence that failed it, so a wrong
+  withhold is readable in the tick rather than inferred from a shrinking dispatch count.
+- Measured on the live board: `C-570` and `C-544` both release (0 of 8 and 0 of 6 criteria ticked),
+  so a tick with eight free slots and nine ready items now fills all eight and withholds the ninth
+  on width.
+- `DRIVE_WITHHOLD_STREAK_LIMIT = 5` is a judgement, not a measurement. The presence half of the
+  artifact check is deliberately weak — it can only fail to veto a withhold, never create one.

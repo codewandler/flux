@@ -124,7 +124,9 @@ pub mod tools {
 /// filter, paging, and weak-reference contracts are re-exported here so an SDK embedder does not
 /// need to name flux's internal capability crates.
 pub mod datasource {
-    pub use flux_capabilities::{LiveAccess, LiveDatasource, LiveDatasourceSurface};
+    pub use flux_capabilities::{
+        live_connection_system, LiveAccess, LiveDatasource, LiveDatasourceSurface, LiveLocality,
+    };
     pub use flux_datasource::live::{
         FilterKey, FilterType, FilterValue, Filters, LiveEntity, LiveSchema, Page, PageRequest,
         Reference, Row,

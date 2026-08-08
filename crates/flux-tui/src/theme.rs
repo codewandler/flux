@@ -304,6 +304,12 @@ impl Theme {
     pub fn assistant_style(&self) -> Style {
         Style::default().fg(self.assistant)
     }
+    /// Ordinary body text. Distinct from [`Theme::assistant_style`], which is a *speaker* role that
+    /// merely happens to share the color in most themes.
+    pub fn text_style(&self) -> Style {
+        Style::default().fg(self.text)
+    }
+
     pub fn tool_style(&self) -> Style {
         Style::default().fg(self.tool)
     }

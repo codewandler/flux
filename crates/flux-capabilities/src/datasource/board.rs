@@ -45,7 +45,8 @@ use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
 use super::live::{
-    filter_schema, normalize_filters, normalize_limit, parse, valid_domain, LiveAccess,
+    access_placement, admit_locality, connection_system, filter_schema, normalize_filters,
+    normalize_limit, parse, valid_domain, validate_locality, LiveAccess,
 };
 
 /// The single entity a board exposes. Boards are item-shaped by construction, so this is a constant
@@ -278,6 +279,13 @@ const OPERATIONS: [&str; 11] = [
 /// authority advertised at registration are the same vocabulary used to route calls — a backend
 /// cannot widen its own authority after the fact.
 pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec<Arc<dyn Tool>>> {
+    Ok(board_tools(board_projection(domain, backend)?))
+}
+
+/// Snapshot and validate one board's contract exactly once — the sibling of
+/// [`super::live`]'s projection, and for the same reason: placement, advertised authority and the
+/// locality admission all read one `access()` snapshot.
+fn board_projection(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Arc<BoardProjection>> {
     let schema = backend.schema();
     let access = backend.access();
     validate_board_contract(domain, &schema, &access)?;
@@ -285,15 +293,18 @@ pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec
     let filters = declared_filters(&schema);
     let mut query_filters = filters.clone();
     query_filters.push(depends_on_filter());
-    let projection = Arc::new(BoardProjection {
+    Ok(Arc::new(BoardProjection {
         domain: domain.to_string(),
         filters,
         query_filters,
         schema,
         access,
         backend,
-    });
-    Ok(OPERATIONS
+    }))
+}
+
+fn board_tools(projection: Arc<BoardProjection>) -> Vec<Arc<dyn Tool>> {
+    OPERATIONS
         .into_iter()
         .map(|op| -> Arc<dyn Tool> {
             Arc::new(BoardOp {
@@ -302,7 +313,7 @@ pub fn work_board_tools(domain: &str, backend: Arc<dyn WorkBoard>) -> Result<Vec
                 projection: projection.clone(),
             })
         })
-        .collect())
+        .collect()
 }
 
 /// Atomically install exactly the eleven operations for one board domain.
@@ -315,9 +326,27 @@ pub fn try_register_work_board(
     domain: &str,
     backend: Arc<dyn WorkBoard>,
 ) -> Result<WorkBoardSurface> {
-    let tools = work_board_tools(domain, backend)?;
-    registry.try_register_all_from(board_source(domain), tools)?;
+    let projection = board_projection(domain, backend)?;
+    let placement = access_placement(&projection.access);
+    registry.try_register_all_from_with_placement(
+        board_source(domain),
+        board_tools(projection),
+        placement,
+    )?;
     Ok(board_surface(domain))
+}
+
+/// The guarded substrate a work board backend makes its connection through.
+///
+/// The board's half of [`live_connection_system`](super::live::live_connection_system), with the
+/// same contract: a host-bound access connects from the substrate its binding names, and one with
+/// no declared host connects exactly as it does today.
+pub fn board_connection_system(
+    ctx: &ToolContext,
+    domain: &str,
+    access: &[LiveAccess],
+) -> Result<Arc<dyn flux_system::port::ExecutionSystem>> {
+    connection_system(ctx, &format!("work board `{domain}`"), access)
 }
 
 fn board_source(domain: &str) -> String {
@@ -404,8 +433,10 @@ impl BoardProjection {
             AuthorityRequirement::board_read(subject)
         }];
         requirements.extend(self.access.iter().map(|access| match access {
-            LiveAccess::Network { subject } => AuthorityRequirement::network_fetch(subject),
-            LiveAccess::Connection { subject } => AuthorityRequirement::connection_dial(subject),
+            LiveAccess::Network { subject, .. } => AuthorityRequirement::network_fetch(subject),
+            LiveAccess::Connection { subject, .. } => {
+                AuthorityRequirement::connection_dial(subject)
+            }
         }));
         requirements
     }
@@ -485,6 +516,11 @@ impl Tool for BoardOp {
 
     async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let op = &self.spec.name;
+        admit_locality(
+            ctx,
+            &format!("work board `{}`", self.projection.domain),
+            &self.projection.access,
+        )?;
         let backend = &self.projection.backend;
         Ok(match self.kind {
             OpKind::List => {
@@ -1267,14 +1303,13 @@ pub fn validate_board_contract(
                 "work board `{domain}` authority subject `{subject}` is blank or whitespace-padded"
             )));
         }
-        if !resources.insert(declared) {
+        if !resources.insert((declared.kind(), subject)) {
             return Err(Error::Other(format!(
                 "work board `{domain}` declares duplicate authority `{subject}`"
             )));
         }
     }
-
-    Ok(())
+    validate_locality(&format!("work board `{domain}`"), access)
 }
 
 #[cfg(test)]
@@ -1341,23 +1376,43 @@ mod tests {
 
     #[test]
     fn duplicate_and_blank_authority_subjects_are_refused() {
-        let blank = [LiveAccess::Network {
-            subject: "  ".into(),
-        }];
+        let blank = [LiveAccess::network("  ")];
         assert!(validate_board_contract("board", &schema(), &blank).is_err());
 
         let duplicate = [
-            LiveAccess::Network {
-                subject: "https://board.example".into(),
-            },
-            LiveAccess::Network {
-                subject: "https://board.example".into(),
-            },
+            LiveAccess::network("https://board.example"),
+            LiveAccess::network("https://board.example"),
         ];
         assert!(validate_board_contract("board", &schema(), &duplicate)
             .unwrap_err()
             .to_string()
             .contains("duplicate authority"));
+
+        // C-716: the same subject declared twice with two different localities is a duplicate too,
+        // and a board that could only be read from two machines at once is unsatisfiable.
+        let contradictory = [
+            LiveAccess::network("https://board.example"),
+            LiveAccess::network("https://board.example").from_host("prod"),
+        ];
+        assert!(validate_board_contract("board", &schema(), &contradictory)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate authority"));
+
+        let two_hosts = [
+            LiveAccess::network("https://board.example").from_host("prod"),
+            LiveAccess::connection("tcp:board-db.example:5432").from_host("staging"),
+        ];
+        assert!(validate_board_contract("board", &schema(), &two_hosts)
+            .unwrap_err()
+            .to_string()
+            .contains("two hosts"));
+
+        let blank_host = [LiveAccess::network("https://board.example").from_host(" ")];
+        assert!(validate_board_contract("board", &schema(), &blank_host)
+            .unwrap_err()
+            .to_string()
+            .contains("blank or whitespace-padded host binding"));
     }
 
     /// C-240: `record_evidence` takes the two [`Reference`] spellings side by side and accepts

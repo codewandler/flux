@@ -17,9 +17,7 @@ impl LiveDatasource for FixtureBackend {
     }
 
     fn access(&self) -> Vec<LiveAccess> {
-        vec![LiveAccess::Network {
-            subject: "https://tickets.example".into(),
-        }]
+        vec![LiveAccess::network("https://tickets.example")]
     }
 
     async fn list(
@@ -105,16 +103,12 @@ fn validation_rejects_impossible_schemas_and_authority() {
         .to_string()
         .contains("duplicate entity"));
 
-    assert!(validate_live_contract(
-        "tickets",
-        &valid_schema(),
-        &[LiveAccess::Connection {
-            subject: " ".into(),
-        }],
-    )
-    .unwrap_err()
-    .to_string()
-    .contains("blank connection"));
+    assert!(
+        validate_live_contract("tickets", &valid_schema(), &[LiveAccess::connection(" ")],)
+            .unwrap_err()
+            .to_string()
+            .contains("blank connection")
+    );
 
     assert!(validate_live_contract("bad.domain", &valid_schema(), &[]).is_err());
 }

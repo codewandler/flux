@@ -32,6 +32,7 @@ pub mod memory;
 #[cfg(feature = "otel")]
 pub mod otel;
 mod projection;
+pub mod receipt;
 pub mod retention;
 mod session_log;
 mod shape;
@@ -45,6 +46,10 @@ pub use projection::{
     render_run_diff, run_diff, run_trace, stmt_rows, stmt_texts, turns, DiffLineKind, DiffRow,
     EfficiencySummary, ModelCost, PendingWakeup, PlanAttempt, RunDiff, StmtRow, TurnSummary,
 };
+// C-575's resource-receipt vocabulary is deliberately *not* re-exported here. It is ~20 types, and
+// several of the names it needs (`Measurement`, `Dimension`, `Unit`, `Coverage`, `Freshness`) are
+// generic enough that flattening them into the crate root would collide with an embedder's own —
+// so it stays namespaced behind `flux_events::receipt`, unlike A-107's six memory types.
 pub use retention::{
     is_retained_from_adhoc_prune, AdhocRetention, AdhocStreamFamily, ADHOC_STREAM_FAMILIES,
 };

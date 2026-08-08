@@ -52,7 +52,7 @@ const CYAN4: Rgb = Rgb(0x00, 0x3f, 0x5c);
 const DIM: Rgb = Rgb(0x00, 0x44, 0x66);
 const TAG_DIM: Rgb = Rgb(0x00, 0x66, 0x88);
 
-fn lerp(a: Rgb, b: Rgb, t: f64) -> Rgb {
+pub(crate) fn lerp(a: Rgb, b: Rgb, t: f64) -> Rgb {
     let mix = |x: u8, y: u8| (f64::from(x) + t * (f64::from(y) - f64::from(x))) as u8;
     Rgb(mix(a.0, b.0), mix(a.1, b.1), mix(a.2, b.2))
 }
@@ -99,7 +99,7 @@ const MATRIX_CHARS: &str = "ﾊﾐﾋｰｳｼﾅﾓﾆｻﾜﾂｵﾘｱﾎﾃ�
 // Hand-rolled (PCG-XSH-RR) so the animation stays dependency-free and every
 // frame is reproducible from the seed.
 
-struct Pcg32 {
+pub(crate) struct Pcg32 {
     state: u64,
     inc: u64,
 }
@@ -116,11 +116,11 @@ impl Pcg32 {
         rng
     }
 
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self::with_stream(seed, 0xda3e_39cb_94b9_5bdb)
     }
 
-    fn next_u32(&mut self) -> u32 {
+    pub(crate) fn next_u32(&mut self) -> u32 {
         let old = self.state;
         self.state = old
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -129,11 +129,11 @@ impl Pcg32 {
         xorshifted.rotate_right((old >> 59) as u32)
     }
 
-    fn gen_range(&mut self, n: usize) -> usize {
+    pub(crate) fn gen_range(&mut self, n: usize) -> usize {
         ((u64::from(self.next_u32()) * n as u64) >> 32) as usize
     }
 
-    fn gen_f64(&mut self) -> f64 {
+    pub(crate) fn gen_f64(&mut self) -> f64 {
         f64::from(self.next_u32()) / 4_294_967_296.0
     }
 }

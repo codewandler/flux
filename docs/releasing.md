@@ -58,19 +58,44 @@ manifest conflict. **Confirm `release` is a descendant of `main` before advancin
 
 ## Advancing `release` correctly
 
-The trigger commit must be a two-parent merge whose tree equals its second parent's, and that parent
-must be an ancestor of canonical `main`. A plain merge of `main` into `release` satisfies this
-exactly:
+`release` is a protected branch. A direct push is **rejected** — it requires eleven status checks,
+`enforce_admins`, and the strict up-to-date rule. Required approving reviews is **zero**, so no
+person has to approve; the pull request exists to run the checks, not to gate on a human. This is
+why the `release-source/*` branch class exists, and it is load bearing rather than vestigial.
+
+The promotion script then requires the resulting trigger commit to be a two-parent merge whose tree
+equals its second parent's, with that parent an ancestor of canonical `main`. Because the strict
+rule forces the source to be up to date with `release`, the source head is itself one merge of the
+current `release` tip into `main` — the wrapper shape `promote-release-flow.sh` unwraps explicitly.
 
 ```bash
-git worktree add --detach <scratch dir> origin/release
+git worktree add --detach <scratch dir> origin/main
 cd <scratch dir>
-git merge --no-ff origin/main
-# verify before pushing: three parent fields, parent 2 is main, trees equal
+git merge --no-ff origin/release          # parent 1 = main, parent 2 = the release tip
+
+# Verify before pushing: parent 1 is main, and the tree still equals main's.
 git rev-list --parents -n1 HEAD
 git rev-parse HEAD^{tree} origin/main^{tree}
-git push origin HEAD:refs/heads/release
+
+git push origin HEAD:refs/heads/release-source/v<next>-<main sha>
+gh pr create --base release --head release-source/v<next>-<main sha> --title "release: promote main"
+# merge once the checks are green; that merge is the release trigger
 ```
+
+One of the eleven required checks is `every version tag has a Release and /releases/latest is
+newest` — the audit in `scripts/check-release-tags.sh`. A tag with no GitHub Release therefore
+blocks every future release until it is backfilled or removed.
+
+### The one thing standing between this and an unattended release
+
+Every step above is an API call, and `release` requires **zero** approving reviews — no person has
+to approve anything. The only manual act left is clicking merge once the checks are green, and
+`gh pr merge --auto --merge` exists exactly for that.
+
+It currently fails with `Auto merge is not allowed for this repository`. Enabling **Settings →
+General → Allow auto-merge** is the single toggle that closes the gap, and it weakens no protection:
+the eleven required checks, `enforce_admins` and the strict up-to-date rule all still gate the
+merge. Until it is on, a release needs one deliberate click or one `gh pr merge` call.
 
 ## When a release fails
 
