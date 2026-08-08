@@ -15,6 +15,12 @@
 
 ## [Unreleased]
 
+### New
+
+- **Flow runs can go quiet.** `flux flow run -q` (or `FLUX_QUIET=1`) turns off the progress
+  display — spinners, per-step lines, and timers — so a scripted run prints nothing but the final
+  result, plus any errors or approval prompts. Great for wrappers and CI logs.
+
 ## [0.59.2] - 2026-08-08
 
 ## [0.59.1] - 2026-08-08

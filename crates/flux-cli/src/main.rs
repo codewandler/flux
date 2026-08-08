@@ -568,6 +568,7 @@ mod tests {
                         map_inputs,
                         model,
                         yes,
+                        quiet,
                         resumable,
                         resume,
                         resume_value,
@@ -579,6 +580,7 @@ mod tests {
                 assert_eq!(map_inputs.as_deref(), Some("deploy three replicas"));
                 assert_eq!(model.as_deref(), Some("aws/sonnet"));
                 assert!(yes && resumable);
+                assert!(!quiet, "quiet defaults off");
                 assert_eq!(resume.as_deref(), Some("last"));
                 assert_eq!(resume_value.as_deref(), Some("42"));
             }

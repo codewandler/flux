@@ -436,6 +436,17 @@ jobs:
           ./scripts/check-release-integrity.sh --self-test
           ./scripts/check-release-integrity.sh
 
+      # C-719: v0.59.0 was tagged, its Release workflow reported `success`, and no Release was ever
+      # created — GitHub propagates `skipped` transitively through `needs`, the whole publish chain
+      # skipped below a green `host`, and a run whose jobs all skipped concludes `success`. This
+      # schedules the committed release.yml through a model of that rule and refuses any graph in
+      # which a publishing run can conclude `success` without a published Release. Its self-test
+      # replays the v0.59.0 job table and requires the verdict to be red.
+      - name: A tag build that publishes nothing is red
+        run: |
+          ./scripts/check-publish-chain.sh --self-test
+          ./scripts/check-publish-chain.sh
+
       # C-354: permissions are job-scoped and secrets can be step-scoped, so least privilege for a
       # release pipeline is a property of the parsed workflow/job/step graph. This parses all four
       # release workflows and rejects any credential that escapes its explicit authorized steps.

@@ -683,6 +683,15 @@ pub(super) fn run() -> Result<()> {
     if let Some(flags) = cli.command.as_ref().and_then(Commands::agent_flags) {
         apply_agent_env(flags);
     }
+    // `flow run -q/--quiet` — exported pre-runtime for the same single-thread reason, and as an
+    // env signal (like `FLUX_VERBOSE`) so the rendering sink and banner sites observe it without
+    // threading a flag through every constructor.
+    if let Some(Commands::Flow {
+        action: FlowAction::Run { quiet: true, .. },
+    }) = cli.command.as_ref()
+    {
+        std::env::set_var("FLUX_QUIET", "1");
+    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -808,6 +817,8 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                         map_inputs,
                         model,
                         yes,
+                        // Already exported as FLUX_QUIET pre-runtime; the sink reads the env.
+                        quiet: _,
                         resumable,
                         resume,
                         resume_value,

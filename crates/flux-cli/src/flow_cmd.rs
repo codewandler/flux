@@ -753,10 +753,12 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     // model op — replaying one must not demand credentials.
     let (engine, session_id, model_spec, _spawner) =
         build_agent_lazy(flags, resume_session).await?;
-    eprintln!(
-        "{}",
-        style::dim(&format!("flow · {} · session {session_id}", engine.model))
-    );
+    if !rendering::quiet() {
+        eprintln!(
+            "{}",
+            style::dim(&format!("flow · {} · session {session_id}", engine.model))
+        );
+    }
     // C-43: authored flow runs record the cassette too (the engine arms it per agent turn; this
     // path executes directly, so it arms its own) — and persist the executed plan as an accepted
     // `plan_source` attempt (this path has no loop host to record it), so `flux flow run`
@@ -918,12 +920,14 @@ pub(crate) async fn run_draft_ast_with_composites_resumable(
     } else {
         flux_flow::runtime::plan_risk_with_composites(ast, &registry, &active_composites)
     };
-    eprintln!(
-        "\n{}  {}{}",
-        style::bold("flow"),
-        risk_badge(&risk.summary()),
-        style::dim(&format!(" · {} op(s)", risk.ops.len()))
-    );
+    if !rendering::quiet() {
+        eprintln!(
+            "\n{}  {}{}",
+            style::bold("flow"),
+            risk_badge(&risk.summary()),
+            style::dim(&format!(" · {} op(s)", risk.ops.len()))
+        );
+    }
 
     // Point the installed loop host at this run's session + sink. A flow may call `ai_segment` or
     // `flow_run`; the shared sink keeps nested stage and operation events on one surface.
