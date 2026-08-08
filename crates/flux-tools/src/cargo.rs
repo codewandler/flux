@@ -216,7 +216,13 @@ fn cargo_build_argv(params: &Value) -> Vec<String> {
     argv
 }
 
-fn cargo_test_argv(params: &Value) -> Vec<String> {
+/// The exact argv `cargo_test` runs for a set of typed parameters.
+///
+/// Public because Fleet recovers a finished worker's targeted validation from the `cargo_test` tool
+/// call recorded in its own turn, and then RE-RUNS it to produce handoff evidence. Reconstructing
+/// the argv there from the same input would be a second copy of this mapping, and the copy that
+/// drifted would be the one nobody reads until a wave has already been assembled from it.
+pub fn cargo_test_argv(params: &Value) -> Vec<String> {
     let mut argv = vec!["cargo".to_string(), "test".to_string()];
     push_manifest_path(&mut argv, params);
     push_package_or_workspace(&mut argv, params, "--workspace");
