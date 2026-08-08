@@ -17,3 +17,23 @@ note: "connectors and exchange declare canonical_ref = origin/main, a remote-tra
 ## Acceptance
 
 - [ ] Define acceptance.
+
+## Progress
+
+- The config change alone is **not safe**, and this is the finding that matters. Both members do
+  have a local `main`, so the ref exists — but measured 2026-08-08 they are badly stale against
+  their remotes:
+  - `connectors`: local `main` is **1 ahead, 61 behind** `origin/main`. The 1 ahead is an unpushed
+    local commit that must not be discarded.
+  - `exchange`: local `main` is **0 ahead, 169 behind** `origin/main`. Its checkout is also sitting
+    on `wave-1-live-evidence`, not `main`, which is why `flux board transition X-139 …` reports
+    `not-found`: the story file exists on main and not on that branch.
+- So repointing `canonical_ref` at `main` would make every dispatched worker branch from
+  169-commit-stale code and gate against it. The reconciliation of those local mains is a
+  prerequisite, not a detail, and it needs the operator's judgement about the unpushed connectors
+  commit.
+- Order this story's work as: reconcile each member's local `main` with its remote → repoint
+  `canonical_ref` → add the board validation that refuses a remote-tracking ref, so the
+  misconfiguration cannot return.
+- Until then `flux fleet promote` refuses both members by name, which is the correct behaviour and
+  is why this is a configuration defect rather than a code one.
