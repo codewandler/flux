@@ -15,6 +15,19 @@
 
 ## [Unreleased]
 
+### New
+
+- **Say which machine an endpoint is reachable from.** A service that only answers inside your
+  cluster and one that answers from anywhere used to look identical once written down, so flux
+  would happily try a cluster-internal address from your laptop and fail at dial time. An endpoint
+  can now name the host it is reachable through — `host = "k8s-dev"` in its config, or
+  `flux endpoint add --host k8s-dev` — and `list`, `show` and `resolve` all show it, so `resolve`
+  now tells you *from where* as well as *as whom*. Endpoints that do not name a host keep working
+  exactly as before, meaning reachable from wherever you happen to be. Two things get caught early
+  instead of late: naming a host that does not exist is reported when the config loads, listing the
+  hosts that do exist, and asking for a host-bound endpoint while working from somewhere else is
+  refused up front, naming both sides, before any credential is unlocked.
+
 ## [0.59.0] - 2026-08-07
 
 ### Action needed

@@ -6,6 +6,51 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **An endpoint records the host it is reachable through (C-709).** `EndpointRef` recorded url,
+  product, credential_ref and labels and nothing about locality, so a ClusterIP endpoint looked
+  identical to a public one — a cluster-internal name is meaningless on a laptop and exactly right
+  inside the cluster, and the record could not tell the two apart. `EndpointRef` gains
+  `host: Option<String>`, the `[[host]]` binding id the endpoint is reachable through; absent means
+  "reachable from wherever the caller is", which is every endpoint declared before this field
+  existed, so the wire and store forms skip the key and old records read back unchanged.
+  `[[endpoint.static]]` may declare `host = "k8s-dev"`, `flux endpoint add` takes `--host`, and
+  `list`/`show`/`resolve` render it — `resolve` now answers "from where" alongside the credential
+  location it already answered "as whom" with. Naming an undeclared binding is a load-time error
+  naming the endpoint, the binding and the ones that do exist, not a dial-time surprise: malformed
+  entries stay warn-and-skip, but this one is fatal because skipping it would leave the endpoint
+  reachable-from-anywhere, so a typo'd binding name would silently *widen* where it is dialled
+  from. `StaticResolver` carries the session's selected binding and refuses a host-bound endpoint
+  from any other position, naming both, before any credential is materialized. An unbound endpoint
+  resolves exactly as before.
+
+### Fixed
+
+- **A tag build that publishes nothing is now red (C-719).** v0.59.0 was tagged and its Release
+  workflow reported success while creating no Release at all: no binaries, no attestation, no
+  image, no announcement. GitHub propagates `skipped` transitively through `needs`, so the chain
+  has to be broken at every hop rather than only the first — `host` already broke it with
+  `always()`, but the jobs below did not, so a correctly skipped `build-local-artifacts` flowed
+  through a successful `host` and took attest, publish-github-release and publish-container-image
+  with it. Those three now use `always()` and assert their upstreams actually succeeded, which
+  admits a transitively-skipped graph but never a failed or skipped dependency, and
+  `verify-published` fails the run when the ref was publishing and no Release was created.
+
+- **The plugins workspace resolves against flux-evidence 1.2.0 again (C-719).** The release bump
+  moved `codewandler-flux-evidence` to 1.2.0 while `plugins/Cargo.lock` still pinned 1.1.0, so every
+  job that resolves that workspace with `--locked` refused outright. That took down three CI jobs at
+  once — the plugins workspace fetch, and `plugin_builds_exclude_host_only_crates` in both the
+  sandboxed and unsandboxed test jobs, which resolve the same workspace.
+
+- **`codewandler-flux-evidence` moves to 1.2.0 so its published API matches its users (C-143).**
+  crates.io publication of 0.59.0 stopped at `codewandler-flux-flow`, which references
+  `flux_evidence::KIND_BUDGET_PROJECTION` — a constant that exists in this workspace but not in the
+  published flux-evidence 1.1.0. The constant predates v0.58.0, so the release-tag comparison never
+  flagged it: a protocol-line crate can drift from its published self without any diff against the
+  last release showing it. Already-published crates are skipped on re-run, so the remaining closure
+  resumes from this fix.
+
 ## [0.59.0] - 2026-08-07
 
 ### Added
