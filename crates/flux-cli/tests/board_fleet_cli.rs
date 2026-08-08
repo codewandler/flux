@@ -624,10 +624,10 @@ fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
             "story",
             "--title",
             "Authored then committed",
+            // C-736: `ready` is where a contract becomes mandatory, and `create` writes the
+            // placeholder. This test is about the commit verb, so it drafts at backlog.
             "--status",
-            "ready",
-            "--priority",
-            "7",
+            "backlog",
             "--output",
             "json",
         ],
@@ -1348,12 +1348,12 @@ fn workspace_board_federates_namespaced_items_and_routes_member_writes() {
     fs::create_dir_all(web.join("docs/stories")).unwrap();
     fs::write(
         api.join("docs/stories/C-1-api.md"),
-        "---\nid: C-1\ntitle: API contract\nstatus: done\n---\n\n# API contract\n",
+        "---\nid: C-1\ntitle: API contract\nstatus: done\n---\n\n# API contract\n\n## Goal\n\nThe member exposes its contract.\n\n## Acceptance\n\n- [x] The contract is published.\n",
     )
     .unwrap();
     fs::write(
         web.join("docs/stories/C-1-web.md"),
-        "---\nid: C-1\ntitle: Web client\nstatus: ready\npriority: 1\ndepends_on: [api/C-1]\n---\n\n# Web client\n",
+        "---\nid: C-1\ntitle: Web client\nstatus: ready\npriority: 1\ndepends_on: [api/C-1]\n---\n\n# Web client\n\n## Goal\n\nThe client consumes the member contract.\n\n## Acceptance\n\n- [ ] The client calls the published contract.\n",
     )
     .unwrap();
     fs::create_dir_all(workspace.join(".flux")).unwrap();
