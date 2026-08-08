@@ -16021,6 +16021,23 @@ fn drive_integration_exhausted(state: &FleetState) -> Vec<Value> {
         .collect()
 }
 
+/// C-732: waves whose candidate is accepted and pinned, and whose member's canonical ref does not
+/// contain it yet.
+///
+/// `awaiting-delivery` is exactly the state C-721 has `apply` record when it accepted a candidate it
+/// could not deliver — so it is the evidence that the last mile is owed, rather than a guess. Used
+/// only to decide whether a tick spends a `promote` at all: the verb is idempotent and refuses on
+/// its own, but calling it every interval costs a config read and a git probe per member for
+/// nothing.
+fn drive_promotion_ready(state: &FleetState) -> Vec<String> {
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| wave["status"].as_str() == Some(WAVE_AWAITING_DELIVERY))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
 /// What a tick would decide on, rendered as one stable value.
 ///
 /// The bash driver answered "did anything change?" by diffing rendered status text, which changed
@@ -17145,12 +17162,47 @@ fn drive_one_tick(
             }
         }
     }
+    // C-732, and the last operator-invoked step in the pipeline. Integration assembles a candidate
+    // and `apply` accepts it, but until this call *landing* was still a verb a human typed — so a
+    // fleet left alone finished every wave and delivered none of them, which is the whole gap
+    // between "the harness runs" and "the harness ships".
+    //
+    // Deliberately calls the same `promote_members` the CLI verb does, rather than reimplementing
+    // the rules here: it honours `command.dry_run` itself, refuses a member whose `canonical_ref` is
+    // remote-tracking, leaves every branch untouched on a red gate, and re-reads containment after
+    // landing. A second copy of those rules would drift, and the copy that drifted would be the
+    // unattended one.
+    let mut promotion = Value::Null;
+    let awaiting = drive_promotion_ready(&read_fleet_state(root)?);
+    if !awaiting.is_empty() {
+        match promote_members(command, root, read_fleet_state(root)?, None) {
+            Ok((summary, result, mut promote_warnings, _)) => {
+                warnings.append(&mut promote_warnings);
+                promotion = json!({"waves": awaiting, "summary": summary, "result": result});
+            }
+            Err(error) => {
+                // Same contract as a failed dispatch or a failed integrator: a fact to report, never
+                // a reason to lose a tick that already recorded handoffs and reviews.
+                let message = redact(&error.to_string());
+                warnings.push(format!("promotion failed: {message}"));
+                promotion = json!({"waves": awaiting, "promoted": false, "error": message});
+                if !command.dry_run {
+                    append_fleet_event(
+                        root,
+                        "fleet.drive.promotion-failed",
+                        json!({"waves": awaiting, "error": message}),
+                    )?;
+                }
+            }
+        }
+    }
     let revision = read_fleet_state(root)?.revision;
     let data = json!({
         "schema": DRIVE_TICK_SCHEMA,
         "tick": tick,
         "fingerprint": plan.fingerprint,
         "idle": idle,
+        "promotion": promotion,
         "report": {
             "revision": revision,
             "previous_fingerprint": previous.fingerprint,
@@ -17168,7 +17220,7 @@ fn drive_one_tick(
     });
     Ok((
         format!(
-            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), reviewed {} wave(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s), integrated {} wave(s)",
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), reviewed {} wave(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s), integrated {} wave(s), promoted {}",
             advanced.len(),
             reconstructed.len(),
             reviewed.len(),
@@ -17180,6 +17232,20 @@ fn drive_one_tick(
                 .iter()
                 .filter(|record| record["dispatched"] == json!(true))
                 .count(),
+            // The last mile has to be legible in the one line an unattended loop prints, or nobody
+            // can tell a fleet that delivered from one that only looked busy. Says what promotion
+            // ANSWERED, not that it was attempted: no wave owed one, or the summary promote itself
+            // produced, or the refusal.
+            match &promotion {
+                Value::Null => "nothing (no wave awaiting delivery)".to_string(),
+                value => value["summary"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!(
+                        "FAILED: {}",
+                        value["error"].as_str().unwrap_or("unknown error")
+                    )),
+            },
         ),
         data,
         warnings,
@@ -23636,6 +23702,42 @@ mod tests {
             vec!["wave-1".to_string()]
         );
         assert!(drive_integration_exhausted(&state).is_empty());
+    }
+
+    /// C-732: the tick owes a promotion exactly when a wave is `awaiting-delivery`, and never
+    /// otherwise.
+    ///
+    /// That status is not a guess about what might be landable — it is the record C-721 has `apply`
+    /// write when it accepted a candidate whose canonical ref does not contain it. So it is the one
+    /// piece of evidence that the last mile is owed. `applied` means the work already landed and
+    /// asking again would spend a config read and a git probe per member for nothing; the statuses
+    /// on either side of delivery mean the wave has not earned the question yet.
+    #[test]
+    fn a_wave_awaiting_delivery_is_what_makes_a_tick_promote() {
+        let mut state = drive_fixture_state();
+        state
+            .waves
+            .insert("wave-1".into(), json!({"status": WAVE_AWAITING_DELIVERY}));
+        state
+            .waves
+            .insert("wave-2".into(), json!({"status": "applied"}));
+        state
+            .waves
+            .insert("wave-3".into(), json!({"status": "handoffs-ready"}));
+
+        assert_eq!(
+            drive_promotion_ready(&state),
+            vec!["wave-1".to_string()],
+            "only the wave whose candidate is accepted and undelivered owes a promotion"
+        );
+
+        // Once it lands, the tick must stop asking. A promotion that keeps being attempted against
+        // an already-delivered wave is the shape that makes an idle loop look busy.
+        state.waves.get_mut("wave-1").expect("wave")["status"] = json!("applied");
+        assert!(
+            drive_promotion_ready(&state).is_empty(),
+            "a delivered wave owes nothing"
+        );
     }
 
     /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not
