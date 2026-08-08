@@ -2,8 +2,7 @@
 id: C-742
 title: "An epic is one entity with its own measurable contract"
 pillar: "Core"
-status: in-progress
-priority: 3
+status: done
 epic: delivery-is-verified
 areas: [flux-cli]
 ---

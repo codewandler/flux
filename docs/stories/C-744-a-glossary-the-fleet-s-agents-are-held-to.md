@@ -2,8 +2,7 @@
 id: C-744
 title: "A glossary the fleet's agents are held to"
 pillar: "Core"
-status: backlog
-priority: 4
+status: done
 epic: delivery-is-verified
 areas: [docs]
 ---
@@ -26,6 +25,13 @@ survive contact with a fresh agent; a checked glossary might.
 - [x] A lint flags near-miss synonyms across stories — wave versus batch, park versus block, claim
       versus lock — because a story that renames a concept is how the vocabulary drifts.
 - [x] The glossary changes in the same commit as a rename, so it cannot lag the code it describes.
+- [x] **Failing-first**: `crates/flux-cli/tests/delivery_vocabulary.rs`. All three tests were run
+      against the merge-base tree — `docs/glossary.md` absent, `AGENTS.md` and `docs/README.md`
+      restored to their base state — and all three failed, on
+      `read .../docs/glossary.md: No such file or directory` and on *"AGENTS.md is what every agent
+      reads first; a glossary it does not name is one no agent reads"*. The backups were restored
+      byte-identical and md5-verified.
+      verify: `cargo test -p flux-cli --test delivery_vocabulary`
 
 ## Progress
 

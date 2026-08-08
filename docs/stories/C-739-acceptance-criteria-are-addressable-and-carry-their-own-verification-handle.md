@@ -2,8 +2,7 @@
 id: C-739
 title: "Acceptance criteria are addressable and carry their own verification handle"
 pillar: "Core"
-status: backlog
-priority: 2
+status: done
 epic: delivery-is-verified
 areas: [flux-cli]
 ---

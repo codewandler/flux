@@ -94,69 +94,73 @@ them by status. New work? Copy [`_TEMPLATE.md`](_TEMPLATE.md). For the bigger pi
 
 ## Next (ready — take the top one unless the user named a story)
 - [C-748 — A story the board cannot parse is a failure, not a silent skip](C-748-a-story-the-board-cannot-parse-is-a-failure-not-a-silent-skip.md) · Core · C-320 sat at `status: active` — not a parseable value — and was dropped by every board read while `check` exited 0. Invisible is worse than invalid.
-- [C-719 — A tag build that publishes nothing must be red](C-719-a-tag-build-that-publishes-nothing-must-be-red.md) · Core · GitHub propagates skipped transitively through needs; the publish chain skipped and the run still reported success, so v0.59.0 has a tag and no Release
 - [C-718 — Reconcile proves a story's own implementation, not a mention of its id](C-718-reconcile-proves-a-story-s-own-implementation-not-a-mention-of-its-id.md) · Core · implementation-landed fires on any commit mentioning the id, including docs commits that file or block the story; the drive then withholds real work as already-built
 - [C-546 — Generalized provider credits/usage/subscription introspection, callable by the model and shown in the TUI](C-546-provider-credits-usage-introspection.md) · Core · a capability-gated Provider op returns credits, usage against limits (session/weekly windows) and subscription identity; exposed as a model-callable op and a TUI surface
 
 ### The agent-authored surface — panes the model opens, config it can safely change
+_The design behind this epic is [docs/designs/agent-authored-surface.md](../designs/agent-authored-surface.md)._
 - [C-219 — The agent-authored surface — panes the model opens, config it can safely change (epic)](C-219-agent-authored-surface-epic.md) · Core · the tool→surface seam already exists twice (ToolProgressSink/SpawnActivitySink) and op.register already lets the model extend the harness one layer down — what's missing is the surface layer, and the whole risk is that a model-drawn region can imitate the approval sheet
 - [C-225 — config.get / config.set over an agent-writable allowlist, disjoint from PinnableKey by test](C-225-agent-writable-config.md) · Core · the first model-facing op that writes a file the safety envelope reads back — PinnableKey::ALL (config lib.rs:451-505) already enumerates every security-relevant key, so asserting the agent-writable set is DISJOINT from it makes [permissions]/[sandbox]/workspace.allow_all unrepresentable rather than denied
 - [C-306 — The pane read-back contract — can an agent ask what is on screen, and should it?](C-306-pane-read-back-contract.md) · Core · C-223 could not ship pane.list: C-220 made SurfaceSink send-only ON PURPOSE and forbids tool-held pane state, so a listing would report panes the surface has already dropped. This is a contract decision, not an implementation detail
 
 ### Agent evidence scope
-_Flux governs what an agent may *do* and what it is *told*, but not what it may *look at*._
+_The design behind this epic is [docs/designs/agent-evidence-scope.md](../designs/agent-evidence-scope.md)._
 - [C-611 — Enforce Fleet fences at path resolution, or rename them](C-611-enforce-fleet-fences-at-path-resolution-or-rename-them.md) · Core · the .git fence can never fire, .flux/fleet is checked against the wrong repository, template fences are dropped
 - [C-614 — Keep machine and account detail out of shared repository docs](C-614-keep-machine-and-account-detail-out-of-shared-repository-docs.md) · Improve · a committed skill carried this host's paths, a credentials file location and the operator's billing state
 
 ### Agent fleet runtime — addressing, lifecycle and discovery for a fleet of agents
+_The design behind this epic is [docs/designs/agent-fleet-runtime.md](../designs/agent-fleet-runtime.md)._
 - [A-124 — DockerRuntime — an agent as a container](A-124-docker-runtime.md) · Agent · flux ships no Dockerfile today — this story owns the image contract as well as the runtime
 - [A-125 — KubernetesRuntime — an agent as a pod, over the existing kubernetes plugin](A-125-kubernetes-runtime.md) · Agent · the k8s plugin and its endpoint provider (D-28) already exist — this rides them rather than adding a second cluster client
 - [A-126 — Fleet discovery — agents as a product of the endpoint broker that already exists](A-126-fleet-discovery-over-endpoint-broker.md) · Agent · C-243's ExternalRuntime exists but is not CLI-wired; project endpoint-broker agent refs into that shipped worker vocabulary rather than inventing flux-fleet/AgentAddress
 
 ### Watch the agent think — the loop as a live thread, expandable down to the graph
-_flux's central claim is that **the LLM is not the runtime** — authored control flow and a deterministic_
+_The design behind this epic is [docs/designs/agent-loop-visibility.md](../designs/agent-loop-visibility.md)._
 - [A-137 — The loop view becomes the TUI's main display, with view options — depth, condensing, detail, variables](A-137-the-step-thread.md) · Agent · ⚠ SCOPE CHANGED 2026-08-02, owner-directed: no longer a thread beside the transcript — the TUI's PRIMARY surface. Two things to decide before coding: where the conversation goes, and that `show variables` puts run state on the DEFAULT screen, escalating A-142's disclosure requirement from an opt-in pane to what is on screen during every demo
 
-### Connector Channels
+### The generic `connector` channel kind — one arm instead of one adapter per vendor
+_Its history was written down in [D-215](../stories/D-215-connector-channel-kind-epic.md), which stays the narrative record._
 - [C-416 — Identity is sniffed from payload field names, so Slack threads get none — an adapter should declare its principal and how well it is authenticated](C-416-a-channel-adapter-should-declare-its-principal.md) · Core · raised by the owner: a Slack thread is a room scenario. C-407's fence already covers it (it names no field); C-408's identity does not, because `room_participant_identity` sniffs for `speaker`+`room`. The deeper point is that a Slack `user` is authenticated BY SLACK while a MUC `speaker` is self-asserted, and the current design cannot express that difference
 - [D-222 — `EventDecl::when` const-equality matching — the narrowed event a connector arm currently refuses](D-222-connector-event-when-matching.md) · Agent · filed from D-216's implementation, not from planning — `when` was named as v1 scope in D-216's Notes and the epic design's item 5, but D-216 shipped a load REFUSAL instead of matching, deliberately and fail-closed; this is the story that decides whether matching arrives or the refusal becomes the permanent answer
 
-### Connector Native Integrations
+### Connector-native integrations replace the official plugin fleet
+_Its history was written down in [C-500](../stories/C-500-connector-native-integrations-epic.md), which stays the narrative record._
 - [C-509 — Complete Linux-local onboarding and cross-platform Exchange use](C-509-complete-first-run-local-exchange-integration-cli.md) · Core · Queued behind X-134/X-126/C-510: owner onboarding is Linux-local; every Flux target retains the authenticated remote runtime client
 - [C-510 — Install and supervise a verified local Exchange release](C-510-install-and-supervise-a-verified-local-exchange.md) · Core · Queued behind X-134/X-126: managed lifecycle exists on the two Linux GNU targets and refuses without side effects elsewhere
 
-### Connector Platform
+### The connectors seam — a vendor credential flux is structurally unable to hold
+_Its history was written down in [C-420](../stories/C-420-connector-platform-epic.md), which stays the narrative record._
 - [C-405 — The plugin pack carries twelve private percent-encoders and one has already drifted](C-405-the-plugin-packs-twelve-encoders-have-started-to-drift.md) · Core · found by C-313's census — drift observed, not predicted. `plugins/gitlab`'s `enc` omits `~` from the unreserved set, so it emits %7E where the other eleven emit `~`. The nested workspace structurally cannot delegate to flux-core, so the fix is a shared encoder in host-kit — a protocol-line change owing a pack release
 
 ### Delivery Is Verified
-- [C-728 — A program-eligible item outside every wave is dispatched, not dropped](C-728-a-program-eligible-item-outside-every-wave-is-dispatched-not-dropped.md) · Core · A tick with eight free slots and eight program-eligible dependency-satisfied items planned four dispatches and recorded no reason for the other four. Dispatch draws from configured waves, so an item named by no wave never reaches the withhold logic and leaves the schedulable pool with no record at all. C-723 made a withhold state its evidence; this is the path that produces no withhold to state
+_Filed by the C-742 migration: 24 stories carried `epic: delivery-is-verified` with no document behind it._
 - [C-749 — A ready item is the fleet's work whether or not a human wrote a lane for it](C-749-a-ready-item-is-the-fleet-s-work-whether-or-not-a-human-wrote-a-lane-for-it.md) · Core · 104 ready, contract-carrying stories; 8 free worker slots; 0 dispatched. Every flux program lane in the active milestone is done, and dispatch reads only `[[waves]]`. The empty-board fallback makes a fresh board dispatch everything and a mature board dispatch nothing — the queue narrows as the project matures
 - [C-725 — A worker turn records whether it left uncommitted work behind](C-725-a-worker-turn-records-whether-it-left-uncommitted-work-behind.md) · Core · C-722 acceptance 4: a turn's recorded status must not claim more than its worktree can show. doctor now reports a dirty story worktree and fleet capture recovers it, but the turn record itself still reads success or failure with no signal that work was left uncommitted
 - [C-726 — Re-dispatch resumes an abandoned attempt from its committed state](C-726-re-dispatch-resumes-an-abandoned-attempt-from-its-committed-state.md) · Core · C-724 acceptance 4, second half: a released item re-dispatches from the canonical ref, discarding the abandoned attempt's commits. plan_wave_topology pins base_commit from the canonical ref and handoff verification requires the cited test to fail at that pinned base, so seeding from an old attempt's branch inverts that evidence and needs a design decision
+- [C-750 — The acceptance parser is not fence-aware, so a story documenting the syntax corrupts its own contract](C-750-the-acceptance-parser-is-not-fence-aware-so-a-story-documenting-the-syntax-corrupts-its-own-contract.md) · Core · section_contract decides its section by scanning `## ` headings with no fence awareness, so a heading inside a fenced block re-opens the section. C-739's own Syntax example gave the story a seventh criterion that could never be ticked. C-740 already solved this class with outside_code_spans
 
 ### The docs are missing things a user expects to find — starting with context management
-_Someone evaluating an agent harness arrives with a checklist they did not write down. *How does it_
+_The design behind this epic is [docs/designs/docs-completeness.md](../designs/docs-completeness.md)._
 - [C-442 — What do Codex, Claude Code, OpenCode and Pi document that we do not?](C-442-peer-docs-gap-audit.md) · Core · ⚠ verify against the LIVE docs; do not write this from recollection. A gap list assembled from memory of what a competitor's docs probably contain is exactly the confident-and-wrong artifact this repo keeps catching — leave a row empty rather than guess it
 
-### the execution substrate — `flux-system` for a second consumer
-_`flux-system` has had exactly one consumer since it was written: flux. That is about to stop being_
+### flux-system as a shared execution substrate
+_The design behind this epic is [docs/designs/execution-substrate.md](../designs/execution-substrate.md)._
 - [C-397 — A container backend for guarded process spawn](C-397-container-process-backend.md) · Core · OWNERSHIP DECIDED 2026-08-01: flux owns it, flux-exchange reuses it. flux must be able to do this locally as dev without depending on a service — that is the local-first principle, not a convenience
 
 ### Explore, then freeze — ad-hoc browser testing that becomes a deterministic script
-_Ask an agent: *"go to site X, log in, then test the happy path of module U."* It explores — misreads a_
+_The design behind this epic is [docs/designs/explore-then-freeze.md](../designs/explore-then-freeze.md)._
 - [C-432 — A password in the prompt is redacted by nothing — browser credentials must come from the secret store](C-432-browser-credentials-never-come-from-the-prompt.md) · Core · ⚠ the epic's safety story. `Redactor` redacts values it has been TOLD about; a password typed into a prompt was never registered, so it reaches the model context and the durable event log unredacted. The motivating phrasing for this whole epic — 'log in as X with password Y' — is the exact leak
 - [C-430 — Distil a recorded exploration into a flow — keep the path that worked, drop the trial and error](C-430-distil-an-exploration-into-a-flow.md) · Core · the epic's core verb. Raw material exists — since L-38 every accepted plan records parseable `plan_source`, redacted at record time — but nothing turns a recorded SESSION into a saved FLOW: `flux flow` has list and run, no save. ⚠ Do not emit `e<N>` refs; C-431 owns why
 - [C-431 — `e<N>` refs mean nothing in a fresh session — freezing must re-anchor them to role and name](C-431-durable-locators.md) · Core · ⚠ VERIFIED, not suspected: RefMap (crates/flux-web/src/digest.rs:53-72) keys on backendDOMNodeId and assigns `next += 1` in first-encounter order WITHIN one live session. `e17` is stable while exploring and meaningless in a new session. The fix material is in the same data — every ref carries an AX role and name (digest.rs:180)
 
 ### First-class hosts
-_The substrate abstraction already exists — `flux-system` owns the guarded port, `flux-codegate`_
+_The design behind this epic is [docs/designs/first-class-hosts.md](../designs/first-class-hosts.md)._
 - [C-702 — A guaranteed-denied operation is not offered to the model](C-702-a-guaranteed-denied-operation-is-not-offered-to-the-model.md) · Core · observed: plain flux in /tmp offers slack/web fetches that egress policy refuses unconditionally; the fleet hit the same class as 16 guaranteed denials and 5 dead datasource tools
 - [C-714 — The served router's timeout and a request's budget agree](C-714-the-served-router-s-timeout-and-a-request-s-budget-agree.md) · Core · C-701's review: the router times out at 120s while a caller's budget clamps at 300s, and the 408 that results is classified Refused rather than as a timeout the caller can recognise
 
 ### Fleet harness throughput
-_Wave 1 closed the confidentiality holes. This wave is about the thing the operator originally asked_
+_The design behind this epic is [docs/designs/fleet-harness-throughput.md](../designs/fleet-harness-throughput.md)._
 - [C-631 — flux fleet drive replaces the bash autopilot](C-631-flux-fleet-drive-replaces-the-bash-autopilot.md) · Core · the 582-line bash driver parses state three ways without --if-revision and cannot self-edit safely; its loops (planner/retro/scribe) are authored .flux files it invokes host-side, so the port inherits them unchanged
-- [C-664 — cargo test --workspace --lib never tests flux-cli](C-664-cargo-test-workspace-lib-never-tests-flux-cli.md) · Core
 - [C-660 — fleet run returns as soon as workers are dispatched](C-660-fleet-run-returns-as-soon-as-workers-are-dispatched.md) · Core
 - [C-617 — Fleet reclaims wave storage and refuses to dispatch without disk headroom](C-617-fleet-reclaims-wave-storage-and-refuses-to-dispatch-without-disk-headroom.md) · Core
 - [C-662 — One colorized diff stream multiplexed across all fleet workers](C-662-one-colorized-diff-stream-multiplexed-across-all-fleet-workers.md) · Core
@@ -169,13 +173,14 @@ _Wave 1 closed the confidentiality holes. This wave is about the thing the opera
 - [C-604 — Layer Fleet configuration, and separate a fleet's config source from its state store](C-604-fleet-config-layers-and-relocatable-state.md) · Core · safety invariants like 'a writer gets no shell' are per-directory today, so one forgotten fleet dir reintroduces the hole
 - [C-594 — Make `flux fleet run --dry-run` validate a wave without a real worktree](C-594-fleet-run-dry-run-builds-a-workspace-on-an-uncreated-worktree.md) · Core · --dry-run plans the wave, deliberately skips worktree creation, then builds a Workspace on the directory it did not create
 
-### Design record: host-enforced fleet loop
+### The native fleet runs the planning-to-integration loop through Flux CLI
+_The design behind this epic is [docs/designs/fleet-loop.md](../designs/fleet-loop.md)._
 - [C-561 — A failed Fleet worker can resume its exact durable turn](C-561-resume-a-failed-fleet-worker.md) · Core · dogfood stop-line — resume currently routes through the availability check that rejects failed workers
 - [C-563 — An operator can start, talk to and watch a Fleet from the public guide](C-563-document-the-fleet-operator-journey.md) · Core · public-doc gap — commands exist, but the first working main-agent conversation and watch loop are not taught as one journey
 - [C-564 — Nested Fleet tasks cannot steal a worker's continuation session](C-564-isolate-nested-fleet-task-sessions.md) · Core · dogfood defect — nested task turns changed the store's latest-session target, moving one worker from s_1 through s_4
 
 ### flux-lang hardening — remediate the 2026-08-01 subsystem review
-_The 2026-08-01 adversarial subsystem review of `flux-lang`_
+_The design behind this epic is [docs/designs/flux-lang-hardening.md](../designs/flux-lang-hardening.md)._
 - [L-113 — flux-lang hardening — remediate the 2026-08-01 subsystem review (epic)](L-113-flux-lang-hardening-epic.md) · Language · EPIC — every finding of the 2026-08-01 flux-lang review owned: two parser totality bugs, interpreter budgets, confirm intents, mirror debt, fuzzing
 - [L-124 — The docs never say that flux-lang is total, which is one of its most important properties](L-124-document-that-flux-lang-is-total.md) · Language · nothing in the tree states it. `grep -rn 'Turing\\|terminates\\|totality'` over docs/, website/docs/ and crates/flux-lang/docs/ returns only flux-exchange 'terminates channels' and the roadmap's round-trip-totality note — a different sense of both words. The website's control-flow page says 'keep loops bounded' without saying what that buys
 - [L-122 — `cst_decode`'s \"token text is decoded only at leaves\" is a claim, not an enforced invariant — ~13 `semantic_line` sites still scan reconstructed text](L-122-text-decoded-only-at-leaves-is-aspirational.md) · Language · found by L-115's sweep. L-115 fixed `each`; the module header already claims the property for the whole module. The sharpest remaining case is `lower_scope`'s split_once('='), which is safe ONLY because a formatter guard three files away refuses to spell the shape that would break it — neither side says so
@@ -184,92 +189,97 @@ _The 2026-08-01 adversarial subsystem review of `flux-lang`_
 - [L-120 — flux-lang drift & paper-cut batch from the 2026-08-01 review](L-120-doc-drift-and-paper-cuts.md) · Language · Review F9–F13 LOW/INFO — replace_ident byte/char mix, `_`-separator diagnostic, reference.md expr whitelist, ~HOME on the pure path, ledger count, Prism split_once
 
 ### Flux notation workbench — one AST, several readable projections
-_Flux has one honest execution model and one `DraftAst`, but different moments want different views:_
+_The design behind this epic is [docs/designs/flux-notation-workbench.md](../designs/flux-notation-workbench.md)._
 - [L-98 — Flux Tape — a flat path-addressed transport notation](L-98-flux-tape-notation.md) · Language · Every line locates its AST node; indentation is cosmetic and malformed path structure fails closed
 - [L-99 — S-Flux — a self-delimiting Lisp projection of DraftAst](L-99-s-flux-notation.md) · Language · Data-only S-expressions with named fields and `(ast {...})` escape — no macros, eval, or embedded Lisp runtime
 
 ### flux recipes — real programs that make the difference click
-_Someone evaluating flux against any other agent sees a feature list and a folder of examples, and has_
+_The design behind this epic is [docs/designs/flux-recipes.md](../designs/flux-recipes.md)._
 - [C-428 — Half the language has no example — `agent_loop`, `await`, `datasource` and eleven more appear in zero files](C-428-the-example-coverage-census.md) · Core · measured 2026-08-01 across the 16 files in examples/: agent_loop 0, await 0, datasource 0, agent 0, checkpoint 0, memo 0, throttle 0, debounce 0, risk 0, try/catch/finally 0, race 0, match 0. journey/trigger/channel appear once each — all in channels-app.flux. ⚠ The durability vocabulary is what separates flux from a chat loop, and it is undemonstrated
 
 ### Flux syntax simplification — one way to write each thing
+_The design behind this epic is [docs/designs/flux-syntax-simplification.md](../designs/flux-syntax-simplification.md)._
 - [L-102 — Flux syntax simplification — one way to write each thing (epic)](L-102-flux-syntax-simplification-epic.md) · Language · EPIC — simplify by subtraction: canonical dialect everywhere, a migration tool, then delete the legacy grammar; supersedes L-98/L-99's direction
 - [L-105 — docs/syntax.md teaches one dialect and stops contradicting itself](L-105-single-dialect-syntax-spec.md) · Language · P4 — fix the mandatory-$ contradiction, move aspirational sections to the evolution doc, document `?` and `do`, one legacy-spelling appendix
 
-### Cross-harness session history as a datasource
-_flux already does the hard half. `flux usage` (`crates/flux-cli/src/usage.rs`, 2919 lines) locates,_
+### Cross-harness session history — search what was already said, in any local harness
+_The design behind this epic is [docs/designs/harness-history.md](../designs/harness-history.md)._
 - [C-212 — Cross-harness session history — search what was already said, in any local harness (epic)](C-212-harness-history-epic.md) · Core · flux usage already parses codex/claude-code/opencode state and discards the message text one field short; the new work is not acquisition but containment — this is the first datasource whose input is out-of-jail, secret-bearing and injection-shaped
 - [C-302 — The fourth adapter — flux's own session log as HarnessMessage](C-302-flux-native-message-adapter.md) · Core · split out of C-214, which shipped the three EXTERNAL adapters (codex/claude-code/opencode). flux's own history needs a flux-events dependency in flux-capabilities — legal (L5 → L2) but a manifest+lockfile change, so it runs solo rather than riding a wave
 
-### meeting rooms — a multi-party channel where humans and agents meet
-_Every channel flux has is either **1:1** or **fire-and-forget**. `flux-channels` (D-04, D-09) carries_
+### Meeting rooms — a multi-party channel where humans and agents meet
+_The design behind this epic is [docs/designs/meeting-rooms.md](../designs/meeting-rooms.md)._
 - [D-203 — Meeting rooms — a multi-party channel where humans and agents meet (epic)](D-203-meeting-rooms-epic.md) · Agent · EPIC — feasibility PROVEN live 2026-07-30 against a real Brave Talk room: guest JWT from the public rooms endpoint, focus allocation, XMPP MUC presence and bidirectional chat, all with no browser and no account. Text+presence are native Rust; audio/screenshare need a feature-gated headless-Chrome media peer
 - [D-209 — Room audio in — attributed speech from many speakers into the turn seam](D-209-room-audio-in.md) · Agent · 48 kHz room audio resampled to the realtime model's 24 kHz via flux-audio's phase-carrying Resampler, with per-speaker attribution — the existing voice seam assumes exactly one caller
 - [D-213 — The room safety envelope — untrusted co-presence, consent, and approved publication](D-213-room-safety-envelope.md) · Agent · a room is untrusted MULTI-party input and anyone with the link can put a client in it — proven by the spike itself, which joined with no account; this story owns the invariants the rest of the epic must not break
 - [C-417 — A shared conversation has one reply channel and several audiences, so authorizing the asker is not enough](C-417-a-shared-room-has-one-reply-channel-and-many-audiences.md) · Agent · raised by the owner: a room holds an operator AND an audience. D-213 sets the floor (co-presence grants no authority) and C-408/C-416 give per-speaker identity — but every authorization decision in flux is a function of the ASKER, and a room reply is broadcast to everyone present. So an operator cannot ask anything in a room that the audience may not see
 
 ### Ops Explorer
+_Filed by the C-742 migration: 4 stories carried `epic: ops-explorer` with no document behind it._
 - [C-643 — flux ops --explore: the core catalog explorer](C-643-flux-ops-explore-the-core-catalog-explorer.md) · Core · iteration 1: Google-like start screen, node-constellation pictogram, fuzzy search, category filter, docs links
 - [C-644 — Ops explorer: plugin operations stream in, with source and availability facets](C-644-ops-explorer-plugin-operations-stream-in-with-source-and-availability-facets.md) · Core · depends on C-643 landing; do not dispatch in the same wave as C-643
 - [C-645 — Ops explorer: docs in the detail pane and an /ops overlay in the chat TUI](C-645-ops-explorer-docs-in-the-detail-pane-and-an-ops-overlay-in-the-chat-tui.md) · Core · depends on C-643 landing; do not dispatch in the same wave as C-643
 - [C-646 — Ops explorer: connector-ready catalog over the effective catalogue seam](C-646-ops-explorer-connector-ready-catalog-over-the-effective-catalogue-seam.md) · Core · depends on C-643; re-scope against roadmap Milestone 1 (C-318/X-113) at pickup
 
 ### What the Pi comparison says to fix — and what to defend instead
-_`docs/reviews/single/2026-08-01-pi-flux-harness-comparison.md` is two isolated source-level reviews_
+_The design behind this epic is [docs/designs/pi-comparison-remediation.md](../designs/pi-comparison-remediation.md)._
 - [C-445 — Interactive turns are deliberately exempt from OS confinement — re-take that decision with the finding in hand](C-445-interactive-confinement-posture.md) · Core · the precise remaining secure-defaults gap after C-410: unattended CLI is fail-closed, interactive is not, and `even installed plugin startup can run unconfined` (dispatch.rs:111). Deliberate is a decision that should be RE-TAKEN, not inherited
 - [C-448 — Audit cancellation — Pi's reaches retries, compaction and bash; whether flux's does is unknown](C-448-cancellation-coverage.md) · Core · Pi strength, flux unaudited. The review credits Pi with cancellation reaching `the high-level agent and session-owned work, including retries, compaction and bash`, and scores both 9.0 on that axis — so this is about confirming flux's coverage, not assuming a deficit
 - [C-451 — Nobody has measured either harness — every performance claim in the comparison is inferred from source](C-451-the-head-to-head-benchmark.md) · Core · ⚠ the review's OWN first open question, and the one that would settle several arguments at once. It states plainly: `no task-quality benchmark, runtime benchmark, fuzzing` — so the 6.5-vs-7.5 performance score, and flux's own throughput ceiling claim, are both readings of code
 - [C-446 — Windows has no native sandbox backend — so the OS isolation boundary is not everywhere](C-446-no-windows-sandbox-backend.md) · Core · the review's sharpest one-line summary of F2: `Flux has a mandatory policy/guarded-IO boundary everywhere, but not a mandatory OS isolation boundary everywhere`. Either build the backend or say plainly what a Windows deployment does not get
 - [C-447 — One `FlowEngine` serializes every turn — can the mutex go without weakening turn identity?](C-447-the-per-engine-turn-mutex.md) · Core · F3 of the Pi comparison: all public turn entries acquire the same `turn_gate` (flux-flow/src/engine.rs:713). ⚠ It is a STRENGTH and a ceiling at once — the review calls it `a strong identity/session-integrity simplification and a real throughput ceiling`. Answer the question before optimising
 
-### a portable Flux runtime — WebAssembly as a second execution substrate
+### A portable Flux runtime — WebAssembly as a second execution substrate
+_The design behind this epic is [docs/designs/portable-wasm-runtime.md](../designs/portable-wasm-runtime.md)._
 - [C-268 — A portable Flux runtime — WebAssembly as a second execution substrate (epic)](C-268-portable-wasm-runtime-epic.md) · Core · EPIC — run someone else's .flux inside a sandbox that starts with NO authority; port the interpreter, never a Flux-to-Wasm codegen. Blockers measured: flux-system::System is a struct not a trait; flux-flow binds rusqlite in 1/22 files
 
 ### Recovery and inspection have no CLI, so every failure is hand-driven
-_The happy path has verbs. `fleet run`, `handoff`, `integrate`, `apply`, `reclaim` each do one thing well._
+_The design behind this epic is [docs/designs/recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven.md](../designs/recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven.md)._
 - [C-647 — Attention is a present condition, not an accumulated history](C-647-attention-is-a-present-condition-not-an-accumulated-history.md) · Core · 25 of 25 flagged workers are cancelled or failed corpses of waves long finished; the driver halts on attention_required and therefore halts forever
 - [C-657 — Split board_fleet_cmd so fleet verbs stop serialising on one file](C-657-split-board-fleet-cmd-so-fleet-verbs-stop-serialising-on-one-file.md) · Core · one 17k-line file holds all 52 FleetAction arms, so every story in the ops-CLI epic collides with every other one
 - [C-658 — fleet schedule proposes a wave-safe batch at a requested width](C-658-fleet-schedule-proposes-a-wave-safe-batch-at-a-requested-width.md) · Core · board next --independent picks the set; nothing yet asks it for a wave, and the board cannot see fleet claims
 - [C-640 — fleet land merges accepted candidates and re-gates against the canonical branch](C-640-fleet-land-merges-accepted-candidates-and-re-gates-against-the-canonical-branch.md) · Core · acceptance pins a candidate against the base it was gated on; landing is a separate act needing its own verification, and it is a bash approximation in the driver
 
 ### Remote agents — run the agent here, land the effects there
-_Running an agent on your own machine means your machine is what it touches. Sometimes that is exactly_
+_The design behind this epic is [docs/designs/remote-agents.md](../designs/remote-agents.md)._
 - [C-705 — Tool activity crosses the A2A wire](C-705-tool-activity-crosses-the-a2a-wire.md) · Core · C-686's review: flux-server's StreamSink implements text_delta only, so an attached operator sees prose and never learns which files were read or commands ran
 - [C-706 — A served agent maps a contextId to its task](C-706-a-served-agent-maps-a-contextid-to-its-task.md) · Core · C-686's review: task id IS the session id server-side and find_correlated maps context to session, but nothing exposes it — so a fresh process can only replay history after sending something
 - [C-456 — Two more topologies exist and we do not list them — Anthropic's cloud sandbox, and its self-hosted worker](C-456-the-managed-agent-topologies.md) · Core · ⚠ the second one is C-436 INVERTED: Anthropic keeps orchestration and moves tool execution to infrastructure you control. Same seam as flux-runtime/flux-system, opposite side — which is outside validation that the seam is real, and a row the topologies page cannot honestly omit
 - [C-457 — Could flux be the environment worker for someone else's brain? — the one place our envelope plugs into another harness](C-457-flux-as-an-environment-worker.md) · Core · ⚠ an INVESTIGATION with a real product idea inside it. Anthropic's self-hosted sandbox is a polled work queue — outbound HTTPS only, no inbound. A worker claims an item, downloads skills, RUNS THE TOOL CALLS, posts results back. flux is exactly `infrastructure you control` with a policy envelope
 
 ### The road to stable — what must be true before flux is measured rather than built
-_flux has 663 done stories and ~110 open. The open set is not a queue of equal work: **roughly 16_
+_The design behind this epic is [docs/designs/road-to-stable.md](../designs/road-to-stable.md)._
 - [C-342 — The road to stable — what must be true before flux is measured rather than built (epic)](C-342-road-to-stable-epic.md) · Core · STABILITY EPIC — ~16 of 110 open stories block a credible stable claim; the other ~94 are capability stability does not depend on. The real blocker is not the bug count but the published API surface: C-337 records a scheduled breaking window and carries zero implementation stories
 - [C-402 — Nothing lists or prunes `~/.flux/worktrees`, so a stranded worktree is silent and unbounded](C-402-nothing-lists-or-prunes-the-worktree-parent.md) · Core · split out of C-391, which proved the leak exists in production rather than only in tests. C-391 fixed where the *test* write lands; it deliberately did not touch the production paths, because for a real user those directories are the product of an operation they asked for and hold real work — removing them automatically would be wrong. What is missing is visibility, not cleanup
 - [C-406 — Five epic slugs carry open stories with no tracker story, and twenty-two have no roadmap narrative](C-406-the-board-has-epics-with-no-tracker-and-no-narrative.md) · Core · found by a mechanical audit of all 862 stories on 2026-08-01. The board is internally consistent — no malformed frontmatter, no duplicate ids — but the epic layer has drifted: `network-primitives` has 5 open stories and no tracker at all, and ~50 open stories sit under epics the roadmap never describes
 
 ### Pause and resume a live run
-_Watching an agent work is only half of control. The other half is being able to say *stop* — to read_
+_The design behind this epic is [docs/designs/run-control.md](../designs/run-control.md)._
 - [A-140 — Pause a live run from the TUI, and continue it](A-140-pause-a-live-run.md) · Agent · ⚠ flux already suspends three ways — `await`/journeys, ParkedAsk, and approval — but ALL are cooperative and declared in advance. This is operator-initiated: stop now, wherever you are. Approval is the mechanism to extend: it already proves the runtime can hold a turn mid-flight without losing state
 
 ### The secret the agent never sees — flux's redaction against Anthropic's substitution
-_Anthropic's [Vaults](https://platform.claude.com/docs/en/managed-agents/vaults) solve the same problem_
+_The design behind this epic is [docs/designs/secrets-the-agent-never-sees.md](../designs/secrets-the-agent-never-sees.md)._
 - [C-458 — Give the agent a placeholder, not the secret — splice the real value in at the guarded send](C-458-substitute-at-egress.md) · Core · ⚠ prevention instead of containment. flux's three known secret bugs — C-339 (redaction fails OPEN), C-432 (cannot redact what it was never told), D-234 (a Debug impl prints it) — are all containment failures and NONE is expressible in a substitution model. Feasibility crux verified: flux has one egress GUARD but not one egress SENDER
 - [C-460 — Rotating a secret means a restart, and nothing records which secret was used where](C-460-rotation-revocation-audit.md) · Core · the operational half. Vaults re-resolves credentials periodically so `rotation, archival, or deletion propagates to running sessions without a restart`, and archiving `purges the secret; records are retained for auditing`. flux resolves once at load and keeps no record
 
 ### Security assurance — close the gap between the envelope and its proof
+_The design behind this epic is [docs/designs/security-assurance.md](../designs/security-assurance.md)._
 - [C-414 — No fuzzing anywhere in the tree, on any parser or wire surface](C-414-no-fuzzing-anywhere-in-the-tree.md) · Core · F8 of the 2026-08-01 security-posture review at 0.47.1, LOW-MEDIUM. L-119 already scopes raw-text fuzzing for the flux-lang parser front-end; this story is the tree-wide question — the plugin NDJSON wire, the manifest deserialiser and the channel payload paths have no equivalent
 
 ### Session screencast — render a recorded run as a terminal cast
-_Demos, docs and blog posts need to *show* flux working. Today the only way to get that is to point a_
+_The design behind this epic is [docs/designs/session-screencast.md](../designs/session-screencast.md)._
 - [C-421 — `flux tui` cannot be given a task — every demo opens with someone typing](C-421-tui-takes-a-task-from-the-cli.md) · Core · `Commands::Tui` takes only AgentFlags (crates/flux-cli/src/args.rs:298) while `run` and `app run` both take a positional prompt — the TUI is the outlier. Small on its own; it is what makes a demo scriptable, and therefore re-recordable
 - [C-422 — Rebuild a session's visual timeline from the durable log — and say honestly what cannot be rebuilt](C-422-the-render-projection.md) · Core · the epic's real work and its real risk. The TUI's durable→screen path is 100 lines handling FIVE observation kinds (crates/flux-tui/src/projection.rs) against TWENTY-SIX live UiEvent variants. The data is largely on disk; the projection is not. Gates C-423
 - [C-424 — A cast leaves the machine — redact the rendered frames, not just the recorded payloads](C-424-a-cast-is-a-publishing-act.md) · Core · the epic's safety story, deliberately NOT folded into C-423. `flux replay`'s output stays local; a cast's whole purpose is to be published, and C-339 already found redaction failing OPEN in this codebase. Rendering is a second chance to leak: a secret can be absent from a payload and present in a wrapped, ANSI-styled frame reassembled from it
 
-### Session Truth
+### Agents and operators can inspect the durable truth of a session
+_Its history was written down in [C-589](../stories/C-589-session-truth-and-self-inspection-epic.md), which stays the narrative record._
 - [C-589 — Agents and operators can inspect the durable truth of a session (epic)](C-589-session-truth-and-self-inspection-epic.md) · Core · s_2013 executed a real task-child uninstall, then later turns falsely denied it because chat context omitted execution provenance
 - [C-590 — Query and inspect one session through CLI and agent operations](C-590-session-query-cli-and-operations.md) · Core · one redacted bounded projection backs --id/--json, flux session inspect and session.list/session.inspect
 - [C-591 — Preserve verified execution provenance across turns](C-591-preserve-verified-execution-provenance-across-turns.md) · Core · a later turn must not infer 'nothing ran' from conversational context that omitted task-child events
 
 ### The SIP channel — flux answers the phone, and places calls
-_A phone call is the oldest and widest channel there is. Giving flux an inbound number — it answers,_
+_The design behind this epic is [docs/designs/sip-channel.md](../designs/sip-channel.md)._
 - [D-225 — One SIP channel, two localities — the same program runs against a local process or a hosted exchange](D-225-one-sip-channel-two-localities.md) · Agent · the seam, and it is NOT blocked. ⚠ Neither locality may become mandatory — ecosystem.md: `flux must never require flux-exchange`; C-399: `flux must be able to do this locally as dev without depending on a service — that is the local-first principle, not a convenience`. Rooms already prove the pattern: one `room` channel, three backends
 - [D-226 — Inbound — flux answers, and the caller is `Untrusted` because caller ID proves nothing](D-226-inbound-a-caller-is-untrusted.md) · Agent · ⚠ SIP `From` headers are trivially forged — caller ID is a claim, not an authentication. This is exactly what C-416 asks every adapter to declare, and C-408's `unauthenticated_participant` is the constructor to reuse. The SEMANTICS are settleable now even though the wiring (D-225) is blocked upstream
 - [D-227 — Outbound — placing a call bills money and rings a human, so it is an approval-gated effect with a destination allowlist](D-227-outbound-a-call-is-an-effect-that-costs-money.md) · Agent · ⚠ the toll-fraud story. A model that can choose a dialled number is a premium-rate fraud vector, and the failure is financial and fast. The destination allowlist is the telephone analogue of guard_url_scoped — and must not be softened for ergonomics
@@ -277,15 +287,19 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [D-231 — The remote backend — flux-exchange terminates the call, flux exchanges channel events](D-231-the-remote-sip-backend.md) · Agent · the hosted half. By ecosystem.md's own mechanical test the exchange owns this — it `terminates channels` and owns whatever `requires holding a credential or knowing a tenant`, and a SIP trunk is both. ⚠ Consumes C-399, whose ownership was already decided in exactly this direction
 
 ### The substrate seam: what crosses it, and who may compose it
+_The design behind this epic is [docs/designs/the-substrate-seam.md](../designs/the-substrate-seam.md)._
 - [C-689 — DNS resolution follows the selected substrate](C-689-dns-resolution-follows-the-selected-substrate.md) · Core · HostResolver exists as a test seam inside net.rs but never reaches the port, so the coordinator resolves names the substrate will dial — a cluster name resolves to the wrong answer or none
 
 ### Tool-output rendering — a correct, legible transcript card pipeline
+_The design behind this epic is [docs/designs/tool-output-rendering.md](../designs/tool-output-rendering.md)._
 - [C-532 — Carry both faces of a ToolResult to surfaces; yank copies canonical content](C-532-carry-both-faces-of-a-tool-result-to-surfaces.md) · Core · run_call flattens view into content at the sink boundary; yank copies line-numbered views
 
 ### Tui Board Surface
+_Filed by the C-742 migration: 5 stories carried `epic: tui-board-surface` with no document behind it._
 - [C-661 — TUI /task starts a sub-agent, with @ references for files and agents](C-661-tui-task-starts-a-sub-agent-with-references-for-files-and-agents.md) · Core
 
-### Unattended run integrity — surviving provider transport failure, and being honest when you don't
+### Unattended run integrity — survive provider transport failure, and be honest when you don't
+_The design behind this epic is [docs/designs/unattended-run-integrity.md](../designs/unattended-run-integrity.md)._
 - [C-229 — Unattended run integrity — survive provider transport failure, and be honest when you don't (epic)](C-229-unattended-run-integrity-epic.md) · Core · three separately-filed stories are one failure at three depths — a provider bug, no resume, and no way to tell a dead turn from a live one; C-228 must be DIAGNOSED before C-227 is designed, or the retry masks a deterministic codec bug as a flaky network
 - [C-228 — Gemini 3.x over OpenRouter drops the stream mid-exploration, reproducibly](C-228-gemini-3x-over-openrouter-drops-the-stream-mid-exploration.md) · Core · gemini-3.6-flash and gemini-3.5-flash both die with `stream closed before completion` during exploration at 12-21k ctx; gemini-2.5-flash (no reasoning stream) survives the same workload — points at reasoning-delta handling on the Messages path, not at OpenRouter generally
 - [C-227 — A dropped provider stream ends the whole turn — no automatic resume for a transport-class failure](C-227-no-automatic-resume-on-transport-class-provider-failure.md) · Core · `stream closed before completion` mid-exploration kills a 34-step run outright; flux has `--continue` but nothing retries, so long headless runs are a coin flip on provider transport
@@ -325,9 +339,11 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [I-01 — Statistically clean self-improvement headline gain (trials ≥ 3)](I-01-headline-gain.md) · Improve · DE-PRIORITIZED 2026-07-06 (user call — focus shifts to hardening/docs/cleanup; resume via I-05's queued fixes first); offline half done; 2026-07-02 calibration VERDICT — the synthetic suite is stable but SATURATED (Sonnet 4.6 AND Haiku 4.5 via OpenRouter both score 1000/1000, mean_iters 1.0, twice) → zero headroom, it is a regression floor not a gain vehicle; the headline gain must come from terminal-bench (tb + Docker + musl all present; OpenRouter key forwards into the container) — full loop run postponed by user 2026-07-02
 
 ### The agent-authored surface — panes the model opens, config it can safely change
+_The design behind this epic is [docs/designs/agent-authored-surface.md](../designs/agent-authored-surface.md)._
 - [C-527 — ui.display — show the user a file, diff, flow or artifact by reference](C-527-ui-display-reference-first-user-presentation.md) · Core · The agent should point at what it already made; it must not spend context reconstructing a file, diff or flow merely to show it to the user
 
-### Agent change recovery and provenance — 2026-08-01
+### Agent change recovery and provenance — know what you changed, and be able to take it back
+_The design behind this epic is [docs/designs/agent-change-recovery-and-provenance.md](../designs/agent-change-recovery-and-provenance.md)._
 - [C-382 — Agent change recovery and provenance — know what you changed, and be able to take it back (epic)](C-382-agent-change-recovery-and-provenance-epic.md) · Agent · EPIC — 15 git ops and no history-preserving undo; write receipts are pre-dispatch and content-blind; every read-only git observer is refused the evidence phase; the transcript datasource is built and reachable from no shipped assembly
 - [C-383 — git_uncommit — a history-preserving undo for an unpushed HEAD](C-383-git-uncommit-history-preserving-undo.md) · Agent · the model-facing family has 15 git ops and no mixed-reset equivalent; git_revert appends an inverse commit, and the only git_reset in the repo is flux-eval's Risk::Destructive reset --hard + clean -fd, which destroys the patch
 - [C-384 — Record success-time, content-anchored write receipts](C-384-success-time-content-anchored-write-receipts.md) · Agent · the only path-anchored durable record is the PRE-dispatch tool_call observation, so a failed edit is indistinguishable from a successful one; no blob or hunk identity, and the model-facing reader sees the in-process log only
@@ -339,11 +355,13 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [C-390 — Collapse the timed-pane authoring pattern in the docs and the shipped demo flow](C-390-collapse-the-timed-pane-authoring-pattern.md) · Language · LANG-01 does NOT validate as a language gap — the collapsed `each` over a frame table with a nested `loop for …, every:` parses, lowers and RUNS correctly today (executed during validation). The verbosity is one hand-unrolled demo flow and a missing docs row
 
 ### Agent fleet runtime — addressing, lifecycle and discovery for a fleet of agents
+_The design behind this epic is [docs/designs/agent-fleet-runtime.md](../designs/agent-fleet-runtime.md)._
 - [A-123 — A later NDJSON transport can attach foreign CLI workers to AgentRuntime](A-123-ndjson-transport.md) · Agent · Decision 0010 excludes direct Claude/Codex process workers from native fleet V1; they are CLI clients now, and this remains a later transport story
 - [A-127 — Roles carry an address — one delegation vocabulary, local or remote](A-127-roles-carry-an-address.md) · Agent · ⚠ cap_scope is enforced by constructing the child registry IN-PROCESS; across the wire it becomes a request, not an enforcement — that divergence must be surfaced, never silently trusted
 - [A-128 — Fleet monitor journey over the shipped worker lifecycle](A-128-fleet-lifecycle-ops-and-monitor.md) · Agent · C-243 shipped fleet.start/worker_status/stop; the remaining headline proof joins discovery, dispatch/task status and worker liveness in one offline monitor journey
 
-### explicit agent-loop harnesses, progress and hierarchical budgets
+### Every agent starts under an explicit loop harness
+_The design behind this epic is [docs/designs/agent-loop-harnesses.md](../designs/agent-loop-harnesses.md)._
 - [C-567 — Fleet workers use assignment-selected operator-authored loops](C-567-run-codex-fleet-writers-as-fresh-workhorses.md) · Core · postponed convenience policy — configured sub-agents can already select operator-authored loops through C-569
 - [C-571 — Fleet budgets reserve and settle across fleet, wave, task, agent and loop](C-571-hierarchical-fleet-budget-ledger.md) · Core · narrow-only hierarchical targets/limits with durable reservation, idempotent settlement, warnings and resumable exhaustion
 - [C-572 — Fleet review and rework run under explicit reviewer and repair loops](C-572-fleet-review-and-rework-loops.md) · Core · fresh tool-free review over story contract + exact diff; typed PASS/REWORK/PARK; repair resumes the writer loop and the host keeps the two-round ceiling
@@ -352,79 +370,80 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [C-688 — A start-path census pins the resolved loop binding](C-688-a-start-path-census-pins-the-resolved-loop-binding.md) · Core · C-569 shipped the contract but no test fails when a new start path skips the funnel; a re-pointed census exists on fleet/wave-299/flux/story/C-569
 
 ### Watch the agent think — the loop as a live thread, expandable down to the graph
-_flux's central claim is that **the LLM is not the runtime** — authored control flow and a deterministic_
+_The design behind this epic is [docs/designs/agent-loop-visibility.md](../designs/agent-loop-visibility.md)._
 - [A-139 — The loop view must not become the bottleneck or the liar — bounded redraw, honest elision](A-139-the-loop-view-under-load.md) · Agent · a fast loop emits events faster than a terminal can usefully redraw, and sub-agent fan-out multiplies it. ⚠ The failure mode is a view that silently drops steps — which in a demo reads as flux doing less than it did
 
-### Agent-native Flux documentation
-_`flux docs` already serves the documentation bundled with the running binary, and generated Flux_
+### Agent-native Flux documentation — release-matched answers through a datasource
+_The design behind this epic is [docs/designs/agent-native-flux-docs.md](../designs/agent-native-flux-docs.md)._
 - [C-578 — Agent-native Flux documentation — release-matched answers through a datasource (epic)](C-578-agent-native-flux-documentation-epic.md) · Core · EPIC — Flux questions activate a bounded built-in docs datasource instead of relying on model memory, arbitrary checkout reads or web search
 - [C-579 — Build the release-matched Flux documentation datasource](C-579-build-the-release-matched-flux-docs-datasource.md) · Core · derive deterministic topic/page/section records from the same committed public-doc source and bind them to the Flux release and corpus digest
 - [C-580 — Expose bounded Flux documentation retrieval through datasource operations](C-580-expose-bounded-flux-docs-retrieval-operations.md) · Core · register flux-docs in complete agent assemblies and reuse sources/search/get/list/relation/batch_get; topic overview is a projection, not a second backend
 - [C-581 — Surface Flux documentation for questions about Flux itself](C-581-surface-flux-docs-for-self-directed-questions.md) · Agent · intent-aware activation for Flux commands, configuration, Agent-Loop, Flux-Lang, Board/Fleet, SDK and safety without polluting unrelated turns
 
-### Approval Distillation
+### Approval distillation — the policy that learns from the audit trail
+_Its history was written down in [C-94](../stories/C-94-approval-distillation-epic.md), which stays the narrative record._
 - [C-94 — Approval distillation — the policy that learns from the audit trail (epic)](C-94-approval-distillation-epic.md) · Core · EPIC — mine the event store's approve/deny history into proposed durable policy grants; attacks approval fatigue without weakening default-deny
 
-### Architectural simplification — fewer paths, smaller modules, honest boundaries
+### Architectural simplification — fewer assembly paths, smaller modules, less compatibility debt
+_The design behind this epic is [docs/designs/architectural-simplification.md](../designs/architectural-simplification.md)._
 - [C-337 — Architectural simplification — fewer assembly paths, smaller modules, less compatibility debt (epic)](C-337-architectural-simplification-epic.md) · Core · EPIC — simplify inside the existing L0–L6 boundaries: one safe execution-environment assembly path, expired compatibility APIs removed, subsystem-sized files split into modules, and crate ownership re-audited
 
-### Assurance lane residuals — 2026-08-01
+### Assurance lane residuals — a declared lane that has never run is not a lane
+_The design behind this epic is [docs/designs/assurance-lane-residuals.md](../designs/assurance-lane-residuals.md)._
 - [C-358 — Assurance lane residuals — a declared lane that has never run is not a lane (epic)](C-358-assurance-lane-residuals-epic.md) · Core · EPIC — ASSURE-01 split lane by lane: SAST/Miri/attestation are historical-fixed, fuzzing and sanitizers are still absent, and Miri + corpus-deep + the weekly dependency audit have NEVER executed (all runs are event=push)
 - [C-359 — Triage the open critical CodeQL alerts and make the lane gate](C-359-triage-codeql-critical-alerts-and-gate-the-lane.md) · Core · 13 open critical rust/hard-coded-cryptographic-value alerts (10x flux-plugin/src/host.rs, 2x rooms/xmpp/mod.rs, 1x plugins/sql/src/main.rs), untriaged, on a job that succeeds regardless of findings
 - [C-360 — Prove every scheduled assurance lane actually executes](C-360-prove-scheduled-assurance-lanes-execute.md) · Core · Miri and corpus-deep have never run (0 schedule/dispatch events); security-audit.yml's weekly cron has never fired across 43 runs, all event=push. Three declared lanes, zero executions
 - [C-361 — Add a coverage-guided fuzz lane with a persistent corpus](C-361-add-a-coverage-guided-fuzz-lane.md) · Core · no fuzz/ dir, no cargo-fuzz, no arbitrary, no seed corpora — the 'adversarial corpus' is a seeded deterministic generator over committed fixtures and keeps nothing it finds
 - [C-362 — Add a sanitizer lane over the unsafe-adjacent seams](C-362-add-a-sanitizer-lane.md) · Core · no -Zsanitizer flags anywhere in the repo; ASan/TSan/MSan is the other limb of ASURE-01 that no addition has touched
 
-### Batched inputs for repeatable observation operations
-_An agent often asks the same read-only operation about several independent inputs. If the operation_
+### Batched operation inputs — fewer calls for repeatable observations
+_The design behind this epic is [docs/designs/batched-operation-inputs.md](../designs/batched-operation-inputs.md)._
 - [C-584 — Batched operation inputs — fewer calls for repeatable observations (epic)](C-584-batched-operation-inputs-epic.md) · Core · EPIC — let measured read-only operations accept bounded arrays when one call preserves semantics; never batch writes by schema accident
 - [C-585 — Let git_diff inspect multiple paths in one operation call](C-585-git-diff-accepts-multiple-paths.md) · Core · make path a bounded string-or-array and invoke one fixed git diff argv with exact per-path permission subjects
 - [C-586 — Mine Flux operation history for safe array-input candidates](C-586-mine-operation-history-for-batchable-inputs.md) · Improve · content-free SQLite census of repeated call shapes, live schemas and operation semantics; distinguish missing batching from unused batching
 
-### Connector-backed storage — one registry, two safe facades
-_The hosted connectors platform needs ordinary customer storage and credential storage to be_
+### Connector-backed storage — one registry, safe object and credential facades
+_The design behind this epic is [docs/designs/connector-backed-storage-facade.md](../designs/connector-backed-storage-facade.md)._
 - [D-221 — Connector-backed storage — one registry, safe object and credential facades](D-221-connector-backed-storage-facade-epic.md) · Core · EPIC — account-scoped named stores with per-capability defaults; platform-managed S3 for objects, Vault/1Password for credentials, and connector declarations driving both without exposing secrets
 
-### Connector Channels
+### The generic `connector` channel kind — one arm instead of one adapter per vendor
+_Its history was written down in [D-215](../stories/D-215-connector-channel-kind-epic.md), which stays the narrative record._
 - [D-215 — The generic `connector` channel kind — one arm instead of one adapter per vendor (epic)](D-215-connector-channel-kind-epic.md) · Agent · EPIC — build_channels is a closed match with one arm per vendor, and the slack arm's last act is to hand-build a chat.postMessage that flux-connectors already compiles. A channel binding is DATA: transport + verification + payload map + a reply operation. Reading it retires 217 lines of vendor Rust and makes the next vendor zero
 - [D-217 — A channel can call an operation — `Deliverer::call_operation` through the full safety envelope](D-217-channel-reply-through-the-executor.md) · Agent · the crux: Channel::start gets ONE seam, `Arc<dyn Deliverer>`, whose only method is deliver() — so a channel that wants to answer an event has to open its own client, which is exactly what adapters/slack.rs does at :150-161. That is a second, unpoliced request path inside the process
 - [D-218 — The binding's reply is the connector Tool pack's operation — delete the hand-built `chat.postMessage`](D-218-reply-through-the-connector-tool-pack.md) · Agent · adapters/slack.rs:150-154 constructs a chat.postMessage from channel/text/thread_ts — the three body params of an operation flux-connectors compiles, declared in slack.toml as `operation = \"slack-chat-post-message\"` plus a two-entry bind map. This story is where that Rust stops existing
 - [D-219 — Who may trigger this agent stays operator config — allow-lists keyed on the binding's payload symbols](D-219-operator-allow-lists-over-payload-symbols.md) · Agent · allow_users/allow_channels are a DEPLOYMENT policy about who may wake an agent; a vendor spec cannot know them and a connector upgrade must not be able to change them. Generalise them without moving them into the manifest — the keys are payload symbols the binding declares, the values are this deployment's ids
 - [D-220 — Socket Mode becomes a transport under the binding driver — the last 40 lines of the Slack adapter](D-220-slack-socket-as-a-transport.md) · Agent · a WebSocket handshake is a vendor protocol and no manifest can describe one, so the slack-morphism dependency does not vanish — but everything ABOVE the connection does. This is what makes 'slack.rs can be deleted' honest instead of a claim that quietly costs operators their NAT-friendly deployment
 
-### Connector Native Integrations
+### Connector-native integrations replace the official plugin fleet
+_Its history was written down in [C-500](../stories/C-500-connector-native-integrations-epic.md), which stays the narrative record._
 - [C-504 — Prove each legacy adapter through Exchange before deletion](C-504-prove-local-and-exchange-connector-parity.md) · Core · a reusable frozen-fixture harness compares each legacy plugin with its Exchange connector replacement before that plugin is deleted
 - [C-505 — Retire every official native integration crate after Exchange proof](C-505-retire-official-native-integration-crates.md) · Core · remove each of the 18 vendor adapters when its Exchange replacement passes C-504; no local fallback and no big-bang deletion
 - [C-506 — Remove plugin support and distribution from Flux](C-506-move-or-retire-plugin-support-infrastructure.md) · Core · after the last adapter cutover, delete plugin host/install/index and every archive/sign/upload path; CI rejects their return
 
-### Connector Platform
+### The connectors seam — a vendor credential flux is structurally unable to hold
+_Its history was written down in [C-420](../stories/C-420-connector-platform-epic.md), which stays the narrative record._
 - [C-420 — The connectors seam — a vendor credential flux is structurally unable to hold (epic)](C-420-connector-platform-epic.md) · Core · tracker filed 2026-08-01 by a board audit. ⚠ Seven of its eight stories are DONE and the epic had no narrative anywhere — no tracker, no design, no roadmap entry — so the credential boundary, one of flux's central invariants, was recorded only inside the stories that built it
 
 ### Context-local Git worktrees
-_Agents that mutate a repository while the user (or another agent) works in the same checkout step on_
+_The design behind this epic is [docs/designs/context-local-git-worktrees.md](../designs/context-local-git-worktrees.md)._
 - [C-525 — Tell the model its confinement and worktree topology, then expose native worktree operations](C-525-surface-confinement-and-native-worktree-operations.md) · Core · No trial-and-error escape probes: inject proven sandbox/worktree facts before the first turn and manage linked worktrees through guarded Git ops
 
 ### knowledge datasource — a real RAG layer
-_`flux-capabilities::datasource` today is an **in-memory keyword TF index** + a `search` tool. A_
+_The design behind this epic is [docs/designs/datasource-rag.md](../designs/datasource-rag.md)._
 - [C-592 — Search every RFC from a fast local indexed datasource](C-592-rfc-editor-indexed-datasource.md) · Core · mirror the RFC Editor corpus into a versioned local cache; search/get/list are offline and never crawl one RFC per query
 
 ### Delivery Is Verified
+_Filed by the C-742 migration: 24 stories carried `epic: delivery-is-verified` with no document behind it._
 - [C-720 — A reclaimed wave must prove its worktrees and build output are gone](C-720-a-reclaimed-wave-must-prove-its-worktrees-and-build-output-are-gone.md) · Core · flux fleet reclaim printed 'reclaimed 39 wave(s)' and exit 0 while freeing 0 bytes: 39G of worktrees, 34 directories and 72 fleet branches all survived, and fleet doctor still reported the same 36 branch-without-unique-work findings whose prescribed fix is that exact command
 - [C-731 — A fleet service the TUI can call without depending on the CLI](C-731-a-fleet-service-the-tui-can-call-without-depending-on-the-cli.md) · Core · board_fleet_cmd.rs is 24973 lines holding the whole Fleet product, and flux-tui is forbidden from depending on flux-cli (C-518), so the TUI cannot reuse any of it. flux-cli currently reaches UP to L6 to implement flux_tui::operations::FleetBoardSource in a 692-line impl, which is the dependency backwards: the surface owns the port and its only implementation lives in a binary crate nothing may depend on. Extract a new internal crate flux-fleet at L3 holding the view types and the port, so both flux-cli and flux-tui call it. Plan at ~/.claude/plans/fizzy-baking-owl.md
 - [C-733 — A member's canonical_ref must be a ref the fleet can write](C-733-a-member-s-canonical-ref-must-be-a-ref-the-fleet-can-write.md) · Core · connectors and exchange declare canonical_ref = origin/main, a remote-tracking ref no fleet operation can write. apply cannot reach it, promote refuses it by name, and C-721 reports both members' waves as applied-without-delivery. Decision 0021 section 2 says board validation must refuse the combination rather than accept it and silently under-deliver. Needs the config change plus the validation, and the website example config carries the same mistake
 - [C-734 — A worker turn produces structured reflection the fleet can learn from](C-734-a-worker-turn-produces-structured-reflection-the-fleet-can-learn-from.md) · Core · C-587 built the review half of its story and deliberately ticked no acceptance box, because every item is a compound review-and-reflection claim and only review is true. Outstanding: the AgentReflection/v1 document, the bounded worker-transcript packet it is derived from, the central improvement projection, and flux fleet insights. Review judges one candidate; reflection is how the fleet gets better at producing them
-- [C-738 — Creating a story generates the template and refuses a ready story with no contract](C-738-creating-a-story-generates-the-template-and-refuses-a-ready-story-with-no-contract.md) · Core
-- [C-739 — Acceptance criteria are addressable and carry their own verification handle](C-739-acceptance-criteria-are-addressable-and-carry-their-own-verification-handle.md) · Core
-- [C-740 — An unresolved question blocks the ready transition](C-740-an-unresolved-question-blocks-the-ready-transition.md) · Core
-- [C-741 — A story declares its kind and is validated as that kind](C-741-a-story-declares-its-kind-and-is-validated-as-that-kind.md) · Core
-- [C-742 — An epic is one entity with its own measurable contract](C-742-an-epic-is-one-entity-with-its-own-measurable-contract.md) · Core
-- [C-743 — The integrator composes the wave's changelog entry](C-743-the-integrator-composes-the-wave-s-changelog-entry.md) · Core
-- [C-744 — A glossary the fleet's agents are held to](C-744-a-glossary-the-fleet-s-agents-are-held-to.md) · Core
 - [C-745 — A story already implemented on a live branch is not re-dispatched](C-745-a-story-already-implemented-on-a-live-branch-is-not-re-dispatched.md) · Core
 - [C-746 — branch-without-unique-work prescribes a fix that cannot act on it](C-746-branch-without-unique-work-prescribes-a-fix-that-cannot-act-on-it.md) · Core
 - [C-747 — A branch retained as durable storage says so where a reaper can read it](C-747-a-branch-retained-as-durable-storage-says-so-where-a-reaper-can-read-it.md) · Core
 
-### Egress pinning and confinement residuals — 2026-08-01
+### Egress pinning and confinement residuals — pin every outer adapter, not just the reviewed ones
+_The design behind this epic is [docs/designs/egress-pinning-and-confinement-residuals.md](../designs/egress-pinning-and-confinement-residuals.md)._
 - [C-345 — Egress pinning and confinement residuals — pin every outer adapter, not just the reviewed ones (epic)](C-345-egress-pinning-and-confinement-residuals-epic.md) · Core · EPIC — NET-01/NET-02/PROC-01/PROC-02 all validate as historical-fixed, but the fix was applied per REVIEWED adapter; three unreviewed egress paths still resolve twice, one while carrying a credential
 - [C-346 — Pin A2A push-notification delivery to the addresses its guard vetted](C-346-pin-a2a-push-notification-delivery.md) · Core · the NET-01 shape on a path that ships X-A2A-Notification-Token — guarded but unpinned, on a shared pooled client with no no_proxy(); C-59 claims this is closed and it is not
 - [C-347 — Pin or explicitly bound browser (CDP) egress, and make its audit record name the address dialled](C-347-pin-browser-cdp-egress.md) · Core · model-facing web.browser guards the URL and lets Chrome resolve again; a THIRD resolution writes the audit record, so the audit can disagree with what was contacted. C-77 recorded this residual and no follow-up story was ever filed
@@ -434,21 +453,23 @@ _`flux-capabilities::datasource` today is an **in-memory keyword TF index** + a 
 - [C-351 — Bound eval_run's model-reachable surface and bind it to session confinement](C-351-bound-eval-run-model-reachable-surface.md) · Core · the C-258 fix holds — flux_bin is rejected and credentials are allow-listed — but the schema has no additionalProperties:false, so trials/concurrency/timeout_secs/members are model-reachable and trials has a floor with NO ceiling
 
 ### Evidence-pinned memory — cross-session memory with provenance
+_The design behind this epic is [docs/designs/evidence-pinned-memory.md](../designs/evidence-pinned-memory.md)._
 - [A-108 — memory_note — the op whose citation the model cannot supply, forge, or omit](A-108-memory-note-op-host-stamped-citation.md) · Agent · the epic's load-bearing invariant: the model supplies the claim, the HOST supplies the receipt + git SHA + paths — same property that makes ActionBatch trustworthy (staged.rs:203)
 - [A-109 — Inject memory as ContextBlocks with git-pin staleness computed at turn assembly](A-109-memory-injection-and-staleness.md) · Agent · stale entries are STILL injected, marked stale='true' with the reason — dropping them silently loses real knowledge; reuses the A-21-hardened, A-24-budgeted <knowledge-base> seam rather than a second injection path
 - [A-110 — flux memory list/show/forget — the inspect surface and the --stale review queue](A-110-flux-memory-cli.md) · Agent · `--stale` is the maintenance loop — the review queue for knowledge whose evidence moved; flux never silently forgets on the agent's behalf, pruning is a user verb
 
 ### Explore, then freeze — ad-hoc browser testing that becomes a deterministic script
-_Ask an agent: *"go to site X, log in, then test the happy path of module U."* It explores — misreads a_
+_The design behind this epic is [docs/designs/explore-then-freeze.md](../designs/explore-then-freeze.md)._
 - [C-433 — A distilled sequence of clicks is automation, not a test — what the agent verified has to survive freezing](C-433-a-frozen-script-asserts.md) · Core · ⚠ the epic's worst failure mode: a green suite that asserts nothing is worse than no suite, because it is trusted. 'Test the happy path' means checking something; a frozen click sequence proves only that the clicks did not error
 - [C-434 — The worked recipe — explore a real site, freeze it, run the frozen script in CI](C-434-the-e2e-recipe.md) · Core · this epic's proof and a member of the flux-recipes family (C-427's contract applies). Filed under explore-then-freeze so it is not orphaned if that epic re-sequences. ⚠ Needs a target that can be committed — a public demo app, not a production login
 
-### Design record: first-class board split
+### First-class boards have explicit scope, profile, backend and planning documents
+_The design behind this epic is [docs/designs/first-class-board.md](../designs/first-class-board.md)._
 - [A-115 — JiraBoard through Exchange-governed operations, with a configurable status↔state mapping](A-115-jira-board.md) · Agent · re-pointed by Decision 0006: the vendor mapping is a connector board member and every write an admitted Exchange operation — the plugin path this was written over is deleted by Milestone 5; the status↔State mapping stays config, not code
 - [A-118 — GitlabBoard — a second Exchange-governed tracker proves the WorkBoard port generalizes](A-118-gitlab-board.md) · Agent · re-pointed by Decision 0006 away from plugins/gitlab (Milestone 5 deletes the plugin path); deferrable — its value is the proof that WorkBoard is not 'Jira with a trait on top'
 
 ### First-class hosts
-_The substrate abstraction already exists — `flux-system` owns the guarded port, `flux-codegate`_
+_The design behind this epic is [docs/designs/first-class-hosts.md](../designs/first-class-hosts.md)._
 - [C-676 — A kubernetes binding resolves to a served pod substrate](C-676-a-kubernetes-binding-resolves-to-a-served-pod-substrate.md) · Core · Decision 0018 rule 3: compose the delivered remote protocol with the C-480 artifacts; today HostBackend::Kubernetes is 'unwired (selection fails closed)'
 - [C-678 — End users see only host bindings granted to them](C-678-end-users-see-only-host-bindings-granted-to-them.md) · Core · Decision 0018 rule 4's second sentence is unimplemented across the flux host surface; C-654's review measured the gap
 - [C-679 — The remote client bounds every response it decodes](C-679-the-remote-client-bounds-every-response-it-decodes.md) · Core · the server caps requests (MAX_REQUEST_BYTES); the client caps nothing — response.json() on the wire answer and the handshake are unbounded
@@ -463,14 +484,15 @@ _The substrate abstraction already exists — `flux-system` owns the guarded por
 - [C-707 — The agent can propose a host binding it may not grant itself](C-707-the-agent-can-propose-a-host-binding-it-may-not-grant-itself.md) · Core · C-649 shipped only the read half of host.*; add/rm are CLI-only, so an operator cannot say `configure access to my cluster` and have it done
 - [C-708 — A host declares a two-part locus and egress composite binding](C-708-a-host-declares-a-two-part-locus-and-egress-composite-binding.md) · Core · Decision 0020 rules 5-10: composite declared in configuration, indivisible locus, selectable egress with resolution following it, two-part SubstrateIdentity, whole-composite grant deny-by-default, confinement claim is the weaker part
 
-### Design record: fleet coordinator foundations
+### Remote fleet transports extend the native local coordinator later
+_The design behind this epic is [docs/designs/fleet-coordinator.md](../designs/fleet-coordinator.md)._
 - [A-111 — Remote fleet transports extend the native local coordinator later (epic)](A-111-fleet-coordinator-epic.md) · Agent · Decision 0010 moved the product coordinator to C-239/A-117 and local Flux sub-agents; this epic now holds later remote/A2A extensions only
 - [A-132 — A run-routed `Bus::emit` silently drops its event when the supervisor queue is full — decide the semantics and make them observable](A-132-run-routed-emit-drops-on-a-full-supervisor-queue.md) · Agent · filed from A-129's implementor report — pre-existing lossy path, but A-129's admission bound makes a full supervisor queue far more reachable, and `emit` returns `0` for both 'dropped' and 'nobody listening'
 - [A-133 — Startup does not strictly precede bus events under `App::run` — the run lease activates before `Start` completes](A-133-startup-strictly-precedes-bus-events.md) · Agent · filed from A-112's implementor report and still unaddressed — it has been living as a Note on A-129, which explicitly declined it as out of Acceptance
 - [A-135 — A later remote A2A fleet test needs an injectable, guarded transport](A-135-socket-free-fleet-journey-test.md) · Agent · Decision 0010's native local V1 no longer depends on a stub A2A worker; retain this as remote-transport testability work
 
 ### Fleet harness throughput
-_Wave 1 closed the confidentiality holes. This wave is about the thing the operator originally asked_
+_The design behind this epic is [docs/designs/fleet-harness-throughput.md](../designs/fleet-harness-throughput.md)._
 - [C-625 — Board planning mutations commit their writes](C-625-board-planning-mutations-commit-their-writes.md) · Core · an uncommitted implementation (create --no-commit, board_fleet_cmd.rs + board_fleet_cli.rs, 184 insertions) sits in the working tree; finish it under this story and extend to transition/done. Roadmap dogfood needed a git-amend loop per created story.
 - [C-626 — A worker failure carries its own cause, not a sandbox banner](C-626-a-worker-failure-carries-its-own-cause-not-a-sandbox-banner.md) · Core · wave-286 died with no recoverable diagnostic; the real error was the last stderr line under two screens of plugin noise; parse_fleet_agent_events context drops the source error. Cost two waves and an unjustified revert.
 - [C-627 — Admission refuses a loop revision whose source digest changed](C-627-admission-refuses-a-loop-revision-whose-source-digest-changed.md) · Core · three different programs were served as implementation@9; revisions 3 and 5 share one digest; resume reconstruction failed for wave-338/340/350/360
@@ -486,14 +508,15 @@ _Wave 1 closed the confidentiality holes. This wave is about the thing the opera
 - [C-713 — Concurrent story workers do not serialize on one cargo package cache](C-713-concurrent-story-workers-do-not-serialize-on-one-cargo-package-cache.md) · Core · wave-602: a cargo_test took 126s wall against 25s of work, its log full of 'Blocking waiting for file lock on package cache' while the sibling worker built
 
 ### `fleet:init` interviews an operator and writes a working fleet
-_Standing up the fleet in this workspace took many hours across several sessions, and almost none of_
+_The design behind this epic is [docs/designs/fleet-init-interviews-an-operator-and-writes-a-working-fleet.md](../designs/fleet-init-interviews-an-operator-and-writes-a-working-fleet.md)._
 - [C-634 — A public tutorial takes a reader from empty repo to an applied fleet wave](C-634-a-public-tutorial-takes-a-reader-from-empty-repo-to-an-applied-fleet-wave.md) · Core · fleet loop authoring is 100% undocumented and fleet init scaffolds only commented-out TOML; six-lesson series under website/docs/tutorial/fleet/ with website_contract.rs pins and embedded-docs zip in the same commit
 
-### Flow Package Registry
+### Flow package registry — flux flow install
+_Its history was written down in [D-194](../stories/D-194-flow-package-registry-epic.md), which stays the narrative record._
 - [D-194 — Flow package registry — flux flow install (epic)](D-194-flow-package-registry-epic.md) · Language · EPIC — flows/journeys are shareable artifacts with no distribution story; reuse the signed plugin-pack channel (D-46/D-47: signed index, sha256, versioned store) for .flux flow packages: flux flow install <name> fetches into ~/.flux/flows/, flow_list surfaces them, the analyzer runs at install time so a broken pack fails at install
 
 ### Flux-Lang authoring ergonomics — typed protocols, concise data and control
-_Flux can express substantial agent workflows today, but authors pay a ceremony tax whenever a flow_
+_The design behind this epic is [docs/designs/flux-lang-authoring-ergonomics.md](../designs/flux-lang-authoring-ergonomics.md)._
 - [L-131 — Flux-Lang authoring ergonomics — typed protocols, concise data and control (epic)](L-131-flux-lang-authoring-ergonomics-epic.md) · Language · EPIC — provider-neutral types, task contracts, recovery, reusable values, fan-out, collecting loops, structured context, and explicit optional results
 - [L-132 — Structural records, enums, and bounded refinements](L-132-structural-record-enum-and-refinement-types.md) · Language · Name recurring protocol shapes locally: records, optional fields, lists, finite values, and deterministic refinements
 - [L-133 — Typed task result contracts at the Flux boundary](L-133-typed-task-result-contracts.md) · Language · A task returns a validated Flux value or a typed validation failure, independent of provider-native structured output
@@ -506,16 +529,18 @@ _Flux can express substantial agent workflows today, but authors pay a ceremony 
 - [L-140 — First-class Option and Result values for recoverable control flow](L-140-first-class-option-and-result-values.md) · Language · Unify lenient access, optional reads, validation failures, and settled branches under typed exhaustive control flow
 
 ### flux-planner: from trained-and-usable to shippable
+_The design behind this epic is [docs/designs/flux-planner-ship.md](../designs/flux-planner-ship.md)._
 - [L-40 — Re-run the emission A/B with the fine-tuned local model as the text arm](L-40-emission-ab-finetuned-arm.md) · Language · the ONE pre-registered condition allowed to re-open L-20's keep-json decision: a model that natively speaks the text syntax; blocked on flux-model M-15 producing a candidate that passes the ship gate
 
 ### flux recipes — real programs that make the difference click
-_Someone evaluating flux against any other agent sees a feature list and a folder of examples, and has_
+_The design behind this epic is [docs/designs/flux-recipes.md](../designs/flux-recipes.md)._
 - [C-425 — A compact recipe demonstrates the native planning-board surface](C-425-the-flagship-recipe-tracking-as-a-flux-app.md) · Core · Decision 0010 makes tracking a supported product; this later recipe must consume `flux board`, not reimplement Track invariants in a Program
 - [C-426 — Make the determinism claim checkable — the reader runs it, rather than believing it](C-426-the-determinism-proof.md) · Core · BLOCKED on C-425. Deliberately not folded into the flagship: an unverified determinism claim on a page arguing FOR determinism is the worst available failure, and folded in it becomes a README sentence nobody runs. ⚠ Must state precisely which layer the claim covers — model-authored stages are not deterministic, the shape of the run is
 - [C-427 — What makes a recipe a recipe — the contract, and where recipes live](C-427-the-recipe-contract.md) · Core · generalized FROM the flagship, not before it — a recipe contract written with no recipe in hand is speculation. Key property to preserve: examples_validate.rs sweeps the whole directory with no hand-picked list, so a recipe is gated the day it lands
 - [C-429 — The recipes page — argue from the architecture, name no competitor, back every claim with a command](C-429-the-recipes-surface-and-positioning.md) · Core · the artifact the ask is really about, filed LAST because it is worthless without recipes underneath it. ⚠ Compares against the pattern — the transcript as the runtime contract — not against a named product: claims about a competitor's internals cannot be verified from here, age into misrepresentations, and are weaker than a command the reader can run
 
 ### Flux syntax simplification — one way to write each thing
+_The design behind this epic is [docs/designs/flux-syntax-simplification.md](../designs/flux-syntax-simplification.md)._
 - [L-104 — Migrate the corpus to the canonical dialect](L-104-canonical-corpus-migration.md) · Language · P2+P3 — agent-loop.flux, examples/*.flux, doc snippets, skill examples; plus the hand-fixes a formatter can't do (fmt(\"\") noise, fmt-pre-binds)
 - [L-106 — Deprecation diagnostics for every legacy spelling](L-106-legacy-spelling-deprecation.md) · Language · P5a — the strict parser warns (with the canonical replacement) on the nine legacy dimensions; the LSP offers a canonicalize quick-fix
 - [L-107 — Remove the legacy grammar (breaking ⇒ MINOR)](L-107-remove-legacy-grammar.md) · Language · P5b — one release after L-106: the strict parser rejects legacy spellings; the tolerant CST keeps recognizing them for the quick-fix only
@@ -525,10 +550,12 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 - [L-111 — Hot-path ergonomics — match on expressions, else-when chains, multi-value cases](L-111-match-and-when-ergonomics.md) · Language · P9 — removes the `$kind = $step.kind` pre-bind, three-deep when nesting, and duplicated byte-identical case arms visible in agent-loop.flux
 - [L-112 — Syntax consistency batch — verify's message, durations everywhere, named-input order](L-112-syntax-consistency-fixes.md) · Language · P10 — verify grows assert's comma-message; bare-ms numbers deprecated in time positions; decide author-order vs alphabetical named inputs
 
-### Habit Compiler
+### The habit compiler — an automation ratchet from session history to authored Flux
+_Its history was written down in [L-84](../stories/L-84-habit-compiler-epic.md), which stays the narrative record._
 - [L-84 — The habit compiler — an automation ratchet from session history to authored Flux (epic)](L-84-habit-compiler-epic.md) · Language · EPIC — mine recurring plan shapes across sessions into authored composite ops; report how much work migrated from model tokens to the deterministic runtime
 
-### Harness route integrity — 2026-08-01
+### Harness route integrity — the requested route must be runnable, and completion must prove it ran
+_The design behind this epic is [docs/designs/harness-route-integrity.md](../designs/harness-route-integrity.md)._
 - [C-375 — Harness route integrity — the requested route must be runnable, and completion must prove it ran (epic)](C-375-harness-route-integrity-epic.md) · Agent · EPIC — the two 2026-07-31 harness reviews produced ZERO board items; C-255 was scoped to the security reviews only. flow_run has no path parameter, routes to the family described as 'pure deterministic', has no preflight, and nothing binds completion to a route
 - [C-377 — Route the flow ops into a capability family whose description is true of them](C-377-route-flow-ops-into-a-truthful-family.md) · Agent · C-376 makes flow_run's source read metadata truthful, but the three flow operations still have no explicit shared family; virtual_family also still permits a Risk::Medium NonIdempotent op with empty effects to fall into core
 - [C-378 — flow_check — an exact-flow preflight that separates inspectable from executable](C-378-flow-check-exact-flow-preflight.md) · Agent · no preflight of any kind exists; lowering happens inside run_authored_flow AFTER the decision to execute, against the FULL registry, so a flow needing an unsurfaced family lowers cleanly and then fails at dispatch
@@ -537,24 +564,28 @@ _Someone evaluating flux against any other agent sees a feature list and a folde
 - [C-381 — Measure first-pass capability routing and give first-party families routing hints](C-381-measure-first-pass-routing-and-add-family-hints.md) · Agent · Family.routing_signals is wired end to end but populated ONLY from KIND_TURN_INTENT matchers, which no built-in group emits — only installed plugins reach it. And edcd9dcc enriched declare_intent with no story, no CHANGELOG entry and no test
 
 ### Host metrics seam
-_A host exposes nothing about itself. Dispatch-layer telemetry, substrate provenance and the usage_
+_The design behind this epic is [docs/designs/host-metrics-seam.md](../designs/host-metrics-seam.md)._
 - [C-655 — A Kubernetes host serves node metrics](C-655-a-kubernetes-host-serves-node-metrics.md) · Core · Decision 0018 rule 6: node/pod metrics mapped into the same closed vocabulary; follows the container/Kubernetes backend (C-397, C-480)
 
 ### Hosted Single Org
+_Filed by the C-742 migration: 1 stories carried `epic: hosted-single-org` with no document behind it._
 - [C-656 — SSO member login to a hosted Exchange](C-656-sso-member-login-to-a-hosted-exchange.md) · Core · Decision 0019 rule 5: browser OIDC sign-in, member token mint, token stored under the named binding credential reference; replaces the transitional env pair
 
 ### The interactive debugger — stop, inspect, change a value, continue
-_Debugging an agent today means reading a transcript after the fact and running it again. Being able to_
+_The design behind this epic is [docs/designs/interactive-debugger.md](../designs/interactive-debugger.md)._
 - [A-142 — Inspect a paused run — read-only first, redacted, and it cannot corrupt anything](A-142-inspect-a-paused-run.md) · Agent · read-only deliberately: useful alone, cannot corrupt a run, and it is what makes the write half reviewable. ⚠ Inspection is a DISCLOSURE surface — a paused run holds tool outputs and possibly secret material, and in a demo the debugger pane is on a shared screen
 - [A-143 — Change a value and continue — recorded as an intervention, never silently applied](A-143-change-a-value-and-continue.md) · Agent · ⚠ `flux fork --at N --inject <json>` (A-46, SHIPPED) already does stop/change/continue for RECORDED runs. The gap is live: a forked replay holds NOTHING (hermetic prefix, no side effects) while a live paused run holds real resources, so a changed value can contradict effects that already happened
 
-### Mcp Interop
+### MCP interop — consume and expose Model Context Protocol
+_Its history was written down in [D-193](../stories/D-193-mcp-interop-epic.md), which stays the narrative record._
 - [D-193 — MCP interop — consume and expose Model Context Protocol (epic)](D-193-mcp-interop-epic.md) · Agent · EPIC — mount MCP servers as guarded tool sources through the existing envelope/schema/surfacing pipeline, and expose flux ops/flows as an MCP server; completes the interop dialect the Claude epic (D-186..D-192) started
 
-### Monetary Budgets
+### Monetary budgets & quotas — hard spend enforcement
+_Its history was written down in [C-130](../stories/C-130-monetary-budgets-epic.md), which stays the narrative record._
 - [C-130 — Monetary budgets & quotas — hard spend enforcement (epic)](C-130-monetary-budgets-epic.md) · Core · extend C-571's hierarchical ledger with currency and rolling per-principal caps; unknown price is never treated as zero
 
-### Guarded network primitives — design questions
+### Guarded network primitives — DNS, TCP, UDP and ICMP behind one egress decision
+_The design behind this epic is [docs/designs/network-primitives.md](../designs/network-primitives.md)._
 - [C-284 — Design guarded network primitives](C-284-design-guarded-network-primitives.md) · Core · Protocol families need different authority, addressing, lifecycle, and result contracts; do not flatten them into a generic socket escape hatch
 - [C-285 — Add a guarded DNS operation](C-285-add-a-guarded-dns-operation.md) · Core · Resolution is useful only if the answer consumed later is the answer that passed policy
 - [C-286 — Add a guarded TCP operation](C-286-add-a-guarded-tcp-operation.md) · Core · Settle connection handles and policy-checked destination reuse before exposing a stream
@@ -562,51 +593,56 @@ _Debugging an agent today means reading a transcript after the fact and running 
 - [C-288 — Add a guarded ICMP operation](C-288-add-a-guarded-icmp-operation.md) · Core · ICMP must remain fail-closed on platforms where the host cannot obtain the required privilege
 - [C-418 — Guarded network primitives — DNS, TCP, UDP and ICMP behind one egress decision (epic)](C-418-guarded-network-primitives-epic.md) · Core · tracker filed 2026-08-01 by a board audit: five stories (C-284..C-288) carried this slug with nothing stating what the initiative is. ⚠ It overlaps `execution-substrate`'s C-396 and that boundary was never written down — this tracker exists mainly to state it
 
-### Quorum Approval
+### Quorum approval — the two-person rule for agents
+_Its history was written down in [C-96](../stories/C-96-quorum-approval-epic.md), which stays the narrative record._
 - [C-96 — Quorum approval — the two-person rule for agents (epic)](C-96-quorum-approval-epic.md) · Core · EPIC — policy can require N distinct approvers for destructive ops in protected scopes on served/channel agents; the identity plumbing already exists
 
 ### Recovery and inspection have no CLI, so every failure is hand-driven
-_The happy path has verbs. `fleet run`, `handoff`, `integrate`, `apply`, `reclaim` each do one thing well._
+_The design behind this epic is [docs/designs/recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven.md](../designs/recovery-and-inspection-have-no-cli-so-every-failure-is-hand-driven.md)._
 - [C-671 — A turn's evidence outlives the process that ran it](C-671-a-turn-s-evidence-outlives-the-process-that-ran-it.md) · Core · the receipt is written after the turn by the process that ran it, so a killed supervisor loses the commit sha, write set and test argv even though the commit landed
 - [C-704 — A killed worker turn still accounts for the calls it completed](C-704-a-worker-s-transcript-and-cost-survive-its-worktree.md) · Core · usage flushes on turn end, so a turn that never emits a terminal event records nothing: wave-472-worker-9 wrote 531 insertions and recorded zero tokens. C-632 hangs usage on the turn event this failure never produces
 
-### Release trust residuals — 2026-08-04
+### Release trust residuals — the authority half of REL-01 that no code change addressed
+_The design behind this epic is [docs/designs/release-trust-residuals.md](../designs/release-trust-residuals.md)._
 - [C-352 — Release trust residuals — the authority half of REL-01 that no code change addressed (epic)](C-352-release-trust-residuals-epic.md) · Core · EPIC — C-559 supersedes the App/environment proposal and closes v0.56.0 authority; consumer verification and governance residuals remain
 - [C-356 — Make attestation verification part of the primary install path](C-356-make-attestation-verification-the-default-install-path.md) · Core · the installer IS attested, but the documented primary path is download-then-sh with no verify step; the checksums it embeds come from the same workflow and are not an independent root
 - [C-357 — Record bus factor and independent review as owned risks with a review date](C-357-bus-factor-and-independent-review-risk-register.md) · Core · one administrator and 26 merged PRs but zero recorded reviews; no succession or incident-exercise evidence. Independent-review governance remains a visible residual, not a v0.56.0 publication blocker
 
 ### Remote agents — run the agent here, land the effects there
-_Running an agent on your own machine means your machine is what it touches. Sometimes that is exactly_
+_The design behind this epic is [docs/designs/remote-agents.md](../designs/remote-agents.md)._
 - [C-479 — Plugins on a selected execution system — keep the plugin local, route its guarded host callbacks deliberately](C-479-plugins-on-the-selected-execution-system.md) · Core · Docker/Kubernetes plugins are disabled under --remote today; the decision is where the trusted plugin process lives versus where each declared process/file/connection capability lands
 - [C-687 — A supervisor authorization model for approvals over the network](C-687-a-supervisor-authorization-model-for-approvals-over-the-network.md) · Core · named as required by the remote-approval work and by the fleet-across-machines design; never filed until now — principal auth is refused for approvals precisely because this model does not exist
 
-### Remote Approvals
+### Remote approvals — the approval gate over Slack / webhook
+_Its history was written down in [C-127](../stories/C-127-remote-approvals-epic.md), which stays the narrative record._
 - [C-127 — Remote approvals — the approval gate over Slack / webhook (epic)](C-127-remote-approvals-epic.md) · Core · EPIC — pluggable approver transport for headless/serve agents: approval requests post to Slack (Block Kit buttons) or a signed webhook, timeout = deny, decision lands in the audit trail; complements quorum approval (C-96) — that changes how many approvers, this changes where they are
 
 ### Authenticated remote fleet membership and task workers
-_An A2A endpoint being discoverable does not make it a trusted fleet worker. Remote membership needs_
+_The design behind this epic is [docs/designs/remote-fleet-membership.md](../designs/remote-fleet-membership.md)._
 - [C-554 — Remote agents join a fleet only through authenticated admission and leases](C-554-remote-fleet-admission-and-leases.md) · Core · follow-up remote boundary — invite, authenticated hello/capabilities, coordinator admission, expiry
 - [C-555 — An admitted A2A agent executes through the generic task-agent backend](C-555-a2a-task-agent-backend.md) · Core · follow-up remote execution — membership is C-554; exact artifacts still cross host verification
 
-### causal resource receipts and result cost
+### Every result carries a realistic attributable resource bill
+_The design behind this epic is [docs/designs/resource-accounting.md](../designs/resource-accounting.md)._
 - [C-574 — Every result carries a realistic attributable resource bill (epic)](C-574-resource-accounting-epic.md) · Core · measure physical usage and money provenance once; attribute causally to request/story; roll up without double-counting
 - [C-576 — Attribute resource usage to requests, results and Board work](C-576-attribute-resource-usage-to-board-work.md) · Core · explicit causal BoardRef/assignment links; exclusive/inclusive totals; shared overhead stays visible or uses a versioned allocation policy
 - [C-577 — Expose resource bills and rollups from result through Fleet](C-577-resource-bills-and-rollups.md) · Core · bounded bills by request/story/epic/worker/wave/repository/Fleet with physical usage, money basis, coverage and Board evidence links
 - [C-727 — Instrument the runtime seams that produce resource receipts](C-727-instrument-the-runtime-seams-that-produce-resource-receipts.md) · Core · C-575 landed the receipt ledger, the 36-dimension catalogue and its conformance suite, but nothing writes to it: the model-call seam, the guarded transport, the guarded process runner and the tool dispatcher all record nothing. Until these produce receipts the catalogue is a promise rather than a bill
 
 ### Pause and resume a live run
-_Watching an agent work is only half of control. The other half is being able to say *stop* — to read_
+_The design behind this epic is [docs/designs/run-control.md](../designs/run-control.md)._
 - [A-141 — What pause means for an effect already in flight — and saying it honestly](A-141-what-pause-means-for-an-effect-in-flight.md) · Agent · the story that makes pause trustworthy or not. A pause pressed while an HTTP request is in flight, a subprocess is running or a model is streaming cannot un-send any of it. ⚠ A pause that reports stopped while effects continue is WORSE than no pause — it invites the operator to relax at the wrong moment
 
 ### Scouting makes the backlog schedulable
-_The fleet can only run wide over work whose shape it knows, and it does not know that shape._
+_The design behind this epic is [docs/designs/scouting-makes-the-backlog-schedulable.md](../designs/scouting-makes-the-backlog-schedulable.md)._
 - [C-665 — The board records what a scout saw, and what it still owes](C-665-the-board-records-what-a-scout-saw-and-what-it-still-owes.md) · Core · 1182 stories, 471 declare areas; the other 711 are held back as an undeclared write set and no verb can fix that after creation
 - [C-666 — A scheduled scout app inspects tickets on a timer](C-666-a-scheduled-scout-app-inspects-tickets-on-a-timer.md) · Core · the schedule channel, the trigger binding and the app runner all exist and are e2e tested; nothing new is needed to make something run on a clock
 - [C-667 — Backfill the undeclared backlog and measure the width it unlocks](C-667-backfill-the-undeclared-backlog-and-measure-the-width-it-unlocks.md) · Core · measure the undeclared tail becoming batchable, NOT the workspace board's width of 3 — that one is C-657's to move
 - [C-668 — An unscouted item cannot become ready](C-668-an-unscouted-item-cannot-become-ready.md) · Core · ready already refuses without a priority; a scout stamp is one more clause in a rule that exists, not a new concept
 - [C-669 — A scout proposes a persona as a decision, never grants one](C-669-a-scout-proposes-a-persona-as-a-decision-never-grants-one.md) · Core · an agent_templates entry carries capabilities, fences and a model; a read-only scout must not be able to mint one
 
-### Serving surface and turn outcome residuals — 2026-08-01
+### Serving surface and turn outcome residuals — the ingress nobody inventoried
+_The design behind this epic is [docs/designs/serving-surface-and-turn-outcome-residuals.md](../designs/serving-surface-and-turn-outcome-residuals.md)._
 - [C-369 — Serving surface and turn outcome residuals — the ingress nobody inventoried (epic)](C-369-serving-surface-and-turn-outcome-residuals-epic.md) · Core · EPIC — SRV-01/SRV-02/OUTCOME-01 are all genuinely fixed in flux-server, and all three reopen one layer out: the webhook/connector channel adapters mount a bare Router with no limits and spawn before admission, and turn_end.outcome still reports suspended/max_iter/cancelled as ok
 - [C-370 — Bring the webhook and connector channel adapters under the server limit contract](C-370-bring-channel-adapters-under-the-limit-contract.md) · Core · both mount a bare Router::new() — no body limit, no timeout, no rate guard, no concurrency permit, no provider budget — and tokio::spawn the delivery BEFORE admission; connector.rs:1086-1089 comments that it 'adds no queue of its own', which is wrong
 - [C-371 — Bound queued work at the turn gate](C-371-bound-queued-work-at-the-turn-gate.md) · Core · FlowEngine::turn_gate is one mutex per engine, so one principal's slow turn head-of-line-blocks every other principal; per-principal in-flight limits do not isolate the resource that is actually scarce. Queue depth is unbounded on every ingress
@@ -615,17 +651,19 @@ _The fleet can only run wide over work whose shape it knows, and it does not kno
 - [C-374 — Make the stage-failure carry total rather than best-effort](C-374-make-the-stage-failure-carry-total.md) · Agent · carry_stage_failure requires both kind and text as strings; a stage that tags differently silently reverts to pre-C-226 laundering, guarded only by a debug_assert that release builds compile out
 
 ### Session screencast — render a recorded run as a terminal cast
-_Demos, docs and blog posts need to *show* flux working. Today the only way to get that is to point a_
+_The design behind this epic is [docs/designs/session-screencast.md](../designs/session-screencast.md)._
 - [C-423 — `flux cast` — render a recorded session to an asciicast, headless, from the real TUI widgets](C-423-flux-cast.md) · Core · BLOCKED on C-422 — without the render projection there is nothing to paint. Emits asciicast v2 (text, diffable, no image dependency); GIF/SVG is `agg`/`svg-term`'s job, deliberately not flux's
 
-### Session Truth
+### Agents and operators can inspect the durable truth of a session
+_Its history was written down in [C-589](../stories/C-589-session-truth-and-self-inspection-epic.md), which stays the narrative record._
 - [C-633 — A worker session store survives its turn for post-mortem](C-633-a-worker-session-store-survives-its-turn-for-post-mortem.md) · Core · session_mode: fresh discards the store; a failed worker leaves only the unordered activity projection; the retro pipeline (roadmap R-22) needs the transcript. Complements C-602 which streams a live bounded projection
 
 ### The SIP channel — flux answers the phone, and places calls
-_A phone call is the oldest and widest channel there is. Giving flux an inbound number — it answers,_
+_The design behind this epic is [docs/designs/sip-channel.md](../designs/sip-channel.md)._
 - [D-228 — One voice-turn machinery for rooms and SIP — a call is a room with one participant and a worse codec](D-228-one-voice-turn-machinery.md) · Agent · ⚠ rooms are building this RIGHT NOW — D-209 (audio in, attributed) and D-210 (audio out, interruptible). crates/flux-flow/src/voice/ already holds driver, sink, speaker, transcript, room_transcript, and VoiceTurnHandler is the seam. A second voice path would drift within a release
 
-### Structural gate blind spots — 2026-08-01
+### Structural gate blind spots — eleven mutations that pass every source gate today
+_The design behind this epic is [docs/designs/structural-gate-blind-spots.md](../designs/structural-gate-blind-spots.md)._
 - [C-363 — Structural gate blind spots — eleven mutations that pass every source gate today (epic)](C-363-structural-gate-blind-spots-epic.md) · Core · EPIC — ASSURE-02/03's filed holes are closed, but mutation-testing found eleven survivors including a LIVE un-waived ureq POST in a scanned crate and a whole second production catalog (flux-app) that no census covers
 - [C-364 — Teach the direct-I/O gate about ureq and resolve the live un-waived hit](C-364-teach-the-direct-io-gate-about-ureq.md) · Core · PROVEN LIVE MISS — crates/flux-capabilities/src/datasource/embeddings.rs:130 is an un-waived outbound ureq POST inside a scanned model-facing crate, and the gate passes today
 - [C-365 — Close the const/static/field alias blind spot and record the macro-body one](C-365-close-alias-and-macro-blind-spots-in-syn-gates.md) · Core · C-263's closure review closed the `let` alias hole; the const/static/struct-field twin was never closed. Separately, syn never parses macro token streams — a repo-wide blind spot affecting EVERY source gate
@@ -633,15 +671,17 @@ _A phone call is the oldest and widest channel there is. Giving flux an inbound 
 - [C-367 — Extend the catalog census to the flux-app assembly and the infallible register family](C-367-extend-the-catalog-census-to-flux-app.md) · Core · LIVE CONSEQUENCE — flux app run assembles a SECOND production catalog; emit/send/ask/spawn are registered there and are checked by no metadata-coherence gate and no risk gate. The seam scan is rooted at flux-cli/src only
 - [C-368 — Require every catalog op to publish a risk tier in a risk-bearing table](C-368-require-a-published-risk-tier-for-every-catalog-op.md) · Core · risk verification only walks rows under a `risk` header; coverage accepts a row in ANY table. 57 of 164 op rows sit in risk-less tables today, and the checked>60 floor leaves ~46 ops able to lose their published tier with both gates green
 
-### Taint Flow Policy
+### Taint-flow policy through the envelope
+_Its history was written down in [C-95](../stories/C-95-taint-flow-policy-epic.md), which stays the narrative record._
 - [C-95 — Taint-flow policy through the envelope (epic)](C-95-taint-flow-policy-epic.md) · Core · EPIC — label byte origins at guarded IO and enforce flow rules; prompt-injection defense becomes a deterministic data-flow gate, not prompt-level pleading
 
 ### Task-agent backends and CLI harness adapters
-_Fleet membership and task execution are separate concerns. The V1 fleet can admit and coordinate_
+_The design behind this epic is [docs/designs/task-agent-backends.md](../designs/task-agent-backends.md)._
 - [C-552 — One TaskAgentBackend separates agent execution from fleet membership](C-552-task-agent-backend-contract.md) · Core · follow-up after native loop/report contracts — lifecycle stays generic and advertises which harness and budget semantics a backend can uphold
 - [C-553 — Codex, Claude, Hermes and Pi run through typed local task-agent adapters](C-553-cli-agent-harness-adapters.md) · Core · local harness CLIs are task backends; each maps only loop/report/yield/budget behavior it can prove and refuses the rest
 
 ### The substrate seam: what crosses it, and who may compose it
+_The design behind this epic is [docs/designs/the-substrate-seam.md](../designs/the-substrate-seam.md)._
 - [C-690 — Clock offset joins the host metric vocabulary](C-690-clock-offset-joins-the-host-metric-vocabulary.md) · Core · time is not an authorization boundary — it is substrate condition; sampled_at is stamped by the reader's clock and no field expresses the skew a consumer compares across
 - [C-691 — WebSocket rides the remote protocol](C-691-websocket-rides-the-remote-protocol.md) · Core · GuardedNetwork::open_websocket_scoped is on the port and native-only; RemoteSystem answers Unserved and websocket is absent from the wire's bounded operations — HTTP's position before C-674
 - [C-692 — An accepted WebSocket session is a guarded resource](C-692-an-accepted-websocket-session-is-a-guarded-resource.md) · Core · ingress is guarded at bind_tcp and the TCP framing layer; the upgrade happens above the seam, so an accepted WS session has no per-message ceiling the way an outbound one does
@@ -651,22 +691,25 @@ _Fleet membership and task execution are separate concerns. The V1 fleet can adm
 - [C-716 — A live datasource connects from where its endpoint is reachable](C-716-a-live-datasource-connects-from-where-its-endpoint-is-reachable.md) · Core · LiveDatasource receives ToolContext and must route IO through the guards its LiveAccess declares, but nothing ties the connection to the substrate its endpoint is reachable from
 
 ### Time Machine — hermetic replay, fork-at-any-decision, run-diff
-_Every mainstream agent framework lets the LLM *be* the control flow, so its runs are irreproducible_
+_The design behind this epic is [docs/designs/time-machine.md](../designs/time-machine.md)._
 - [A-47 — TUI time-machine cockpit — scrub / step / branch a run visually (optional)](A-47-tui-time-machine-cockpit.md) · Agent · Time Machine Phase 4 (optional polish) — visual scrub/step/branch over a replayed run in the TUI; reuses UiEvent/Entry::Plan + the approval modal; UNBLOCKED (A-45/A-46 shipped 2026-07-07), pick up on demand — the CLI verbs are the product
 
 ### Tool-output rendering — a correct, legible transcript card pipeline
+_The design behind this epic is [docs/designs/tool-output-rendering.md](../designs/tool-output-rendering.md)._
 - [C-538 — Walk past the tool-card detail cap at runtime](C-538-walk-past-the-detail-cap-at-runtime.md) · Core · The '… N more lines' row is inert; the only escape is restarting with -v
 
 ### Transactional turns — a compensating undo for the world, not just the session
+_The design behind this epic is [docs/designs/transactional-turns.md](../designs/transactional-turns.md)._
 - [A-104 — Materialize reverse actions — pre-image capture at the dispatch seam + EventKind::Compensated](A-104-preimage-capture-and-compensated-event.md) · Agent · capture runs inside the guarded boundary immediately before execution (NOT at approval time — prior bytes aren't knowable then); BREAKING: EventKind is a closed set, a new variant ⇒ MINOR
 - [A-105 — flux undo --turn <n> — reverse-batch reconstruction, LIFO execution, itemized report](A-105-flux-undo-turn.md) · Agent · the epic's headline verb; undo is NOT privileged — it runs through the ordinary approval + guarded envelope, so the undo itself records compensations and is undoable
 - [A-106 — Irreversibility disclosure — surface 'cannot be undone' at approval and to policy](A-106-irreversibility-disclosure-at-approval.md) · Agent · the risk signal that IS available at approval time because declaration is static; rides the C-182 op list + C-154 risk tint rather than adding a new sheet
 
 ### TUI polish — 5 UX + 5 UI improvements
-_The TUI became a daily driver with A-65 and gained its boot splash + spinners with C-101. The_
+_The design behind this epic is [docs/designs/tui-polish.md](../designs/tui-polish.md)._
 - [C-526 — Make TUI copy/paste work without hidden terminal choreography](C-526-tui-copy-paste-without-hidden-terminal-choreography.md) · Core · Dogfood report: text could neither be copied nor pasted in the TUI despite C-105 and C-111 being marked done
 
-### Usage Observatory
+### Usage Observatory — animated cross-harness, provider, and model replay in the TUI
+_Its history was written down in [C-518](../stories/C-518-usage-observatory-epic.md), which stays the narrative record._
 - [C-518 — Usage Observatory — animated cross-harness, provider, and model replay in the TUI (epic)](C-518-usage-observatory-epic.md) · Core · EPIC — turn the existing cross-harness usage import and per-call Flux events into a truthful 4h/1d/7d time-lapse: replay activity, compare harness/provider/model token and cost totals, and keep estimated or unattributed data visibly honest
 - [C-520 — Project truthful usage attribution and cost](C-520-truthful-usage-attribution-and-cost.md) · Core · Keep provider, model, timestamp and price provenance explicit; never double-count Flux call and turn totals
 - [C-521 — Build adaptive usage buckets and comparisons](C-521-adaptive-usage-buckets-and-comparisons.md) · Core · Derive stable plot-width buckets, cumulative totals, hierarchy groups and previous-period deltas from the truthful timeline
@@ -674,7 +717,8 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-523 — Add deterministic usage replay and bounded animation](C-523-deterministic-usage-replay-and-animation.md) · Core · Drive the static observatory with a virtual clock, seekable playback, coalesced pulses and bounded per-frame work
 - [C-524 — Close Usage Observatory accessibility, performance, and entry points](C-524-usage-observatory-closure.md) · Core · Wire navigation and help, preserve live /usage, and prove the complete observatory accessible and responsive
 
-### Verified Webhook Channel
+### The verified webhook channel — a delivery flux can prove came from who it claims
+_Its history was written down in [C-419](../stories/C-419-verified-webhook-channel-epic.md), which stays the narrative record._
 - [C-292 — Webhook signature schemes — one parameterized HMAC, constant-time, replay-bounded](C-292-webhook-signature-schemes.md) · Core · four vendors' 'unique' schemes collapse to one algorithm over {digest, encoding, signed-template, tolerance}; test vectors must come from vendor documentation, never from our own implementation — and the verifier must accept a SET of candidate digests, because Stripe sends several v1= during a secret rotation
 - [C-293 — Webhook challenge/handshake — answer endpoint verification without waking an agent](C-293-webhook-challenge-handshake.md) · Core · Slack's url_verification echo and Meta's hub.challenge GET arrive at the same path as real events; waking a journey to answer a handshake is both wasteful and a way to hand vendor-shaped text to an agent for no reason — and the channel routes only `post` today, so the GET half needs a route
 - [C-294 — Route a webhook to a trigger label by its event discriminator](C-294-webhook-discriminator-routing.md) · Core · today one webhook channel = one trigger label, so every vendor event lands in one journey that must switch on JSON — while the vendor already tells us the type in a header or a body field
@@ -1245,6 +1289,7 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-652 — HTTP joins the guarded port](C-652-http-joins-the-guarded-port.md) · Core · Decision 0018 rule 5: GuardedHttp on the port so web effects can follow the selected substrate; remote wire support stays a separate versioned change
 - [C-653 — Typed host metrics vocabulary and the native backend](C-653-typed-host-metrics-vocabulary-and-the-native-backend.md) · Core · Decision 0018 rule 6: closed metric vocabulary, fail-closed Unserved, native reads the local machine; unsupported is explicitly unavailable, never zero
 - [C-654 — Host metrics over the remote protocol and the host surface](C-654-host-metrics-over-the-remote-protocol-and-the-host-surface.md) · Core · Decision 0018 rule 6: host.metrics bounded wire operation under a protocol version bump; flux host metrics CLI and usage-observatory projection
+- [C-664 — cargo test --workspace --lib never tests flux-cli](C-664-cargo-test-workspace-lib-never-tests-flux-cli.md) · Core
 - [C-670 — A finished turn records its own handoff](C-670-a-finished-turn-records-its-own-handoff.md) · Core · handoff-accepted is written only by the CLI verb, and no agent in the fleet can invoke it; ten workers ended their turns and the fleet recorded nothing
 - [C-673 — Harden the native metrics reader against hostile mounts and pinned roots](C-673-harden-the-native-metrics-reader-against-hostile-mounts-and-pinned-roots.md) · Core · C-653 review findings: the reading is bounded at the answer, not at every seam edge; caps truncate silently and one parse path can panic
 - [C-674 — HTTP rides the remote protocol under a version bump](C-674-http-rides-the-remote-protocol-under-a-version-bump.md) · Core · Decision 0018 rule 5's deferred wire change; C-652's review fixed the shape constraints the frame must honor before secrets ride it
@@ -1257,15 +1302,24 @@ _The TUI became a daily driver with A-65 and gained its boot splash + spinners w
 - [C-686 — The TUI attaches to an agent that lives on a host](C-686-the-tui-attaches-to-an-agent-that-lives-on-a-host.md) · Core · `flux a2a <url>` already gives a REPL against a served agent; the TUI renders from the local event store, so it cannot show a session that lives somewhere else
 - [C-696 — The release publishes a container image and stamps the profiles with it](C-696-the-release-publishes-a-container-image-and-stamps-the-profiles-with-it.md) · Core · release-blocking: the profiles pin newTag 0.58.0 and cut-release.sh does not restamp it, and newName is a bare local name no workflow publishes
 - [C-701 — Guarded HTTP honors 429 and Retry-After](C-701-guarded-http-honors-429-and-retry-after.md) · Core · flux-web has no 429 or Retry-After handling at all, while flux-provider/src/retry.rs already treats 429 as retryable for provider calls — the guarded family is the odd one out
+- [C-719 — A tag build that publishes nothing must be red](C-719-a-tag-build-that-publishes-nothing-must-be-red.md) · Core · GitHub propagates skipped transitively through needs; the publish chain skipped and the run still reported success, so v0.59.0 has a tag and no Release
 - [C-721 — A wave is applied only when the canonical ref contains its commits](C-721-a-wave-is-applied-only-when-the-canonical-ref-contains-its-commits.md) · Core · wave-649 is recorded applied while X-139's two commits exist only on fleet/wave-649/exchange/story/X-139: absent from origin/main, absent from local main, and absent from the wave's own integration branch. apply never pushes, yet exchange and connectors declare canonical_ref = origin/main, so apply cannot reach their canonical ref by construction and still reports success
 - [C-722 — A story worktree holding uncommitted work must be reported, never silently reclaimed](C-722-a-story-worktree-holding-uncommitted-work-must-be-reported-never-silently-reclaimed.md) · Core · wave-745 died with an 18KB failing-first test for C-575 uncommitted in its story worktree. handoff --from-worktree derives its write set from base..HEAD so it cannot see the file, doctor reported the branch as holding no commit of its own, and its prescribed fix was reclaim, which is documented to delete worktrees that provably hold no work
 - [C-723 — The driver must not withhold ready work on an unverified already-built signal](C-723-the-driver-must-not-withhold-ready-work-on-an-unverified-already-built-signal.md) · Core · A dry-run tick with 8 free slots and 9 ready items dispatched 1. C-570 and C-544 were withheld as already-built on board reconcile's say-so, yet AgentReport and safe_checkpoint do not exist in any crate, the flux-tui skill doc states the C-570 operation is unbuilt, and every C-544 hit in Rust is a doc comment forward-referencing the id. C-718 already establishes reconcile matches a mention, not an implementation; the driver consumes it as a hard block
 - [C-724 — A wave whose supervisor is gone must release its claim on ready items](C-724-a-wave-whose-supervisor-is-gone-must-release-its-claim-on-ready-items.md) · Core · wave-745 kept an exclusive claim on C-575 and C-519 after its supervisor pid 3513527 died. doctor detected agent-supervisor-gone and prescribed cancelling the two workers, but cancelling the workers did not release the wave's claim; only cancelling the wave itself did, taking dispatch from 1 item to 3. Nothing reclaims a claim held by a dead supervisor, so a driver crash removes its items from the schedulable pool permanently
+- [C-728 — A program-eligible item outside every wave is dispatched, not dropped](C-728-a-program-eligible-item-outside-every-wave-is-dispatched-not-dropped.md) · Core · A tick with eight free slots and eight program-eligible dependency-satisfied items planned four dispatches and recorded no reason for the other four. Dispatch draws from configured waves, so an item named by no wave never reaches the withhold logic and leaves the schedulable pool with no record at all. C-723 made a withhold state its evidence; this is the path that produces no withhold to state
 - [C-729 — The crate-version guard compares against the registry, not just git](C-729-the-crate-version-guard-compares-against-the-registry-not-just-git.md) · Core · codewandler-flux-secret 1.3.0 was published during a failed release run, then C-709 added a pub host field to that same version. check-crate-versions.sh compares a crate's version against git history, so the bump from 1.2.0 to 1.3.0 satisfied it and the later content change did not. The result was a green CI and a crates.io publish that stopped at flux-capabilities with 'no field host on type &EndpointRef', because the published 1.3.0 and the local 1.3.0 are different crates. The guard must ask crates.io whether this exact version is already published and whether its content still matches
 - [C-730 — A finished worker turn becomes a verified handoff without an operator](C-730-a-finished-worker-turn-becomes-a-verified-handoff-without-an-operator.md) · Core · Nothing converts turn_end into a handoff: grep finds zero wiring, fleet_handoff exists only as a CLI verb an operator types, and drive writes only provisional handoffs by reconstruction. The integrator role is worse — the string integrator appears 0 times in flux-cli, so the configured role and wave-integration.flux are dead config the driver never dispatches. Until a turn produces a handoff carrying its own validation evidence and the tick dispatches an integrator, every wave stops at the writers and the rest of the pipeline is an operator typing verbs
 - [C-732 — The drive tick promotes a delivered wave without an operator](C-732-the-drive-tick-promotes-a-delivered-wave-without-an-operator.md) · Core · C-681 built flux fleet promote and it is idempotent, but no drive tick calls it, so landing on a member's local canonical ref is still operator-invoked. With C-730 dispatching the integrator and C-587 gating on review, promote is the last link the tick does not pull. Wiring it closes worker to local main end to end
 - [C-736 — board check validates the contract a story is dispatched against](C-736-board-check-validates-the-contract-a-story-is-dispatched-against.md) · Core
 - [C-737 — A missing or suffixed Acceptance heading cannot pass for a satisfied contract](C-737-a-missing-or-suffixed-acceptance-heading-cannot-pass-for-a-satisfied-contract.md) · Core
+- [C-738 — Creating a story generates the template and refuses a ready story with no contract](C-738-creating-a-story-generates-the-template-and-refuses-a-ready-story-with-no-contract.md) · Core
+- [C-739 — Acceptance criteria are addressable and carry their own verification handle](C-739-acceptance-criteria-are-addressable-and-carry-their-own-verification-handle.md) · Core
+- [C-740 — An unresolved question blocks the ready transition](C-740-an-unresolved-question-blocks-the-ready-transition.md) · Core
+- [C-741 — A story declares its kind and is validated as that kind](C-741-a-story-declares-its-kind-and-is-validated-as-that-kind.md) · Core
+- [C-742 — An epic is one entity with its own measurable contract](C-742-an-epic-is-one-entity-with-its-own-measurable-contract.md) · Core
+- [C-743 — The integrator composes the wave's changelog entry](C-743-the-integrator-composes-the-wave-s-changelog-entry.md) · Core
+- [C-744 — A glossary the fleet's agents are held to](C-744-a-glossary-the-fleet-s-agents-are-held-to.md) · Core
 - [D-01 — Parameterized flow execution — the behaviour-runner seam](D-01-flow-input-seeding.md) · Agent · deterministic `FlowClient::parse` (no model round-trip) + a per-run input-seeding seam (`FlowStore::seed` + `FlowClient::execute_with`/`run_flow`) so a stored flow runs per invocation with injected `$var` settings — fresh-store isolation, flow-local binds shadow seeds, envelope unchanged; modules, zero new crates; serves downstream behaviour-runner/preset consumers (see [CHANGELOG](../../CHANGELOG.md))
 - [D-02 — Tenant/context-taggable event substrate for downstream run persistence](D-02-tenant-event-substrate.md) · Core · optional stream-level account/agent/correlation context envelope on `flux-events` runs + account-scoped reads (`list_for_account`/`account_streams`) (commit `c97c8a4`)
 - [D-03 — Reusable A2A server helpers on the current spec](D-03-a2a-server-helpers.md) · Agent · lifted flux-server's A2A routes into the reusable `flux_a2a::server` helper; unblocks downstream A2A consumers + fixed the `tasks/send` drift (commit `7dcc6b3`)

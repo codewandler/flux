@@ -2,8 +2,7 @@
 id: C-740
 title: "An unresolved question blocks the ready transition"
 pillar: "Core"
-status: backlog
-priority: 2
+status: done
 epic: delivery-is-verified
 areas: [flux-cli]
 ---

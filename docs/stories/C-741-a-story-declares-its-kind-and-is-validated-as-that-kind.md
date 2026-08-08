@@ -2,8 +2,7 @@
 id: C-741
 title: "A story declares its kind and is validated as that kind"
 pillar: "Core"
-status: backlog
-priority: 3
+status: done
 epic: delivery-is-verified
 areas: [flux-cli]
 ---
