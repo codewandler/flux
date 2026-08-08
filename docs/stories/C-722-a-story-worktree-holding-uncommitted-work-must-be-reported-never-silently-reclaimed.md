@@ -2,8 +2,7 @@
 id: C-722
 title: "A story worktree holding uncommitted work must be reported, never silently reclaimed"
 pillar: "Core"
-status: backlog
-priority: 1
+status: done
 epic: delivery-is-verified
 areas: [flux-orchestrate]
 note: "wave-745 died with an 18KB failing-first test for C-575 uncommitted in its story worktree. handoff --from-worktree derives its write set from base..HEAD so it cannot see the file, doctor reported the branch as holding no commit of its own, and its prescribed fix was reclaim, which is documented to delete worktrees that provably hold no work"
@@ -39,6 +38,9 @@ turns an interrupted turn into lost work.
       branch — so recovery does not require hand-running `git` in a worktree the fleet owns.
 - [x] Regression test: a story worktree at its pinned base whose only content is one untracked
       file is reported as holding work, survives `reclaim`, and is recoverable through the CLI.
+
+> **Acceptance 4 moved to [[C-725]].** The work landed here is complete and gated;
+> that criterion is tracked separately rather than left as an open box on a delivered story.
 
 ## Progress
 
