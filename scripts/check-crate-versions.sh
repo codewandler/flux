@@ -27,6 +27,44 @@ cd "$(git rev-parse --show-toplevel)"
 
 fail() { printf '\033[31mFAIL\033[0m %s\n' "$1" >&2; }
 
+# Is this exact version already on crates.io? (C-729)
+#
+# The git comparison above cannot answer this, and the workspace build cannot either: every
+# first-party crate resolves through its `path` dependency, so the LOCAL content always wins and
+# `cargo build --workspace` is green no matter what the registry holds. `cargo publish` resolves
+# from the registry instead, and skips a version that is already there — so a crate edited under an
+# already-published version ships nothing, and the next crate in the closure compiles against the
+# stale published copy and fails there, after the whole pipeline has run.
+#
+# That is exactly how `codewandler-flux-secret` 1.3.0 shipped without the `host` field it had
+# locally: 1.2.0 -> 1.3.0 satisfied the git check, 1.3.0 was published by an earlier failed run, and
+# the field was added afterwards under the same number.
+#
+# Reads the sparse index directly — one HTTP GET, no build, no credential, no `cargo` invocation, so
+# it can run first and cost nothing. A network failure warns rather than fails: this check must not
+# make an offline working tree unbuildable. `FLUX_SKIP_REGISTRY_CHECK=1` opts out explicitly.
+registry_has_version() {
+  local crate="$1" version="$2" path body
+  [ "${FLUX_SKIP_REGISTRY_CHECK:-}" = 1 ] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  case ${#crate} in
+    1) path="1/$crate" ;;
+    2) path="2/$crate" ;;
+    3) path="3/${crate:0:1}/$crate" ;;
+    *) path="${crate:0:2}/${crate:2:2}/$crate" ;;
+  esac
+  # 404 means "never published", which is a clean pass — distinguish it from a transport failure.
+  body="$(curl -sS --fail-with-body --max-time 20 \
+    -H 'User-Agent: flux check-crate-versions (https://github.com/codewandler/flux)' \
+    "https://index.crates.io/$path" 2>/dev/null)"
+  case $? in
+    0) ;;
+    22) return 1 ;;
+    *) printf '\033[33mwarn\033[0m  could not reach the crates.io index for %s; skipping the published-version check\n' "$crate" >&2; return 1 ;;
+  esac
+  printf '%s' "$body" | grep -Fq "\"vers\":\"$version\""
+}
+
 # Emit the exact resolved direct, external dependency edges for one workspace. Cargo.lock already
 # pins the resolved package; this review lock makes *which first-party package directly chose it*
 # visible too. The final column calls out Cargo's lifecycle-script analogue: a dependency whose
@@ -217,6 +255,12 @@ while IFS= read -r manifest; do
   fi
   if [ "$now_version" = "$base_version" ]; then
     fail "$name changed since $BASE but is still $now_version"
+    stale="$stale $name"
+  elif registry_has_version "$name" "$now_version"; then
+    # C-729. Git said the version moved, and that was not enough: a version already on crates.io
+    # cannot be published again — `cargo publish` skips it — so a content change under it ships
+    # nothing while every consumer keeps compiling against the published copy.
+    fail "$name is $now_version, which is ALREADY on crates.io, and its content changed since $BASE"
     stale="$stale $name"
   else
     echo "   $name $base_version -> $now_version"
