@@ -110,6 +110,14 @@ Two states worth recognising:
   publish steps are skipped, leaving staged assets and no public release. `scripts/check-release-tags.sh`
   fails naming the tag. Either backfill from the runbook, or delete the tag and re-cut — the content
   ships in the next version either way.
+
+  Since C-719 the tag run itself refuses to be green in that state. GitHub propagates `skipped`
+  *transitively* through `needs`, so a legitimately-skipped `build-local-artifacts` on the promote
+  path used to skip the whole publish chain through a green `host`; v0.59.0 was tagged with a
+  `success` run and no Release. Every publish job now breaks the chain with `always()` and asserts
+  its real upstreams succeeded, and `verify-published` fails the run when a publishing ref produced
+  no Release. `scripts/check-publish-chain.sh` holds that shape structurally — read it before
+  editing any `if:` in the publish chain.
 - **A stale `release` branch.** Merging an old release-source branch cuts from stale content.
   Verify ancestry first; the conflict that eventually catches it costs a full CI run.
 
@@ -119,4 +127,7 @@ Two states worth recognising:
   uncommitted work is never swept in. Safe to re-run after a red gate. Does not push.
 - `scripts/verify-github-release.sh` — the closed-set check for the one tag being cut.
 - `scripts/check-release-tags.sh` — the weaker fleet-wide audit that runs on every push to `main`.
+- `scripts/check-publish-chain.sh` — schedules the committed `release.yml` through a model of
+  GitHub's transitive skip propagation and refuses any graph in which a publishing run can conclude
+  `success` without a published Release (C-719).
 - `plugins/` is not part of a Flux cut; those crates sit on an independent protocol line.
