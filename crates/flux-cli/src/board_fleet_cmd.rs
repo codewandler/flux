@@ -1305,6 +1305,25 @@ struct DriveRecord {
     /// The fleet revision the previous tick observed.
     #[serde(default)]
     revision: u64,
+    /// C-723: how long each ready item has been withheld, keyed by item.
+    ///
+    /// A withhold is the only silent thing a tick does — the item leaves the schedulable pool and
+    /// the tick reports a smaller dispatch count, not a missing story — so the run has to be
+    /// recorded before `fleet doctor` can be asked about it. Pruned to the items the current tick
+    /// withheld rather than accumulated: a map that only grows is how one state file reached 12.9MB.
+    #[serde(default)]
+    withheld: BTreeMap<String, DriveWithhold>,
+}
+
+/// C-723: one ready item's unbroken run of withheld ticks.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct DriveWithhold {
+    /// The reason the most recent tick gave. A different reason starts a new run.
+    reason: String,
+    /// Consecutive ticks withheld on that reason.
+    ticks: u64,
+    /// The tick the run started at, so a reader can date it against the journal.
+    since_tick: u64,
 }
 
 /// C-642: the durable fact that dispatch is stopped, and why.
@@ -11423,13 +11442,21 @@ fn wave_worktrees(wave: &Value) -> Vec<WaveWorktree> {
 }
 
 /// The runtime questions `fleet doctor` answers, in report order.
-const FLEET_RUNTIME_CHECKS: [&str; 5] = [
+const FLEET_RUNTIME_CHECKS: [&str; 6] = [
     "agent-supervisor-gone",
     "wave-wedged",
     "worktree-missing",
     "item-double-claimed",
+    "item-withheld-persistently",
     "branch-without-unique-work",
 ];
+
+/// C-723: consecutive withheld ticks after which a ready item becomes a `fleet doctor` finding.
+///
+/// A withhold that repeats is not a schedule, it is a decision no one reviewed. Five ticks is longer
+/// than any dispatch takes to change the picture and short enough to catch inside a single drive
+/// interval — the observed failure ran 82 ticks over 75 minutes without ever becoming a question.
+const DRIVE_WITHHOLD_STREAK_LIMIT: u64 = 5;
 
 /// One runtime finding. `fix` is the single next action, in the spirit of `flux doctor`'s fix-it hints:
 /// every one of these is a question with one correct answer, so reporting it without the answer just
@@ -11555,6 +11582,39 @@ fn double_claimed_findings(state: &FleetState) -> Vec<Value> {
         .collect()
 }
 
+/// C-723: ready items the driver has withheld on the same reason, tick after tick.
+///
+/// Every other frontier problem announces itself. This one subtracts: a tick with eight free slots
+/// and nine ready items dispatched one, and from the outside that is indistinguishable from a queue
+/// with one item in it. `drive` records each item's run; this is where the run becomes a question
+/// with an answer, so a permanent withhold cannot masquerade as an empty queue.
+///
+/// `width` is excluded upstream, in [`drive_withhold_streaks`] — capacity is a fact about the fleet
+/// that resolves itself when a worker frees a slot, not a judgement about an item.
+fn persistent_withhold_findings(state: &FleetState) -> Vec<Value> {
+    let Some(drive) = state.drive.as_ref() else {
+        return Vec::new();
+    };
+    drive
+        .withheld
+        .iter()
+        .filter(|(_, held)| held.ticks >= DRIVE_WITHHOLD_STREAK_LIMIT)
+        .map(|(item, held)| {
+            runtime_finding(
+                "item-withheld-persistently",
+                item,
+                format!(
+                    "ready, and withheld as `{}` on {} consecutive tick(s) since tick {}",
+                    held.reason, held.ticks, held.since_tick
+                ),
+                "flux fleet drive --tick --dry-run --output json (the tick names the evidence \
+                 behind every withhold)"
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The fleet-owned branch heads of one checkout, resolved in a single git call.
 ///
 /// One call per repository, not one per branch: a fleet that has run for a day holds hundreds of
@@ -11630,6 +11690,7 @@ fn fleet_runtime_health(state: &FleetState) -> Value {
     findings.extend(wedged_wave_findings(state));
     findings.extend(missing_worktree_findings(state));
     findings.extend(double_claimed_findings(state));
+    findings.extend(persistent_withhold_findings(state));
     findings.extend(stale_branch_findings(state, git_fleet_branch_heads));
     json!({
         "healthy": findings.is_empty(),
@@ -14617,6 +14678,10 @@ struct DrivePlan {
     dispatch: Vec<String>,
     /// Items this tick deliberately did not send, each with the reason it was held back.
     withheld: Vec<Value>,
+    /// C-723: reasons that claimed an item but could not prove it, each with the evidence that
+    /// failed. A released item goes on to dispatch; recording it is what makes a wrong withhold
+    /// visible in the tick output instead of inferred from a shrinking dispatch count.
+    released: Vec<Value>,
     /// Why the dispatch phase sent nothing at all, when that is a property of the fleet.
     blocked: Option<String>,
     /// Free worker slots at the configured width.
@@ -14728,6 +14793,346 @@ fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, ItemClaim> {
     claims
 }
 
+/// C-723: the most Acceptance-named artifacts one finding is verified against.
+///
+/// Each costs a `git grep` in the member checkout, so the work one finding can demand is bounded by
+/// this rather than by how long somebody's Acceptance happens to be.
+const DRIVE_ACCEPTANCE_ARTIFACTS: usize = 12;
+
+/// The contents of every single-backtick span on one line.
+fn backtick_spans(line: &str) -> Vec<&str> {
+    let mut spans = Vec::new();
+    let mut rest = line;
+    while let Some((_, after)) = rest.split_once('`') {
+        let Some((span, tail)) = after.split_once('`') else {
+            break;
+        };
+        spans.push(span.trim());
+        rest = tail;
+    }
+    spans
+}
+
+/// Is this backticked span something a tree can actually be asked to produce?
+///
+/// A path needs a separator and path-shaped characters. A symbol needs identifier characters and
+/// the *shape* of one — an underscore or an interior capital. Everything else in backticks names a
+/// behaviour rather than an artifact: `flux fleet drive` is a command, `*.flux` is a glob, `task` is
+/// an English word, and a story id like `C-544` is the very mention this verification exists to stop
+/// counting. Asking git about those answers a different question than the Acceptance poses.
+fn is_checkable_artifact(span: &str) -> bool {
+    if span.len() < 4 || span.contains(char::is_whitespace) {
+        return false;
+    }
+    if span.contains('/') {
+        return span
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_'));
+    }
+    let mut rest = span.chars();
+    let Some(first) = rest.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    if !span.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    span.contains('_') || rest.any(|c| c.is_ascii_uppercase())
+}
+
+/// The symbols and paths a story's `## Acceptance` names, deduplicated in reading order.
+fn acceptance_artifacts(body: &str) -> Vec<String> {
+    let mut artifacts: Vec<String> = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(heading) = trimmed.strip_prefix("## ") {
+            in_section = heading.trim().eq_ignore_ascii_case("Acceptance");
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        for span in backtick_spans(trimmed) {
+            if is_checkable_artifact(span) && !artifacts.iter().any(|held| held == span) {
+                artifacts.push(span.to_string());
+            }
+        }
+    }
+    artifacts.truncate(DRIVE_ACCEPTANCE_ARTIFACTS);
+    artifacts
+}
+
+/// Does this `git grep` hit sit in code rather than in a comment?
+///
+/// The hit is `path:line:content`. A doc comment naming a symbol the story has yet to build is a
+/// forward reference, and counting it as the implementation is the same error one level down from
+/// counting a commit that names an id — a plan written next to the code is not the code.
+fn grep_hit_is_code(hit: &str) -> bool {
+    let content = hit.splitn(3, ':').nth(2).unwrap_or_default().trim_start();
+    !content.is_empty()
+        && !["///", "//!", "//", "<!--", "*"]
+            .iter()
+            .any(|marker| content.starts_with(marker))
+}
+
+/// Is `artifact` present in this checkout as something other than prose?
+///
+/// `None` when the tree cannot answer, and an unanswered question is never evidence of absence —
+/// absence is what *releases* a withhold, so it has to be established rather than assumed. A path
+/// is answered by the filesystem; a symbol by `git grep` over tracked and untracked non-Markdown
+/// files, with comment-only hits discarded.
+///
+/// The two answers are deliberately of unequal strength, and the asymmetry is the whole design.
+/// **Absent is conclusive**: a name the Acceptance asks for that appears nowhere in the tree's code
+/// cannot have been implemented, and absence is what releases work back into the pool. **Present is
+/// weak** — a string literal or a fixture also matches — so presence never withholds on its own; it
+/// only fails to veto a withhold that the story's own ticked Acceptance already justifies. Being
+/// wrong in the weak direction costs a redundant turn; being wrong in the strong one loses a story.
+fn artifact_present_in(root: &Path, artifact: &str) -> Option<bool> {
+    if artifact.contains('/') {
+        return Some(root.join(artifact).exists());
+    }
+    let output = guarded_git(
+        root,
+        &[
+            "grep",
+            "--no-color",
+            "--untracked",
+            "-I",
+            "--fixed-strings",
+            "--line-number",
+            "-e",
+            artifact,
+            "--",
+            ":(exclude)*.md",
+        ],
+    )
+    .ok()?;
+    match output.exit_code {
+        0 => Some(output.stdout.lines().any(grep_hit_is_code)),
+        1 => Some(false),
+        _ => None,
+    }
+}
+
+/// The verdict on one `already-built` finding, and what it rests on.
+#[derive(Clone, Debug, PartialEq)]
+struct AlreadyBuiltVerdict {
+    /// Withhold the item only when this is true.
+    withhold: bool,
+    /// The one line a reader needs, whichever way it went.
+    detail: String,
+    /// What the verdict actually rests on, artifact by artifact.
+    evidence: Vec<Value>,
+}
+
+/// Verify an `already-built` finding against the story it claims to have implemented.
+///
+/// Reconcile's `implementation-landed` fires on any commit that names an id (C-718), and the driver
+/// consumed that as a hard block: one story was withheld every tick on a *sibling* story's feature
+/// commit, another on a doc comment forward-referencing it, while both sat wholly unticked and the
+/// symbols their Acceptance names existed in no crate. Meanwhile the one item that tick did dispatch
+/// was the one whose implementation genuinely existed. The signal was wrong in both directions, and
+/// only one of those directions is silent.
+///
+/// So this fails closed toward dispatching. Four gates, and a withhold must pass all of them:
+///
+/// 1. **The story's record does not contradict the signal.** A wholly unticked Acceptance is the
+///    story saying, in its own words, that it still owes everything, and that outranks a commit
+///    which merely mentions the id. Checked first because it needs no IO.
+/// 2. **Every artifact the Acceptance names is present.** One absent symbol or path settles it.
+/// 3. **Every artifact could be checked at all.** A tree that cannot answer has not said "yes".
+/// 4. **Something was actually verified.** A finding with no artifact behind it and no reviewer
+///    behind it is a guess, and a guess dispatches — a redundant turn is recoverable, a silently
+///    skipped story is not.
+fn verify_already_built(finding: &Value, story_body: &str, root: &Path) -> AlreadyBuiltVerdict {
+    let reviewed = value_strings(&finding["signals"])
+        .iter()
+        .any(|signal| signal == "acceptance-complete");
+    let (ticked, _, total) = checkbox_counts(story_body, "Acceptance");
+    let mut evidence = vec![json!({
+        "acceptance_ticked": ticked,
+        "acceptance_total": total,
+        "reviewed_complete": reviewed,
+    })];
+    if total > 0 && ticked == 0 {
+        return AlreadyBuiltVerdict {
+            withhold: false,
+            detail: format!(
+                "none of the {total} Acceptance criteria are ticked; a commit naming the id does \
+                 not outrank the story's own record of what it still owes"
+            ),
+            evidence,
+        };
+    }
+
+    let (mut present, mut absent, mut unanswered) = (Vec::new(), Vec::new(), Vec::new());
+    for artifact in acceptance_artifacts(story_body) {
+        let answer = artifact_present_in(root, &artifact);
+        evidence.push(json!({"artifact": artifact, "present": answer}));
+        match answer {
+            Some(true) => present.push(artifact),
+            Some(false) => absent.push(artifact),
+            None => unanswered.push(artifact),
+        }
+    }
+
+    let release = |detail: String| AlreadyBuiltVerdict {
+        withhold: false,
+        detail,
+        evidence: evidence.clone(),
+    };
+    if !absent.is_empty() {
+        return release(format!(
+            "the Acceptance names {} artifact(s) this checkout does not have ({}); the signal is a \
+             mention of the id, not its implementation",
+            absent.len(),
+            absent.join(", ")
+        ));
+    }
+    if !unanswered.is_empty() {
+        return release(format!(
+            "{} artifact(s) named by the Acceptance could not be checked in this checkout ({}); an \
+             unanswered question is not evidence the work is present",
+            unanswered.len(),
+            unanswered.join(", ")
+        ));
+    }
+    if !reviewed && present.is_empty() {
+        return release(
+            "nothing behind this signal could be verified: the Acceptance names no symbol or path \
+             to check, and no reviewer ticked it complete"
+                .to_string(),
+        );
+    }
+    AlreadyBuiltVerdict {
+        withhold: true,
+        detail: format!(
+            "{ticked} of {total} Acceptance criteria ticked and every named artifact is present in \
+             this checkout ({})",
+            if present.is_empty() {
+                "none named".to_string()
+            } else {
+                present.join(", ")
+            }
+        ),
+        evidence,
+    }
+}
+
+/// Where the story behind a reconcile finding lives, and which checkout would hold its work.
+///
+/// Reconcile reports a workspace item as `member/docs/stories/<file>` and a single-repository item as
+/// a bare filename under this root's own `docs/stories`. Both shapes have to resolve, because the
+/// driver runs from a workspace root and the verification has to be testable without one.
+fn drive_finding_story(root: &Path, finding: &Value) -> Option<(PathBuf, PathBuf)> {
+    let file = finding["file"].as_str()?;
+    match file.split_once('/') {
+        Some((member, rest)) => {
+            let checkout = member_root(root, member).ok()?;
+            let story = checkout.join(rest);
+            Some((checkout, story))
+        }
+        None => Some((root.to_path_buf(), root.join("docs/stories").join(file))),
+    }
+}
+
+/// The items a schedule would consider dispatching this tick.
+fn schedule_eligible_items(schedule: &Value) -> BTreeSet<String> {
+    schedule["waves"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|wave| value_strings(&wave["eligible"]))
+        .collect()
+}
+
+/// Attach to every reconcile finding the verdict its own story earns.
+///
+/// The driver read `board reconcile` as a set of ids, and membership in that set removed a ready
+/// item from the pool with no further question asked. The IO the verification needs happens once,
+/// here, so [`drive_tick_plan`] stays a pure decision over already-read facts — and so the evidence
+/// is on the finding, where the tick can report it either way.
+///
+/// Only findings the schedule could actually dispatch are verified. Reconcile reports on every
+/// outstanding item on the board — seventy of them on this workspace — and a tick that greps the
+/// tree for all of them is a tick nobody leaves running. A finding left unverified simply never
+/// withholds, which is the same direction every other uncertainty here resolves to.
+fn drive_verified_reconcile(root: &Path, reconcile: &Value, eligible: &BTreeSet<String>) -> Value {
+    let mut verified = reconcile.clone();
+    let Some(findings) = verified["findings"].as_array_mut() else {
+        return verified;
+    };
+    for finding in findings {
+        if !finding["id"]
+            .as_str()
+            .is_some_and(|id| eligible.contains(id))
+        {
+            continue;
+        }
+        let verdict = match drive_finding_story(root, finding) {
+            Some((checkout, story)) => match fs::read_to_string(&story) {
+                Ok(body) => verify_already_built(finding, &body, &checkout),
+                Err(error) => AlreadyBuiltVerdict {
+                    withhold: false,
+                    detail: format!(
+                        "the story this signal names could not be read ({}), so nothing verifies it",
+                        redact(&error.to_string())
+                    ),
+                    evidence: Vec::new(),
+                },
+            },
+            None => AlreadyBuiltVerdict {
+                withhold: false,
+                detail: "the finding names no readable story file, so nothing verifies it"
+                    .to_string(),
+                evidence: Vec::new(),
+            },
+        };
+        finding["withhold"] = json!({
+            "verified": verdict.withhold,
+            "detail": verdict.detail,
+            "evidence": verdict.evidence,
+        });
+    }
+    verified
+}
+
+/// C-723: carry each withheld item's streak forward by one tick.
+///
+/// Only the items this tick withheld survive, so the map is bounded by the ready pool and a run ends
+/// the moment the item ships or the reason changes. `width` is not recorded: it is a capacity fact
+/// that resolves itself when a worker frees a slot, and counting it would bury the judgements that
+/// do not.
+fn drive_withhold_streaks(
+    previous: &BTreeMap<String, DriveWithhold>,
+    withheld: &[Value],
+    tick: u64,
+) -> BTreeMap<String, DriveWithhold> {
+    let mut next = BTreeMap::new();
+    for entry in withheld {
+        let (Some(item), Some(reason)) = (entry["item"].as_str(), entry["reason"].as_str()) else {
+            continue;
+        };
+        if reason == "width" {
+            continue;
+        }
+        let run = previous.get(item).filter(|held| held.reason == reason);
+        next.insert(
+            item.to_string(),
+            DriveWithhold {
+                reason: reason.to_string(),
+                ticks: run.map_or(1, |held| held.ticks.saturating_add(1)),
+                since_tick: run.map_or(tick, |held| held.since_tick),
+            },
+        );
+    }
+    next
+}
+
 /// Compute one tick's decisions. Pure: every input is already-read durable state.
 ///
 /// `reconcile` is `None` when `board reconcile` could not be read, and that case **fails closed**:
@@ -14813,14 +15218,28 @@ fn drive_tick_plan(
                 continue;
             }
             if let Some(finding) = already_built.get(&item) {
-                plan.withheld.push(json!({
+                // C-723: membership in reconcile's already-present set is a claim, not a fact, and
+                // the verdict `drive_verified_reconcile` attached is what decides. A finding with no
+                // verdict at all was never verified, so it releases — withholding is the strongest
+                // and the only silent action a tick takes, and it fails closed toward dispatching.
+                let withhold = &finding["withhold"];
+                let detail = withhold["detail"].as_str().unwrap_or(
+                    "this already-built signal carries no verification, and an unverified withhold \
+                     is a silently skipped story",
+                );
+                let record = json!({
                     "item": item,
                     "reason": "already-built",
-                    "detail": "board reconcile reports the implementation is already present",
+                    "detail": detail,
+                    "evidence": withhold["evidence"].clone(),
                     "signals": finding["signals"].clone(),
                     "transition_path": finding["transition_path"].clone(),
-                }));
-                continue;
+                });
+                if withhold["verified"] == json!(true) {
+                    plan.withheld.push(record);
+                    continue;
+                }
+                plan.released.push(record);
             }
             if plan.dispatch.len() >= plan.width {
                 plan.withheld.push(json!({
@@ -14975,7 +15394,14 @@ fn drive_one_tick(
     let schedule = fleet_schedule(root)?;
     let mut warnings = Vec::new();
     let reconcile = match drive_reconcile(root) {
-        Ok(data) => Some(data),
+        // C-723: reconcile answers "does some commit name this id?", and the driver needs "is this
+        // story's own implementation here?". Each finding this tick could act on is verified against
+        // the story it names before the plan is allowed to withhold on it.
+        Ok(data) => Some(drive_verified_reconcile(
+            root,
+            &data,
+            &schedule_eligible_items(&schedule),
+        )),
         Err(error) => {
             warnings.push(format!(
                 "board reconcile could not be read ({}); this tick dispatched nothing",
@@ -15001,8 +15427,10 @@ fn drive_one_tick(
         "reconstruct": plan.reconstruct,
         "dispatch": plan.dispatch,
         "withheld": plan.withheld,
+        "released": plan.released,
         "blocked": plan.blocked,
     });
+    let withheld = plan.withheld.clone();
     persist_delta_mutation(
         command,
         root,
@@ -15037,6 +15465,9 @@ fn drive_one_tick(
             record.ticks += 1;
             record.fingerprint = Some(fingerprint.clone());
             record.revision = state.revision;
+            // C-723: a withhold is invisible from the outside, so its run is recorded here and
+            // `fleet doctor` reports the ones that never end.
+            record.withheld = drive_withhold_streaks(&record.withheld, &withheld, record.ticks);
             Ok(())
         },
     )?;
@@ -15048,6 +15479,7 @@ fn drive_one_tick(
         "width": plan.width,
         "items": plan.dispatch,
         "withheld": plan.withheld,
+        "released": plan.released,
         "blocked": plan.blocked,
     });
     if !plan.dispatch.is_empty() && !command.dry_run {
@@ -15101,11 +15533,12 @@ fn drive_one_tick(
     });
     Ok((
         format!(
-            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), dispatched {} item(s), withheld {}",
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), dispatched {} item(s), withheld {}, released {} unverified withhold(s)",
             advanced.len(),
             reconstructed.len(),
             dispatch["items"].as_array().map_or(0, Vec::len),
             dispatch["withheld"].as_array().map_or(0, Vec::len),
+            dispatch["released"].as_array().map_or(0, Vec::len),
         ),
         data,
         warnings,
@@ -21279,6 +21712,9 @@ mod tests {
     }
 
     /// A story whose implementation is already present is WITHHELD and named, never silently dropped.
+    ///
+    /// C-723 added the `withhold` verdict: reconcile proposes, verification disposes, and only a
+    /// finding that survived verification may take an item out of the schedulable pool.
     #[test]
     fn drive_dispatch_withholds_an_item_whose_work_is_already_present() {
         let state = drive_fixture_state();
@@ -21287,6 +21723,11 @@ mod tests {
             "id": "flux/C-1",
             "signals": ["commit-subject"],
             "transition_path": ["in-progress", "done"],
+            "withhold": {
+                "verified": true,
+                "detail": "4 of 4 Acceptance criteria ticked and every named artifact is present",
+                "evidence": [{"artifact": "AlreadyThere", "present": true}],
+            },
         }]});
 
         let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 3);
@@ -21296,7 +21737,118 @@ mod tests {
         assert_eq!(plan.withheld[0]["item"], "flux/C-1");
         assert_eq!(plan.withheld[0]["reason"], "already-built");
         assert_eq!(plan.withheld[0]["signals"], json!(["commit-subject"]));
+        assert_eq!(
+            plan.withheld[0]["evidence"],
+            json!([{"artifact": "AlreadyThere", "present": true}]),
+            "a withheld item reports what justified withholding it: {:?}",
+            plan.withheld[0]
+        );
+        assert!(plan.released.is_empty(), "{:?}", plan.released);
         assert!(plan.blocked.is_none());
+    }
+
+    /// C-723, failing first: the live tick, reproduced. Eight free slots, nine ready items, and
+    /// `board reconcile` naming two of them — and the fleet dispatched one.
+    ///
+    /// `already-built` is not a fact the driver verifies; it is reconcile's heuristic, and C-718
+    /// establishes that the heuristic matches a *mention* of a story id rather than an
+    /// implementation. `C-544`'s sole evidence was a sibling story's feature commit and `C-570`'s
+    /// was a forward-referencing doc comment, yet both left the schedulable pool every tick.
+    ///
+    /// Withholding is the strongest action a tick takes and the only silent one, so it fails closed
+    /// toward dispatching: a finding that carries no verification does not withhold. Eight slots
+    /// fill, and the ninth item waits on width — a fact about the fleet — rather than on a guess
+    /// about the tree.
+    #[test]
+    fn drive_dispatches_an_item_whose_already_built_signal_carries_no_verification() {
+        let ready = [
+            "flux/C-544",
+            "flux/C-570",
+            "flux/C-601",
+            "flux/C-602",
+            "flux/C-603",
+            "flux/C-604",
+            "flux/C-605",
+            "flux/C-606",
+            "exchange/X-139",
+        ];
+        let state = drive_fixture_state();
+        let schedule = drive_fixture_schedule(&ready);
+        let reconcile = json!({"findings": [
+            {
+                "id": "flux/C-544",
+                "signals": ["implementation-landed"],
+                "transition_path": ["in-progress", "done"],
+            },
+            {
+                "id": "flux/C-570",
+                "signals": ["implementation-landed"],
+                "transition_path": ["in-progress", "done"],
+            },
+        ]});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 8);
+
+        assert_eq!(plan.width, 8, "eight workers are free");
+        assert_eq!(
+            plan.dispatch.len(),
+            8,
+            "eight free slots must fill; unverified reconcile findings are not a block: {:?}",
+            plan.dispatch
+        );
+        assert!(
+            plan.dispatch.contains(&"flux/C-544".to_string())
+                && plan.dispatch.contains(&"flux/C-570".to_string()),
+            "the two withheld fixtures are exactly the ones that must dispatch: {:?}",
+            plan.dispatch
+        );
+        assert!(
+            plan.withheld
+                .iter()
+                .all(|entry| entry["reason"] == json!("width")),
+            "the only item held back is held on capacity, not on a heuristic: {:?}",
+            plan.withheld
+        );
+    }
+
+    /// C-723: a released signal is reported, not swallowed. A wrong withhold has to be readable in
+    /// the tick output — the failure mode being fixed is one whose only symptom was a smaller number.
+    #[test]
+    fn drive_reports_the_evidence_behind_every_released_already_built_signal() {
+        let state = drive_fixture_state();
+        let schedule = drive_fixture_schedule(&["flux/C-570"]);
+        let reconcile = json!({"findings": [{
+            "id": "flux/C-570",
+            "signals": ["implementation-landed"],
+            "transition_path": ["in-progress", "done"],
+            "withhold": {
+                "verified": false,
+                "detail": "the Acceptance names 1 artifact(s) this checkout does not have \
+                           (AgentReport); the signal is a mention of the id, not its implementation",
+                "evidence": [{"artifact": "AgentReport", "present": false}],
+            },
+        }]});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 8);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-570".to_string()]);
+        assert!(plan.withheld.is_empty(), "{:?}", plan.withheld);
+        assert_eq!(plan.released.len(), 1, "{:?}", plan.released);
+        assert_eq!(plan.released[0]["item"], "flux/C-570");
+        assert_eq!(plan.released[0]["reason"], "already-built");
+        assert_eq!(
+            plan.released[0]["evidence"],
+            json!([{"artifact": "AgentReport", "present": false}]),
+            "the concrete evidence travels with the release: {:?}",
+            plan.released[0]
+        );
+        assert!(
+            plan.released[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("AgentReport")),
+            "{:?}",
+            plan.released[0]
+        );
     }
 
     /// An item a live wave still holds an attempt at is not a second wave's to take.
@@ -21358,6 +21910,371 @@ mod tests {
         assert_eq!(
             released.dispatch,
             vec!["flux/C-1".to_string(), "flux/C-2".to_string()]
+        );
+    }
+
+    /// `C-570`'s real Acceptance, abridged to the criteria that name an artifact.
+    ///
+    /// One box is ticked — a worker got its failing test established and stopped — so the story's
+    /// own record does not settle the question and the artifact gate is the one under test. The
+    /// wholly unticked case is [`a_wholly_unticked_acceptance_outranks_a_commit_that_names_the_id`].
+    const UNBUILT_STORY: &str = "---\nid: C-570\nstatus: ready\n---\n\n# Report progress\n\n\
+         ## Goal\n\nOne bounded durable protocol.\n\n## Acceptance\n\n\
+         - [x] Failing first, a blocking native `task` child emits observations but cannot produce a\n\
+         \x20     durable, acknowledged progress record.\n\
+         - [ ] `AgentReport` has stable report/sequence identities, phase/state and a bounded\n\
+         \x20     redacted summary. Persistence returns an acknowledgement and is idempotent.\n\
+         - [ ] `candidate_ready` means implementation is frozen for review; `handoff_ready` is\n\
+         \x20     host-derived only after both mandatory receipts settle.\n\
+         - [ ] Native `task` transports reports through the existing correlated child boundary.\n\
+         \x20     `SpawnActivity` remains compatible host telemetry.\n\n## Notes\n\nSee `TaskAgentBackend`.\n";
+
+    /// A single-repository board checkout, as `board reconcile` reports one: bare ids, bare story
+    /// filenames. Real git, because the only question that matters is what this tree contains.
+    fn story_checkout(label: &str, file: &str, story: &str, sources: &[(&str, &str)]) -> PathBuf {
+        let root = reclaim_test_dir(label);
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        fs::write(root.join("docs/stories").join(file), story).expect("story");
+        for (path, body) in sources {
+            let target = root.join(path);
+            fs::create_dir_all(target.parent().expect("source parent")).expect("source dir");
+            fs::write(target, body).expect("source");
+        }
+        guarded_git(&root, &["init", "--initial-branch=main"]).expect("git init");
+        root
+    }
+
+    /// C-723 (the story's own regression, failing first): free slots, a ready item, and a reconcile
+    /// finding asserting `implementation-landed` for a story whose named symbols are absent.
+    ///
+    /// The fixture is `C-570`'s own Acceptance, with one box ticked so the story's record cannot
+    /// settle it and the tree has to. Its `AgentReport` and `candidate_ready` are in no crate, and
+    /// the only trace of the story in Rust is a doc comment naming its id. One symbol the Acceptance
+    /// names — `SpawnActivity` — genuinely does exist, which is the point: a partially present set is
+    /// not an implementation, and the absent members are what decide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_dispatches_a_story_whose_named_symbols_are_absent_from_the_tree() {
+        let root = story_checkout(
+            "withhold-unbuilt",
+            "C-570-agent-progress.md",
+            UNBUILT_STORY,
+            &[(
+                "crates/flux-runtime/src/spawn.rs",
+                "pub struct SpawnActivity;\n/// Correlation only; the C-570 report protocol is unbuilt.\npub fn correlate() {}\n",
+            )],
+        );
+        let reconcile = json!({"findings": [{
+            "id": "C-570",
+            "status": "ready",
+            "file": "C-570-agent-progress.md",
+            "signals": ["implementation-landed"],
+            "transition_path": ["in-progress", "done"],
+        }]});
+
+        let schedule = drive_fixture_schedule(&["C-570"]);
+        let verified =
+            drive_verified_reconcile(&root, &reconcile, &schedule_eligible_items(&schedule));
+        let plan = drive_tick_plan(&drive_fixture_state(), &schedule, Some(&verified), 8);
+
+        assert_eq!(
+            plan.dispatch,
+            vec!["C-570".to_string()],
+            "a story whose named symbols are absent dispatches: {:?} / {:?}",
+            plan.withheld,
+            plan.released
+        );
+        assert!(plan.withheld.is_empty(), "{:?}", plan.withheld);
+        assert_eq!(plan.released.len(), 1, "{:?}", plan.released);
+
+        let detail = plan.released[0]["detail"].as_str().expect("a detail");
+        assert!(detail.contains("AgentReport"), "{detail}");
+        let evidence = plan.released[0]["evidence"]
+            .as_array()
+            .expect("per-artifact evidence")
+            .clone();
+        let answer = |name: &str| {
+            evidence
+                .iter()
+                .find(|entry| entry["artifact"] == json!(name))
+                .map(|entry| entry["present"].clone())
+        };
+        assert_eq!(answer("AgentReport"), Some(json!(false)), "{evidence:?}");
+        assert_eq!(
+            answer("SpawnActivity"),
+            Some(json!(true)),
+            "a symbol that does exist is reported as present, and does not rescue the withhold: {evidence:?}"
+        );
+        assert_eq!(
+            answer("task"),
+            None,
+            "an English word in backticks is not an artifact: {evidence:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other direction, so the gate is not simply disabled: a reviewed story whose named symbol
+    /// is really in the tree still withholds, and says what it verified.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drive_still_withholds_a_story_whose_acceptance_is_ticked_and_whose_symbol_is_present()
+    {
+        let story = "---\nid: C-1\nstatus: ready\n---\n\n## Acceptance\n\n\
+             - [x] `ReportEnvelope` carries the bounded summary.\n\
+             - [x] `crates/flux-runtime/src/report.rs` holds it.\n";
+        let root = story_checkout(
+            "withhold-built",
+            "C-1-report-envelope.md",
+            story,
+            &[(
+                "crates/flux-runtime/src/report.rs",
+                "pub struct ReportEnvelope {\n    pub summary: String,\n}\n",
+            )],
+        );
+        let reconcile = json!({"findings": [{
+            "id": "C-1",
+            "status": "ready",
+            "file": "C-1-report-envelope.md",
+            "signals": ["acceptance-complete", "implementation-landed"],
+            "transition_path": ["in-progress", "done"],
+        }]});
+
+        let schedule = drive_fixture_schedule(&["C-1"]);
+        let verified =
+            drive_verified_reconcile(&root, &reconcile, &schedule_eligible_items(&schedule));
+        let plan = drive_tick_plan(&drive_fixture_state(), &schedule, Some(&verified), 8);
+
+        assert!(plan.dispatch.is_empty(), "{:?}", plan.dispatch);
+        assert!(plan.released.is_empty(), "{:?}", plan.released);
+        assert_eq!(plan.withheld.len(), 1, "{:?}", plan.withheld);
+        assert_eq!(plan.withheld[0]["reason"], "already-built");
+        let detail = plan.withheld[0]["detail"].as_str().expect("a detail");
+        assert!(detail.contains("2 of 2"), "{detail}");
+        assert!(detail.contains("ReportEnvelope"), "{detail}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// The cheapest gate, and the one that settles both live fixtures: a story that has ticked
+    /// nothing is telling you, in its own words, that it still owes everything. No tree is opened —
+    /// which is also what keeps a tick affordable across a whole board of findings.
+    #[test]
+    fn a_wholly_unticked_acceptance_outranks_a_commit_that_names_the_id() {
+        let unticked = UNBUILT_STORY.replace("- [x]", "- [ ]");
+
+        let verdict = verify_already_built(
+            &json!({"signals": ["implementation-landed"]}),
+            &unticked,
+            Path::new("/nonexistent-checkout-c723"),
+        );
+
+        assert!(!verdict.withhold, "{verdict:?}");
+        assert!(verdict.detail.contains("none of the 4"), "{verdict:?}");
+        assert_eq!(
+            verdict.evidence,
+            vec![json!({
+                "acceptance_ticked": 0,
+                "acceptance_total": 4,
+                "reviewed_complete": false,
+            })],
+            "the record settles it before any checkout is read: {verdict:?}"
+        );
+    }
+
+    /// Reconcile reports on every outstanding item on the board; a tick only ever acts on the ones
+    /// its schedule offers. Verification follows the tick, so its cost is the ready pool rather than
+    /// the backlog — and an unverified finding still cannot withhold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn verification_visits_only_the_findings_this_tick_could_dispatch() {
+        let root = story_checkout(
+            "verify-scope",
+            "C-1-x.md",
+            "---\nid: C-1\n---\n\n## Acceptance\n\n- [x] `Present` exists.\n",
+            &[("src/present.rs", "pub struct Present;\n")],
+        );
+        let reconcile = json!({"findings": [
+            {"id": "C-1", "file": "C-1-x.md", "signals": ["acceptance-complete"]},
+            {"id": "C-2", "file": "C-2-not-on-this-schedule.md", "signals": ["acceptance-complete"]},
+        ]});
+        let schedule = drive_fixture_schedule(&["C-1"]);
+
+        let verified =
+            drive_verified_reconcile(&root, &reconcile, &schedule_eligible_items(&schedule));
+
+        assert_eq!(verified["findings"][0]["withhold"]["verified"], json!(true));
+        assert_eq!(
+            verified["findings"][1]["withhold"],
+            Value::Null,
+            "an item this tick cannot dispatch is never opened: {:?}",
+            verified["findings"][1]
+        );
+
+        // And an unvisited finding is powerless even if the schedule later names it.
+        let plan = drive_tick_plan(
+            &drive_fixture_state(),
+            &drive_fixture_schedule(&["C-2"]),
+            Some(&verified),
+            8,
+        );
+        assert_eq!(
+            plan.dispatch,
+            vec!["C-2".to_string()],
+            "{:?}",
+            plan.withheld
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A doc comment naming a symbol is a forward reference, not an implementation — the same error
+    /// as counting a commit that names an id, one level down.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_symbol_that_appears_only_in_a_comment_is_not_present() {
+        let root = story_checkout(
+            "artifact-comment",
+            "C-2-x.md",
+            "---\nid: C-2\n---\n",
+            &[(
+                "crates/flux-runtime/src/later.rs",
+                "/// Superseded once `AgentReport` lands.\n// AgentReport is not here yet.\npub fn placeholder() {}\n",
+            )],
+        );
+
+        assert_eq!(
+            artifact_present_in(&root, "AgentReport"),
+            Some(false),
+            "a doc comment and a line comment are the only mentions"
+        );
+        assert_eq!(
+            artifact_present_in(&root, "placeholder"),
+            Some(true),
+            "a real definition on the same line is what presence means"
+        );
+        assert_eq!(
+            artifact_present_in(&root, "crates/flux-runtime/src/later.rs"),
+            Some(true)
+        );
+        assert_eq!(
+            artifact_present_in(&root, "crates/flux-runtime/src/absent.rs"),
+            Some(false)
+        );
+
+        // A checkout git cannot read answers nothing, and nothing is never evidence of absence — so
+        // the verdict releases rather than withholding on a question it could not put.
+        let unreadable = reclaim_test_dir("artifact-no-git");
+        fs::remove_dir_all(&unreadable).ok();
+        fs::create_dir_all(&unreadable).expect("bare dir");
+        assert_eq!(artifact_present_in(&unreadable, "AgentReport"), None);
+        let verdict = verify_already_built(
+            &json!({"signals": ["acceptance-complete"]}),
+            "## Acceptance\n- [x] `AgentReport` lands.\n",
+            &unreadable,
+        );
+        assert!(!verdict.withhold, "{verdict:?}");
+        assert!(
+            verdict.detail.contains("could not be checked"),
+            "{verdict:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&unreadable).ok();
+    }
+
+    /// What an Acceptance names that a tree can be asked about — and what it does not.
+    #[test]
+    fn acceptance_artifacts_names_symbols_and_paths_but_never_prose_or_an_id() {
+        assert_eq!(
+            acceptance_artifacts(UNBUILT_STORY),
+            vec![
+                "AgentReport".to_string(),
+                "candidate_ready".to_string(),
+                "handoff_ready".to_string(),
+                "SpawnActivity".to_string(),
+            ],
+            "`task` is an English word and `TaskAgentBackend` is outside the Acceptance"
+        );
+        assert!(
+            acceptance_artifacts(
+                "## Acceptance\n- [ ] `flux fleet drive` writes a `*.flux` file for `C-544`.\n"
+            )
+            .is_empty(),
+            "a command, a glob and a story id are not artifacts"
+        );
+        assert_eq!(
+            acceptance_artifacts(
+                "## Acceptance\n- [ ] `.agents/skills/flux-tui/SKILL.md` says so.\n"
+            ),
+            vec![".agents/skills/flux-tui/SKILL.md".to_string()]
+        );
+    }
+
+    /// C-723: a withhold that never ends is a decision nobody reviewed, and `fleet doctor` is where
+    /// it stops being invisible. Capacity is excluded — that one resolves itself.
+    #[test]
+    fn a_ready_item_withheld_tick_after_tick_becomes_a_doctor_finding() {
+        let withheld = [
+            json!({"item": "flux/C-570", "reason": "already-built", "detail": "verified"}),
+            json!({"item": "flux/C-9", "reason": "width", "detail": "8 of 8 slots in use"}),
+        ];
+        let mut streaks = BTreeMap::new();
+        for tick in 1..=DRIVE_WITHHOLD_STREAK_LIMIT {
+            streaks = drive_withhold_streaks(&streaks, &withheld, tick);
+        }
+        assert!(
+            !streaks.contains_key("flux/C-9"),
+            "capacity is a fact about the fleet, not a judgement about an item: {streaks:?}"
+        );
+        assert_eq!(streaks["flux/C-570"].ticks, DRIVE_WITHHOLD_STREAK_LIMIT);
+        assert_eq!(streaks["flux/C-570"].since_tick, 1);
+
+        let mut state = drive_fixture_state();
+        state.drive = Some(DriveRecord {
+            ticks: DRIVE_WITHHOLD_STREAK_LIMIT,
+            withheld: streaks.clone(),
+            ..DriveRecord::default()
+        });
+        let findings = persistent_withhold_findings(&state);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0]["check"], "item-withheld-persistently");
+        assert_eq!(findings[0]["subject"], "flux/C-570");
+        assert!(
+            findings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("already-built") && detail.contains("5")),
+            "{findings:?}"
+        );
+        assert!(
+            findings[0]["fix"]
+                .as_str()
+                .is_some_and(|fix| !fix.is_empty()),
+            "{findings:?}"
+        );
+        assert!(
+            fleet_runtime_health(&state)["healthy"] == json!(false),
+            "the runtime verdict carries it"
+        );
+
+        // The run ends the moment the item ships, so the finding cannot outlive the problem.
+        let cleared = drive_withhold_streaks(&streaks, &[], DRIVE_WITHHOLD_STREAK_LIMIT + 1);
+        assert!(cleared.is_empty(), "{cleared:?}");
+    }
+
+    /// One tick under the limit is not yet a finding: a withhold is allowed to be transient.
+    #[test]
+    fn a_briefly_withheld_item_is_not_a_finding() {
+        let withheld = [json!({"item": "flux/C-570", "reason": "claimed", "detail": "wave-9"})];
+        let mut streaks = BTreeMap::new();
+        for tick in 1..DRIVE_WITHHOLD_STREAK_LIMIT {
+            streaks = drive_withhold_streaks(&streaks, &withheld, tick);
+        }
+        let mut state = drive_fixture_state();
+        state.drive = Some(DriveRecord {
+            ticks: DRIVE_WITHHOLD_STREAK_LIMIT - 1,
+            withheld: streaks,
+            ..DriveRecord::default()
+        });
+
+        assert!(
+            persistent_withhold_findings(&state).is_empty(),
+            "{:?}",
+            persistent_withhold_findings(&state)
         );
     }
 
