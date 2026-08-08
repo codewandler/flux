@@ -14,6 +14,10 @@ only repository policy that must be known before acting. Product documentation s
   beside the primary Flux checkout. The local story's Goal and Acceptance still define done. If they
   contradict the cross-repository decision, amend or supersede the story before implementation
   instead of treating roadmap prose as acceptance.
+- Before acting on a board or fleet contract, read [docs/glossary.md](docs/glossary.md). It defines
+  the delivery vocabulary — wave, claim, park, capture, fence, canonical ref, member, lane,
+  milestone, candidate, handoff — with the distinction each term exists to protect. The corrections
+  this file used to repeat in prose live there now, checked against the code they describe.
 - Begin with `git status --short --branch`. Treat existing changes as user-owned. Do not reset,
   discard, rebase, rewrite history, force-push, create a branch/worktree, or commit unless the user
   explicitly asks.
@@ -78,6 +82,8 @@ These are release boundaries, not conventions. Never add a bypass.
 
 Read the focused contract before changing these areas:
 
+- The delivery vocabulary the board and fleet contracts depend on:
+  [docs/glossary.md](docs/glossary.md)
 - Flux-Lang syntax, generated references, or editor mirrors:
   [crates/flux-lang/AGENTS.md](crates/flux-lang/AGENTS.md)
 - Plugins or the nested plugin workspace: [plugins/AUTHORING.md](plugins/AUTHORING.md)
