@@ -3,8 +3,7 @@ id: C-601
 title: "Give turn cancellation a visible state and sub-agents a wall-clock bound"
 pillar: Core
 epic: fleet-harness-throughput
-status: ready
-priority: 30
+status: done
 areas: [flux-tui, flux-orchestrate]
 note: "cancel works but cannot interrupt an in-flight model call, and the UI keeps spinning with no cancelling state"
 ---

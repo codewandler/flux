@@ -2,8 +2,7 @@
 id: C-622
 title: "Board item expand and collapse works by click and by keyboard alike"
 pillar: "Core"
-status: ready
-priority: 22
+status: done
 epic: tui-board-surface
 areas: [flux-tui]
 design: docs/designs/the-tui-board-is-a-real-board-collapsed-expandable-clickable-items-rendering-markdown-detail.md

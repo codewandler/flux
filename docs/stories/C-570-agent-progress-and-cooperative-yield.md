@@ -2,13 +2,12 @@
 id: C-570
 title: "Agents report typed progress and cooperatively yield upstream"
 pillar: Core
-status: ready
+status: in-progress
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-runtime, flux-flow, flux-orchestrate, flux-cli]
 depends_on: [C-569]
 note: "SpawnActivity is host telemetry; add durable child-authored reports, acknowledgement and a resumable safe-checkpoint yield"
-priority: 10
 ---
 
 # Report progress without claiming authority

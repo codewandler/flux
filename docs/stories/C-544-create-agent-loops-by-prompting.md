@@ -2,8 +2,7 @@
 id: C-544
 title: "Create a new agent loop by prompting, available in the loop selector"
 pillar: Core
-status: ready
-priority: 32
+status: done
 epic:
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-tui, flux-lang, flux-agent]
@@ -37,7 +36,9 @@ flux source.
       operator's prompt.
 - [x] The saved loop has stable profile/revision/source-digest metadata for C-569 resolution. Creating
       it does not automatically authorize it for Fleet task kinds or alter an admitted worker.
-- [ ] The gate is green in both workspaces.
+- [x] The gate is green in both workspaces. *(`scripts/release-full-gate.sh` on the combined wave-761
+      tree: `mandatory release gate green`. The gate runs `cargo fmt --manifest-path
+      plugins/Cargo.toml --all --check` and `test -p flux-codegate`, so both workspaces are covered.)*
 
 ## Progress
 
