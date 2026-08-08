@@ -2,7 +2,7 @@
 id: C-719
 title: "A tag build that publishes nothing must be red"
 pillar: "Core"
-status: ready
+status: done
 priority: 5
 areas: [workflows, release]
 note: "GitHub propagates skipped transitively through needs; the publish chain skipped and the run still reported success, so v0.59.0 has a tag and no Release"
@@ -49,18 +49,80 @@ passed" carried no information about whether a release existed.
 
 ## Acceptance
 
-- [ ] `attest`, `publish-github-release` and `publish-container-image` break the skip chain with
+- [x] `attest`, `publish-github-release` and `publish-container-image` break the skip chain with
       `always()` and assert their real upstreams succeeded — admitting a transitively-skipped graph,
       never a failed or skipped dependency.
-- [ ] A `verify-published` job fails the run when `plan.outputs.publishing == 'true'` and
+      → `release.yml:658`, `:686`, `:780` (landed in `e353d528`). Held structurally by
+      `scripts/check-publish-chain.sh`, whose `attest-loses-always`,
+      `publish-github-release-loses-always`, `publish-container-image-loses-always`,
+      `announce-loses-always`, `attest-admits-a-failed-host`,
+      `publish-github-release-admits-a-failed-attest` and
+      `container-image-admits-an-unpublished-release` fixtures each restore one of these holes and
+      are each rejected.
+- [x] A `verify-published` job fails the run when `plan.outputs.publishing == 'true'` and
       `publish-github-release` did not succeed, so a publish-nothing tag build can never be green
       again. This is the story's failing-first evidence: the job must fail on the v0.59.0 job
       results and pass on a run that actually published.
-- [ ] Promoting a prepared candidate still skips the build jobs and still publishes — the fix must
+      → `release.yml:908`. `scripts/check-publish-chain.sh` **executes that job's own step script**
+      with `needs.publish-github-release.result` substituted: it must exit non-zero for `skipped`,
+      `failure` and `cancelled`, and zero for `success`. The `verify-published-deleted`,
+      `verify-published-gated-on-the-result-it-checks`, `verify-published-accepts-a-skipped-publish`,
+      `verify-published-assertion-made-conditional` and `verify-published-needs-a-checkout` fixtures
+      cover the ways it stops being a backstop.
+- [x] Promoting a prepared candidate still skips the build jobs and still publishes — the fix must
       not force a rebuild on the promote path.
-- [ ] `v0.59.0` ends with a real GitHub Release carrying binaries and attestation, or is superseded
+      → confirmed in production: runs `31246987406` (v0.59.1) and `31251445072` (v0.59.2) both
+      skipped `build-local-artifacts` and `build-global-artifacts` and both published 28 assets.
+      Held by the model's liveness assertion — on the promote path every authority job and the
+      backstop must conclude `success` — and by `promote-path-forces-a-rebuild`, which rejects the
+      "just rebuild on the tag" escape that would satisfy every skip rule while discarding
+      build-once.
+- [x] `v0.59.0` ends with a real GitHub Release carrying binaries and attestation, or is superseded
       by a version that does.
-- [ ] The gate is green in both workspaces.
+      → superseded. `v0.59.1` and `v0.59.2` each carry the exact 28-asset inventory, and
+      `/releases/latest` is `v0.59.2`. `v0.59.0` remains a tag with no Release.
+- [x] The gate is green in both workspaces.
+      → `scripts/release-full-gate.sh` green on `impl/C-719`; see Progress for the exact line.
+
+## Progress
+
+- 2026-08-08 — the workflow half had already landed in `e353d528`; what was missing was the
+  assertion that keeps it. Added `scripts/check-publish-chain.sh` and wired it into `ci.yml`'s
+  `action-pins` job beside the other release guards.
+
+  GitHub Actions YAML cannot be unit-tested by running it, so the script models the one scheduling
+  rule this defect lives in — **transitive** skip propagation over the `needs` closure, with
+  `always()` as the only thing that stops it — and schedules the *committed* `release.yml` through
+  it. Every `if:` is read from the file, never restated, and the publish chain is derived (every job
+  with `host` in its `needs` closure) rather than listed, so a publish job added later is covered
+  the day it lands. A condition outside the tiny supported grammar aborts the check instead of being
+  guessed at.
+
+  Three kinds of assertion: structural (`always()` at every hop, real upstream success asserted,
+  the backstop gated on nothing but `publishing`), executed (the backstop's real script, run), and
+  simulated (216 publishing runs — every `host` × `build-local` × `build-global` result crossed
+  with every subset of the authority jobs failing — must satisfy *run concluded success ⇒
+  publish-github-release succeeded*, plus the liveness half so "fail every tag run" is not a pass).
+
+  Fidelity, not just strictness — the model was checked against real runs of this workflow in both
+  directions:
+
+  | run | workflow | model predicts | GitHub did |
+  |---|---|---|---|
+  | `31196060862` (v0.59.0) | `release.yml` at `e353d528^` | attest / publish-github-release / publish-container-image / announce `skipped`, conclusion `success` | identical — and no Release |
+  | `31246987406` (v0.59.1) | as committed | all five `success` | identical, 28 assets |
+  | `31251445072` (v0.59.2) | as committed | all five `success` | identical, 28 assets |
+
+  Both v0.59.1 and v0.59.2 are promote-path runs with `build-local-artifacts` and
+  `build-global-artifacts` `skipped`, so acceptance criterion 3 is confirmed in production and not
+  only in the model. `--replay` against the `e353d528^` file also makes the check exit 1, which is
+  the failing-first evidence against real history. The self-test asserts the same table from a
+  synthetic reconstruction, because CI checks out at depth 1 and cannot read a parent commit.
+
+  What it does not catch: it is a model, not GitHub. It does not validate the Actions schema, does
+  not evaluate `fromJson`/`startsWith`, and takes `plan`, `resolve-release-candidate`, the two build
+  jobs and `host` as inputs rather than deciding them — which is the form the v0.59.0 evidence
+  arrived in. Whether the published *bytes* are right remains `scripts/verify-github-release.sh`.
 
 ## Notes
 
