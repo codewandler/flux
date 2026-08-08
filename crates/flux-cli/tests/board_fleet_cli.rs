@@ -2459,6 +2459,473 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::remove_dir_all(root).ok();
 }
 
+/// A member checkout with one committed story, on a local `main`.
+fn promote_member(root: &Path, id: &str, stories: &[(&str, i64)]) -> PathBuf {
+    let member = root.join("members").join(id);
+    fs::create_dir_all(member.join("docs/stories")).unwrap();
+    fs::write(member.join("README.md"), format!("# {id}\n")).unwrap();
+    for (story, priority) in stories {
+        fs::write(
+            member.join(format!("docs/stories/{story}-story.md")),
+            format!(
+                "---\nid: {story}\ntitle: Story {story}\nstatus: ready\npriority: {priority}\n---\n\n# Story {story}\n\n## Acceptance\n\n- [ ] ship\n"
+            ),
+        )
+        .unwrap();
+    }
+    let member = member.to_path_buf();
+    assert!(git(&member, &["init", "-q", "-b", "main"]).status.success());
+    assert!(
+        git(&member, &["config", "user.email", "fleet@example.test"])
+            .status
+            .success()
+    );
+    assert!(git(&member, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&member, &["add", "."]).status.success());
+    assert!(git(&member, &["commit", "-qm", "fixture"]).status.success());
+    member
+}
+
+fn head_of(repository: &PathBuf, reference: &str) -> String {
+    let resolved = git(repository, &["rev-parse", reference]);
+    assert!(
+        resolved.status.success(),
+        "{reference} must resolve: {}",
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    String::from_utf8(resolved.stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// Dispatch one wave holding `items`, returning its id and the worktree of each story.
+fn promote_dispatch(root: &PathBuf, items: &[&str]) -> (String, Vec<PathBuf>) {
+    let mut args = vec!["fleet", "run"];
+    args.extend_from_slice(items);
+    args.extend_from_slice(&["--prepare-only", "--output", "json"]);
+    let dispatched = flux(root, &args);
+    assert!(
+        dispatched.status.success(),
+        "dispatch {items:?}: stdout={} stderr={}",
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&dispatched.stderr)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let wave = dispatched["data"]["wave"].as_str().unwrap().to_string();
+    let worktrees = items
+        .iter()
+        .map(|item| {
+            let found = dispatched["data"]["topology"]["repositories"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|repository| repository["stories"].as_array().unwrap())
+                .find(|story| story["board_ref"].as_str() == Some(item))
+                .unwrap_or_else(|| panic!("{item} must be in the dispatched topology"));
+            PathBuf::from(found["worktree"].as_str().unwrap())
+        })
+        .collect();
+    (wave, worktrees)
+}
+
+/// Commit `contents` in a story worktree and hand it off as that story's delivered work.
+fn promote_deliver(
+    root: &PathBuf,
+    wave: &str,
+    item: &str,
+    worktree: &PathBuf,
+    file: &str,
+    contents: &str,
+) {
+    fs::write(worktree.join(file), contents).unwrap();
+    assert!(git(worktree, &["add", file]).status.success());
+    assert!(git(worktree, &["commit", "-qm", &format!("write {file}")])
+        .status
+        .success());
+    let commit = head_of(worktree, "HEAD");
+    let handoff = flux(
+        root,
+        &[
+            "fleet",
+            "handoff",
+            wave,
+            item,
+            "--commit",
+            &commit,
+            "--write-set",
+            file,
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            file,
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "Implemented the story contract",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "handoff {item}: stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+}
+
+/// Gate the wave and accept every green candidate, leaving one annotated tag per member.
+fn promote_accept(root: &PathBuf, wave: &str) {
+    let integrated = flux(root, &["fleet", "integrate", wave, "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "integrate {wave}: stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let applied = flux(root, &["fleet", "apply", wave, "--output", "json"]);
+    assert!(
+        applied.status.success(),
+        "apply {wave}: stdout={} stderr={}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
+    // The state this story exists to resolve: accepted, pinned, and NOT on any canonical branch.
+    assert_eq!(applied["data"]["merged_locally"], false);
+    assert_eq!(applied["data"]["delivered"], false);
+}
+
+fn promote_fleet_config(threshold: u64) -> String {
+    format!(
+        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n\
+         [promote]\nthreshold = {threshold}\n\n\
+         [[repositories]]\nid = \"client\"\nroot = \"members/client\"\nboard = \"default\"\ncanonical_ref = \"main\"\ndepends_on = [\"engine\"]\ngate = [\"git\", \"status\", \"--short\"]\n\n\
+         [[repositories]]\nid = \"engine\"\nroot = \"members/engine\"\nboard = \"default\"\ncanonical_ref = \"main\"\ngate = [\"git\", \"status\", \"--short\"]\n\n\
+         [[repositories]]\nid = \"mirror\"\nroot = \"members/mirror\"\nboard = \"default\"\ncanonical_ref = \"origin/main\"\ngate = [\"git\", \"status\", \"--short\"]\n"
+    )
+}
+
+/// Failing first: `flux fleet promote` lands accepted work on every member's LOCAL canonical branch.
+///
+/// This is the last mile, and until now nothing in the product walked it. `fleet apply` accepts a
+/// green candidate, pins it with an annotated tag and reports `merged_locally: false`; C-619 removed
+/// the local merge it used to attempt because that merge landed on a detached worktree HEAD and never
+/// reached a branch at all. What actually advanced `main` was `snapshot_and_merge()` in one operator's
+/// `autopilot.sh` — called once, hardcoded to a single member, with that machine's absolute path as
+/// its argument. In any other deployment the release train silently never ran, and in that one the
+/// other two members were simply never promoted.
+///
+/// Four properties are proved here, and each is a defect if it regresses.
+///
+///  * **The order comes from the declared graph, not from the file or the alphabet.** `client` is
+///    declared first and also sorts first, and it declares `depends_on = ["engine"]` — so decision
+///    0005's `engine → client` order is only produced by reading the graph. Both orders a naive
+///    implementation falls into are wrong here.
+///  * **The threshold is configuration.** With `[promote] threshold = 2` one accepted candidate per
+///    member is withheld and every canonical ref is untouched; the identical command lands the
+///    identical state once the configuration says one is enough.
+///  * **A member whose canonical ref is remote-tracking is refused by name.** Only a push can move
+///    `origin/main`, and the fleet never pushes, so reporting anything but a refusal would be the
+///    over-claim C-721 was written to close.
+///  * **Landing is verified by re-reading the ref**, not by trusting the merge's exit code.
+#[test]
+fn fleet_promote_lands_every_member_on_its_local_canonical_branch_in_dependency_order() {
+    let root = fixture("fleet-promote-order");
+    install_test_fleet_loops(&root);
+    let client = promote_member(&root, "client", &[("C-2", 2)]);
+    let engine = promote_member(&root, "engine", &[("C-1", 1)]);
+    let mirror = promote_member(&root, "mirror", &[]);
+    // A remote-tracking ref that resolves without a network: `origin/main` exists, and nothing but a
+    // push could ever move it.
+    let mirror_head = head_of(&mirror, "HEAD");
+    assert!(git(
+        &mirror,
+        &["update-ref", "refs/remotes/origin/main", &mirror_head]
+    )
+    .status
+    .success());
+
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/board.toml"),
+        "schema = \"flux.board-workspace/v1\"\nid = \"product\"\ndefault = true\nactive_milestone = \"current\"\n\n\
+         [[members]]\nid = \"client\"\nroot = \"members/client\"\nboard = \"default\"\ncanonical_ref = \"main\"\n\n\
+         [[members]]\nid = \"engine\"\nroot = \"members/engine\"\nboard = \"default\"\ncanonical_ref = \"main\"\n",
+    )
+    .unwrap();
+    fs::write(root.join(".flux/fleet.toml"), promote_fleet_config(2)).unwrap();
+    let started = flux(&root, &["fleet", "start"]);
+    assert!(
+        started.status.success(),
+        "the promotion threshold is configuration the fleet must accept: stdout={} stderr={}",
+        String::from_utf8_lossy(&started.stdout),
+        String::from_utf8_lossy(&started.stderr)
+    );
+
+    let engine_base = head_of(&engine, "main");
+    let client_base = head_of(&client, "main");
+
+    let (wave, worktrees) = promote_dispatch(&root, &["engine/C-1", "client/C-2"]);
+    promote_deliver(
+        &root,
+        &wave,
+        "engine/C-1",
+        &worktrees[0],
+        "engine.txt",
+        "engine landed\n",
+    );
+    promote_deliver(
+        &root,
+        &wave,
+        "client/C-2",
+        &worktrees[1],
+        "client.txt",
+        "client landed\n",
+    );
+    promote_accept(&root, &wave);
+
+    // A dry run reports the exact merges it would make and writes nothing.
+    let preview = flux(
+        &root,
+        &["fleet", "promote", "--dry-run", "--output", "json"],
+    );
+    assert!(
+        preview.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&preview.stdout),
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let preview: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let previewed = preview["data"]["members"].as_array().unwrap();
+    assert_eq!(
+        previewed
+            .iter()
+            .map(|member| member["member"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["engine", "client", "mirror"],
+        "the preview walks the declared dependency graph: {}",
+        preview["data"]
+    );
+    assert_eq!(
+        head_of(&engine, "main"),
+        engine_base,
+        "a preview writes nothing"
+    );
+
+    // The threshold is configuration, and below it nothing is landed.
+    let withheld = flux(&root, &["fleet", "promote", "--output", "json"]);
+    assert!(
+        withheld.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&withheld.stdout),
+        String::from_utf8_lossy(&withheld.stderr)
+    );
+    let withheld: serde_json::Value = serde_json::from_slice(&withheld.stdout).unwrap();
+    assert_eq!(withheld["data"]["threshold"], 2);
+    let engine_withheld = withheld["data"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["member"] == "engine")
+        .unwrap()
+        .clone();
+    assert_eq!(engine_withheld["status"], "withheld", "{engine_withheld}");
+    assert!(
+        engine_withheld["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("1/2"),
+        "a withheld member says how far it is from its threshold: {engine_withheld}"
+    );
+    assert_eq!(head_of(&engine, "main"), engine_base);
+    assert_eq!(head_of(&client, "main"), client_base);
+
+    // The same state, the same command, one configuration value changed.
+    fs::write(root.join(".flux/fleet.toml"), promote_fleet_config(1)).unwrap();
+    let promoted = flux(&root, &["fleet", "promote", "--output", "json"]);
+    assert!(
+        promoted.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&promoted.stdout),
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+    let promoted: serde_json::Value = serde_json::from_slice(&promoted.stdout).unwrap();
+    assert_eq!(
+        promoted["data"]["promoted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|member| member.as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["engine", "client"],
+        "the upstream member lands first: {}",
+        promoted["data"]
+    );
+    assert_eq!(promoted["data"]["pushed"], false);
+    assert_eq!(promoted["data"]["released"], false);
+    assert_eq!(promoted["data"]["deployed"], false);
+
+    // Landing is a git fact, re-read from the member's own checkout.
+    assert_ne!(
+        head_of(&engine, "main"),
+        engine_base,
+        "engine main advanced"
+    );
+    assert_ne!(
+        head_of(&client, "main"),
+        client_base,
+        "client main advanced"
+    );
+    let engine_file = git(&engine, &["show", "main:engine.txt"]);
+    assert!(
+        engine_file.status.success(),
+        "the accepted work is on the member's local main: {}",
+        String::from_utf8_lossy(&engine_file.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&engine_file.stdout),
+        "engine landed\n"
+    );
+    assert!(git(&client, &["show", "main:client.txt"]).status.success());
+
+    // A member whose canonical ref only a push could move is refused BY NAME, and the refusal names
+    // the ref rather than reporting an unlanded member as done.
+    let refused = promoted["data"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|member| member["member"] == "mirror")
+        .unwrap()
+        .clone();
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("origin/main"),
+        "the refusal names the ref: {refused}"
+    );
+
+    // C-721's check must now agree: the wave's canonical refs contain its accepted candidates, so the
+    // wave is `applied` rather than `awaiting-delivery`.
+    let status = flux(
+        &root,
+        &["fleet", "inspect", "wave", &wave, "--output", "json"],
+    );
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(
+        status["data"]["data"]["status"], "applied",
+        "promotion resolves the delivery question it just answered: {}",
+        status["data"]["data"]
+    );
+    assert_eq!(
+        status["data"]["data"]["delivery"]["delivered"], true,
+        "and records the containment it re-read, not the fact that it merged"
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// Failing first: one candidate that will not combine must not cost the others their promotion.
+///
+/// Two waves accepted from the same base, each rewriting one file, cannot both merge. The bash
+/// snapshot got this right and it is the property most easily lost: forcing the conflict would land
+/// an ungated tree, and abandoning the whole accumulation would strand delivered work behind a
+/// collision it had no part in. So the conflicting candidate is left out, reported by name, and the
+/// rest still land.
+#[test]
+fn fleet_promote_excludes_a_conflicting_candidate_and_lands_the_rest() {
+    let root = fixture("fleet-promote-conflict");
+    install_test_fleet_loops(&root);
+    let engine = promote_member(&root, "engine", &[("C-1", 1), ("C-2", 2)]);
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/board.toml"),
+        "schema = \"flux.board-workspace/v1\"\nid = \"product\"\ndefault = true\nactive_milestone = \"current\"\n\n\
+         [[members]]\nid = \"engine\"\nroot = \"members/engine\"\nboard = \"default\"\ncanonical_ref = \"main\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!(
+            "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n\
+             [[repositories]]\nid = \"engine\"\nroot = \"members/engine\"\nboard = \"default\"\ncanonical_ref = \"main\"\ngate = [\"git\", \"status\", \"--short\"]\n"
+        ),
+    )
+    .unwrap();
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let base = head_of(&engine, "main");
+
+    let (first, worktrees) = promote_dispatch(&root, &["engine/C-1"]);
+    promote_deliver(
+        &root,
+        &first,
+        "engine/C-1",
+        &worktrees[0],
+        "shared.txt",
+        "from the first wave\n",
+    );
+    promote_accept(&root, &first);
+
+    // Accepting does not move `main`, so the second wave is assembled from the same base and its
+    // candidate rewrites the same file.
+    assert_eq!(head_of(&engine, "main"), base);
+    let (second, worktrees) = promote_dispatch(&root, &["engine/C-2"]);
+    promote_deliver(
+        &root,
+        &second,
+        "engine/C-2",
+        &worktrees[0],
+        "shared.txt",
+        "from the second wave\n",
+    );
+    promote_accept(&root, &second);
+
+    let promoted = flux(&root, &["fleet", "promote", "--output", "json"]);
+    assert!(
+        promoted.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&promoted.stdout),
+        String::from_utf8_lossy(&promoted.stderr)
+    );
+    let promoted: serde_json::Value = serde_json::from_slice(&promoted.stdout).unwrap();
+    let member = promoted["data"]["members"][0].clone();
+    assert_eq!(member["status"], "promoted", "{member}");
+    let excluded = member["excluded"].as_array().unwrap();
+    assert_eq!(
+        excluded.len(),
+        1,
+        "exactly one candidate is left out: {member}"
+    );
+    assert_eq!(
+        excluded[0]["wave"], second,
+        "and it is named, so it can be re-integrated rather than lost: {member}"
+    );
+    assert!(
+        excluded[0]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("conflict"),
+        "{member}"
+    );
+
+    // The surviving candidate really landed, and the excluded one did not.
+    assert_eq!(
+        String::from_utf8_lossy(&git(&engine, &["show", "main:shared.txt"]).stdout),
+        "from the first wave\n"
+    );
+    assert_ne!(head_of(&engine, "main"), base);
+
+    fs::remove_dir_all(root).ok();
+}
+
 /// Failing first: concurrent handoffs against one wave all land.
 ///
 /// A handoff writes the wave record and its worker's record, and at width every worker reaches that point

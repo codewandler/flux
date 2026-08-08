@@ -1122,6 +1122,19 @@ pub(super) enum FleetAction {
         #[arg(long)]
         only: Option<String>,
     },
+    /// Land every member's accepted candidates on its LOCAL canonical branch, in dependency order.
+    ///
+    /// C-681. `apply` accepts and pins; this is the step that writes the branch. Per member, in the
+    /// order `depends_on` declares: accumulate the accepted candidates that the canonical ref does not
+    /// already contain, merge them in a throwaway worktree branched from that ref, gate the result
+    /// there, and only then advance the branch — by a compare-and-swap ref update, so no working tree
+    /// anywhere is touched. A conflicting candidate is left out and named. A red gate anywhere leaves
+    /// EVERY member's branch untouched. Nothing is pushed, released or deployed.
+    Promote {
+        /// Promote only this repository.
+        #[arg(long)]
+        only: Option<String>,
+    },
     Status,
     Schedule,
     /// Run the unattended driver: one deterministic tick, or an interval loop over it.
@@ -1477,7 +1490,30 @@ struct FleetConfig {
     #[serde(default = "default_worktree_root")]
     worktree_root: PathBuf,
     #[serde(default)]
+    promote: PromoteConfig,
+    #[serde(default)]
     repositories: Vec<FleetRepository>,
+}
+
+/// When accumulated acceptance is worth spending a full repository gate on.
+///
+/// C-681. This was `SNAPSHOT_EVERY` in one operator's shell driver — an environment variable read by
+/// a script that lived outside the product, so no other deployment had it and nothing validated it.
+/// Landing is a first-class fleet operation, so its one tuning knob is first-class configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromoteConfig {
+    /// Accepted candidates a member must have waiting before promotion gates and lands it.
+    #[serde(default = "default_promote_threshold")]
+    threshold: usize,
+}
+
+impl Default for PromoteConfig {
+    fn default() -> Self {
+        Self {
+            threshold: default_promote_threshold(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1621,6 +1657,15 @@ struct FleetRepository {
     fences: Vec<String>,
     #[serde(default)]
     concurrency: Option<usize>,
+    /// Repositories whose promotion must precede this one.
+    ///
+    /// C-681. Which member lands first is a property of the DEPLOYMENT, not of Flux: the roadmap
+    /// workspace's decision 0005 fixes `flux → connectors → exchange`, and a fleet with one repository
+    /// declares nothing at all. So the order is read from this graph rather than written into the
+    /// product, and no member id appears in Flux's own source. Declaration order breaks ties, so an
+    /// operator who simply lists repositories in dependency order already gets it.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 const fn default_max_workers() -> usize {
@@ -1636,6 +1681,11 @@ const fn default_true() -> bool {
     true
 }
 const fn default_template_instances() -> usize {
+    1
+}
+/// Land as soon as anything is accepted. Raising it batches several waves into one gate run, at the
+/// cost of leaving accepted work off the canonical branch for longer.
+const fn default_promote_threshold() -> usize {
     1
 }
 /// The task kind that grants a template the dedicated wave-integrator catalogue. Declaring it in
@@ -4970,11 +5020,15 @@ worktree_root = ".flux/fleet/worktrees"
 # fences = [".git/**", ".flux/fleet/**"]
 # max_instances = {max_workers}
 
+# [promote]
+# threshold = 1 # accepted candidates a member accumulates before promotion gates and lands it
+
 # [[repositories]]
 # id = "repo"
 # root = "."
 # board = "default"
-# canonical_ref = "origin/main"
+# canonical_ref = "main" # a LOCAL branch: promotion cannot write a remote-tracking ref
+# depends_on = [] # repositories that must be promoted before this one
 # gate = ["cargo", "test", "--workspace"]
 "#,
                         ),
@@ -6078,6 +6132,7 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Apply { wave, only } => {
             apply_wave(command, root, state, wave, only.as_deref())
         }
+        FleetAction::Promote { only } => promote_members(command, root, state, only.as_deref()),
         FleetAction::Call { operation } => fleet_call(command, root, state, operation, request),
     }
 }
@@ -6220,6 +6275,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Reopen { .. }
             | FleetAction::Resume { .. }
             | FleetAction::Apply { .. }
+            | FleetAction::Promote { .. }
             | FleetAction::Note { .. }
             | FleetAction::Reclaim { .. }
             | FleetAction::Repair { .. }
@@ -6395,6 +6451,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "reopen",
         "resume",
         "apply",
+        // Promote MUTATES: it advances a member's local canonical branch.
+        "promote",
         "status",
         "schedule",
         // Drive MUTATES and DISPATCHES: one tick advances waves, accumulates its own record, and
@@ -6493,7 +6551,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, or deploys. `apply` accepts a green candidate and pins it with a tag; `promote` is the only operation that writes a member's local canonical branch.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\nflux fleet promote --dry-run --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet promote` is the last mile: per member, in the order `depends_on` declares, it accumulates the accepted candidates its canonical ref lacks, merges and gates them in a throwaway worktree, and advances the local branch by a compare-and-swap ref update — a conflicting candidate is left out and named, a red gate anywhere leaves every member's branch untouched, and a member whose `canonical_ref` is remote-tracking is refused because only a push could move it. `[promote] threshold` in `.flux/fleet.toml` sets how many accepted candidates a member accumulates first; it defaults to `1`. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -19395,6 +19453,823 @@ fn reopen_wave(
         state.revision,
     ))
 }
+/// The order members are landed in: the declared dependency graph, stable-sorted by declaration.
+///
+/// C-681. Decision 0005 fixes a cross-repository publication order, and it belongs to the workspace
+/// that has those repositories — so it is read from `depends_on` rather than encoded here. A fleet
+/// that declares no dependencies promotes in the order its `fleet.toml` lists, which is what an
+/// operator writing that file already means.
+fn promotion_order(repositories: &[FleetRepository]) -> Result<Vec<usize>> {
+    let declared = repositories
+        .iter()
+        .map(|repository| repository.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for repository in repositories {
+        for dependency in &repository.depends_on {
+            if dependency == &repository.id {
+                bail!(
+                    "input/schema: fleet repository {} declares itself as its own promotion dependency",
+                    repository.id
+                )
+            }
+            if !declared.contains(dependency.as_str()) {
+                bail!(
+                    "not-found: fleet repository {} depends on {dependency}, which is not a configured repository",
+                    repository.id
+                )
+            }
+        }
+    }
+    let mut placed = vec![false; repositories.len()];
+    let mut satisfied = BTreeSet::<&str>::new();
+    let mut order = Vec::with_capacity(repositories.len());
+    while order.len() < repositories.len() {
+        let next = repositories.iter().enumerate().find(|(index, repository)| {
+            !placed[*index]
+                && repository
+                    .depends_on
+                    .iter()
+                    .all(|dependency| satisfied.contains(dependency.as_str()))
+        });
+        let Some((index, repository)) = next else {
+            let stuck = repositories
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !placed[*index])
+                .map(|(_, repository)| repository.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "input/schema: fleet repository promotion dependencies form a cycle among {stuck}"
+            )
+        };
+        placed[index] = true;
+        satisfied.insert(repository.id.as_str());
+        order.push(index);
+    }
+    Ok(order)
+}
+
+/// Waves are numbered, and `wave-10` must accumulate after `wave-9` rather than after `wave-1`.
+fn wave_sequence(id: &str) -> (u64, String) {
+    let number = id
+        .rsplit('-')
+        .next()
+        .and_then(|tail| tail.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    (number, id.to_string())
+}
+
+/// One candidate a green gate accepted, pinned by its tag, waiting for a canonical branch.
+#[derive(Clone, Debug)]
+struct AcceptedCandidate {
+    wave: String,
+    candidate: String,
+    tag: String,
+}
+
+/// Every candidate `apply` accepted for one member, oldest wave first.
+///
+/// The acceptance record IS the fact, so this reads `applied` rather than filtering on wave status:
+/// a candidate that passed its gate and was pinned by an annotated tag is exactly what promotion
+/// exists to land, whatever the wave went on to be recorded as.
+fn accepted_candidates(state: &FleetState, member: &str) -> Vec<AcceptedCandidate> {
+    let mut waves = state.waves.iter().collect::<Vec<_>>();
+    waves.sort_by_key(|(id, _)| wave_sequence(id));
+    let mut accepted = Vec::new();
+    for (id, wave) in waves {
+        for entry in wave["applied"].as_array().into_iter().flatten() {
+            if entry["repository"].as_str() != Some(member) {
+                continue;
+            }
+            let (Some(candidate), Some(tag)) =
+                (entry["candidate"].as_str(), entry["accepted_tag"].as_str())
+            else {
+                continue;
+            };
+            accepted.push(AcceptedCandidate {
+                wave: id.clone(),
+                candidate: candidate.to_string(),
+                tag: tag.to_string(),
+            });
+        }
+    }
+    accepted
+}
+
+/// Which local branch, if any, promotion is allowed to advance for this member.
+///
+/// Decision 0021 §2: a canonical ref names where work lands, so it must be a ref the fleet can
+/// write. `origin/main` is not one — only a push moves it and promotion never pushes — and reporting
+/// anything but a refusal for such a member is the over-claim C-721 exists to prevent.
+enum PromotionTarget {
+    Branch(String),
+    Refused(String),
+}
+
+fn promotion_target(source: &Path, canonical_ref: &str) -> PromotionTarget {
+    match git_output(source, &["rev-parse", "--symbolic-full-name", canonical_ref]) {
+        Some(full) if full.starts_with("refs/heads/") => PromotionTarget::Branch(full),
+        Some(full) if full.starts_with("refs/remotes/") => PromotionTarget::Refused(format!(
+            "canonical_ref {canonical_ref} is the remote-tracking ref {full}; only a push could move it and promotion never pushes, so this member cannot be landed — declare a local branch instead"
+        )),
+        Some(full) if !full.is_empty() => PromotionTarget::Refused(format!(
+            "canonical_ref {canonical_ref} resolves to {full}, which is not a local branch, so promotion has no branch to advance"
+        )),
+        _ => PromotionTarget::Refused(format!(
+            "canonical_ref {canonical_ref} does not resolve in {}",
+            display_path(source)
+        )),
+    }
+}
+
+/// Build space for one member's accumulation, deliberately outside the wave worktree namespace.
+///
+/// `orphaned_wave_dirs` treats every directory under `worktree_root` as a wave that state has lost,
+/// so a promotion checkout there would be reported as an orphaned wave. It is neither a wave nor a
+/// record: its tree is anchored by an annotated tag before the gate runs, and the directory itself is
+/// removed on every exit path.
+fn promote_worktree_path(root: &Path, member: &str) -> PathBuf {
+    root.join(".flux/fleet/promote")
+        .join(safe_ref_segment(member))
+}
+
+/// Checkouts other than the promotion worktree that have this branch checked out.
+///
+/// Promotion advances the branch with a ref update and touches no working tree, which is what keeps
+/// it out of shared checkouts — but a checkout sitting on that branch then holds an index and files
+/// from the previous tip, and that is a hazard an operator has to be told about in words.
+fn worktrees_on_branch(source: &Path, branch: &str, exclude: &Path) -> Vec<String> {
+    let Some(listing) = git_output(source, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let mut holders = Vec::new();
+    let mut path: Option<String> = None;
+    for line in listing.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            if value == branch {
+                if let Some(path) = path.as_deref() {
+                    if Path::new(path) != exclude {
+                        holders.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    holders
+}
+
+/// A member whose accumulation passed its gate and is waiting for the whole train to be green.
+struct GatedMember {
+    id: String,
+    source: PathBuf,
+    canonical_ref: String,
+    branch: String,
+    from: String,
+    accumulation: String,
+    tag: String,
+    merged: Vec<AcceptedCandidate>,
+}
+
+/// Accumulate, gate and land every member's accepted candidates.
+///
+/// C-681, and the last mile of decision 0021 §0: the fleet's autonomous job ends when accepted work
+/// is on a member's LOCAL canonical branch. `apply` stops one step short of that on purpose — it pins
+/// a candidate with an annotated tag and reports `merged_locally: false` — and until now the only
+/// thing that closed the gap was `snapshot_and_merge()` in one operator's `autopilot.sh`: called once,
+/// hardcoded to a single member, with that machine's absolute path as its argument. Every other
+/// deployment's release train silently never ran.
+///
+/// The shape is the bash version's learned invariants, which are the contract rather than a starting
+/// point, plus the two things it got wrong:
+///
+///  * The gate runs in a THROWAWAY WORKTREE branched from the canonical ref, so a long gate cannot be
+///    disturbed by concurrent work and a red gate leaves the branch untouched.
+///  * A candidate that will not combine is EXCLUDED AND NAMED, never forced. Forcing would land an
+///    ungated tree; abandoning the accumulation would strand delivered work behind a collision it had
+///    no part in.
+///  * The landing itself is a COMPARE-AND-SWAP REF UPDATE, not a merge in a checkout. The bash merged
+///    into the operator's primary checkout — a surface other sessions are working in — and a merge
+///    there also fails outright whenever that checkout is dirty. A ref update is atomic, refuses if
+///    the branch moved while the gate ran, and writes no working tree at all.
+///  * The verdict is RE-READ FROM GIT. `merged_locally` was once reported from an exit code and was
+///    false for weeks (C-721); here the canonical ref is resolved again after the update and each
+///    candidate's containment is asked of git, so `landed` describes the ref rather than the attempt.
+///
+/// Nothing here pushes, tags a release or deploys. Decision 0021 §0 keeps those out of scope.
+fn promote_members(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    only: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let config = read_fleet_config(root)?;
+    if config.repositories.is_empty() {
+        bail!(
+            "conflict/precondition: no fleet repositories are configured, so there is no canonical branch to promote onto"
+        )
+    }
+    if let Some(only) = only {
+        if !config
+            .repositories
+            .iter()
+            .any(|repository| repository.id == only)
+        {
+            bail!("not-found: fleet repository {only}")
+        }
+    }
+    let threshold = config.promote.threshold;
+    if threshold == 0 {
+        bail!("input/schema: [promote] threshold must be at least 1")
+    }
+    let order = promotion_order(&config.repositories)?;
+    let mut warnings = Vec::new();
+    // One report per member, in promotion order. A member that never reaches the gate is settled
+    // here; a member that passes it is finished in the landing phase below.
+    let mut reports: Vec<Value> = Vec::new();
+    let mut gated: Vec<Option<GatedMember>> = Vec::new();
+    let mut blocked_by: Vec<String> = Vec::new();
+
+    for index in &order {
+        let repository = &config.repositories[*index];
+        if only.is_some_and(|only| only != repository.id) {
+            continue;
+        }
+        let id = repository.id.clone();
+        let canonical_ref = repository.canonical_ref.clone();
+        let settle = |status: &str, reason: String, extra: Value| {
+            let mut report = json!({
+                "member": id,
+                "canonical_ref": canonical_ref,
+                "status": status,
+                "reason": reason,
+            });
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                report[key] = value.clone();
+            }
+            report
+        };
+        let source = match repository_root(root, repository) {
+            Ok(source) => source,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                warnings.push(format!("{}: {reason}", repository.id));
+                reports.push(settle("refused", reason, Value::Null));
+                gated.push(None);
+                continue;
+            }
+        };
+        // The writability question comes FIRST, before any accumulation: a member configured with a
+        // ref the fleet cannot write is a defect worth reporting whether or not it has work waiting.
+        let branch = match promotion_target(&source, &repository.canonical_ref) {
+            PromotionTarget::Branch(branch) => branch,
+            PromotionTarget::Refused(reason) => {
+                warnings.push(format!("{} cannot be promoted: {reason}", repository.id));
+                reports.push(settle("refused", reason, Value::Null));
+                gated.push(None);
+                continue;
+            }
+        };
+        let Some(from) = git_output(&source, &["rev-parse", &repository.canonical_ref]) else {
+            let reason = format!(
+                "canonical_ref {} does not resolve to a commit",
+                repository.canonical_ref
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle("refused", reason, Value::Null));
+            gated.push(None);
+            continue;
+        };
+        let accepted = accepted_candidates(&state, &repository.id);
+        let mut pending = Vec::new();
+        let mut contained = Vec::new();
+        let mut excluded = Vec::new();
+        for candidate in accepted {
+            // "Absent" and "will not combine" are different operator problems with different answers,
+            // and a merge failure would report the first as the second. Ask git which one it is before
+            // spending a merge on it.
+            if git_output(
+                &source,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("{}^{{commit}}", candidate.candidate),
+                ],
+            )
+            .is_none()
+            {
+                let reason = format!(
+                    "candidate is absent from {}, so it cannot be accumulated; its accepted tag {} no longer resolves there",
+                    display_path(&source),
+                    candidate.tag
+                );
+                warnings.push(format!(
+                    "{} candidate {} from {} was excluded: {reason}",
+                    repository.id, candidate.candidate, candidate.wave
+                ));
+                excluded.push(json!({
+                    "wave": candidate.wave,
+                    "candidate": candidate.candidate,
+                    "accepted_tag": candidate.tag,
+                    "reason": reason,
+                }));
+                continue;
+            }
+            let already = guarded_git(
+                &source,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &candidate.candidate,
+                    &repository.canonical_ref,
+                ],
+            )
+            .map(|output| output.exit_code == 0)
+            .unwrap_or(false);
+            if already {
+                contained.push(json!({"wave": candidate.wave, "candidate": candidate.candidate}));
+            } else {
+                pending.push(candidate);
+            }
+        }
+        let waiting = pending
+            .iter()
+            .map(|candidate| json!({"wave": candidate.wave, "candidate": candidate.candidate, "accepted_tag": candidate.tag}))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            let (status, reason) = if excluded.is_empty() {
+                (
+                    "up-to-date",
+                    format!(
+                        "{} already contains every accepted candidate",
+                        repository.canonical_ref
+                    ),
+                )
+            } else {
+                (
+                    "unchanged",
+                    format!(
+                        "no candidate could be accumulated; {} were excluded",
+                        excluded.len()
+                    ),
+                )
+            };
+            reports.push(settle(
+                status,
+                reason,
+                json!({"contained": contained, "excluded": excluded}),
+            ));
+            gated.push(None);
+            continue;
+        }
+        if pending.len() < threshold {
+            reports.push(settle(
+                "withheld",
+                format!(
+                    "{}/{threshold} accepted candidate(s) accumulated",
+                    pending.len()
+                ),
+                json!({"accumulated": waiting, "contained": contained, "excluded": excluded}),
+            ));
+            gated.push(None);
+            continue;
+        }
+        if command.dry_run {
+            reports.push(settle(
+                "preview",
+                format!(
+                    "would merge {} accepted candidate(s) into {} at {from}, gate the result, then advance the branch",
+                    pending.len(),
+                    repository.canonical_ref
+                ),
+                json!({"from": from, "would_merge": waiting, "contained": contained, "excluded": excluded}),
+            ));
+            gated.push(None);
+            continue;
+        }
+
+        let worktree = promote_worktree_path(root, &repository.id);
+        // Build space from an interrupted run is not a record — its tree was anchored by a tag before
+        // any gate ran — so it is replaced rather than treated as a conflict.
+        let _ = guarded_git(&source, &["worktree", "prune"]);
+        if worktree.exists() {
+            let _ = guarded_git(
+                &source,
+                &["worktree", "remove", "--force", &display_path(&worktree)],
+            );
+        }
+        if let Some(parent) = worktree.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let added = guarded_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &display_path(&worktree),
+                &from,
+            ],
+        )?;
+        if added.exit_code != 0 {
+            let reason = format!(
+                "could not create the promotion worktree: {}",
+                clipped_redacted(added.stderr.as_bytes())
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle("failed", reason, json!({"from": from})));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+
+        let mut merged = Vec::new();
+        for candidate in &pending {
+            let message = format!(
+                "Fleet promotion: accumulate {} candidate {} for {}",
+                candidate.wave, candidate.candidate, repository.id
+            );
+            let outcome = guarded_git(
+                &worktree,
+                &[
+                    "merge",
+                    "--no-ff",
+                    "--no-edit",
+                    "-m",
+                    &message,
+                    &candidate.candidate,
+                ],
+            )?;
+            if outcome.exit_code == 0 {
+                merged.push(candidate.clone());
+                continue;
+            }
+            // Read the conflicting paths before aborting, or the evidence goes with the merge.
+            let conflicts = git_output(&worktree, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
+            let _ = guarded_git(&worktree, &["merge", "--abort"]);
+            let reason = if conflicts.trim().is_empty() {
+                "conflict with the accumulated tree".to_string()
+            } else {
+                format!(
+                    "conflict with the accumulated tree in {}",
+                    conflicts.lines().collect::<Vec<_>>().join(", ")
+                )
+            };
+            warnings.push(format!(
+                "{} candidate {} from {} was excluded from this promotion: {reason}; it stays pinned by {} and can be re-integrated",
+                repository.id, candidate.candidate, candidate.wave, candidate.tag
+            ));
+            excluded.push(json!({
+                "wave": candidate.wave,
+                "candidate": candidate.candidate,
+                "accepted_tag": candidate.tag,
+                "reason": reason,
+            }));
+        }
+        let merged_report = merged
+            .iter()
+            .map(|candidate| json!({"wave": candidate.wave, "candidate": candidate.candidate, "accepted_tag": candidate.tag}))
+            .collect::<Vec<_>>();
+        let remove_worktree = |source: &Path, worktree: &Path| {
+            let _ = guarded_git(
+                source,
+                &["worktree", "remove", "--force", &display_path(worktree)],
+            );
+            let _ = guarded_git(source, &["worktree", "prune"]);
+        };
+        if merged.is_empty() {
+            remove_worktree(&source, &worktree);
+            reports.push(settle(
+                "unchanged",
+                "every accumulated candidate conflicts with the canonical branch".to_string(),
+                json!({"from": from, "excluded": excluded, "contained": contained}),
+            ));
+            gated.push(None);
+            continue;
+        }
+        let Some(accumulation) = git_output(&worktree, &["rev-parse", "HEAD"]) else {
+            remove_worktree(&source, &worktree);
+            let reason = "the accumulation worktree has no resolvable HEAD".to_string();
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle("failed", reason, json!({"from": from})));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        };
+        // The anchor, written BEFORE the gate. It is what makes a red gate triageable and what keeps
+        // the accumulation reachable once this worktree is gone; naming it after the newest wave in
+        // the set keeps a retry of the same accumulation on the same tag instead of minting a new one.
+        let newest = merged
+            .last()
+            .expect("a non-empty accumulation")
+            .wave
+            .clone();
+        let tag = format!(
+            "fleet/promote/{}/{}",
+            safe_ref_segment(&repository.id),
+            safe_ref_segment(&newest)
+        );
+        let tagged = guarded_git(
+            &worktree,
+            &[
+                "tag",
+                "-f",
+                "-a",
+                &tag,
+                &accumulation,
+                "-m",
+                &format!(
+                    "Fleet accumulated {} accepted candidate(s) for {} onto {} at {from}; gated before landing.",
+                    merged.len(),
+                    repository.id,
+                    repository.canonical_ref
+                ),
+            ],
+        )?;
+        if tagged.exit_code != 0 {
+            remove_worktree(&source, &worktree);
+            let reason = format!(
+                "could not anchor the accumulation with tag {tag}: {}",
+                clipped_redacted(tagged.stderr.as_bytes())
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle(
+                "failed",
+                reason,
+                json!({"from": from, "merged": merged_report, "excluded": excluded}),
+            ));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+        if repository.gate.is_empty() {
+            remove_worktree(&source, &worktree);
+            let reason = format!(
+                "no configured gate; promotion refuses to land an unproven tree — {tag} is retained for triage"
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle(
+                "red",
+                reason,
+                json!({"from": from, "tag": tag, "merged": merged_report, "excluded": excluded}),
+            ));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+        let gate = run_typed_argv(&worktree, &repository.gate)?;
+        let green = gate["success"].as_bool() == Some(true);
+        // Pure build space. The tag holds the tree, so removing this costs nothing and disk is what
+        // caps how wide the fleet can run.
+        remove_worktree(&source, &worktree);
+        if !green {
+            let reason =
+                format!("the gate failed on the accumulated tree; {tag} is retained for triage");
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle(
+                "red",
+                reason,
+                json!({"from": from, "tag": tag, "merged": merged_report, "excluded": excluded, "gate": gate}),
+            ));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+        reports.push(json!({
+            "member": repository.id,
+            "canonical_ref": repository.canonical_ref,
+            "status": "gated",
+            "reason": format!("the accumulated tree passed the gate at {tag}"),
+            "from": from,
+            "to": accumulation,
+            "tag": tag,
+            "merged": merged_report,
+            "excluded": excluded,
+            "contained": contained,
+            "gate": gate,
+        }));
+        gated.push(Some(GatedMember {
+            id: repository.id.clone(),
+            source,
+            canonical_ref: repository.canonical_ref.clone(),
+            branch,
+            from,
+            accumulation,
+            tag,
+            merged,
+        }));
+    }
+
+    // PARTIAL SUCCESS ACROSS MEMBERS IS NOT SUCCESS.
+    //
+    // The members are a release train, ordered by the dependency graph, so a red gate anywhere makes
+    // the whole set unproven — landing the green half would leave a state nobody can reason about
+    // later and no verb can undo. Refusals and below-threshold skips are NOT red gates and never
+    // withhold anybody: they mean a member had nothing to contribute, not that its work failed.
+    let mut promoted = Vec::new();
+    let mut landed_waves = BTreeSet::new();
+    for (report, member) in reports.iter_mut().zip(gated.iter()) {
+        let Some(member) = member else {
+            continue;
+        };
+        if !blocked_by.is_empty() {
+            report["status"] = json!("blocked");
+            report["landed"] = json!(false);
+            report["reason"] = json!(format!(
+                "gated green, but {} did not, so no member's canonical branch was written; {} is retained and will be re-gated on the next promotion",
+                blocked_by.join(", "),
+                member.tag
+            ));
+            continue;
+        }
+        // Compare-and-swap: the gate ran for as long as the gate runs, and this refuses rather than
+        // clobbering anything that reached the branch in the meantime.
+        let updated = guarded_git(
+            &member.source,
+            &[
+                "update-ref",
+                "-m",
+                &format!(
+                    "flux fleet promote: land {} accepted candidate(s) from {}",
+                    member.merged.len(),
+                    member.tag
+                ),
+                &member.branch,
+                &member.accumulation,
+                &member.from,
+            ],
+        )?;
+        // The verdict is re-read from git, never taken from the update's exit code.
+        let tip = git_output(&member.source, &["rev-parse", &member.canonical_ref]);
+        let containment = member
+            .merged
+            .iter()
+            .map(|candidate| {
+                let contained = guarded_git(
+                    &member.source,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &candidate.candidate,
+                        &member.canonical_ref,
+                    ],
+                )
+                .map(|output| output.exit_code == 0)
+                .unwrap_or(false);
+                json!({"wave": candidate.wave, "candidate": candidate.candidate, "contained": contained})
+            })
+            .collect::<Vec<_>>();
+        let landed = tip.as_deref() == Some(member.accumulation.as_str())
+            && containment
+                .iter()
+                .all(|entry| entry["contained"] == json!(true));
+        report["landed"] = json!(landed);
+        report["tip"] = json!(tip);
+        report["containment"] = json!(containment);
+        if landed {
+            report["status"] = json!("promoted");
+            report["reason"] = json!(format!(
+                "{} contains every merged candidate and now points at {}",
+                member.canonical_ref, member.accumulation
+            ));
+            promoted.push(member.id.clone());
+            for candidate in &member.merged {
+                landed_waves.insert(candidate.wave.clone());
+            }
+            for holder in worktrees_on_branch(
+                &member.source,
+                &member.branch,
+                &promote_worktree_path(root, &member.id),
+            ) {
+                warnings.push(format!(
+                    "{holder} has {} checked out. Promotion advanced the ref without touching that working tree, so its index and files still hold {} — `git commit -am` there would revert the work just landed. Reconcile that checkout before committing in it.",
+                    member.branch, member.from
+                ));
+            }
+        } else {
+            report["status"] = json!("failed");
+            report["reason"] = json!(format!(
+                "{} was not advanced to {}: {}; {} is retained for triage",
+                member.canonical_ref,
+                member.accumulation,
+                if updated.exit_code == 0 {
+                    "git reported success but the ref does not contain the accumulation".to_string()
+                } else {
+                    clipped_redacted(updated.stderr.as_bytes())
+                },
+                member.tag
+            ));
+            warnings.push(format!(
+                "{} did not land: {}",
+                member.id,
+                report["reason"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+
+    // C-721's question, re-asked now that the refs have moved. A wave becomes `applied` only where
+    // every accepted repository's canonical ref is OBSERVED to contain its candidate — the same
+    // verdict `apply` computes, from the same helpers, so promoting cannot make a claim that
+    // `fleet doctor` would then contradict.
+    let mut deliveries = Vec::new();
+    for wave_id in &landed_waves {
+        let Some(wave) = state.waves.get(wave_id) else {
+            continue;
+        };
+        if wave["status"].as_str() == Some("applied") {
+            continue;
+        }
+        let verdicts = wave_delivery_verdicts(wave, git_delivery_probe);
+        if wave_is_delivered(&verdicts) {
+            deliveries.push((wave_id.clone(), verdicts));
+        }
+    }
+    let applied = deliveries
+        .iter()
+        .map(|(wave, _)| wave.clone())
+        .collect::<Vec<_>>();
+    let data = json!({
+        "schema": "flux.fleet-promotion/v1",
+        "dry_run": command.dry_run,
+        "threshold": threshold,
+        "only": only,
+        "order": order
+            .iter()
+            .map(|index| config.repositories[*index].id.clone())
+            .collect::<Vec<_>>(),
+        "members": reports,
+        "promoted": promoted,
+        "blocked_by": blocked_by,
+        "applied_waves": applied,
+        "pushed": false,
+        "released": false,
+        "deployed": false,
+    });
+    // A run that touched nothing leaves no trace. `fleet reclaim` spent nineteen consecutive runs
+    // writing a journal entry indistinguishable from progress while freeing zero bytes (b90e1f4c),
+    // and promotion is invoked on exactly the same cadence — so a sweep that found every member
+    // up to date or below its threshold neither bumps the revision nor journals.
+    let acted = reports.iter().any(|report| {
+        matches!(
+            report["status"].as_str(),
+            Some("promoted" | "red" | "failed" | "blocked" | "unchanged")
+        )
+    });
+    if !command.dry_run {
+        if deliveries.is_empty() {
+            if acted {
+                append_fleet_event(root, "fleet.promoted", data.clone())?;
+            }
+        } else {
+            let recorded = deliveries.clone();
+            persist_delta_mutation(
+                command,
+                root,
+                &mut state,
+                "fleet.promoted",
+                data.clone(),
+                |state| {
+                    for (wave_id, verdicts) in &recorded {
+                        let Some(wave) = state.waves.get_mut(wave_id) else {
+                            continue;
+                        };
+                        wave["status"] = json!("applied");
+                        wave["apply_eligible"] = json!(false);
+                        wave["delivery"] = json!({"delivered": true, "repositories": verdicts});
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    let human = if command.dry_run {
+        format!(
+            "promotion preview: {} member(s) would land accepted candidates; nothing was merged, gated or written",
+            reports
+                .iter()
+                .filter(|report| report["status"] == json!("preview"))
+                .count()
+        )
+    } else if !blocked_by.is_empty() {
+        format!(
+            "promotion withheld: {} gated red, so no member's canonical branch was written — every accumulation tag is retained for triage",
+            blocked_by.join(", ")
+        )
+    } else if promoted.is_empty() {
+        "promotion landed nothing: no member had accepted candidates above its threshold"
+            .to_string()
+    } else {
+        format!(
+            "promoted {} onto their local canonical branches; nothing was pushed, released or deployed",
+            promoted.join(", ")
+        )
+    };
+    Ok((human, data, warnings, state.revision))
+}
+
 fn fleet_call(
     command: &FleetCommand,
     root: &Path,
