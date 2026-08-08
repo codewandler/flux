@@ -3318,7 +3318,10 @@ fn fleet_integrate_refuses_a_candidate_no_independent_reviewer_examined() {
     let reworked: serde_json::Value = serde_json::from_slice(&reworked.stdout).unwrap();
     assert_eq!(reworked["data"]["reviews"][0]["verdict"], "REWORK");
     assert_eq!(reworked["data"]["reviews"][0]["state"], "reviewed");
-    assert_eq!(reworked["data"]["reviews"][0]["rework"]["decision"], "REWORK");
+    assert_eq!(
+        reworked["data"]["reviews"][0]["rework"]["decision"],
+        "REWORK"
+    );
     let still_refused = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
     assert!(
         !still_refused.status.success(),

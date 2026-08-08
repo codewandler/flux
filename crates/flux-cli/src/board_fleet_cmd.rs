@@ -18579,6 +18579,16 @@ struct ReviewCandidate<'a> {
     writer_session: Option<String>,
 }
 
+/// One attempt at obtaining a verdict for one candidate.
+#[derive(Clone, Copy)]
+struct ReviewAttempt<'a> {
+    candidate: &'a ReviewCandidate<'a>,
+    packet: &'a Value,
+    attempt: u64,
+    /// A typed document an external reviewer already produced, instead of dispatching one.
+    external: Option<&'a Value>,
+}
+
 /// What actually happened to a candidate, in the shape the record stores it.
 struct ReviewOutcome {
     /// Why this record is what it is: `reviewed`, `not-run`, `incomplete-context`, `failed`,
@@ -18685,7 +18695,13 @@ fn story_contract_at(source: &Path, commit: &str, item: &str) -> Option<Value> {
     let id = item.rsplit('/').next().unwrap_or(item);
     let listing = git_output(
         source,
-        &["ls-tree", "-r", "--name-only", commit, RECONCILE_BOARD_PREFIX],
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            commit,
+            RECONCILE_BOARD_PREFIX,
+        ],
     )?;
     let path = listing.lines().find(|candidate| {
         candidate
@@ -18726,14 +18742,38 @@ fn review_packet(candidate: &ReviewCandidate<'_>) -> Value {
     let shortstat = git_output(&candidate.source, &["diff", "--shortstat", &range]);
     let write_set = diff_write_set(&candidate.source, &candidate.base, &candidate.commit).ok();
     let contract = story_contract_at(&candidate.source, &candidate.commit, candidate.item);
-    // Complete means complete. A diff at or above the budget may also have been clipped by the
-    // guarded port's own 1 MiB capture cap, so the packet reports that it is short WITHOUT
-    // pretending to know by how much.
-    let complete = diff
-        .as_ref()
-        .is_some_and(|diff| diff.len() < REVIEW_DIFF_BUDGET_BYTES)
-        && contract.is_some()
-        && write_set.is_some();
+    // What the reviewer would actually be shown.
+    //
+    // `redact` is deliberately blunt: one credential pattern anywhere collapses the WHOLE string.
+    // That is right for an error message and catastrophic for a diff — a candidate that merely
+    // mentions `api_key`, or touches `.env.example` or a `.pem`, arrives as the ten characters
+    // `[redacted]`. Judging completeness on the RAW diff would then mark that packet whole, and a
+    // reviewer handed nothing could return PASS over a change no one ever saw. So completeness is
+    // judged on the redacted form, which is the only form that reaches the model.
+    let shown = diff.as_deref().map(redact);
+    // Named rather than merely absent, because "incomplete" is acted on and a reason nobody recorded
+    // is a reason nobody can fix.
+    let incomplete_reason = if diff.is_none() {
+        Some("the diff could not be read from the repository checkout")
+    } else if shown.as_deref() == Some("[redacted]") {
+        Some(
+            "the diff carries a credential pattern, so it cannot be shown to a model without \
+             redacting all of it",
+        )
+    } else if shown
+        .as_deref()
+        .is_some_and(|shown| shown.len() >= REVIEW_DIFF_BUDGET_BYTES)
+    {
+        // At or above the budget the guarded port's own 1 MiB capture cap may also have clipped it,
+        // so this reports that the packet is short WITHOUT pretending to know by how much.
+        Some("the diff exceeds the reviewable packet budget")
+    } else if contract.is_none() {
+        Some("no story contract is present at the reviewed commit")
+    } else if write_set.is_none() {
+        Some("the write set could not be observed from the range")
+    } else {
+        None
+    };
     json!({
         "schema": FLEET_REVIEW_PACKET_SCHEMA,
         "wave": candidate.wave,
@@ -18741,13 +18781,15 @@ fn review_packet(candidate: &ReviewCandidate<'_>) -> Value {
         "repository": candidate.repository,
         "base_commit": candidate.base,
         "candidate_commit": candidate.commit,
+        // Over the raw range, so the candidate's identity is the candidate's, not the redaction's.
         "diff_digest": diff.as_deref().map(flux_lang::runtime::sha256_hex),
         "diff_bytes": diff.as_ref().map(String::len),
         "shortstat": shortstat,
         "write_set": write_set,
         "story": contract,
-        "diff": diff.as_deref().map(redact),
-        "complete": complete,
+        "diff": shown,
+        "complete": incomplete_reason.is_none(),
+        "incomplete_reason": incomplete_reason,
     })
 }
 
@@ -18805,7 +18847,8 @@ fn extract_review_document(text: &str) -> Option<Value> {
         let Some(close) = after[body_start..].find("```") else {
             break;
         };
-        if let Ok(value) = serde_json::from_str::<Value>(after[body_start..body_start + close].trim())
+        if let Ok(value) =
+            serde_json::from_str::<Value>(after[body_start..body_start + close].trim())
         {
             found = Some(value);
         }
@@ -19014,13 +19057,16 @@ fn admit_candidate_reviewer(
     attempt: u64,
     packet: &Value,
 ) -> Result<String> {
-    let id = format!(
+    let mut id = format!(
         "review-{}-{}-{attempt}",
         safe_ref_segment(candidate.wave),
         safe_ref_segment(candidate.item),
     );
+    // A re-review of a candidate whose verdict was already reached reuses the attempt number, and a
+    // reviewer is never resumed — so disambiguate rather than refuse. Refusing here would have
+    // turned an operator's explicit second look into a recorded review failure.
     if state.agents.contains_key(&id) {
-        bail!("conflict/precondition: reviewer {id} is already admitted")
+        id = format!("{id}-{}", state.revision + 1);
     }
     if candidate.writer.as_deref() == Some(id.as_str()) {
         bail!("permission: a story's writer cannot be its reviewer")
@@ -19152,15 +19198,19 @@ fn review_refused_before_dispatch(
         ));
     }
     if packet["complete"].as_bool() != Some(true) {
-        // NOT a refusal that wedges the wave. An unreviewably large candidate is itself a finding,
-        // and routing it as one spends the rework budget and terminates in the host's PARK rather
-        // than in a deadlock only an operator can clear.
+        // NOT a refusal that wedges the wave. A candidate that cannot be examined is itself a
+        // finding, and routing it as one spends the rework budget and terminates in the host's PARK
+        // rather than in a deadlock only an operator can clear.
         let detail = format!(
-            "the candidate does not fit a reviewable packet ({}); split it into changes that can be \
-             examined against their acceptance",
+            "this candidate cannot be examined: {}{}. Split it, or remove what forces the redaction, \
+             so a reviewer can judge it against its acceptance",
+            packet["incomplete_reason"]
+                .as_str()
+                .unwrap_or("the review packet is incomplete"),
             packet["shortstat"]
                 .as_str()
-                .unwrap_or("size could not be measured"),
+                .map(|shortstat| format!(" ({shortstat})"))
+                .unwrap_or_default(),
         );
         return Some(ReviewOutcome {
             state: "incomplete-context",
@@ -19203,11 +19253,14 @@ fn review_candidate(
     root: &Path,
     config: &FleetConfig,
     state: &mut FleetState,
-    candidate: &ReviewCandidate<'_>,
-    packet: &Value,
-    attempt: u64,
-    external: Option<&Value>,
+    review: &ReviewAttempt<'_>,
 ) -> ReviewOutcome {
+    let ReviewAttempt {
+        candidate,
+        packet,
+        attempt,
+        external,
+    } = *review;
     let blocked = |state: &'static str, reason: String| ReviewOutcome {
         state,
         verdict: "BLOCKED",
@@ -19345,6 +19398,25 @@ fn fleet_review(
     let mut reviews = Vec::new();
     let mut warnings = Vec::new();
     for (repository_index, story_index) in selected {
+        // Re-read per candidate rather than working off the snapshot taken above. Reviewing one
+        // story routes findings through `fleet_rework`, which can park the whole wave — and the next
+        // candidate must not then be reviewed against a wave that has already stopped.
+        let wave = state
+            .waves
+            .get(input.wave)
+            .cloned()
+            .with_context(|| format!("not-found: wave {}", input.wave))?;
+        if !matches!(
+            wave["status"].as_str(),
+            Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+        ) {
+            warnings.push(format!(
+                "{} stopped being reviewable ({}) before every candidate was examined",
+                input.wave,
+                wave["status"].as_str().unwrap_or("unknown"),
+            ));
+            break;
+        }
         let repository = &wave["topology"]["repositories"][repository_index];
         let story = &repository["stories"][story_index];
         let item = story["board_ref"]
@@ -19400,16 +19472,13 @@ fn fleet_review(
         };
         let packet = review_packet(&candidate);
         let attempt = story["review_attempts"].as_u64().unwrap_or(0) + 1;
-        let outcome = review_candidate(
-            command,
-            root,
-            &config,
-            &mut state,
-            &candidate,
-            &packet,
+        let review = ReviewAttempt {
+            candidate: &candidate,
+            packet: &packet,
             attempt,
-            external.as_ref(),
-        );
+            external: external.as_ref(),
+        };
+        let outcome = review_candidate(command, root, &config, &mut state, &review);
         let mut receipt = review_receipt(&candidate, &packet, attempt, &outcome);
         // A review that examined the candidate ends the retry run, whatever its verdict: the bound
         // exists for reviews that looked at nothing, not for ones that found something.
@@ -19443,7 +19512,8 @@ fn fleet_review(
         )?;
 
         if outcome.verdict == "REWORK" {
-            let (paths, command_outputs, invariants) = rework_inputs_from_findings(&outcome.findings);
+            let (paths, command_outputs, invariants) =
+                rework_inputs_from_findings(&outcome.findings);
             let reviewer = receipt["reviewer"]["id"]
                 .as_str()
                 .filter(|reviewer| !reviewer.is_empty())
@@ -21564,7 +21634,10 @@ mod tests {
             "verdict": "PASS", "examined": true, "findings": [],
         });
         assert_eq!(candidate_review_refusal(&story), None);
-        assert!(!candidate_awaits_review(&story), "a reached verdict is not re-paid for");
+        assert!(
+            !candidate_awaits_review(&story),
+            "a reached verdict is not re-paid for"
+        );
 
         // Same commit, same empty `findings`, opposite meaning.
         story["review"] = json!({
@@ -21572,7 +21645,8 @@ mod tests {
             "verdict": "BLOCKED", "examined": false, "findings": [],
             "reason": "the reviewer returned no document",
         });
-        let unexamined = candidate_review_refusal(&story).expect("an unexamined candidate is refused");
+        let unexamined =
+            candidate_review_refusal(&story).expect("an unexamined candidate is refused");
         assert!(unexamined.contains("never examined it"), "{unexamined}");
         assert!(
             unexamined.contains("the reviewer returned no document"),
@@ -21583,9 +21657,13 @@ mod tests {
             "reviewed_commit": other, "state": "reviewed",
             "verdict": "PASS", "examined": true, "findings": [],
         });
-        let stale = candidate_review_refusal(&story).expect("a pass over another commit is refused");
+        let stale =
+            candidate_review_refusal(&story).expect("a pass over another commit is refused");
         assert!(stale.contains("stale independent review"), "{stale}");
-        assert!(candidate_awaits_review(&story), "a moved candidate owes a new review");
+        assert!(
+            candidate_awaits_review(&story),
+            "a moved candidate owes a new review"
+        );
 
         // Findings are not advisory.
         story["review"] = json!({
@@ -21644,7 +21722,10 @@ mod tests {
             .expect("the reviewer is admitted");
 
         let reviewer = &state.agents[&id];
-        assert_ne!(id, "wave-1-worker-1", "the writer cannot be its own reviewer");
+        assert_ne!(
+            id, "wave-1-worker-1",
+            "the writer cannot be its own reviewer"
+        );
         assert_eq!(reviewer["role"], json!("reviewer"));
         assert_eq!(reviewer["mode"], json!("read-only"));
         assert_eq!(reviewer["board_ref"], json!("flux/C-1"));
@@ -21713,7 +21794,8 @@ mod tests {
             ],
         });
 
-        let (verdict, findings) = parse_review_document(&document, "reviewer").expect("a typed REWORK");
+        let (verdict, findings) =
+            parse_review_document(&document, "reviewer").expect("a typed REWORK");
 
         assert_eq!(verdict, "REWORK");
         assert_eq!(findings.len(), 3);
@@ -21759,7 +21841,8 @@ mod tests {
             json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"PASS", "findings":[finding]});
         assert!(parse_review_document(&passing_with_findings, "reviewer").is_err());
 
-        let empty_rework = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"REWORK", "findings":[]});
+        let empty_rework =
+            json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"REWORK", "findings":[]});
         assert!(parse_review_document(&empty_rework, "reviewer").is_err());
 
         // The reviewer's vocabulary is PASS and REWORK. It cannot park a wave: a model that can end
@@ -21775,7 +21858,9 @@ mod tests {
         let narrated = "I checked each acceptance item.\n\n```json\n{\"schema\":\"flux.fleet-review/v1\",\"verdict\":\"PASS\",\"findings\":[]}\n```\n";
         let document = extract_review_document(narrated).expect("a fenced verdict is found");
         assert_eq!(
-            parse_review_document(&document, "reviewer").expect("a typed PASS").0,
+            parse_review_document(&document, "reviewer")
+                .expect("a typed PASS")
+                .0,
             "PASS"
         );
         assert!(extract_review_document("Looks good to me!").is_none());
@@ -21889,6 +21974,102 @@ mod tests {
         assert!(
             story_contract_at(&root, &commit, "flux/C-404").is_none(),
             "an absent contract is absent, never an empty one that reads as satisfied"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A diff that cannot be shown to a model is not a diff the model reviewed.
+    ///
+    /// `redact` is blunt by design: one credential pattern anywhere collapses the WHOLE string to
+    /// `[redacted]`. Judging the packet on the raw diff would therefore mark a packet whole whose
+    /// `diff` field is ten characters long — and a reviewer handed nothing could return PASS over a
+    /// change no one saw. Found by reading this diff back, not by a failing gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_diff_that_cannot_be_shown_is_an_incomplete_packet_not_a_silent_pass() {
+        let root = reclaim_test_dir("review-redaction");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Acceptance\n\n- [ ] it ships\n",
+        )
+        .expect("write story");
+        fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+
+        // Ordinary work first: the packet is whole and would be dispatched.
+        fs::write(root.join("clean.rs"), "// nothing sensitive\n").expect("write clean");
+        guarded_git(&root, &["add", "."]).expect("add clean");
+        guarded_git(&root, &["commit", "-m", "clean"]).expect("commit clean");
+        let clean_commit = git_output(&root, &["rev-parse", "HEAD"]).expect("clean sha");
+        let mut candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: root.clone(),
+            base: base.clone(),
+            commit: clean_commit,
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let clean = review_packet(&candidate);
+        assert_eq!(clean["complete"], json!(true), "{clean}");
+        assert!(
+            clean["diff"].as_str().unwrap().contains("clean.rs"),
+            "{clean}"
+        );
+        assert!(
+            review_refused_before_dispatch(true, &candidate, &clean, 1).is_none(),
+            "an ordinary candidate is dispatched"
+        );
+
+        // Now a line that trips the redactor.
+        fs::write(root.join("config.rs"), "let api_key = read_env();\n").expect("write secretish");
+        guarded_git(&root, &["add", "."]).expect("add secretish");
+        guarded_git(&root, &["commit", "-m", "config"]).expect("commit secretish");
+        candidate.commit = git_output(&root, &["rev-parse", "HEAD"]).expect("secretish sha");
+
+        let packet = review_packet(&candidate);
+
+        assert_eq!(
+            packet["diff"],
+            json!("[redacted]"),
+            "the redactor is expected to collapse this whole diff"
+        );
+        assert_eq!(
+            packet["complete"],
+            json!(false),
+            "a packet whose diff is one redaction marker is not complete: {packet}"
+        );
+        assert!(
+            packet["incomplete_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("credential pattern")),
+            "{packet}"
+        );
+        // The candidate's identity still comes from the real range, not from the redaction.
+        assert_ne!(packet["diff_digest"], clean["diff_digest"]);
+
+        let outcome = review_refused_before_dispatch(true, &candidate, &packet, 1)
+            .expect("an unshowable diff is never dispatched as if it were whole");
+        assert_eq!(outcome.verdict, "REWORK");
+        assert!(!outcome.examined, "no model saw this candidate");
+        assert_eq!(outcome.findings[0]["source"], json!("host"));
+        assert!(
+            outcome.findings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("credential pattern")),
+            "{:?}",
+            outcome.findings
         );
 
         fs::remove_dir_all(&root).ok();
