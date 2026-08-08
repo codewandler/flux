@@ -203,6 +203,16 @@ pub enum SpawnActivityEvent {
     Observation {
         observation: Observation,
     },
+    /// C-601: the cancel request reached this child — either the parent turn was cancelled or the
+    /// child's wall-clock deadline fired — and it is winding down.
+    ///
+    /// **Deliberately not terminal.** Cancellation is cooperative and an in-flight provider call is
+    /// not interruptible, so the child may keep that request open until the provider answers; only
+    /// then does [`SPAWN_CLEANUP_GRACE`] start. Without this event a surface has nothing to repaint
+    /// between the keypress and the terminal, so a working system reads as hung. A surface shows it
+    /// as a *cancelling* state, distinct from both *running* and the terminal it has not reached
+    /// yet; the wait is bounded by that in-flight call plus [`SPAWN_CLEANUP_GRACE`].
+    Cancelling,
     Finished {
         usage: Option<flux_core::Usage>,
         /// Whether the child failed, timed out, or was cancelled. No error text crosses this

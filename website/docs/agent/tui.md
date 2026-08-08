@@ -263,6 +263,20 @@ too small to draw it.
   `Ctrl-C` within two seconds exits. Any other key disarms it, so a single reflexive press
   never drops you out of the session.
 
+### How long cancelling takes
+
+Cancellation is cooperative, so it is acknowledged immediately but is not instantaneous. Any
+sub-agent the turn had in flight switches to a `cancelling` row in the fleet pane the moment the
+request lands — a state of its own, neither `running` nor a finished outcome — so you can tell the
+request was received rather than watching a spinner.
+
+The wait has a ceiling: **the provider call already open, plus a 10-second cleanup grace.** A model
+request cannot be interrupted mid-flight, so a child that is waiting on a large-context answer keeps
+that request open until the provider replies; only then does the grace window start, and a child that
+still has not stopped by the end of it is reported as failing to stop. Independently, a sub-agent
+carries a **10-minute wall-clock deadline by default**, which fires the same cancellation path, so a
+child can never run unbounded even if the cancel never reaches it.
+
 `Ctrl-D` exits directly, but only from an idle session with an empty composer. `/quit` and
 `/exit` have one meaning in every state: clear queued follow-ups, cancel a running turn, and leave
 once cancellation finishes.

@@ -61,6 +61,11 @@ pub enum WorkerStatus {
     Running { op: String },
     /// Reported an outcome and has not started anything else.
     Idle,
+    /// C-601: the cancel request reached this worker and it is winding down — it may still be
+    /// inside an uninterruptible provider call. Non-terminal, and deliberately distinct from both
+    /// `Running` (the request has not been acknowledged) and `Finished` (it is over), because
+    /// "cancelling" is precisely the state an operator could not see before.
+    Cancelling,
     /// Terminal, with the spawner-boundary outcome bit. No error text crosses A-79's contract.
     Finished { is_error: bool },
 }
@@ -74,6 +79,7 @@ impl WorkerStatus {
             WorkerStatus::Planning => "planning",
             WorkerStatus::Running { .. } => "running",
             WorkerStatus::Idle => "idle",
+            WorkerStatus::Cancelling => "cancelling",
             WorkerStatus::Finished { is_error: false } => "done",
             WorkerStatus::Finished { is_error: true } => "failed",
         }
@@ -208,13 +214,20 @@ impl FleetProjection {
         };
         let worker = &mut self.workers[index];
         worker.last_activity = now;
+        // C-601: cancellation latches. A child that is winding down keeps reporting — a tool result
+        // lands, a pending call closes — and every one of those would otherwise repaint the row as
+        // ordinary work, which is exactly the "cancel was ignored" impression the state exists to
+        // remove. Only the terminal leaves this state.
+        let cancelling = matches!(worker.status, WorkerStatus::Cancelling);
         match &activity.event {
             SpawnActivityEvent::Planning { active } => {
-                worker.status = if *active {
-                    WorkerStatus::Planning
-                } else {
-                    WorkerStatus::Idle
-                };
+                if !cancelling {
+                    worker.status = if *active {
+                        WorkerStatus::Planning
+                    } else {
+                        WorkerStatus::Idle
+                    };
+                }
             }
             SpawnActivityEvent::ToolCall { call_id, name, .. } => {
                 // `input` is deliberately not read: it is the internal half of A-79's contract.
@@ -222,7 +235,9 @@ impl FleetProjection {
                 if worker.pending.len() < MAX_PENDING {
                     worker.pending.push((*call_id, op.clone()));
                 }
-                worker.status = WorkerStatus::Running { op };
+                if !cancelling {
+                    worker.status = WorkerStatus::Running { op };
+                }
             }
             SpawnActivityEvent::ToolTiming { .. } => {
                 // Timing only refreshes liveness; the op is already named by its `ToolCall`.
@@ -237,14 +252,19 @@ impl FleetProjection {
                 }
                 // An outstanding call means the worker is still inside another op; name that one
                 // rather than claiming the worker went idle.
-                worker.status = match worker.pending.last() {
-                    Some((_, op)) => WorkerStatus::Running { op: op.clone() },
-                    None => WorkerStatus::Idle,
-                };
+                if !cancelling {
+                    worker.status = match worker.pending.last() {
+                        Some((_, op)) => WorkerStatus::Running { op: op.clone() },
+                        None => WorkerStatus::Idle,
+                    };
+                }
             }
             SpawnActivityEvent::Observation { .. } => {
                 // `observation.data` is the other internal half of the contract; only the fact
                 // that the worker reported *something* crosses, as refreshed liveness.
+            }
+            SpawnActivityEvent::Cancelling => {
+                worker.status = WorkerStatus::Cancelling;
             }
             SpawnActivityEvent::Finished { is_error, .. } => {
                 worker.pending.clear();
@@ -411,6 +431,70 @@ mod tests {
         assert!(hung.idle >= Duration::from_secs(120));
         assert!(!working.stalled, "200ms of silence is not: {working:?}");
         assert_eq!(fleet.live(), 2, "both are still live — neither finished");
+    }
+
+    /// C-601 (failing first): when the operator cancels, a worker that is still winding down must
+    /// be visible as *cancelling* — a state distinct from `Running` (which reads as "the cancel was
+    /// ignored") and from the terminal it has not reached yet. Cancellation latches, so a late
+    /// result from the winding-down child cannot repaint the row as ordinary work.
+    #[test]
+    fn a_cancelling_worker_is_distinct_from_running_and_from_its_terminal() {
+        let mut fleet = FleetProjection::new();
+        let t0 = Instant::now();
+        fleet.apply(&activity(1, "researcher", call(1, "read", json!({}))), t0);
+        assert_eq!(
+            fleet.rows(t0)[0].status,
+            WorkerStatus::Running { op: "read".into() }
+        );
+
+        // Ctrl-C. The child is mid-provider-call and has not stopped yet.
+        let cancelled_at = t0 + Duration::from_secs(1);
+        fleet.apply(
+            &activity(1, "researcher", SpawnActivityEvent::Cancelling),
+            cancelled_at,
+        );
+        let row = fleet.rows(cancelled_at).remove(0);
+        assert_eq!(row.status, WorkerStatus::Cancelling);
+        assert_eq!(row.status.label(), "cancelling");
+        assert_eq!(row.status.op(), None, "a cancelling worker names no op");
+        assert_eq!(fleet.live(), 1, "cancelling is not terminal");
+
+        // A result the winding-down child still reports must not read as work resuming.
+        fleet.apply(
+            &activity(
+                1,
+                "researcher",
+                SpawnActivityEvent::ToolResult {
+                    call_id: 1,
+                    name: "read".into(),
+                    is_error: false,
+                },
+            ),
+            cancelled_at,
+        );
+        assert_eq!(
+            fleet.rows(cancelled_at)[0].status,
+            WorkerStatus::Cancelling,
+            "cancellation latches until the terminal"
+        );
+
+        // And the terminal still lands, distinct from both.
+        fleet.apply(
+            &activity(
+                1,
+                "researcher",
+                SpawnActivityEvent::Finished {
+                    usage: None,
+                    is_error: true,
+                },
+            ),
+            cancelled_at,
+        );
+        assert_eq!(
+            fleet.rows(cancelled_at)[0].status,
+            WorkerStatus::Finished { is_error: true }
+        );
+        assert_eq!(fleet.live(), 0);
     }
 
     #[test]

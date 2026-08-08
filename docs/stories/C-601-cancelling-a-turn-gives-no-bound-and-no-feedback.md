@@ -19,14 +19,33 @@ ceiling — so a working system looks hung.
 
 ## Acceptance
 
-- [ ] Cancelling a turn puts its running cards into a distinct *cancelling* state, visibly different
+- [x] Cancelling a turn puts its running cards into a distinct *cancelling* state, visibly different
       from both *running* and *cancelled*, so the operator can tell the request was received.
-- [ ] A research/`task` child carries a wall-clock deadline by default, rather than relying on the
-      iteration cap alone.
-- [ ] Failing first, a test proves a cancelled turn with a child in flight reaches a terminal state
-      within the advertised bound.
-- [ ] The bound (in-flight provider call + `SPAWN_CLEANUP_GRACE`) is documented where an operator
-      will read it.
+      `SpawnActivityEvent::Cancelling` (non-terminal) → `WorkerStatus::Cancelling`, which latches
+      until the terminal so a late tool result cannot repaint the row as ordinary work.
+- [x] A research/`task` child carries a wall-clock deadline by default, rather than relying on the
+      iteration cap alone. `SpawnLimits::new` now fills in `DEFAULT_SPAWN_WALL_CLOCK` (10 minutes,
+      the value the SDK client builders already applied, so no surface gets a shorter bound).
+- [x] Failing first, a test proves a cancelled turn with a child in flight reaches a terminal state
+      within the advertised bound —
+      `cancelling_a_child_in_flight_is_announced_and_terminal_within_the_bound`.
+- [x] The bound (in-flight provider call + `SPAWN_CLEANUP_GRACE`) is documented where an operator
+      will read it — `website/docs/agent/tui.md`, "How long cancelling takes", reached from the
+      `Ctrl-C` section an operator is already reading when they ask.
+
+## Progress
+
+- Landed. Failing-first tests, all named for C-601:
+  - `codewandler-flux-orchestrate` — `cancelling_a_child_in_flight_is_announced_and_terminal_within_the_bound`
+    (the `Cancelling` announcement precedes the terminal, and the whole cancel completes inside the
+    in-flight provider call plus `SPAWN_CLEANUP_GRACE`) and
+    `default_sub_agent_limits_carry_a_wall_clock_deadline`.
+  - `flux-tui` — `a_cancelled_turns_worker_card_shows_cancelling_instead_of_running` (rendered
+    screen, not just the projection) and
+    `a_cancelling_worker_is_distinct_from_running_and_from_its_terminal`.
+- The announcement is emitted from a second handle on the activity sink, because the child future
+  holds `&mut sink` for the whole cancel race — that is the only reason the signal can leave while
+  the child is still winding down.
 
 ## Notes
 
