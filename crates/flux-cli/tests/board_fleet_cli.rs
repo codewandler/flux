@@ -5129,3 +5129,112 @@ fn fleet_quiesce_stops_dispatch_and_refuses_to_confirm_while_a_worker_is_in_flig
     );
     fs::remove_dir_all(root).ok();
 }
+
+/// C-736/C-737: the contract a story is dispatched against is checked, and absence never reads as
+/// satisfaction.
+///
+/// Five `ready` stories reached `main` with no usable contract and five `done` stories closed with
+/// zero criteria, because `check` never opened a body and `board done` could not tell `total == 0`
+/// from "everything ticked". Both halves are proved here on one fixture.
+#[test]
+fn a_story_without_a_contract_cannot_be_ready_or_done() {
+    let root = fixture("story-contract");
+    let stories = root.join("docs/stories");
+    fs::write(
+        stories.join("README.md"),
+        "# Board\n\n<!-- BEGIN track:board -->\n<!-- END track:board -->\n",
+    )
+    .unwrap();
+
+    // Dispatchable and empty: the shape that reached main five times.
+    fs::write(
+        stories.join("C-1-ready-without-a-contract.md"),
+        "---\nid: C-1\ntitle: \"Ready without a contract\"\npillar: Core\nstatus: ready\npriority: 1\n---\n\n# Ready without a contract\n\n## Goal\n\n\n## Acceptance\n\n- [ ] Define acceptance.\n",
+    )
+    .unwrap();
+    // Drafting: identical content, but backlog is allowed to be incomplete.
+    fs::write(
+        stories.join("C-2-still-drafting.md"),
+        "---\nid: C-2\ntitle: \"Still drafting\"\npillar: Core\nstatus: backlog\n---\n\n# Still drafting\n\n## Goal\n\n\n## Acceptance\n\n- [ ] Define acceptance.\n",
+    )
+    .unwrap();
+
+    let checked = flux(&root, &["board", "check", "--output", "json"]);
+    let text = String::from_utf8_lossy(&checked.stdout).to_string()
+        + &String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        !checked.status.success(),
+        "a ready story with no contract must fail check: {text}"
+    );
+    assert!(
+        text.contains("C-1"),
+        "the failure must name the story: {text}"
+    );
+    assert!(
+        !text.contains("C-2 has no Acceptance"),
+        "a backlog story is drafting, not broken: {text}"
+    );
+
+    // C-737: a story with no Acceptance section at all closes today because remaining == 0.
+    fs::write(
+        stories.join("C-3-no-acceptance-section.md"),
+        "---\nid: C-3\ntitle: \"No acceptance section\"\npillar: Core\nstatus: in-progress\n---\n\n# No acceptance section\n\n## Goal\n\nSomething.\n",
+    )
+    .unwrap();
+    let done = flux(&root, &["board", "done", "C-3", "--output", "json"]);
+    let done_text =
+        String::from_utf8_lossy(&done.stdout).to_string() + &String::from_utf8_lossy(&done.stderr);
+    assert!(
+        !done.status.success(),
+        "a story with zero criteria must not close: {done_text}"
+    );
+    assert!(
+        done_text.contains("no Acceptance criteria"),
+        "the refusal must say what is missing, not report unchecked boxes: {done_text}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// C-737: a qualified Acceptance heading names the same section.
+///
+/// `## Acceptance (for the epic)` and `## Acceptance — stage 1` reported zero criteria, so ten
+/// stories carried contracts that `board done`, `reconcile`, `stats` and the driver's withhold
+/// verification all counted as absent.
+#[test]
+fn a_qualified_acceptance_heading_is_still_the_acceptance_section() {
+    let root = fixture("qualified-heading");
+    let stories = root.join("docs/stories");
+    fs::write(
+        stories.join("README.md"),
+        "# Board\n\n<!-- BEGIN track:board -->\n<!-- END track:board -->\n",
+    )
+    .unwrap();
+    fs::write(
+        stories.join("C-1-suffixed-heading.md"),
+        "---\nid: C-1\ntitle: \"Suffixed heading\"\npillar: Core\nstatus: in-progress\n---\n\n# Suffixed heading\n\n## Goal\n\nReal goal.\n\n## Acceptance (for the epic)\n\n- [ ] One unticked criterion.\n",
+    )
+    .unwrap();
+
+    // It has a criterion, and that criterion is unticked — so `done` must refuse for THAT reason,
+    // not because it thinks the section is empty.
+    let done = flux(&root, &["board", "done", "C-1", "--output", "json"]);
+    let text =
+        String::from_utf8_lossy(&done.stdout).to_string() + &String::from_utf8_lossy(&done.stderr);
+    assert!(!done.status.success(), "{text}");
+    assert!(
+        text.contains("1 unchecked"),
+        "the suffixed heading must be read, so the refusal counts its criterion: {text}"
+    );
+
+    // And `check` must not report it as contract-less.
+    let checked = flux(&root, &["board", "check", "--output", "json"]);
+    let checked_text = String::from_utf8_lossy(&checked.stdout).to_string()
+        + &String::from_utf8_lossy(&checked.stderr);
+    assert!(
+        !checked_text.contains("has no Acceptance criteria"),
+        "a qualified heading is not a missing section: {checked_text}"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}

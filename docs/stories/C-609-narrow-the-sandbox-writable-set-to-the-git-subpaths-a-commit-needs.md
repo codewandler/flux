@@ -14,7 +14,8 @@ done_override: "Implemented in main: the sandbox writable set grants the admin d
 
 ## Goal
 
+Delivered before contracts were validated; see this story's commits.
 
 ## Acceptance
 
-- [ ] Define acceptance.
+- [x] `contract_waived` These criteria were never written. The story shipped, and inventing a contract for it now would be fiction rather than migration — what it actually delivered is in its commits. Recorded so `check` reports a known, reasoned gap instead of a silent one.
