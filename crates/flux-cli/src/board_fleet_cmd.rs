@@ -1337,6 +1337,12 @@ struct Story {
     id: String,
     title: String,
     status: String,
+    /// C-741: what kind of work this is, which selects the contract it is validated against.
+    ///
+    /// Always resolved, never absent, so every reader handed an item sees a kind rather than having
+    /// to know the default. A story that predates the field reads as `feature`, which is how the
+    /// field can be added without invalidating a single existing story.
+    kind: String,
     file: String,
     pillar: Option<String>,
     epic: Option<String>,
@@ -4774,14 +4780,7 @@ fn run_board_action(
             id,
             status,
             override_reason,
-        } => transition_with_override(
-            command,
-            root,
-            id,
-            status,
-            None,
-            override_reason.as_deref(),
-        ),
+        } => transition_with_override(command, root, id, status, None, override_reason.as_deref()),
         BoardAction::Start { id } => transition(command, root, id, "in-progress", None),
         BoardAction::Block { id, reason } => transition(
             command,
@@ -4793,14 +4792,7 @@ fn run_board_action(
         BoardAction::Unblock {
             id,
             override_reason,
-        } => transition_with_override(
-            command,
-            root,
-            id,
-            "ready",
-            None,
-            override_reason.as_deref(),
-        ),
+        } => transition_with_override(command, root, id, "ready", None, override_reason.as_deref()),
         BoardAction::Done {
             id,
             override_reason,
@@ -6863,6 +6855,7 @@ fn story_from_body(file: String, body: String) -> Option<Story> {
         id,
         title,
         status,
+        kind: declared_story_kind(&fm),
         file,
         pillar: fm
             .get("pillar")
@@ -7408,6 +7401,7 @@ fn read_stories_with_warnings(root: &Path, warnings: &mut Vec<String>) -> Result
             id: id.clone(),
             title: title.clone(),
             status,
+            kind: declared_story_kind(&fm),
             file: name,
             pillar: fm
                 .get("pillar")
@@ -8345,6 +8339,88 @@ fn outside_code_spans(line: &str) -> String {
     visible
 }
 
+/// C-741: the kinds of work a story can declare.
+///
+/// Not bureaucracy — it selects which rules apply. Every story is otherwise validated as though it
+/// were a feature, and a spike's output is a decision, an enabler's is capability, a bug's contract
+/// is current-versus-expected behaviour. Judging any of those against "behaviour implemented with a
+/// failing-first test" is a schema lie, and it pushes authors into writing criteria they do not mean.
+const STORY_KINDS: [&str; 4] = ["feature", "enabler", "spike", "bug"];
+
+/// The kind a story is read as when it declares none.
+///
+/// Defaulting rather than requiring is what makes the field additive: every story written before it
+/// existed reads as a feature and stays exactly as valid as it was.
+const DEFAULT_STORY_KIND: &str = "feature";
+
+/// The kind a story declares, normalized, or the default.
+fn declared_story_kind(frontmatter: &BTreeMap<String, String>) -> String {
+    frontmatter
+        .get("kind")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_STORY_KIND.to_string())
+}
+
+/// Whether the story states its kind rather than inheriting the default.
+fn declares_kind(story: &Story) -> bool {
+    parse_frontmatter(&story.body).contains_key("kind")
+}
+
+/// What a story of this kind must state, and the phrasings that satisfy each clause.
+///
+/// The phrasing sets are deliberately blunt: they are a floor on what a contract *states*, not a
+/// judgement of how well it states it. `--override-reason` records the cases they misjudge, which is
+/// the honest posture for a lint that cannot read intent.
+fn kind_contract(kind: &str) -> Vec<(&'static str, &'static [&'static str])> {
+    match kind {
+        "spike" => vec![(
+            "name where its answer is recorded",
+            &["decision", "design", "finding", "recorded", "document"],
+        )],
+        "bug" => vec![
+            (
+                "state the current behaviour",
+                &["current", "today", "reproduc", "observed", "instead of"],
+            ),
+            (
+                "state the expected behaviour",
+                &["expected", "should", "instead", "correct"],
+            ),
+        ],
+        "enabler" => vec![(
+            "name the capability it unlocks",
+            &["capabilit", "unlock", "enable", "makes possible", "so that"],
+        )],
+        // Including an unknown kind: it is reported by `board check` as a typo, and until it is
+        // fixed the strictest contract is the safe one to hold it to.
+        _ => vec![(
+            "name the failing-first test that proves it",
+            &[
+                "failing-first",
+                "failing first",
+                "fails first",
+                "failing test",
+                "regression test",
+            ],
+        )],
+    }
+}
+
+/// The clauses of its own kind's contract a story does not state.
+fn kind_contract_findings(kind: &str, prose: &str) -> Vec<String> {
+    let haystack = prose.to_ascii_lowercase();
+    kind_contract(kind)
+        .into_iter()
+        .filter(|(_, phrasings)| {
+            !phrasings
+                .iter()
+                .any(|phrasing| haystack.contains(*phrasing))
+        })
+        .map(|(clause, _)| format!("a {kind} must {clause}"))
+        .collect()
+}
+
 /// C-740: what refuses a story entry into `ready`, attached to the edge rather than to the type.
 ///
 /// The edge is the only place this rule is expressible. "A story may not carry an open question" is
@@ -8352,15 +8428,22 @@ fn outside_code_spans(line: &str) -> String {
 /// avoid defends nothing. "A story entering `ready` may not carry one" is true, and it is what makes
 /// the dispatch invariant hold: a story that could not reach `ready` cannot be dispatched.
 fn ready_edge_refusals(story: &Story) -> Vec<String> {
+    let mut refusals = Vec::new();
     let questions = open_questions(&story.body);
-    if questions.is_empty() {
-        return Vec::new();
+    if !questions.is_empty() {
+        refusals.push(format!(
+            "{} unresolved question(s) — {}",
+            questions.len(),
+            questions.join("; ")
+        ));
     }
-    vec![format!(
-        "{} unresolved question(s) — {}",
-        questions.len(),
-        questions.join("; ")
-    )]
+    // C-741: the edge applies the contract of the kind the story declares, so a spike is not refused
+    // for lacking a failing-first test it was never going to have.
+    refusals.extend(kind_contract_findings(
+        &story.kind,
+        story_prose(&story.body),
+    ));
+    refusals
 }
 
 fn append_story_section(
@@ -8950,6 +9033,23 @@ fn check_board_with_known_dependencies(
         if let Some(design) = story.design.as_deref() {
             if resolve_story_design(root, design).is_err() {
                 errors.push(format!("{} links missing design {design}", story.id));
+            }
+        }
+        // C-741: an unrecognised kind is a typo, and a typo would otherwise be read as a feature.
+        if !STORY_KINDS.contains(&story.kind.as_str()) {
+            errors.push(format!(
+                "{} declares unknown kind '{}' (one of {})",
+                story.id,
+                story.kind,
+                STORY_KINDS.join("|")
+            ));
+        } else if story.status == "ready" && declares_kind(story) {
+            // A story that states its kind is held to that kind's contract once it is dispatchable.
+            // A story that predates the field is not: it is read as a feature for every other
+            // purpose, but the rule it was never written against is enforced at the `-> ready` edge
+            // it has already crossed, not retroactively here. That is what keeps this additive.
+            for finding in kind_contract_findings(&story.kind, story_prose(&story.body)) {
+                errors.push(format!("{} is ready but {finding}", story.id));
             }
         }
         // C-740: a count, never a failure. Drafting with open questions is the normal state of a
@@ -10175,6 +10275,10 @@ fn import_board(
                 "id",
                 "title",
                 "status",
+                // C-741: `export` emits every `Story` field, so the closed set has to admit `kind`
+                // or a board cannot round-trip through its own export. The authority stays the
+                // story's frontmatter inside `content`; this is the derived copy.
+                "kind",
                 "file",
                 "pillar",
                 "epic",
@@ -19887,6 +19991,9 @@ fn story_contract_at(source: &Path, commit: &str, item: &str) -> Option<Value> {
     let acceptance = markdown_section(prose, "Acceptance")?;
     Some(json!({
         "path": path,
+        // C-741: read from the reviewed commit like everything else in this packet, so the reviewer
+        // judges the work as the kind it was written as rather than always as a feature.
+        "kind": declared_story_kind(&parse_frontmatter(&body)),
         "goal": markdown_section(prose, "Goal"),
         "acceptance": acceptance,
     }))
@@ -19977,10 +20084,14 @@ fn reviewer_instructions() -> String {
         "You are an independent reviewer in a Flux Fleet. You did not write this change and you \
          cannot modify it: you hold read operations only, and the story's own writer is the only \
          agent that may apply a finding.\n\n\
-         Your entire input is one `{FLEET_REVIEW_PACKET_SCHEMA}` packet: the story's Goal and \
+         Your entire input is one `{FLEET_REVIEW_PACKET_SCHEMA}` packet: the story's kind, Goal and \
          Acceptance as they stood at the reviewed commit, the exact normalized diff, the \
          host-observed write set, and the candidate/base identities. Judge the diff against that \
-         contract and against the repository's declared invariants. Do not ask for more context and \
+         contract and against the repository's declared invariants. `contract.kind` says which \
+         rules fit: a `feature` is behaviour proven by a failing-first test, an `enabler` delivers a \
+         capability, a `spike` delivers a recorded decision rather than behaviour, and a `bug` is \
+         judged against the current-versus-expected behaviour it states. Do not ask for more \
+         context and \
          do not speculate about code the packet does not contain — if the packet is insufficient to \
          judge an acceptance item, that is itself a finding in the `evidence` category.\n\n\
          Return exactly one fenced ```json block and nothing else that parses as JSON:\n\n\
@@ -22684,6 +22795,7 @@ mod tests {
             id: id.to_string(),
             title: format!("story {id}"),
             status: "ready".to_string(),
+            kind: DEFAULT_STORY_KIND.to_string(),
             file: format!("docs/stories/{id}.md"),
             pillar: None,
             epic: None,
@@ -25967,8 +26079,7 @@ mod tests {
     /// it is offered for dispatch.
     #[test]
     fn an_open_question_refuses_promotion_and_the_answered_story_promotes() {
-        const QUESTION: &str =
-            "- [ ] [NEEDS CLARIFICATION: which encoding does the export use?]\n";
+        const QUESTION: &str = "- [ ] [NEEDS CLARIFICATION: which encoding does the export use?]\n";
         let story = format!(
             "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: backlog\n---\n\n\
              # Export the ledger\n\n## Goal\n\nOne exported ledger.\n\n## Acceptance\n\n\
@@ -25993,7 +26104,11 @@ mod tests {
         );
 
         // The same story, once the question is answered and the marker removed.
-        fs::write(&path, story.replace(QUESTION, "- [ ] The export is UTF-8.\n")).expect("answer");
+        fs::write(
+            &path,
+            story.replace(QUESTION, "- [ ] The export is UTF-8.\n"),
+        )
+        .expect("answer");
         transition(&command, &root, "C-1", "ready", None)
             .expect("the answered story promotes unchanged in every other respect");
         let promoted = fs::read_to_string(&path).expect("story");
@@ -26015,8 +26130,9 @@ mod tests {
         let root = planning_edge_fixture("documented-marker", &[("C-1-marker.md", story)]);
         let command = planning_command(&root);
 
-        transition(&command, &root, "C-1", "ready", None)
-            .expect("a marker inside a code span or a fenced block is documentation, not a question");
+        transition(&command, &root, "C-1", "ready", None).expect(
+            "a marker inside a code span or a fenced block is documentation, not a question",
+        );
 
         fs::remove_dir_all(&root).ok();
     }
@@ -26049,7 +26165,8 @@ mod tests {
     /// contract the ready edge applies.
     #[test]
     fn a_spike_is_not_required_to_name_a_failing_first_test() {
-        let feature = "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: backlog\n---\n\n\
+        let feature =
+            "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: backlog\n---\n\n\
              # Export the ledger\n\n## Goal\n\nOne exported ledger.\n\n## Acceptance\n\n\
              - [ ] The ledger exports.\n";
         let spike = "---\nid: C-2\ntitle: Survey the export formats\npillar: Core\nstatus: backlog\nkind: spike\n---\n\n\
@@ -26085,9 +26202,13 @@ mod tests {
         let root = planning_edge_fixture("declared-feature", &[("C-1-export.md", unproven)]);
         let failure = format!(
             "{:#}",
-            check_board(&root).expect_err("a declared feature with no failing-first test fails check")
+            check_board(&root)
+                .expect_err("a declared feature with no failing-first test fails check")
         );
-        assert!(failure.contains("C-1") && failure.contains("failing-first"), "{failure}");
+        assert!(
+            failure.contains("C-1") && failure.contains("failing-first"),
+            "{failure}"
+        );
         fs::remove_dir_all(&root).ok();
 
         let spike = "---\nid: C-2\ntitle: Survey the export formats\npillar: Core\nstatus: ready\npriority: 1\nkind: spike\n---\n\n\
