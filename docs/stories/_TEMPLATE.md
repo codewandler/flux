@@ -3,6 +3,7 @@ id: X-NN              # pillar letter (A=Agent, L=Language, I=Improve, C=Core/Sh
 title: Short imperative title
 pillar: Agent         # Agent | Language | Improve | Core
 status: backlog       # backlog | ready | in-progress | blocked | done
+kind: feature         # feature | enabler | spike | bug — selects the contract `ready` validates
 priority:             # integer rank among `ready` stories; omit otherwise
 epic:                 # optional: slug of an epic in docs/epics/; must resolve, like design: does
 design:               # optional: docs/designs/<slug>.md for non-trivial work
@@ -16,6 +17,9 @@ One or two sentences: the outcome this delivers and which pillar value it serves
 
 ## Acceptance
 - [ ] A testable criterion. A behavioral change must name the failing-first test that proves it.
+      A `spike` names where its answer is recorded, an `enabler` the capability it unlocks, a `bug`
+      the current and the expected behaviour. Entering `ready` is refused until the kind's contract
+      is stated, and until every `[NEEDS CLARIFICATION: …]` marker is resolved.
 - [ ] …
 
 ## Progress

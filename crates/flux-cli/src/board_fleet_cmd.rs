@@ -677,7 +677,13 @@ pub(super) enum BoardAction {
         note: Option<String>,
     },
     /// Apply one profile-valid item transition.
-    Transition { id: String, status: String },
+    Transition {
+        id: String,
+        status: String,
+        /// Promote over an edge refusal and record why in the story.
+        #[arg(long = "override-reason")]
+        override_reason: Option<String>,
+    },
     /// Move a planning item to `in-progress`.
     Start { id: String },
     /// Block an item and record why.
@@ -687,7 +693,12 @@ pub(super) enum BoardAction {
         reason: String,
     },
     /// Return a blocked planning item to ready.
-    Unblock { id: String },
+    Unblock {
+        id: String,
+        /// Promote over an edge refusal and record why in the story.
+        #[arg(long = "override-reason")]
+        override_reason: Option<String>,
+    },
     /// Complete a story after verifying all Acceptance checkboxes.
     Done {
         id: String,
@@ -1343,6 +1354,12 @@ struct Story {
     id: String,
     title: String,
     status: String,
+    /// C-741: what kind of work this is, which selects the contract it is validated against.
+    ///
+    /// Always resolved, never absent, so every reader handed an item sees a kind rather than having
+    /// to know the default. A story that predates the field reads as `feature`, which is how the
+    /// field can be added without invalidating a single existing story.
+    kind: String,
     file: String,
     pillar: Option<String>,
     epic: Option<String>,
@@ -4437,7 +4454,9 @@ fn run_session_board_action(
                 next.revision,
             ))
         }
-        BoardAction::Transition { id, status }
+        // The session board is a different state machine with its own statuses; the planning edge's
+        // refusals and their recorded override do not apply to it.
+        BoardAction::Transition { id, status, .. }
         | BoardAction::Block {
             id,
             reason: status,
@@ -4452,7 +4471,7 @@ fn run_session_board_action(
         BoardAction::Start { id } => {
             session_transition(command, board, &snapshot, request_id, id, "in-progress")
         }
-        BoardAction::Unblock { id } => {
+        BoardAction::Unblock { id, .. } => {
             let target = if matches!(snapshot.profile, flux_datasource::board::BoardProfile::General)
             {
                 "open"
@@ -4803,7 +4822,11 @@ fn run_board_action(
             }
             mutate_story(command, root, id, fields, None)
         }
-        BoardAction::Transition { id, status } => transition(command, root, id, status, None),
+        BoardAction::Transition {
+            id,
+            status,
+            override_reason,
+        } => transition_with_override(command, root, id, status, None, override_reason.as_deref()),
         BoardAction::Start { id } => transition(command, root, id, "in-progress", None),
         BoardAction::Block { id, reason } => transition(
             command,
@@ -4812,7 +4835,10 @@ fn run_board_action(
             "blocked",
             Some(("blocked_reason", reason)),
         ),
-        BoardAction::Unblock { id } => transition(command, root, id, "ready", None),
+        BoardAction::Unblock {
+            id,
+            override_reason,
+        } => transition_with_override(command, root, id, "ready", None, override_reason.as_deref()),
         BoardAction::Done {
             id,
             override_reason,
@@ -6883,6 +6909,7 @@ fn story_from_body(file: String, body: String) -> Option<Story> {
         id,
         title,
         status,
+        kind: declared_story_kind(&fm),
         file,
         pillar: fm
             .get("pillar")
@@ -7428,6 +7455,7 @@ fn read_stories_with_warnings(root: &Path, warnings: &mut Vec<String>) -> Result
             id: id.clone(),
             title: title.clone(),
             status,
+            kind: declared_story_kind(&fm),
             file: name,
             pillar: fm
                 .get("pillar")
@@ -8458,6 +8486,23 @@ fn transition(
     status: &str,
     extra: Option<(&str, &String)>,
 ) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    transition_with_override(command, root, id, status, extra, None)
+}
+
+/// One planning transition, with the edge's own validators applied before it is written.
+///
+/// Attaching checks to a `from -> to` edge rather than to the item type is what lets the same story
+/// be legal at `backlog` and refused at `ready`. `override_reason` is the recorded escape: it lets a
+/// promotion go ahead and writes why into the story, so the exception is greppable afterwards
+/// instead of invisible.
+fn transition_with_override(
+    command: &BoardCommand,
+    root: &Path,
+    id: &str,
+    status: &str,
+    extra: Option<(&str, &String)>,
+    override_reason: Option<&str>,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
     let status = normalize_status(status);
     if !STATUSES.contains(&status.as_str()) {
         bail!(
@@ -8465,13 +8510,31 @@ fn transition(
             STATUSES.join("|")
         );
     }
-    let current = get_story(root, id)?.status;
+    let story = get_story(root, id)?;
+    let current = story.status.clone();
     if !valid_planning_transition(&current, &status) {
         bail!("conflict/precondition: planning transition {current} -> {status} is not allowed");
+    }
+    if override_reason.is_some_and(|reason| reason.trim().is_empty()) {
+        bail!("input/schema: --override-reason cannot be empty")
     }
     let mut fields = vec![("status", status.clone())];
     if status != "ready" {
         fields.push(("priority", "null".into()));
+    }
+    // Every edge into `ready` is guarded, not only `backlog -> ready`: `blocked -> ready` reaches the
+    // same dispatchable state, and an invariant with one unguarded entrance is not an invariant.
+    if status == "ready" && current != status {
+        let refusals = ready_edge_refusals(&story);
+        if !refusals.is_empty() {
+            let Some(reason) = override_reason else {
+                bail!(
+                    "validation/gate: {id} cannot enter ready: {}; resolve them, or pass --override-reason to record a reasoned override",
+                    refusals.join("; ")
+                )
+            };
+            fields.push((READY_OVERRIDE_KEY, yaml_quote(reason)));
+        }
     }
     if let Some((key, value)) = extra {
         fields.push((key, yaml_quote(value)));
@@ -8492,6 +8555,185 @@ fn valid_planning_transition(from: &str, to: &str) -> bool {
                 | ("blocked", "in-progress")
                 | ("blocked", "done")
         )
+}
+
+/// C-740: Spec Kit's ambiguity marker, in its literal form.
+///
+/// An agent will never ask for clarification. It guesses, implements the guess, and commits — and
+/// the result compiles and passes its own tests, so nothing downstream can tell the guess from a
+/// decision. A greppable marker is the cheapest available defence, and it only works if writing one
+/// is normal: the refusal therefore belongs to an edge, not to the story.
+const CLARIFICATION_MARKER: &str = "[NEEDS CLARIFICATION";
+
+/// The frontmatter key recording a promotion that went ahead over a refusal.
+///
+/// The precedent is `done_override`. An escape hatch that leaves a trace beats one that does not
+/// exist, because without one the answer is to write `- [ ] it works` and promote that instead.
+const READY_OVERRIDE_KEY: &str = "ready_override";
+
+/// Every unresolved question a story asks, as `line N: <question>`.
+///
+/// Markers inside a code span or a fenced block are documentation, not questions. This repository
+/// prints the marker in its own prose — `AGENTS.md`, this file, and the story that introduced the
+/// rule all do — and a scanner that cannot tell an example from a question would make C-740 itself
+/// unpromotable by its own rule.
+fn open_questions(body: &str) -> Vec<String> {
+    let mut questions = Vec::new();
+    let mut fenced = false;
+    for (number, line) in body.lines().enumerate() {
+        let opener = line.trim_start();
+        if opener.starts_with("```") || opener.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let visible = outside_code_spans(line);
+        let mut offset = 0;
+        while let Some(found) = visible[offset..].find(CLARIFICATION_MARKER) {
+            let start = offset + found + CLARIFICATION_MARKER.len();
+            let rest = &line[start..];
+            let end = rest.find(']').unwrap_or(rest.len());
+            let question = rest[..end].trim_start_matches(':').trim();
+            questions.push(format!(
+                "line {}: {}",
+                number + 1,
+                if question.is_empty() {
+                    "(no question stated)"
+                } else {
+                    question
+                }
+            ));
+            offset = start;
+        }
+    }
+    questions
+}
+
+/// One line with every inline code span blanked out, preserving byte offsets so the original line
+/// still indexes correctly.
+fn outside_code_spans(line: &str) -> String {
+    let mut visible = String::with_capacity(line.len());
+    let mut spanned = false;
+    for character in line.chars() {
+        if character == '`' {
+            spanned = !spanned;
+        }
+        if spanned || character == '`' {
+            visible.extend(std::iter::repeat_n(' ', character.len_utf8()));
+        } else {
+            visible.push(character);
+        }
+    }
+    visible
+}
+
+/// C-741: the kinds of work a story can declare.
+///
+/// Not bureaucracy — it selects which rules apply. Every story is otherwise validated as though it
+/// were a feature, and a spike's output is a decision, an enabler's is capability, a bug's contract
+/// is current-versus-expected behaviour. Judging any of those against "behaviour implemented with a
+/// failing-first test" is a schema lie, and it pushes authors into writing criteria they do not mean.
+const STORY_KINDS: [&str; 4] = ["feature", "enabler", "spike", "bug"];
+
+/// The kind a story is read as when it declares none.
+///
+/// Defaulting rather than requiring is what makes the field additive: every story written before it
+/// existed reads as a feature and stays exactly as valid as it was.
+const DEFAULT_STORY_KIND: &str = "feature";
+
+/// The kind a story declares, normalized, or the default.
+fn declared_story_kind(frontmatter: &BTreeMap<String, String>) -> String {
+    frontmatter
+        .get("kind")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_STORY_KIND.to_string())
+}
+
+/// Whether the story states its kind rather than inheriting the default.
+fn declares_kind(story: &Story) -> bool {
+    parse_frontmatter(&story.body).contains_key("kind")
+}
+
+/// What a story of this kind must state, and the phrasings that satisfy each clause.
+///
+/// The phrasing sets are deliberately blunt: they are a floor on what a contract *states*, not a
+/// judgement of how well it states it. `--override-reason` records the cases they misjudge, which is
+/// the honest posture for a lint that cannot read intent.
+fn kind_contract(kind: &str) -> Vec<(&'static str, &'static [&'static str])> {
+    match kind {
+        "spike" => vec![(
+            "name where its answer is recorded",
+            &["decision", "design", "finding", "recorded", "document"],
+        )],
+        "bug" => vec![
+            (
+                "state the current behaviour",
+                &["current", "today", "reproduc", "observed", "instead of"],
+            ),
+            (
+                "state the expected behaviour",
+                &["expected", "should", "instead", "correct"],
+            ),
+        ],
+        "enabler" => vec![(
+            "name the capability it unlocks",
+            &["capabilit", "unlock", "enable", "makes possible", "so that"],
+        )],
+        // Including an unknown kind: it is reported by `board check` as a typo, and until it is
+        // fixed the strictest contract is the safe one to hold it to.
+        _ => vec![(
+            "name the failing-first test that proves it",
+            &[
+                "failing-first",
+                "failing first",
+                "fails first",
+                "failing test",
+                "regression test",
+            ],
+        )],
+    }
+}
+
+/// The clauses of its own kind's contract a story does not state.
+fn kind_contract_findings(kind: &str, prose: &str) -> Vec<String> {
+    let haystack = prose.to_ascii_lowercase();
+    kind_contract(kind)
+        .into_iter()
+        .filter(|(_, phrasings)| {
+            !phrasings
+                .iter()
+                .any(|phrasing| haystack.contains(*phrasing))
+        })
+        .map(|(clause, _)| format!("a {kind} must {clause}"))
+        .collect()
+}
+
+/// C-740: what refuses a story entry into `ready`, attached to the edge rather than to the type.
+///
+/// The edge is the only place this rule is expressible. "A story may not carry an open question" is
+/// false — drafting with open questions is the normal state of a backlog story, and a marker authors
+/// avoid defends nothing. "A story entering `ready` may not carry one" is true, and it is what makes
+/// the dispatch invariant hold: a story that could not reach `ready` cannot be dispatched.
+fn ready_edge_refusals(story: &Story) -> Vec<String> {
+    let mut refusals = Vec::new();
+    let questions = open_questions(&story.body);
+    if !questions.is_empty() {
+        refusals.push(format!(
+            "{} unresolved question(s) — {}",
+            questions.len(),
+            questions.join("; ")
+        ));
+    }
+    // C-741: the edge applies the contract of the kind the story declares, so a spike is not refused
+    // for lacking a failing-first test it was never going to have.
+    refusals.extend(kind_contract_findings(
+        &story.kind,
+        story_prose(&story.body),
+    ));
+    refusals
 }
 
 fn append_story_section(
@@ -9466,6 +9708,35 @@ fn check_board_with_known_dependencies(
             if resolve_story_epic(root, epic).is_err() {
                 errors.push(format!("{} names missing epic {epic}", story.id));
             }
+        }
+
+        // C-741: an unrecognised kind is a typo, and a typo would otherwise be read as a feature.
+        if !STORY_KINDS.contains(&story.kind.as_str()) {
+            errors.push(format!(
+                "{} declares unknown kind '{}' (one of {})",
+                story.id,
+                story.kind,
+                STORY_KINDS.join("|")
+            ));
+        } else if story.status == "ready" && declares_kind(story) {
+            // A story that states its kind is held to that kind's contract once it is dispatchable.
+            // A story that predates the field is not: it is read as a feature for every other
+            // purpose, but the rule it was never written against is enforced at the `-> ready` edge
+            // it has already crossed, not retroactively here. That is what keeps this additive.
+            for finding in kind_contract_findings(&story.kind, story_prose(&story.body)) {
+                errors.push(format!("{} is ready but {finding}", story.id));
+            }
+        }
+        // C-740: a count, never a failure. Drafting with open questions is the normal state of a
+        // backlog story; the refusal belongs to the `-> ready` edge, where a guess becomes work.
+        let questions = open_questions(&story.body);
+        if !questions.is_empty() {
+            warnings.push(format!(
+                "{} has {} open question(s): {}",
+                story.id,
+                questions.len(),
+                questions.join("; ")
+            ));
         }
     }
     check_epics(root, &stories, &mut errors, &mut warnings);
@@ -10680,6 +10951,10 @@ fn import_board(
                 "id",
                 "title",
                 "status",
+                // C-741: `export` emits every `Story` field, so the closed set has to admit `kind`
+                // or a board cannot round-trip through its own export. The authority stays the
+                // story's frontmatter inside `content`; this is the derived copy.
+                "kind",
                 "file",
                 "pillar",
                 "epic",
@@ -20984,6 +21259,9 @@ fn story_contract_at(source: &Path, commit: &str, item: &str) -> Option<Value> {
     let acceptance = markdown_section(prose, "Acceptance")?;
     Some(json!({
         "path": path,
+        // C-741: read from the reviewed commit like everything else in this packet, so the reviewer
+        // judges the work as the kind it was written as rather than always as a feature.
+        "kind": declared_story_kind(&parse_frontmatter(&body)),
         "goal": markdown_section(prose, "Goal"),
         "acceptance": acceptance,
     }))
@@ -21193,10 +21471,14 @@ fn reviewer_instructions() -> String {
         "You are an independent reviewer in a Flux Fleet. You did not write this change and you \
          cannot modify it: you hold read operations only, and the story's own writer is the only \
          agent that may apply a finding.\n\n\
-         Your entire input is one `{FLEET_REVIEW_PACKET_SCHEMA}` packet: the story's Goal and \
+         Your entire input is one `{FLEET_REVIEW_PACKET_SCHEMA}` packet: the story's kind, Goal and \
          Acceptance as they stood at the reviewed commit, the exact normalized diff, the \
          host-observed write set, and the candidate/base identities. Judge the diff against that \
-         contract and against the repository's declared invariants. Do not ask for more context and \
+         contract and against the repository's declared invariants. `contract.kind` says which \
+         rules fit: a `feature` is behaviour proven by a failing-first test, an `enabler` delivers a \
+         capability, a `spike` delivers a recorded decision rather than behaviour, and a `bug` is \
+         judged against the current-versus-expected behaviour it states. Do not ask for more \
+         context and \
          do not speculate about code the packet does not contain — if the packet is insufficient to \
          judge an acceptance item, that is itself a finding in the `evidence` category.\n\n\
          Return exactly one fenced ```json block and nothing else that parses as JSON:\n\n\
@@ -23900,6 +24182,7 @@ mod tests {
             id: id.to_string(),
             title: format!("story {id}"),
             status: "ready".to_string(),
+            kind: DEFAULT_STORY_KIND.to_string(),
             file: format!("docs/stories/{id}.md"),
             pillar: None,
             epic: None,
@@ -27141,6 +27424,195 @@ mod tests {
         assert!(!valid_planning_transition("backlog", "done"));
         assert!(!valid_planning_transition("done", "ready"));
     }
+
+    /// A board root holding the given stories, and nothing else.
+    ///
+    /// `transition` needs neither git nor a rendered board — `board_revision` hashes story files and
+    /// optional documents — so the fixture provides neither. A fixture that needs less can fail for
+    /// fewer reasons than the one under test.
+    fn planning_edge_fixture(label: &str, stories: &[(&str, &str)]) -> PathBuf {
+        let root = reclaim_test_dir(label);
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        for (file, body) in stories {
+            fs::write(root.join("docs/stories").join(file), body).expect("story");
+        }
+        root
+    }
+
+    fn planning_command(root: &Path) -> BoardCommand {
+        BoardCommand {
+            root: root.to_path_buf(),
+            board: None,
+            scope: Some(BoardScopeArg::Repository),
+            profile: BoardProfileArg::Planning,
+            output: AgentOutput::Human,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            session: None,
+            // `transition` reads only the root and `dry_run`; a field-free action keeps this helper
+            // independent of the verb's own argument list.
+            action: BoardAction::Show,
+        }
+    }
+
+    /// C-740 (the story's own regression, failing first): an agent never asks for clarification. It
+    /// guesses, implements the guess, and the result compiles and passes its own tests. Spec Kit's
+    /// `[NEEDS CLARIFICATION: …]` makes not-asking illegal — but only at one edge. Refusing it at
+    /// `backlog` would make the marker something authors avoid, and a marker nobody writes defends
+    /// nothing, so the same story must stay legal while it is being drafted and illegal the moment
+    /// it is offered for dispatch.
+    #[test]
+    fn an_open_question_refuses_promotion_and_the_answered_story_promotes() {
+        const QUESTION: &str = "- [ ] [NEEDS CLARIFICATION: which encoding does the export use?]\n";
+        let story = format!(
+            "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: backlog\n---\n\n\
+             # Export the ledger\n\n## Goal\n\nOne exported ledger.\n\n## Acceptance\n\n\
+             - [ ] The export is proven by the failing-first test it names.\n{QUESTION}"
+        );
+        let root = planning_edge_fixture("open-question", &[("C-1-export.md", &story)]);
+        let command = planning_command(&root);
+        let path = root.join("docs/stories/C-1-export.md");
+
+        let refused = transition(&command, &root, "C-1", "ready", None)
+            .expect_err("an unresolved question refuses the ready transition");
+        let refusal = format!("{refused:#}");
+        assert!(
+            refusal.contains("which encoding does the export use?"),
+            "the refusal names each occurrence, so the author knows what to answer: {refusal}"
+        );
+
+        let drafted = fs::read_to_string(&path).expect("story");
+        assert!(
+            drafted.contains("status: backlog"),
+            "a refused promotion writes nothing: {drafted}"
+        );
+
+        // The same story, once the question is answered and the marker removed.
+        fs::write(
+            &path,
+            story.replace(QUESTION, "- [ ] The export is UTF-8.\n"),
+        )
+        .expect("answer");
+        transition(&command, &root, "C-1", "ready", None)
+            .expect("the answered story promotes unchanged in every other respect");
+        let promoted = fs::read_to_string(&path).expect("story");
+        assert!(promoted.contains("status: ready"), "{promoted}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-740: the marker is documented in this repository's own prose — including in the story that
+    /// introduced it — and documenting a marker is not an open question. A scanner that cannot tell
+    /// the two apart makes its own story unpromotable, so code spans and fenced blocks are not
+    /// questions.
+    #[test]
+    fn a_documented_marker_is_not_an_open_question() {
+        let story = "---\nid: C-1\ntitle: Describe the marker\npillar: Core\nstatus: backlog\n---\n\n\
+             # Describe the marker\n\n## Goal\n\nDocument the marker.\n\n## Acceptance\n\n\
+             - [ ] `[NEEDS CLARIFICATION: ...]` is refused at the ready edge, with a failing-first test.\n\n\
+             ## Notes\n\n```text\n[NEEDS CLARIFICATION: a fenced example]\n```\n";
+        let root = planning_edge_fixture("documented-marker", &[("C-1-marker.md", story)]);
+        let command = planning_command(&root);
+
+        transition(&command, &root, "C-1", "ready", None).expect(
+            "a marker inside a code span or a fenced block is documentation, not a question",
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-740: `board check` reports open questions per story and does not fail on them. Drafting is
+    /// the normal state of a backlog story, so the count is a warning; the refusal lives on the edge.
+    // `check_board` reports uncommitted planning documents, which reaches git through the guarded
+    // `flux-system` boundary, so it needs a runtime.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_check_counts_open_questions_without_failing_on_them() {
+        let story = "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: backlog\n---\n\n\
+             # Export the ledger\n\n## Goal\n\nOne exported ledger.\n\n## Acceptance\n\n\
+             - [ ] [NEEDS CLARIFICATION: which encoding?]\n- [ ] [NEEDS CLARIFICATION: which delimiter?]\n";
+        let root = planning_edge_fixture("check-open-questions", &[("C-1-export.md", story)]);
+
+        let (human, _, warnings, _) =
+            check_board(&root).expect("open questions never fail the board check");
+        let reported = warnings.join("; ");
+        assert!(
+            reported.contains("C-1") && reported.contains('2'),
+            "the count of open questions is reported per story: {reported} / {human}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-741 (the story's own regression, failing first): a spike's output is a decision, not
+    /// behaviour. Judging it against "behaviour implemented with a failing-first test" is a schema
+    /// lie, and it pushes authors into writing criteria they do not mean. The kind selects which
+    /// contract the ready edge applies.
+    #[test]
+    fn a_spike_is_not_required_to_name_a_failing_first_test() {
+        let feature =
+            "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: backlog\n---\n\n\
+             # Export the ledger\n\n## Goal\n\nOne exported ledger.\n\n## Acceptance\n\n\
+             - [ ] The ledger exports.\n";
+        let spike = "---\nid: C-2\ntitle: Survey the export formats\npillar: Core\nstatus: backlog\nkind: spike\n---\n\n\
+             # Survey the export formats\n\n## Goal\n\nAnswer which format we adopt.\n\n## Acceptance\n\n\
+             - [ ] The findings are recorded as a decision in `docs/decisions/`.\n";
+        let root = planning_edge_fixture(
+            "kind-contract",
+            &[("C-1-export.md", feature), ("C-2-survey.md", spike)],
+        );
+        let command = planning_command(&root);
+
+        let refused = transition(&command, &root, "C-1", "ready", None)
+            .expect_err("a feature is held to the failing-first test that proves it");
+        let refusal = format!("{refused:#}");
+        assert!(
+            refusal.contains("failing-first"),
+            "the refusal names the contract the kind is held to: {refusal}"
+        );
+
+        transition(&command, &root, "C-2", "ready", None)
+            .expect("a spike's contract is a recorded decision, not a failing-first test");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-741: the kind reaches every reader that decides something. `board check` holds a declared
+    /// kind to its own contract, and the kind is carried on the item itself so dispatch and review
+    /// apply the rules that fit the work.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_kind_is_checked_as_that_kind_and_travels_with_the_item() {
+        let unproven = "---\nid: C-1\ntitle: Export the ledger\npillar: Core\nstatus: ready\npriority: 1\nkind: feature\n---\n\n\
+             # Export the ledger\n\n## Goal\n\nOne exported ledger.\n\n## Acceptance\n\n- [ ] The ledger exports.\n";
+        let root = planning_edge_fixture("declared-feature", &[("C-1-export.md", unproven)]);
+        let failure = format!(
+            "{:#}",
+            check_board(&root)
+                .expect_err("a declared feature with no failing-first test fails check")
+        );
+        assert!(
+            failure.contains("C-1") && failure.contains("failing-first"),
+            "{failure}"
+        );
+        fs::remove_dir_all(&root).ok();
+
+        let spike = "---\nid: C-2\ntitle: Survey the export formats\npillar: Core\nstatus: ready\npriority: 1\nkind: spike\n---\n\n\
+             # Survey the export formats\n\n## Goal\n\nAnswer which format we adopt.\n\n## Acceptance\n\n\
+             - [ ] The findings are recorded as a decision in `docs/decisions/`.\n";
+        let root = planning_edge_fixture("declared-spike", &[("C-2-survey.md", spike)]);
+        check_board(&root).expect("a spike with no failing-first test passes check");
+
+        let story = get_story(&root, "C-2").expect("the spike");
+        assert_eq!(
+            serde_json::to_value(&story).expect("story json")["kind"],
+            json!("spike"),
+            "the kind travels on the item every reader is handed"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn absent_metrics_are_null_not_zero() {
         let value = absent_ratio();
@@ -29671,6 +30143,9 @@ mod tests {
             note: None,
             priority: Some(1),
             dependencies: Vec::new(),
+            // C-741 added the field after C-739 wrote this fixture. The default is what a story
+            // that never declares one is read as, which is exactly this fixture's case.
+            kind: DEFAULT_STORY_KIND.to_string(),
             body: body.to_string(),
         };
 
