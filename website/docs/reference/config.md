@@ -832,6 +832,7 @@ See [Datasources](../agent/datasources.md).
 | Variable | Effect |
 |---|---|
 | `FLUX_VERBOSE` | Verbose output. |
+| `FLUX_QUIET` | Silences `flux flow run` progress output (same as its `-q/--quiet` flag); errors, approvals, and the stdout result are unaffected. |
 | `FLUX_SHOW_LOOP` | Shows agent-loop steps as they run. |
 | `FLUX_NO_SPLASH` | Suppresses the TUI splash screen. |
 | `FLUX_BROWSER_BIN` | Chromium executable for `browser.*` ops. |

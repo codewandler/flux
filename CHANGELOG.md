@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [Unreleased]
 
+### Added
+
+- **`flux flow run` gained `-q/--quiet` (also `FLUX_QUIET`).** Silences the stderr progress
+  surface — the session line, per-op dispatch/result lines, spinners, phase markers, fleet lines,
+  the turn-end rule, and the stale-plugin startup banner — while keeping errors, the destructive-op
+  approval warning, halt reports, sandbox posture disclosures, and the flow result on stdout
+  untouched. Complements `flux review --progress off`; wrapper scripts no longer need to filter the
+  progress stream to get a clean terminal.
+
 ## [0.59.2] - 2026-08-08
 
 ## [0.59.1] - 2026-08-08

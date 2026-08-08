@@ -2347,7 +2347,7 @@ pub(super) fn split_stale_plugins(
 /// remedy: `flux plugin status <name>` shows the recorded (missing) path; rebuild/reinstall the
 /// binary, or unregister the plugin.
 pub(super) fn warn_stale_plugins(stale: &[String]) {
-    if stale.is_empty() {
+    if stale.is_empty() || rendering::quiet() {
         return;
     }
     eprintln!(
