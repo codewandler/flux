@@ -8,6 +8,167 @@ All notable changes to this project are documented in this file. The format is b
 
 ## [0.59.2] - 2026-08-08
 
+Backfilled after the fact (C-743). This section was cut empty over 9675 insertions because
+`scripts/cut-release.sh` rolls `## [Unreleased]` into the version heading and `[Unreleased]` was
+empty: story workers are fenced out of `CHANGELOG.md` — correctly, since two stories each appending
+an entry once made a wave unintegrable — and nothing downstream of that fence composed one. The tag
+and the binaries were always right; only the prose was missing.
+
+### Added
+
+- **A datasource connects from where its endpoint is reachable (C-716).** A host binding says where
+  a connection is made *from*, an endpoint says what is connected *to*, and a datasource is the
+  governed read over that composition — but nothing tied a datasource's connection to the substrate
+  its endpoint is reachable from. `LiveAccess` gains a `LiveLocality` of `Anywhere` (the default and
+  today's behaviour) or `Host(<binding id>)`, copied from the endpoint's own `host` answer rather
+  than re-derived, so the datasource cannot disagree with the record it reads. The refusal happens at
+  admission: the generated `<domain>.list`/`.get` and the eleven board operations check the declared
+  locality against the session's selected binding before entering the backend, and name both the host
+  the endpoint needs and the host the session has. `live_connection_system` and
+  `board_connection_system` hand the backend the substrate its declaration names, and a host-bound
+  domain registers as `SelectedExecutionSystem` rather than `NativeSystemOnly` — hiding it under a
+  selection would refuse it without ever naming the host it needs. A blank host, or a declaration
+  naming two of them, is refused at contract validation, because one session selects one substrate
+  and such a backend could never be satisfied. `flux-codegate` gains the live-backend census: every
+  shipped `LiveDatasource`/`WorkBoard` implementation is enumerated and a backend that builds its own
+  HTTP client, database connection or socket is a red gate — unlike the direct-IO gate, no annotation
+  excuses it, because a self-built client cannot follow a selection. An endpoint with no `host` is
+  unchanged: no admission runs and the backend receives the same system it does today.
+
+- **`flux ops --explore` browses every operation flux can run (C-643).** Operations are what flux
+  actually does, and there was no way to see the whole catalog. The explorer opens a start screen and
+  fuzzy-searches it: a ranked list on the left, and on the right what the selected operation does,
+  its parameters, its risk and its documentation links, with a node-constellation pictogram and a
+  category filter on Tab. `ops_docs.json` carries the documentation index, covered by
+  `crates/flux-cli/tests/ops_doc_index.rs`. Recovered work: it was found uncommitted in a worktree
+  whose branch had already been merged for unrelated build-cache work, and it was committed at its
+  original base — 215 commits behind main — so the authorship stayed separable from the conflict
+  resolution. The index was then regenerated against current documentation, since `fleet.isolate`,
+  `git_worktree_enter`, `http.request`, `web.crawl` and `web.fetch` had each gained a referencing
+  page since that base.
+
+- **Immutable causal resource-usage receipts (C-575).** Token counts and wall time lived in unrelated
+  surfaces and nothing tied either to the request that caused them, so "what did producing this
+  result actually consume?" had no answer that survived two concurrent workers. `flux_events::receipt`
+  is the ledger the rest of the resource-accounting epic reads from: small immutable spans forming one
+  causal tree per request/result, carrying root/span/parent, the causal binding (agent, session,
+  worker, wave, repository, `BoardRef`, assignment revision), timings with clock precision,
+  measurements, money, coverage, freshness and an optional correction identity. A 36-dimension
+  catalogue spans every family the design names, each with a stable wire name and a unit;
+  `measure_model_call` states every `Usage` tier, because a tier missing from a receipt is not the
+  same fact as a tier reported at zero. Absence is typed rather than zeroed and enforced at the
+  builder, so an in-process library can never report child-process CPU it does not have. Receipts
+  ride a `resource:<root-id>` ad-hoc stream on `EventKind::Custom`; the event id *is* the receipt id,
+  derived from (root, span), so an at-least-once pipeline replaying a span gets back the receipt
+  already recorded, and the return value is always decoded from the log rather than from the
+  argument. `span_tree` folds by explicit parent links and yields every receipt exactly once,
+  promoting an orphan or a cycle member to a root rather than dropping it and understating the bill.
+  Money stays separate from physical measurement, and an unpriced dimension carries no charge at all
+  rather than a `$0` one. Retention gains the matching row: a receipt is the measurement itself and
+  cannot be re-derived once the work is over. Nothing produces receipts yet — the model-call seam,
+  the guarded transport, the guarded process runner and the tool dispatcher are not instrumented;
+  this is the ledger and its conformance suite.
+
+### Fixed
+
+- **A wave is applied only when the canonical ref contains its commits (C-721).** `applied` is the
+  fleet's word for "this work is delivered", and `apply` wrote it from intent: it tagged each
+  accepted candidate and then set the status unconditionally, having never once read the ref it was
+  making a claim about. wave-649 carried that claim while it was false in every sense that matters —
+  its repository declares `canonical_ref = "origin/main"`, a remote-tracking ref only a push can move
+  and the fleet never pushes — and the product then contradicted itself: `fleet status` reported it
+  applied while `fleet apply` refused it for having no green gate and `fleet integrate` refused it as
+  not ready. Each accepted repository's canonical ref is now re-read from git after the tags are
+  written, and the wave becomes `applied` only where every one of them is observed to *contain* the
+  candidate, asked of `merge-base --is-ancestor`; a question git declines to answer is never read as
+  delivery. A gated, accepted and pinned wave that has not landed becomes `awaiting-delivery`, which
+  claims exactly what happened, and re-running `apply` re-asks the question. A remote-tracking
+  canonical ref is named as such, with the reason travelling into the report, the warnings and the
+  durable event. `--dry-run` reports no verdict rather than a default one. `fleet doctor` gains
+  `applied-without-delivery` (naming wave, repository, stranded story and the exact missing commit)
+  and `applied-without-green-gate`, and `flux fleet reopen <wave> [--reason]` is the supported path
+  back — it refuses a wave whose status claims no delivery, refuses one whose refs really do hold its
+  candidates, and derives the status it restores rather than choosing it.
+
+- **A story worktree's uncommitted work is reported, never swept (C-722).** wave-745 died overnight
+  with a 531-line failing-first specification sitting *untracked* in its story worktree, and three
+  independent mechanisms agreed the work did not exist: `handoff --from-worktree` derives its write
+  set from `base..HEAD` and could not see an untracked file, `doctor` reported the branch as
+  `branch-without-unique-work`, and the fix doctor prescribed was `reclaim` — the command documented
+  to delete worktrees that provably hold no work. Uncommitted is the normal state of an interrupted
+  worker, and treating it as absence is what turns an interrupted turn into lost work. `fleet doctor`
+  gains `story-worktree-holds-uncommitted-work`, naming the worktree, wave, story and file count from
+  `git status --porcelain -uall` (the default collapses an untracked directory into one entry, so one
+  stray file and a whole afternoon read the same), and it takes precedence over
+  `branch-without-unique-work` — both fire on exactly that state and prescribe opposite actions.
+  Reclamation's refusal now says which of its two conditions it found. And `flux fleet capture <wave>
+  [--item BOARD/ITEM]` commits what an interrupted worker left onto that story's own branch: it
+  stages everything except Fleet's own loop-binding snapshot, refuses a detached or reassigned HEAD,
+  and reports a commit only after re-reading the head and the worktree. The check is deliberately not
+  filtered by wave status or worker liveness — mid-turn is the window in which the host dies, and a
+  check that stayed quiet until the turn ended would have said nothing about the one wave it exists
+  for.
+
+- **The driver verifies an already-built signal before it withholds (C-723).** A drive tick with
+  eight free slots and nine ready items dispatched one, and its reasons were wrong in both
+  directions: two unbuilt stories left the schedulable pool as `already-built` while the single item
+  it sent was the one whose implementation genuinely existed. `already-built` was never a fact the
+  driver established — it was membership in `board reconcile`'s finding set, and reconcile fires
+  `implementation-landed` on any commit that merely *names* an id (C-718). Withholding is the
+  strongest action a tick takes and the only invisible one, so it was the last place that heuristic
+  belonged. Each actionable finding is now verified against the story it claims to have implemented,
+  through four gates: a wholly unticked Acceptance outranks a commit that mentions the id; every
+  symbol and path the story's Acceptance names must be present in that member's checkout, found
+  outside Markdown and outside comments (absent is conclusive and releases the item, present is weak
+  and only fails to veto); an artifact the tree could not be asked about has not said yes; and a
+  finding with no artifact and no reviewer behind it is a guess, and a guess dispatches. A signal that
+  fails verification appears under `released` with the evidence that failed it rather than being
+  swallowed. Because a withhold is invisible from outside, `drive` records how long each one has run
+  and `fleet doctor` reports any ready item withheld across five consecutive ticks as
+  `item-withheld-persistently`.
+
+- **A claim dies with the process that holds it (C-724).** wave-745 claimed two stories against a
+  supervisor pid for ten hours after the host took that pid with it. They sat at the top of a ready
+  board while 70 of the next 82 drive ticks reported an empty dispatch queue, and nothing in the
+  fleet could free them — `doctor` correctly reported `agent-supervisor-gone` and prescribed
+  cancelling the workers, which left the wave still claiming. A driver crash therefore removed its
+  in-flight items from the schedulable pool permanently, which is the opposite of what an unattended
+  machine should do with an interrupted turn. The claim and the disk had one definition of "finished"
+  and needed two, so an interrupted wave now becomes `abandoned`: terminal for claims, in neither
+  `wave_worktrees_are_removable` nor `wave_is_reclaimable`, because its story worktree may hold the
+  only copy of a turn's work. The release is the tick's rather than an operator's — `drive_tick_plan`
+  computes it before reading any claim, so the same tick that frees an item dispatches it — and it
+  fails closed: releasing a live wave's claim would let two workers write one story, so it requires
+  the wave to still claim, to be neither `parked` nor `integrating`, to hold no accepted handoff, to
+  have no worker active by receipt, and to have every worker's recorded supervisor pid provably
+  absent. `supervisor_process_is_gone` splits `ESRCH` from `EPERM`, so a process owned by another
+  user reads as life rather than death. `doctor` gains `claim-without-supervisor`, reported per item
+  and naming wave, item and the dead pid.
+
+- **The crate-version guard asks the registry, not only git, whether a version is spent (C-729,
+  C-709).** The guard compared each crate's version against the base tag, so any bump satisfied it
+  forever. `codewandler-flux-secret` moved 1.2.1 → 1.3.0, 1.3.0 was published by an earlier failed
+  run, and the `host` field was added afterwards under that same number: git said the version moved,
+  crates.io had already spent it. No workspace build can see this, because every first-party crate
+  resolves through its `path` dependency and local content always wins — `cargo publish` resolves
+  from the registry, skips the published version, and the next crate in the closure fails compiling
+  against the stale copy, after everything else has run. The guard now reads the sparse index
+  directly: one HTTP GET, no build, no credential and no cargo invocation, so it stays a first-step
+  check. A transport failure warns rather than fails, and `FLUX_SKIP_REGISTRY_CHECK=1` opts out.
+  `codewandler-flux-secret` moves to 1.4.0, which its published API requires — the additive `host`
+  field on a 1.x line — so the registry closure that stopped after v0.59.1 can resume.
+
+- **A transport failure is no longer reported as the protocol's answer.**
+  `a_far_side_version_mismatch_surfaces_the_protocols_own_refusal` asserted on whatever error came
+  back, so an unreachable fixture sshd was reported as a failure of the refusal it was actually
+  testing. This was the single largest source of red CI: four of the last five `ci` failures, and it
+  aborted a release after the identical suite had passed on the pull request twenty minutes earlier.
+  Waiting harder at startup would not have fixed it — the daemon accepts the fixture's startup probe
+  and can still refuse a later connection under the parallel load of ten sibling tests each running
+  their own sshd. The test now retries while the failure is transport and asserts only on an answer
+  that came from the protocol; the assertion itself is unchanged and no weaker, and a run that never
+  gets past the transport still fails, naming what it saw.
+
 ## [0.59.1] - 2026-08-08
 
 ### Added
