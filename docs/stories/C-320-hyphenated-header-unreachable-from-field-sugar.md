@@ -2,7 +2,7 @@
 id: C-320
 title: "A hyphenated header name is unreachable from the `$resp.headers.x` sugar"
 pillar: Language
-status: active
+status: done
 priority: 15
 areas: [flux-lang]
 note: "found by C-304 — `http.request` now returns a headers map, but `.headers.content-type` and `.headers[\"content-type\"]` both fail: field segments are alphanumeric/underscore and eval_jq_path's bracket index must be numeric, so the commonest header names need a pick() workaround"
@@ -41,7 +41,9 @@ answer — and it is the first thing a caller hits after adopting the new record
 - [x] The node-kind and reference docs regenerate cleanly
       (`UPDATE=1 cargo test -p codewandler-flux-lang --test skill_in_sync` and `--test website_in_sync`),
       and changed semantics get hand-written prose — the generated tables do not cover that.
-- [ ] Full gate green in both workspaces.
+- [x] Full gate green in both workspaces. *(Landed on `main` in `47a26202`, which is an ancestor of
+      `main` today; every `scripts/release-full-gate.sh` run since — including the ones that cut
+      v0.59.1 and v0.59.2 — has carried this parser and passed.)*
 
 ## Progress
 
@@ -59,6 +61,12 @@ answer — and it is the first thing a caller hits after adopting the new record
 - Focused core, generated-reference, mirror, corpus, query, Rust binding, and isolated Helix checks
   are green. The full Flux repository gate remains pending while unrelated active lanes share this
   worktree, so this story remains active.
+- 2026-08-08 — closed. The pending gate resolved itself: the parser change reached `main` in
+  `47a26202`, and every full gate since — including the two that cut v0.59.1 and v0.59.2 — has run
+  against it. The last criterion was satisfied long before anyone ticked it. The status was left at
+  `active`, which is not a value the board parses: `read_stories_with_warnings` drops such a file and
+  `check` still exits 0, so this story was invisible to every board read for the whole interval.
+  Silent-drop is a defect in its own right, and this file is the fixture for turning it into an error.
 
 ## Notes
 
