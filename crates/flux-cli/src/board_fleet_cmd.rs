@@ -1078,6 +1078,18 @@ pub(super) enum FleetAction {
     Unpark {
         wave: String,
     },
+    /// Move a wave out of a delivery status whose preconditions never held.
+    ///
+    /// C-721. A wave recorded `applied` whose canonical ref never gained its commits is unreachable:
+    /// `apply` refuses it for no longer being green and `integrate` refuses it as not ready, so the
+    /// stranded work could only be recovered by hand-editing state or hand-merging a branch. This
+    /// verifies the claim against git first and refuses a wave that really did deliver.
+    Reopen {
+        wave: String,
+        /// Why it is being reopened. Recorded on the wave and in the durable event.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     Resume {
         target: Option<String>,
     },
@@ -5855,6 +5867,9 @@ worktree_root = ".flux/fleet/worktrees"
         }
         FleetAction::Park { wave, reason } => park_wave(command, root, state, wave, reason),
         FleetAction::Unpark { wave } => unpark_wave(command, root, state, wave),
+        FleetAction::Reopen { wave, reason } => {
+            reopen_wave(command, root, state, wave, reason.as_deref())
+        }
         FleetAction::Resume { target } => {
             let target = target.as_deref().unwrap_or("main");
             state.running = true;
@@ -6107,6 +6122,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Cancel { .. }
             | FleetAction::Park { .. }
             | FleetAction::Unpark { .. }
+            | FleetAction::Reopen { .. }
             | FleetAction::Resume { .. }
             | FleetAction::Apply { .. }
             | FleetAction::Note { .. }
@@ -6277,6 +6293,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "cancel",
         "park",
         "unpark",
+        // Reopen MUTATES: it moves a wave out of a delivery status that git says was never true.
+        "reopen",
         "resume",
         "apply",
         "status",
@@ -11228,10 +11246,17 @@ const FLEET_LOOP_ANALYSIS_ITERATIONS: usize = 8;
 /// `green` and `applied` both count: `green` means the final gate passed on the assembled candidate, and
 /// `applied` means that candidate was additionally accepted and pinned. Neither state is reflected on
 /// the Board, so this is the only reliable answer to "has this already been built?".
+///
+/// C-721 adds `awaiting-delivery`, which is `applied` minus the delivery claim: the candidate is gated
+/// and pinned, so the question this answers — "has this already been built?" — is still yes, and
+/// omitting it would have the driver dispatch a second attempt at work already sitting in a tag.
 fn delivered_board_items(state: &FleetState) -> BTreeMap<String, String> {
     let mut delivered = BTreeMap::new();
     for (wave_id, wave) in &state.waves {
-        if !matches!(wave["status"].as_str(), Some("green" | "applied")) {
+        if !matches!(
+            wave["status"].as_str(),
+            Some("green" | "applied" | WAVE_AWAITING_DELIVERY)
+        ) {
             continue;
         }
         for item in wave["items"].as_array().into_iter().flatten() {
@@ -11338,7 +11363,10 @@ fn commit_records(
 
 /// Is this wave finished for good, so that its worktrees are no longer structure it needs?
 fn wave_worktrees_are_removable(status: &str) -> bool {
-    matches!(status, "applied" | "cancelled")
+    // C-721: `awaiting-delivery` sits beside `applied` here on purpose. The wave's own pipeline is
+    // finished either way — the candidate is gated and pinned by a tag that outlives every worktree —
+    // and the only outstanding step is landing, which no worktree of this wave participates in.
+    matches!(status, "applied" | "cancelled" | WAVE_AWAITING_DELIVERY)
 }
 
 /// Does this wave still hold a claim on the items it was dispatched for?
@@ -11423,12 +11451,14 @@ fn wave_worktrees(wave: &Value) -> Vec<WaveWorktree> {
 }
 
 /// The runtime questions `fleet doctor` answers, in report order.
-const FLEET_RUNTIME_CHECKS: [&str; 5] = [
+const FLEET_RUNTIME_CHECKS: [&str; 7] = [
     "agent-supervisor-gone",
     "wave-wedged",
     "worktree-missing",
     "item-double-claimed",
     "branch-without-unique-work",
+    "applied-without-delivery",
+    "applied-without-green-gate",
 ];
 
 /// One runtime finding. `fix` is the single next action, in the spirit of `flux doctor`'s fix-it hints:
@@ -11619,6 +11649,273 @@ fn stale_branch_findings(
     findings
 }
 
+/// C-721. `applied` is the fleet's word for "this work is delivered", so it may only be recorded once
+/// the canonical ref is observed to contain what the wave accepted. Everything from here to
+/// `reopen_wave` exists to make that a verified fact rather than an assumption, and to give an
+/// operator a way out of a status that was written when it was neither.
+///
+/// The intermediate status: the candidate is accepted and pinned by a tag, and the canonical ref does
+/// not contain it yet. It is what `apply` records instead of over-claiming, and it is deliberately
+/// treated as finished-for-reclamation everywhere `applied` is, because the wave's own pipeline has
+/// nothing left to do — only landing is outstanding, and landing is not the fleet's act.
+const WAVE_AWAITING_DELIVERY: &str = "awaiting-delivery";
+
+/// Where a repository's canonical ref lives, and therefore what could ever move it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalRefKind {
+    /// A local branch. `apply` does not write it either — a human lands the accepted tag — but nothing
+    /// structural stops it from gaining the candidate.
+    Local,
+    /// A remote-tracking ref such as `origin/main`. It moves only on fetch, so it cannot gain the
+    /// candidate until somebody pushes, and Fleet never pushes. A repository configured this way can
+    /// never be delivered by any fleet operation — the defect is in the configuration, not the wave.
+    RemoteTracking,
+    /// The ref does not resolve in this checkout, so nothing at all can be concluded about it.
+    Unresolvable,
+}
+
+/// One answer from git about one (canonical ref, candidate) pair.
+///
+/// Both halves come from the same probe so a caller cannot mix a fresh containment answer with a
+/// stale idea of where the ref lives.
+struct DeliveryProbe {
+    kind: CanonicalRefKind,
+    /// `None` when git could not answer — an unresolvable ref, an object it does not have, or a
+    /// checkout it cannot read. An unanswered question is never read as delivery.
+    contains: Option<bool>,
+}
+
+/// Ask git, in this repository, right now.
+///
+/// `--symbolic-full-name` is the only reliable way to tell `origin/main` (which resolves under
+/// `refs/remotes/`) from a local branch that merely happens to be named after a remote.
+fn git_delivery_probe(source: &Path, canonical_ref: &str, commit: &str) -> DeliveryProbe {
+    let kind = match git_output(
+        source,
+        &["rev-parse", "--symbolic-full-name", canonical_ref],
+    ) {
+        Some(full) if full.starts_with("refs/remotes/") => CanonicalRefKind::RemoteTracking,
+        Some(full) if !full.is_empty() => CanonicalRefKind::Local,
+        _ => CanonicalRefKind::Unresolvable,
+    };
+    if kind == CanonicalRefKind::Unresolvable {
+        return DeliveryProbe {
+            kind,
+            contains: None,
+        };
+    }
+    // `--is-ancestor` answers 0 for yes and 1 for no; anything else (a missing object, an unreadable
+    // repository) is not a "no", it is a question git declined to answer.
+    let contains = guarded_git(
+        source,
+        &["merge-base", "--is-ancestor", commit, canonical_ref],
+    )
+    .ok()
+    .and_then(|output| match output.exit_code {
+        0 => Some(true),
+        1 => Some(false),
+        _ => None,
+    });
+    DeliveryProbe { kind, contains }
+}
+
+/// What a wave's own acceptance record claims, checked against what its canonical refs actually hold.
+///
+/// One entry per accepted repository. Each carries the verdict AND the reason, because "not landed
+/// yet" and "cannot ever be landed by this fleet" are different operator problems with different
+/// answers, and a bare `false` collapses them.
+///
+/// The probe is injected so both the check and the operations that depend on it are testable without
+/// a checkout — the shape `stale_branch_findings` already uses for the same reason.
+fn wave_delivery_verdicts(
+    wave: &Value,
+    probe: impl Fn(&Path, &str, &str) -> DeliveryProbe,
+) -> Vec<Value> {
+    let mut verdicts = Vec::new();
+    for accepted in wave["applied"].as_array().into_iter().flatten() {
+        let Some(repository_id) = accepted["repository"].as_str() else {
+            continue;
+        };
+        let Some(candidate) = accepted["candidate"].as_str() else {
+            continue;
+        };
+        let repository = wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|repository| repository["id"].as_str() == Some(repository_id));
+        let canonical_ref = repository
+            .and_then(|repository| repository["canonical_ref"].as_str())
+            .unwrap_or("origin/main");
+        // Named here so a finding can say WHICH story is stranded, not merely which wave.
+        let stories = repository
+            .and_then(|repository| repository["stories"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|story| story["board_ref"].as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let Some(source) = repository
+            .and_then(|repository| repository["source_root"].as_str())
+            .map(PathBuf::from)
+        else {
+            verdicts.push(json!({
+                "repository": repository_id,
+                "candidate": candidate,
+                "canonical_ref": canonical_ref,
+                "stories": stories,
+                "delivered": false,
+                "reason": "the wave records no source checkout for this repository, so containment cannot be verified",
+            }));
+            continue;
+        };
+        let DeliveryProbe { kind, contains } = probe(&source, canonical_ref, candidate);
+        let (delivered, reason) = match (kind, contains) {
+            (_, Some(true)) => (
+                true,
+                format!("{canonical_ref} contains the accepted candidate {candidate}"),
+            ),
+            (CanonicalRefKind::RemoteTracking, _) => (
+                false,
+                format!(
+                    "{canonical_ref} is a remote-tracking ref, so delivering {candidate} there requires a push — and fleet apply never pushes"
+                ),
+            ),
+            (CanonicalRefKind::Unresolvable, _) => (
+                false,
+                format!("{canonical_ref} does not resolve in {}, so containment cannot be verified", display_path(&source)),
+            ),
+            (CanonicalRefKind::Local, Some(false)) => (
+                false,
+                format!("{canonical_ref} does not contain the accepted candidate {candidate}; it has not been landed"),
+            ),
+            (CanonicalRefKind::Local, None) => (
+                false,
+                format!("git could not answer whether {canonical_ref} contains {candidate}"),
+            ),
+        };
+        verdicts.push(json!({
+            "repository": repository_id,
+            "candidate": candidate,
+            "canonical_ref": canonical_ref,
+            "stories": stories,
+            "delivered": delivered,
+            "reason": reason,
+        }));
+    }
+    verdicts
+}
+
+/// Delivered means EVERY accepted repository is in its canonical ref.
+///
+/// An empty verdict list is not delivery. A wave that accepted nothing has delivered nothing, and
+/// `all` over an empty iterator would have said the opposite.
+fn wave_is_delivered(verdicts: &[Value]) -> bool {
+    !verdicts.is_empty()
+        && verdicts
+            .iter()
+            .all(|verdict| verdict["delivered"] == json!(true))
+}
+
+/// Which statuses claim the wave's work reached its canonical ref?
+///
+/// Only `applied` does. `awaiting-delivery` is the honest neighbour that claims the opposite, and is
+/// checked too — so that a wave which later gains its commits is not left reading as undelivered
+/// forever, and so `reopen` can refuse to move a wave whose work really did land.
+fn wave_claims_delivery(status: &str) -> bool {
+    status == "applied"
+}
+
+/// Waves recorded `applied` whose canonical ref does not contain what they claim to have delivered.
+///
+/// This is the check wave-649 needed and nothing offered: it was recorded `applied` while its story's
+/// commits existed only on `fleet/wave-649/exchange/story/X-139` — absent from `origin/main`, and
+/// absent from the wave's own integration branch under those shas. `fleet status` reported it
+/// delivered for weeks; every operation that could have moved it refused it.
+fn undelivered_applied_findings(
+    state: &FleetState,
+    probe: impl Fn(&Path, &str, &str) -> DeliveryProbe + Copy,
+) -> Vec<Value> {
+    let mut findings = Vec::new();
+    for (wave_id, wave) in &state.waves {
+        if !wave["status"].as_str().is_some_and(wave_claims_delivery) {
+            continue;
+        }
+        for verdict in wave_delivery_verdicts(wave, probe) {
+            if verdict["delivered"] == json!(true) {
+                continue;
+            }
+            let repository = verdict["repository"].as_str().unwrap_or("unknown");
+            let candidate = verdict["candidate"].as_str().unwrap_or("unknown");
+            let reason = verdict["reason"].as_str().unwrap_or_default();
+            let stories = verdict["stories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            // One finding per stranded story, because the story is what an operator has to re-deliver.
+            // A repository whose stories were never recorded still gets one, named by repository.
+            let subjects = if stories.is_empty() {
+                vec![format!("{wave_id}/{repository}")]
+            } else {
+                stories
+                    .iter()
+                    .map(|story| format!("{wave_id}/{story}"))
+                    .collect()
+            };
+            for subject in subjects {
+                findings.push(runtime_finding(
+                    "applied-without-delivery",
+                    &subject,
+                    format!(
+                        "wave {wave_id} is recorded applied, but repository {repository} is missing commit {candidate} from its canonical ref: {reason}"
+                    ),
+                    format!("flux fleet reopen {wave_id}"),
+                ));
+            }
+        }
+    }
+    findings
+}
+
+/// Waves recorded `applied` that hold no recorded green final gate.
+///
+/// `apply` refuses a wave without one, so a wave carrying both is a state no operation could have
+/// produced — and the recorded status and the operations' preconditions then disagree permanently.
+/// That disagreement is what makes a wave unrecoverable rather than merely failed: `fleet status`
+/// says finished, and every verb that could move it says it never started.
+fn applied_without_green_gate_findings(state: &FleetState) -> Vec<Value> {
+    let mut findings = Vec::new();
+    for (wave_id, wave) in &state.waves {
+        if !wave["status"].as_str().is_some_and(wave_claims_delivery) {
+            continue;
+        }
+        for repository in wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let repository_id = repository["id"].as_str().unwrap_or("unknown");
+            let status = repository["gate"]["status"].as_str().unwrap_or("none");
+            let runs = repository["gate"]["runs"].as_u64().unwrap_or_default();
+            if status == "green" && runs == 1 {
+                continue;
+            }
+            findings.push(runtime_finding(
+                "applied-without-green-gate",
+                &format!("{wave_id}/{repository_id}"),
+                format!(
+                    "wave {wave_id} is recorded applied, but repository {repository_id} records gate {status} after {runs} run(s); apply demands exactly one green final gate, so no operation could have produced this state"
+                ),
+                format!("flux fleet reopen {wave_id}"),
+            ));
+        }
+    }
+    findings
+}
+
 /// The runtime half of `fleet doctor`: everything the fleet already records and offered no way to ask.
 ///
 /// Read-only by construction — every check reads recorded state, the filesystem, or a `for-each-ref`
@@ -11631,6 +11928,8 @@ fn fleet_runtime_health(state: &FleetState) -> Value {
     findings.extend(missing_worktree_findings(state));
     findings.extend(double_claimed_findings(state));
     findings.extend(stale_branch_findings(state, git_fleet_branch_heads));
+    findings.extend(undelivered_applied_findings(state, git_delivery_probe));
+    findings.extend(applied_without_green_gate_findings(state));
     json!({
         "healthy": findings.is_empty(),
         "checks": FLEET_RUNTIME_CHECKS,
@@ -13602,7 +13901,14 @@ fn goal_key(scope: GoalScope, name: &str) -> Result<String> {
 fn wave_is_reclaimable(status: &str) -> bool {
     matches!(
         status,
-        "applied" | "cancelled" | "conflict" | "red" | "parked" | "agent-turn-failed" | "green"
+        "applied"
+            | "cancelled"
+            | "conflict"
+            | "red"
+            | "parked"
+            | "agent-turn-failed"
+            | "green"
+            | WAVE_AWAITING_DELIVERY
     )
 }
 
@@ -17354,7 +17660,14 @@ fn apply_wave(
     // so the wave rollup says nothing about whether THAT candidate is good. The per-repository green
     // gate is still demanded below, unchanged — this relaxes which waves may be asked, not what counts
     // as accepted.
+    //
+    // C-721: `awaiting-delivery` is admitted alongside `green`. A wave in that status already passed
+    // this same check once — it is how it got there — and its candidate is pinned by a tag. Re-running
+    // apply on it is the verb that RE-ASKS the delivery question, so an operator who has landed the
+    // accepted tag can have the wave confirm it instead of being told the wave is finished with.
+    let awaiting_delivery = record["status"].as_str() == Some(WAVE_AWAITING_DELIVERY);
     if only.is_none()
+        && !awaiting_delivery
         && (!record["apply_eligible"].as_bool().unwrap_or(false)
             || record["status"].as_str() != Some("green"))
     {
@@ -17497,28 +17810,212 @@ fn apply_wave(
     }
     state.revision += 1;
     let mut updated = record;
+    updated["applied"] = json!(merged);
+    // C-721. THE STATUS IS DERIVED FROM A VERIFIED EFFECT, NOT FROM HAVING ACTED.
+    //
+    // This used to write `applied` unconditionally the moment the tags went in, which is a claim about
+    // the CANONICAL REF made without ever reading it. wave-649 carried that claim for weeks: its
+    // repository declares `canonical_ref = "origin/main"`, a remote-tracking ref that only a push can
+    // move and Fleet never pushes, so delivery there was impossible by construction — and the wave read
+    // `applied` while `fleet apply` refused it for having no green gate and `fleet integrate` refused it
+    // as not ready. Nothing in the product could say which of the three was right.
+    //
+    // So each accepted repository's canonical ref is re-read here, after the tags are written, and the
+    // wave becomes `applied` only where every one of them is observed to contain the accepted candidate.
+    // Otherwise it becomes `awaiting-delivery`, which claims exactly what happened: gated, accepted,
+    // pinned, not landed. Re-running apply re-asks the question, so the status converges on the truth
+    // as soon as the work is landed.
+    let verdicts = if command.dry_run {
+        Vec::new()
+    } else {
+        wave_delivery_verdicts(&updated, git_delivery_probe)
+    };
+    let delivered = !command.dry_run && wave_is_delivered(&verdicts);
     // A named apply does not finish the wave, so it must not change the wave's own verdict or reclaim
     // its storage: the repositories left behind still need their worktrees and their builds to be
     // retried. `fleet reclaim` handles them once the wave really is done.
     if only.is_none() {
-        updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
+        updated["status"] = json!(match (command.dry_run, delivered) {
+            (true, _) => "green",
+            (false, true) => "applied",
+            (false, false) => WAVE_AWAITING_DELIVERY,
+        });
         updated["apply_eligible"] = json!(command.dry_run);
+        updated["delivery"] = json!({"delivered": delivered, "repositories": verdicts});
     }
-    updated["applied"] = json!(merged);
     let reclaimed = if command.dry_run || only.is_some() {
         Value::Null
     } else {
         reclaim_wave_storage(&updated)
     };
+    let status = updated["status"].clone();
     state.waves.insert(wave.to_string(), updated);
-    let data = json!({"wave":wave,"repositories":merged,"only":only,"skipped":skipped,"merged_locally":false,"accepted":!command.dry_run,"pushed":false,"released":false,"deployed":false,"reclaimed":reclaimed});
+    // A preview probes nothing, so it reports no verdict rather than a default one. Reporting
+    // `delivered: false` from a run that never asked would be this story's own defect in miniature.
+    let reported_delivery = if command.dry_run {
+        Value::Null
+    } else {
+        json!(delivered)
+    };
+    let data = json!({"wave":wave,"status":status,"delivered":reported_delivery,"delivery":verdicts,"repositories":merged,"only":only,"skipped":skipped,"merged_locally":false,"accepted":!command.dry_run,"pushed":false,"released":false,"deployed":false,"reclaimed":reclaimed});
     persist_fleet_mutation(command, root, &state, "wave.applied", data.clone())?;
-    Ok((
+    // Every undelivered repository is a warning, not a footnote: the wave's headline says "accepted",
+    // and an operator who reads only that must still be told the canonical ref gained nothing.
+    let warnings = verdicts
+        .iter()
+        .filter(|verdict| verdict["delivered"] != json!(true))
+        .map(|verdict| {
+            format!(
+                "{wave} is not delivered for repository {}: {}",
+                verdict["repository"].as_str().unwrap_or("unknown"),
+                verdict["reason"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>();
+    let human = if command.dry_run || only.is_some() {
         format!(
             "{wave} accepted and pinned by tag; awaiting gated accumulation — nothing was merged or pushed"
-        ),
+        )
+    } else if delivered {
+        format!(
+            "{wave} applied: every accepted candidate is present in its canonical ref — nothing was merged or pushed"
+        )
+    } else {
+        format!(
+            "{wave} accepted and pinned by tag but NOT applied: {} repositor(ies) are absent from their canonical ref",
+            warnings.len()
+        )
+    };
+    Ok((human, data, warnings, state.revision))
+}
+
+/// Move a wave out of a status whose preconditions never held.
+///
+/// C-721. Without this there was no supported way back. wave-649 was recorded `applied` while its
+/// story's commits reached neither the canonical ref nor the integration branch, and every verb that
+/// could have re-delivered it refused: `apply` because the wave was no longer `green`, `integrate`
+/// because it was no longer ready. The work was reachable only by hand-editing `state.json` or
+/// hand-merging a branch, which is precisely what makes a bad run into a harness defect.
+///
+/// This is NOT a status editor, and the difference is the whole safety argument:
+///
+/// - It refuses any wave whose status does not CLAIM delivery, because a wave that claims nothing has
+///   no false precondition to escape.
+/// - It re-reads git and refuses a wave whose canonical refs really do contain its accepted
+///   candidates. Reopening genuinely delivered work would be the same lie in the other direction, and
+///   would put a second attempt at a landed story back on the schedule.
+/// - The status it restores is derived from evidence rather than chosen: an intact gated candidate
+///   returns to `green`, where `apply` re-asks the delivery question; anything else returns to
+///   `accepted`, where `integrate` rebuilds the candidate from the story branches.
+fn reopen_wave(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+    reason: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let wave = state
+        .waves
+        .get(wave_id)
+        .cloned()
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let status = wave["status"].as_str().unwrap_or("unknown").to_string();
+    if !wave_claims_delivery(&status) && status != WAVE_AWAITING_DELIVERY {
+        bail!(
+            "conflict/precondition: wave {wave_id} is {status}, which claims no delivery; reopen moves a wave out of applied or {WAVE_AWAITING_DELIVERY}"
+        )
+    }
+    let verdicts = wave_delivery_verdicts(&wave, git_delivery_probe);
+    if wave_is_delivered(&verdicts) {
+        bail!(
+            "conflict/precondition: wave {wave_id} really is delivered — every accepted candidate is present in its canonical ref; reopen refuses to un-deliver landed work"
+        )
+    }
+    // Is the gated candidate still exactly what it was? Then nothing needs rebuilding and the only
+    // outstanding question is delivery, which `apply` is the verb for. A candidate that has been lost
+    // or moved has to be re-assembled instead, and that is `integrate`.
+    let repositories = wave["topology"]["repositories"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let candidate_intact = !repositories.is_empty()
+        && repositories.iter().all(|repository| {
+            let Some(source) = repository["source_root"].as_str().map(PathBuf::from) else {
+                return false;
+            };
+            let (Some(branch), Some(candidate)) = (
+                repository["integration"]["branch"].as_str(),
+                repository["candidate"].as_str(),
+            ) else {
+                return false;
+            };
+            repository["gate"]["status"].as_str() == Some("green")
+                && repository["gate"]["runs"].as_u64() == Some(1)
+                && git_output(&source, &["rev-parse", branch]).as_deref() == Some(candidate)
+        });
+    let restored = if candidate_intact {
+        "green"
+    } else {
+        "accepted"
+    };
+    let next = if candidate_intact {
+        format!("flux fleet apply {wave_id}")
+    } else {
+        format!("flux fleet integrate {wave_id}")
+    };
+    let event = json!({
+        "wave": wave_id,
+        "status": restored,
+        "previous_status": status,
+        "reason": reason,
+        "delivery": verdicts,
+        "next": next,
+    });
+    let previous = status.clone();
+    // The verdicts are computed once, above, and reused here. `persist_delta_mutation` may run this
+    // closure more than once under contention, and re-probing git each time would let two attempts
+    // record different answers for the same decision.
+    let recorded = verdicts.clone();
+    persist_delta_mutation(command, root, &mut state, "wave.reopened", event, |state| {
+        let wave = state
+            .waves
+            .get_mut(wave_id)
+            .with_context(|| format!("not-found: wave {wave_id}"))?;
+        wave["status"] = json!(restored);
+        wave["apply_eligible"] = json!(candidate_intact);
+        // The wave keeps its `applied` record: those tags exist in git, they still pin the candidate,
+        // and dropping them would strand exactly the commits this verb is here to recover.
+        wave["reopened"] = json!({
+            "from": previous,
+            "to": restored,
+            "reason": reason,
+            "delivery": recorded,
+        });
+        Ok(())
+    })?;
+    let data = json!({
+        "wave": wave_id,
+        "status": restored,
+        "previous_status": status,
+        "reason": reason,
+        "apply_eligible": candidate_intact,
+        "delivery": verdicts,
+        "next": next,
+    });
+    Ok((
+        format!("{wave_id} reopened: {status} -> {restored}; next: {next}"),
         data,
-        vec![],
+        verdicts
+            .iter()
+            .filter(|verdict| verdict["delivered"] != json!(true))
+            .map(|verdict| {
+                format!(
+                    "{wave_id} was recorded {status} while repository {} was undelivered: {}",
+                    verdict["repository"].as_str().unwrap_or("unknown"),
+                    verdict["reason"].as_str().unwrap_or_default()
+                )
+            })
+            .collect(),
         state.revision,
     ))
 }
@@ -19220,6 +19717,11 @@ mod tests {
                 "topology": {"repositories": [{
                     "id": "flux",
                     "source_root": display_path(&root),
+                    // C-721: `apply` demands exactly one green final gate before it will record
+                    // `applied`, so a wave carrying that status and no such gate is now itself a
+                    // finding. Spelling it out here keeps this fixture a wave that really could have
+                    // finished, rather than one that only looks like it.
+                    "gate": {"status": "green", "runs": 1},
                     "integration": {"branch": "fleet/wave-0/flux/integration", "worktree": display_path(&absent)},
                 }]},
             }),
@@ -19262,7 +19764,8 @@ mod tests {
                 ("worktree-missing".to_string(), display_path(&absent)),
                 ("item-double-claimed".to_string(), "flux/C-1".to_string()),
             ]),
-            "a live worker, and a finished wave's absent worktree and released claim, are not findings"
+            "a live worker, and a finished wave's absent worktree, released claim and honoured \
+             delivery preconditions, are not findings"
         );
         assert!(
             data["runtime"]["findings"]
@@ -21583,5 +22086,497 @@ mod tests {
             add_unreleased_changelog_entry(&updated, "Board shipped."),
             updated
         );
+    }
+
+    /// A scratch directory unique per call, unlike `reclaim_test_dir`, which keys only on pid and
+    /// thread so two calls from one test collide. Delivery tests need a source repository and a fleet
+    /// root at the same time.
+    fn delivery_test_dir(label: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "flux-delivery-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("scratch dir");
+        path
+    }
+
+    /// wave-649's repository, reproduced: `origin/main` left at the base while the candidate lives
+    /// only on the integration branch, and the story's own commits only on the story branch.
+    ///
+    /// Returns `(source, base, candidate, story_head)`. Real git, because the entire question this
+    /// story asks is what a ref CONTAINS, and a fake resolver cannot be wrong in the way git can.
+    fn wave_649_shaped_repository(label: &str) -> (PathBuf, String, String, String) {
+        let source = delivery_test_dir(label);
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&source, &argv).expect("git setup");
+        }
+        std::fs::write(source.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&source, &["add", "."]).expect("add base");
+        guarded_git(&source, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&source, &["rev-parse", "HEAD"]).expect("base sha");
+        // The remote-tracking ref `exchange` and `connectors` declare. Left at the base: `apply` never
+        // pushes, so nothing it does can ever move this.
+        guarded_git(&source, &["update-ref", "refs/remotes/origin/main", &base])
+            .expect("seed origin/main");
+
+        guarded_git(
+            &source,
+            &["checkout", "-b", "fleet/wave-649/exchange/story/X-139"],
+        )
+        .expect("story branch");
+        std::fs::write(source.join("x139.rs"), "// x139\n").expect("write story");
+        guarded_git(&source, &["add", "."]).expect("add story");
+        guarded_git(&source, &["commit", "-m", "feat(x139): deliver"]).expect("commit story");
+        let story_head = git_output(&source, &["rev-parse", "HEAD"]).expect("story sha");
+
+        // The candidate is a CHERRY-PICK of the story commit, exactly as integration assembles it, so
+        // its sha differs from the story's while its tree matches.
+        guarded_git(&source, &["checkout", &base]).expect("detach at base");
+        guarded_git(
+            &source,
+            &["checkout", "-b", "fleet/wave-649/exchange/integration"],
+        )
+        .expect("integration branch");
+        guarded_git(&source, &["cherry-pick", &story_head]).expect("assemble candidate");
+        let candidate = git_output(&source, &["rev-parse", "HEAD"]).expect("candidate sha");
+
+        (source, base, candidate, story_head)
+    }
+
+    fn wave_649_state(
+        source: &Path,
+        base: &str,
+        candidate: &str,
+        canonical_ref: &str,
+    ) -> FleetState {
+        let mut state = FleetState {
+            revision: 11,
+            running: true,
+            ..FleetState::default()
+        };
+        state.waves.insert(
+            "wave-649".into(),
+            json!({
+                "id": "wave-649",
+                "status": "green",
+                "apply_eligible": true,
+                "items": ["exchange/X-139"],
+                "topology": {"repositories": [{
+                    "id": "exchange",
+                    "source_root": source.display().to_string(),
+                    "canonical_ref": canonical_ref,
+                    "base_commit": base,
+                    "candidate": candidate,
+                    "gate": {"status": "green", "runs": 1, "candidate": candidate},
+                    "integration": {
+                        "branch": "fleet/wave-649/exchange/integration",
+                        "worktree": source.join("wt/integration").display().to_string(),
+                    },
+                    "verify": {
+                        "branch": "fleet/wave-649/exchange/verify",
+                        "worktree": source.join("wt/verify").display().to_string(),
+                    },
+                    "stories": [{
+                        "board_ref": "exchange/X-139",
+                        "branch": "fleet/wave-649/exchange/story/X-139",
+                        "worktree": source.join("wt/stories/X-139").display().to_string(),
+                    }],
+                }]},
+            }),
+        );
+        state
+    }
+
+    /// C-721 (failing first). `applied` is the fleet's word for "this work is delivered", and
+    /// `apply` wrote it from intent: it tagged the candidate and then set the status unconditionally,
+    /// never asking whether the canonical ref had gained anything.
+    ///
+    /// wave-649 is the fixture. Its repository declares `canonical_ref = "origin/main"` — a
+    /// remote-tracking ref — and `apply` never pushes, so delivery there is impossible BY
+    /// CONSTRUCTION. The wave was nonetheless recorded `applied`, while `fleet apply` refused it for
+    /// having no green gate and `fleet integrate` refused it as not ready. A status no operation
+    /// agrees with is a status no operator can act on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_is_applied_only_when_the_canonical_ref_contains_its_candidate() {
+        let root = fleet_tui_fixture("apply-delivery");
+        let (source, base, candidate, _) = wave_649_shaped_repository("apply-remote-canonical");
+        let state = wave_649_state(&source, &base, &candidate, "origin/main");
+
+        let (human, data, warnings, _) = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Apply {
+                    wave: "wave-649".into(),
+                    only: None,
+                },
+            ),
+            &root,
+            state,
+            None,
+        )
+        .expect("acceptance still pins the candidate; only the delivery claim is withheld");
+
+        let persisted = read_fleet_state(&root).expect("state was written");
+        assert_ne!(
+            persisted.waves["wave-649"]["status"],
+            json!("applied"),
+            "a wave whose canonical ref never gained its candidate is not applied: {}",
+            persisted.waves["wave-649"]
+        );
+        assert_eq!(
+            data["delivered"],
+            json!(false),
+            "delivery is a verified fact about the canonical ref, not an assumption: {data}"
+        );
+        assert!(
+            data["repositories"][0]["accepted_tag"].is_string(),
+            "the candidate is still pinned, so nothing is lost by withholding the claim: {data}"
+        );
+        let said = format!("{human} {}", warnings.join(" "));
+        assert!(
+            said.contains("push"),
+            "a remote-tracking canonical ref needs a push apply will not perform, and must say so: {said}"
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other half of the same contract: when the canonical ref genuinely does contain the accepted
+    /// candidate, `applied` is exactly right and must still be recorded.
+    ///
+    /// Without this the fix would be a refusal rather than a verification, and `applied` would become a
+    /// status nothing can ever reach.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_landed_candidate_is_recorded_applied_because_the_canonical_ref_holds_it() {
+        let root = fleet_tui_fixture("apply-delivered");
+        let (source, base, candidate, _) = wave_649_shaped_repository("apply-local-canonical");
+        // The landing the fleet does not perform: the canonical branch now holds the candidate.
+        guarded_git(&source, &["branch", "-f", "main", &candidate]).expect("land the candidate");
+        let state = wave_649_state(&source, &base, &candidate, "main");
+
+        let (human, data, warnings, _) = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Apply {
+                    wave: "wave-649".into(),
+                    only: None,
+                },
+            ),
+            &root,
+            state,
+            None,
+        )
+        .expect("a landed candidate applies");
+
+        assert_eq!(data["delivered"], json!(true), "{data}");
+        let persisted = read_fleet_state(&root).expect("state was written");
+        assert_eq!(
+            persisted.waves["wave-649"]["status"],
+            json!("applied"),
+            "containment held, so the delivery claim is earned: {}",
+            persisted.waves["wave-649"]
+        );
+        assert!(warnings.is_empty(), "nothing is outstanding: {warnings:?}");
+        assert!(human.contains("applied"), "{human}");
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A recorded wave in the exact shape wave-649 holds in durable state: `applied`, with an
+    /// acceptance record naming the tag and the candidate.
+    fn recorded_applied_wave(
+        source: &Path,
+        base: &str,
+        candidate: &str,
+        canonical_ref: &str,
+    ) -> FleetState {
+        let mut state = wave_649_state(source, base, candidate, canonical_ref);
+        let wave = state.waves.get_mut("wave-649").expect("the fixture wave");
+        wave["status"] = json!("applied");
+        wave["apply_eligible"] = json!(false);
+        wave["applied"] = json!([{
+            "repository": "exchange",
+            "candidate": candidate,
+            "accepted_tag": "fleet/accepted/wave-649/exchange",
+            "branch": "fleet/wave-649/exchange/integration",
+            "gated_against_base": base,
+        }]);
+        state
+    }
+
+    /// C-721 acceptance 3. `fleet doctor` must name the wave, the repository, the story and the commit
+    /// the canonical ref is missing — the four facts needed to act, none of which state could answer.
+    ///
+    /// The probe is injected rather than run against a checkout: this check's job is to ask git the
+    /// question for every applied wave and render the answer, and that is exactly what a fake answer
+    /// proves.
+    #[test]
+    fn doctor_names_the_wave_repository_story_and_commit_a_canonical_ref_is_missing() {
+        let mut state = recorded_applied_wave(
+            Path::new("/src/exchange"),
+            &"a".repeat(40),
+            &"b".repeat(40),
+            "origin/main",
+        );
+        // A second wave that really did land: it must not be reported, or the check is noise.
+        let mut delivered = recorded_applied_wave(
+            Path::new("/src/flux"),
+            &"c".repeat(40),
+            &"d".repeat(40),
+            "main",
+        );
+        let landed = delivered
+            .waves
+            .remove("wave-649")
+            .expect("the delivered fixture");
+        state.waves.insert("wave-650".into(), landed);
+
+        let findings = undelivered_applied_findings(&state, |source, canonical_ref, _| {
+            if canonical_ref == "origin/main" {
+                assert_eq!(
+                    source,
+                    Path::new("/src/exchange"),
+                    "resolved per repository"
+                );
+                DeliveryProbe {
+                    kind: CanonicalRefKind::RemoteTracking,
+                    contains: Some(false),
+                }
+            } else {
+                DeliveryProbe {
+                    kind: CanonicalRefKind::Local,
+                    contains: Some(true),
+                }
+            }
+        });
+
+        assert_eq!(findings.len(), 1, "only the undelivered wave: {findings:?}");
+        let finding = &findings[0];
+        assert_eq!(finding["check"], json!("applied-without-delivery"));
+        assert_eq!(
+            finding["subject"],
+            json!("wave-649/exchange/X-139"),
+            "the subject names the wave and the stranded story: {finding}"
+        );
+        let detail = finding["detail"].as_str().expect("a detail");
+        for named in [
+            "wave-649",
+            "exchange",
+            &"b".repeat(40),
+            "origin/main",
+            "push",
+        ] {
+            assert!(detail.contains(named), "detail must name {named}: {detail}");
+        }
+        assert_eq!(
+            finding["fix"],
+            json!("flux fleet reopen wave-649"),
+            "the finding carries the verb that recovers it: {finding}"
+        );
+    }
+
+    /// C-721 acceptance 4. `apply` refuses a wave without exactly one recorded green final gate, so a
+    /// wave holding `applied` AND no such gate is a state no operation could have produced — and every
+    /// verb that could move it will refuse it for the precondition its status implies it already met.
+    #[test]
+    fn an_applied_wave_with_no_recorded_green_gate_is_reported_as_impossible() {
+        let mut state = FleetState::default();
+        state.waves.insert(
+            "wave-700".into(),
+            json!({
+                "status": "applied",
+                "topology": {"repositories": [
+                    {"id": "exchange", "gate": {"status": "red", "runs": 2}},
+                    {"id": "flux", "gate": {"status": "green", "runs": 1}},
+                ]},
+            }),
+        );
+        // A wave that never claimed delivery has no false precondition to report.
+        state.waves.insert(
+            "wave-701".into(),
+            json!({
+                "status": "green",
+                "topology": {"repositories": [{"id": "exchange", "gate": Value::Null}]},
+            }),
+        );
+
+        let findings = applied_without_green_gate_findings(&state);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0]["check"], json!("applied-without-green-gate"));
+        assert_eq!(findings[0]["subject"], json!("wave-700/exchange"));
+        assert_eq!(findings[0]["fix"], json!("flux fleet reopen wave-700"));
+    }
+
+    /// C-721 acceptance 5 and 6, which is the heart of the story: the work must be RECOVERABLE, and
+    /// recoverable through the CLI rather than by editing `state.json` or merging a branch by hand.
+    ///
+    /// wave-649 in its recorded shape: `applied`, candidate pinned, canonical ref untouched. `reopen`
+    /// must verify the claim against git, move the wave to a status whose preconditions genuinely hold,
+    /// and leave the fleet able to carry it forward — asserted by running the very verb that refused it
+    /// before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopen_recovers_a_wave_from_a_delivery_status_that_was_never_true() {
+        let root = fleet_tui_fixture("reopen-undelivered");
+        let (source, base, candidate, story_head) = wave_649_shaped_repository("reopen-stranded");
+        let state = recorded_applied_wave(&source, &base, &candidate, "origin/main");
+
+        // The precondition that makes this a defect rather than a bad run: the story's own commits are
+        // on the story branch and nowhere else.
+        assert!(
+            guarded_git(
+                &source,
+                &["merge-base", "--is-ancestor", &story_head, "origin/main"],
+            )
+            .expect("git answers")
+            .exit_code
+                != 0,
+            "the fixture must reproduce commits absent from the canonical ref"
+        );
+
+        let (human, data, warnings, _) = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Reopen {
+                    wave: "wave-649".into(),
+                    reason: Some(
+                        "recorded applied while origin/main never held the candidate".into(),
+                    ),
+                },
+            ),
+            &root,
+            state,
+            None,
+        )
+        .expect("a wave whose delivery claim git disproves can be reopened");
+
+        assert_eq!(data["status"], json!("green"), "{data}");
+        assert_eq!(data["previous_status"], json!("applied"));
+        assert_eq!(data["next"], json!("flux fleet apply wave-649"));
+        assert!(
+            warnings.iter().any(|warning| warning.contains("push")),
+            "the reason the claim was false travels with the recovery: {warnings:?}"
+        );
+        assert!(human.contains("applied -> green"), "{human}");
+
+        let persisted = read_fleet_state(&root).expect("state was written");
+        let wave = &persisted.waves["wave-649"];
+        assert_eq!(wave["status"], json!("green"));
+        assert_eq!(wave["apply_eligible"], json!(true));
+        assert!(
+            wave["applied"][0]["accepted_tag"].is_string(),
+            "the accepted tag is kept: dropping it would strand the very commits this recovers: {wave}"
+        );
+
+        // Recoverable, not merely re-labelled: the verb that refused this wave now accepts it, and
+        // still declines to claim a delivery that has not happened.
+        let (_, applied, _, _) = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Apply {
+                    wave: "wave-649".into(),
+                    only: None,
+                },
+            ),
+            &root,
+            persisted,
+            None,
+        )
+        .expect("the reopened wave is admissible to apply again");
+        assert_eq!(applied["delivered"], json!(false), "{applied}");
+        assert_eq!(
+            applied["status"],
+            json!(WAVE_AWAITING_DELIVERY),
+            "{applied}"
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The safety property that keeps `reopen` from being a status editor. Un-delivering landed work
+    /// would be the same lie in the other direction, and would put a second attempt at a delivered
+    /// story back on the schedule.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopen_refuses_a_wave_whose_canonical_ref_really_does_hold_its_work() {
+        let root = fleet_tui_fixture("reopen-delivered");
+        let (source, base, candidate, _) = wave_649_shaped_repository("reopen-landed");
+        guarded_git(&source, &["branch", "-f", "main", &candidate]).expect("land the candidate");
+        let state = recorded_applied_wave(&source, &base, &candidate, "main");
+
+        let refused = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Reopen {
+                    wave: "wave-649".into(),
+                    reason: None,
+                },
+            ),
+            &root,
+            state,
+            None,
+        );
+        assert!(
+            refused
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("really is delivered")),
+            "delivered work must never be reopened: {refused:?}"
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A wave that claims no delivery has no false precondition to escape, so `reopen` must refuse it
+    /// rather than becoming a general-purpose way to rewrite a lifecycle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopen_refuses_a_wave_that_never_claimed_delivery() {
+        let root = fleet_tui_fixture("reopen-not-applied");
+        let (source, base, candidate, _) = wave_649_shaped_repository("reopen-green");
+        let state = wave_649_state(&source, &base, &candidate, "origin/main");
+
+        let refused = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Reopen {
+                    wave: "wave-649".into(),
+                    reason: None,
+                },
+            ),
+            &root,
+            state,
+            None,
+        );
+        assert!(
+            refused
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("claims no delivery")),
+            "{refused:?}"
+        );
+
+        std::fs::remove_dir_all(&source).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `reopen` is a mutation and a fleet operation, so every gate that governs mutations governs it.
+    #[test]
+    fn reopen_is_a_mutating_fleet_operation() {
+        let action = FleetAction::Reopen {
+            wave: "wave-649".into(),
+            reason: None,
+        };
+        assert!(fleet_action_mutates(&action));
+        assert!(fleet_operations().contains(&"reopen"));
     }
 }
