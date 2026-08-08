@@ -36,6 +36,7 @@ use crate::context::EventContext;
 use crate::kind::{EventKind, NewEvent, StoredEvent};
 use crate::memory::{self, MemoryEntry, MemoryNote, MemoryScope, Receipt};
 use crate::projection;
+use crate::receipt::{self, ResourceReceipt, ResourceRoot, ResourceSpan};
 
 use ephemeral::EphemeralEvents;
 #[cfg(feature = "sqlite")]
@@ -111,6 +112,21 @@ fn decode_all(stream: &str, ctx: &EventContext, raw: Vec<RawEvent>) -> Result<Ve
     #[cfg(test)]
     DECODED_KINDS.with(|seen| seen.borrow_mut().extend(decoded_tags));
     Ok(out)
+}
+
+/// Decode one stored event into a [`ResourceReceipt`], or `None` when it is not one.
+///
+/// Undecodable is `None` rather than an error, mirroring [`decode_all`]'s and
+/// [`memory_entries`](crate::memory_entries)' skip-and-continue discipline: a receipt written by a
+/// newer build degrades that one row instead of making the whole ledger unreadable.
+fn decode_receipt(ev: &StoredEvent) -> Option<ResourceReceipt> {
+    let EventKind::Custom { name, payload } = &ev.kind else {
+        return None;
+    };
+    if name != receipt::RESOURCE_SPAN_RECORDED {
+        return None;
+    }
+    serde_json::from_value(payload.clone()).ok()
 }
 
 #[cfg(test)]
@@ -1225,6 +1241,77 @@ impl EventStore {
             ev = ev.with_id(id);
         }
         self.append(&scope.stream(), ev)
+    }
+
+    // --- resource receipts (C-575): one causal span tree per request, on its own stream ---------
+
+    /// Record one causal resource span under `root`, returning the receipt **as persisted**.
+    ///
+    /// Append-only and idempotent, both by construction rather than by convention. The event's id
+    /// *is* the receipt id, which [`ResourceRoot::receipt_id`] derives from (root, span) rather
+    /// than minting per append — so an at-least-once pipeline replaying the same span hits
+    /// [`append`](Self::append)'s caller-id idempotency and gets back the receipt already in the
+    /// log. The returned value is always decoded from the stored event, never from the argument, so
+    /// a retry carrying different numbers cannot restate what was measured: the ledger's answer is
+    /// the one the ledger holds.
+    ///
+    /// A correction is an ordinary append under its own span id naming the original
+    /// ([`ResourceSpan::correcting`]); nothing here ever rewrites a recorded receipt.
+    ///
+    /// [`ResourceRoot::receipt_id`]: crate::receipt::ResourceRoot::receipt_id
+    /// [`ResourceSpan::correcting`]: crate::receipt::ResourceSpan::correcting
+    pub fn record_resource_span(
+        &self,
+        root: &ResourceRoot,
+        span: ResourceSpan,
+    ) -> Result<ResourceReceipt> {
+        let receipt = span.into_receipt(root);
+        let stream = root.stream();
+        let ev = NewEvent::new(EventKind::Custom {
+            name: receipt::RESOURCE_SPAN_RECORDED.to_string(),
+            payload: serde_json::to_value(&receipt)?,
+        })
+        .with_id(receipt.receipt_id.clone());
+        let stored = self.append(&stream, ev)?;
+        // Event ids are `UNIQUE(id)` store-wide, so an idempotent retry resolves by id alone.
+        // `receipt_id` is injective over (root, span) and namespaced away from the store's ULIDs,
+        // which makes this unreachable for receipts — but a foreign event squatting the id would
+        // otherwise hand back another stream's payload as this root's accounting, and a provenance
+        // record that resolves to the wrong thing is worse than one that fails.
+        if stored.stream != stream {
+            return Err(Error::Other(format!(
+                "event store: receipt id {} is already held by stream {:?}, not {:?}",
+                receipt.receipt_id, stored.stream, stream
+            )));
+        }
+        decode_receipt(&stored).ok_or_else(|| {
+            Error::Other(format!(
+                "event store: receipt {} did not decode back from the log",
+                receipt.receipt_id
+            ))
+        })
+    }
+
+    /// Every receipt recorded under `root`, in append order.
+    ///
+    /// Backed by a `kind = 'custom'` load (served by `idx_events_stream_kind`) like
+    /// [`memories`](Self::memories), and undecodable rows are skipped rather than failing the read
+    /// — the same discipline [`memory_entries`](crate::memory_entries) applies, so one receipt
+    /// written by a newer build degrades that row instead of the whole ledger.
+    ///
+    /// Use [`span_tree`](crate::receipt::span_tree) to fold these into the causal tree.
+    pub fn resource_receipts(&self, root: &ResourceRoot) -> Result<Vec<ResourceReceipt>> {
+        Ok(self
+            .load_by_kind(&root.stream(), "custom")?
+            .iter()
+            .filter_map(decode_receipt)
+            .collect())
+    }
+
+    /// The full append-only history of `root`'s receipt stream, oldest first — the audit read
+    /// behind "what did this request actually consume, and when was each part of it recorded?".
+    pub fn resource_history(&self, root: &ResourceRoot) -> Result<Vec<StoredEvent>> {
+        self.load_stream(&root.stream(), None)
     }
 
     /// Close a turn with its final outcome, iteration count, assistant answer, and token `usage`

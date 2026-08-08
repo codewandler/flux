@@ -31,6 +31,7 @@
 //! from a generic ad-hoc sweep, which is precisely the mistake this table exists to prevent.
 
 use crate::memory::MemoryScope;
+use crate::receipt::ResourceRoot;
 
 /// What the ad-hoc prune may do with one ad-hoc stream family.
 ///
@@ -82,6 +83,21 @@ pub const ADHOC_STREAM_FAMILIES: &[AdhocStreamFamily] = &[
         why: "cross-session memory is durable evidence with no second copy; forgetting it is a \
               user verb (A-110 `flux memory forget`), never a timer's",
     },
+    // C-575 causal resource receipts (`resource:<root-id>`, one stream per request/result).
+    // Retained: a receipt is the measurement itself, not a derivation of one — the work it records
+    // is over, so nothing can re-measure it, and every consumer downstream of it (C-576 rollups,
+    // C-577 bills and story evidence links, C-571/C-573 budgets) reads history rather than live
+    // state. Age is the opposite of disuse here: an old receipt is exactly the row a bill, an
+    // audit or a repricing reaches back for, and a sweep that deleted it would silently shrink
+    // recorded spend, which reads as "this was cheaper than it was" rather than as data loss.
+    // Bounding this ledger is a real future question; the answer must be an explicit, scoped
+    // policy (and a correction/rollup path that preserves totals), never an ad-hoc timer.
+    AdhocStreamFamily {
+        prefix: ResourceRoot::STREAM_PREFIX,
+        retention: AdhocRetention::Retained,
+        why: "a resource receipt is the measurement itself and cannot be re-derived once the work \
+              is over; deleting one silently understates recorded spend instead of erroring",
+    },
 ];
 
 /// `true` when `stream` belongs to a family the ad-hoc prune must never delete.
@@ -107,6 +123,9 @@ mod tests {
                 key: "flux".to_string()
             }
             .stream()
+        ));
+        assert!(is_retained_from_adhoc_prune(
+            &ResourceRoot::new("req-1").stream()
         ));
         // Not a blanket opt-out: the streams D-77 was written for stay reachable.
         assert!(!is_retained_from_adhoc_prune("audit-2026-07"));
