@@ -23,8 +23,6 @@
 
 ## [0.59.2] - 2026-08-08
 
-## [0.59.1] - 2026-08-08
-
 ### New
 
 - **`flux ops --explore` browses every operation flux can run.** Operations are the things flux actually
@@ -32,6 +30,52 @@
   `flux ops --explore` opens a search box: start typing and you get a ranked list on the left and, on the
   right, what the selected operation does, the parameters it takes, how risky it is, and links to its
   documentation. Tab cycles a category filter, `Ctrl-Y` copies the doc link, and `Esc` steps back out.
+
+- **A datasource connects from the machine its endpoint is reachable through.** Naming the host an
+  endpoint answers on told flux where to dial from, but a datasource reading that endpoint still
+  opened its connection wherever the session happened to be. It now follows the endpoint: a
+  host-bound datasource is refused up front if you are working from somewhere else, naming both the
+  machine it needs and the machine you have, and it is refused before any connection is attempted
+  rather than failing at dial time. Datasources whose endpoints name no host are unchanged.
+
+- **Rescue the work an interrupted run left behind.** If the machine goes down mid-run, a worker's
+  uncommitted changes used to be invisible — the run reported no work, and the repair it suggested
+  was the command that deletes the directory holding it. `flux fleet doctor` now reports a working
+  directory holding uncommitted changes, says how many files, and takes precedence over the advice
+  that would have thrown them away. `flux fleet capture <wave>` commits what was left, onto that
+  piece of work's own branch. And `flux fleet reopen <wave>` puts a run that stopped short of
+  delivery back where it can continue, instead of leaving it stranded in a state no command could
+  move.
+
+### Fixed
+
+- **A run is reported delivered only when the work is actually on the branch.** "Delivered" was
+  written from intent: the run tagged what it had built and then said it had landed, without ever
+  checking. A run that finished its own pipeline but has not landed now says so — and re-running the
+  final step re-asks the question, so the answer catches up as soon as the work lands. Where landing
+  requires a push, flux says that plainly instead of quietly claiming success.
+
+- **An interrupted run stops holding its work hostage.** When the process supervising a run died,
+  the items it had claimed stayed claimed, so the queue reported itself empty while the top of the
+  list never moved and no command could free it. A run whose supervising process is provably gone
+  now releases its claims on the next tick — carefully, so a live run is never released — and the
+  same tick picks the work up again. Its working directories are kept, because they may hold the
+  only copy of what was in progress.
+
+- **Ready work is no longer skipped on a guess.** The scheduler could decide a piece of work was
+  "already built" because some unrelated commit mentioned it, and skipping is the one decision that
+  leaves no trace. It now checks the claim against the work itself before acting on it, and a check
+  that fails is reported alongside the work being scheduled rather than silently swallowed. Anything
+  skipped repeatedly is now reported, so a permanent skip cannot pass for an empty queue.
+
+- **A flaky test no longer fails a release.** A test that checked how flux refuses a version
+  mismatch reported an unreachable fixture as that refusal failing, which was the single largest
+  source of failing builds here and once aborted a release twenty minutes after the same suite had
+  passed.
+
+## [0.59.1] - 2026-08-08
+
+### New
 
 - **Say which machine an endpoint is reachable from.** A service that only answers inside your
   cluster and one that answers from anywhere used to look identical once written down, so flux

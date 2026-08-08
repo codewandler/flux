@@ -8469,15 +8469,9 @@ fn add_unreleased_changelog_entry(changelog: &str, entry: &str) -> String {
         return changelog.to_string();
     }
 
-    const UNRELEASED: &str = "## [Unreleased]";
     const ADDED: &str = "### Added";
     let mut updated = changelog.to_string();
-    if let Some(unreleased) = updated.find(UNRELEASED) {
-        let section_start = unreleased + UNRELEASED.len();
-        let section_end = updated[section_start..]
-            .find("\n## ")
-            .map(|offset| section_start + offset)
-            .unwrap_or(updated.len());
+    if let Some((section_start, section_end)) = unreleased_section_range(&updated) {
         if let Some(added_offset) = updated[section_start..section_end].find(ADDED) {
             let insert = section_start + added_offset + ADDED.len();
             updated.insert_str(insert, &format!("\n\n{bullet}"));
@@ -8493,9 +8487,25 @@ fn add_unreleased_changelog_entry(changelog: &str, entry: &str) -> String {
         .unwrap_or(updated.len());
     updated.insert_str(
         prefix_end,
-        &format!("\n{UNRELEASED}\n\n{ADDED}\n\n{bullet}\n"),
+        &format!("\n{UNRELEASED_HEADING}\n\n{ADDED}\n\n{bullet}\n"),
     );
     updated
+}
+
+const UNRELEASED_HEADING: &str = "## [Unreleased]";
+
+/// The byte range of the `## [Unreleased]` section's body — everything after the heading and before
+/// the next `## ` heading.
+///
+/// This is the span a release cut rolls into its version heading, so it is also the only span in
+/// which a composed entry counts as present: an entry written anywhere else in the file would be
+/// there for a reader and absent from the release notes.
+fn unreleased_section_range(changelog: &str) -> Option<(usize, usize)> {
+    let start = changelog.find(UNRELEASED_HEADING)? + UNRELEASED_HEADING.len();
+    let end = changelog[start..]
+        .find("\n## ")
+        .map_or(changelog.len(), |offset| start + offset);
+    Some((start, end))
 }
 
 fn transition(
@@ -22531,6 +22541,222 @@ fn integration_order(root: &Path, selected: &[String]) -> Result<Vec<String>> {
     Ok(order)
 }
 
+/// Repository paths that are planning apparatus rather than released product.
+///
+/// A story that wrote only these changed nothing a reader of the changelog can observe: the board,
+/// the story and design documents, the roadmap and the fleet's own configuration are how work is
+/// *tracked*, not what the work *is*. Everything else — source, tests, scripts, workflows, website,
+/// prose documentation — either ships or gates something that ships, so it is release material and
+/// gets a line.
+///
+/// Directory entries match by prefix and file entries exactly, and the comparison is
+/// case-insensitive because the same document is spelled `docs/roadmap.md` in one member repository
+/// and `docs/ROADMAP.md` in another.
+const PLANNING_ONLY_PATHS: &[&str] = &[
+    ".flux/",
+    "docs/decisions/",
+    "docs/designs/",
+    "docs/roadmap.md",
+    "docs/stories/",
+    "docs/vision.md",
+];
+
+fn is_planning_only_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    PLANNING_ONLY_PATHS
+        .iter()
+        .any(|entry| match entry.ends_with('/') {
+            true => path.starts_with(entry),
+            false => path == *entry,
+        })
+}
+
+/// The wave's composed `## [Unreleased]` entry, with the per-story reasoning that produced it.
+struct ComposedChangelog {
+    /// The single entry, or `None` when the wave has nothing user-visible to say.
+    entry: Option<String>,
+    /// One record per story: the line it contributed, or the reason it contributed none.
+    contributions: Vec<Value>,
+}
+
+/// Compose the wave's `## [Unreleased]` entry from the stories the candidate actually carries.
+///
+/// Story workers are fenced out of `CHANGELOG.md` on purpose — `wave-346` became unintegrable
+/// because two of them each appended an entry — and the fence was written with the note that
+/// assembling a wave-level changelog is the integrator's job. Nothing in the integrator did it, so
+/// v0.59.2 was cut with an empty `## [0.59.2]` section over 5977 insertions: `cut-release.sh` rolls
+/// `## [Unreleased]` into the version heading, and an empty section rolls to an empty section. The
+/// tag and the binaries were right; only the prose was missing, and nobody owned it.
+///
+/// The prose is each story's own **Goal**, read out of the candidate tree rather than out of the
+/// worker's handoff summary. The summary is a claim about a turn ("recorded from the worker's
+/// worktree when its turn ended" for every recorded handoff); the Goal is the contract the story was
+/// accepted against, and it is the sentence the story's author already wrote for this purpose.
+///
+/// A story that wrote only planning artifacts contributes nothing and says why. An entry padded to
+/// prove the step ran is worse than no entry: it teaches the reader that the section is noise, which
+/// is a slower version of the same failure.
+fn compose_unreleased_entry(
+    worktree: &Path,
+    wave_id: &str,
+    stories: &[(String, Value)],
+) -> ComposedChangelog {
+    let documents = read_stories(worktree).unwrap_or_default();
+    let mut contributions = Vec::new();
+    let mut ids = Vec::new();
+    let mut lines = Vec::new();
+    for (item, story) in stories {
+        let id = item.rsplit('/').next().unwrap_or(item);
+        let write_set = story["handoff"]["write_set"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        if !write_set.is_empty() && write_set.iter().all(|path| is_planning_only_path(path)) {
+            contributions.push(json!({
+                "item": item,
+                "contributed": false,
+                "reason": format!(
+                    "wrote only planning artifacts ({}), so it has no user-visible change to record",
+                    write_set.join(", ")
+                ),
+            }));
+            continue;
+        }
+        let Some(document) = documents.iter().find(|candidate| candidate.id == id) else {
+            contributions.push(json!({
+                "item": item,
+                "contributed": false,
+                "reason": format!(
+                    "the candidate carries no story document for {id}, so no prose could be composed from its contract"
+                ),
+            }));
+            continue;
+        };
+        // A story with no Goal is still named. It IS user-visible; it only lacks prose, and dropping
+        // it would silently shorten the release notes — the exact failure mode this composes against.
+        let line = match markdown_section(story_prose(&document.body), "Goal")
+            .map(|goal| collapse_first_paragraph(&goal))
+        {
+            Some(goal) => format!("**{} ({id}).** {goal}", document.title),
+            None => format!(
+                "**{} ({id}).** The story records no Goal, so this line carries only its title; describe the change before the cut.",
+                document.title
+            ),
+        };
+        contributions.push(json!({"item": item, "contributed": true, "line": line}));
+        ids.push(id.to_string());
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return ComposedChangelog {
+            entry: None,
+            contributions,
+        };
+    }
+    let mut entry = wrap_changelog_prose(
+        &format!(
+            "**{wave_id} ({}).** Composed by `fleet integrate` from the accepted stories' own goals; edit into release prose before the cut.",
+            ids.join(", ")
+        ),
+        2,
+        2,
+    );
+    for line in &lines {
+        entry.push_str("\n  - ");
+        entry.push_str(&wrap_changelog_prose(line, 4, 4));
+    }
+    ComposedChangelog {
+        entry: Some(entry),
+        contributions,
+    }
+}
+
+/// A story Goal's opening paragraph as one whitespace-collapsed line, ready to be wrapped.
+///
+/// The story template asks for "one or two sentences: the outcome this delivers" as the opening
+/// paragraph, so that paragraph is the summary and anything after it is supporting detail.
+fn collapse_first_paragraph(text: &str) -> String {
+    text.split("\n\n")
+        .next()
+        .unwrap_or(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Greedy word wrap for a composed changelog bullet.
+///
+/// `first_offset` is how many columns the caller's own list marker already spent on the opening line
+/// (`- ` is two, a nested `  - ` is four); continuation lines are indented by `indent`. Every other
+/// entry in the file is wrapped, and the file is read by hand before every release, so an unwrapped
+/// 400-column line would announce itself as machine-written before anyone read a word of it.
+fn wrap_changelog_prose(text: &str, first_offset: usize, indent: usize) -> String {
+    const WIDTH: usize = 100;
+    let mut wrapped: Vec<String> = Vec::new();
+    let mut line = String::new();
+    let mut budget = WIDTH.saturating_sub(first_offset);
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > budget {
+            wrapped.push(std::mem::take(&mut line));
+            budget = WIDTH.saturating_sub(indent);
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        wrapped.push(line);
+    }
+    wrapped.join(&format!("\n{}", " ".repeat(indent)))
+}
+
+/// Write the composed entry into the candidate, then read it back out of the commit.
+///
+/// "Reports composing an entry" and "has one in the tree" are different claims, and the fleet has
+/// made the first while the second was false often enough that only the second is worth recording.
+/// So the entry is verified where the candidate actually lives — the committed tree, which is what
+/// the gate runs against and what an accepted tag pins — rather than on disk, and never from the
+/// intent that wrote it.
+fn commit_unreleased_entry(worktree: &Path, wave_id: &str, entry: &str) -> Result<String> {
+    let path = worktree.join("CHANGELOG.md");
+    let prior = fs::read_to_string(&path).context("validation/gate: candidate CHANGELOG.md")?;
+    fs::write(&path, add_unreleased_changelog_entry(&prior, entry))
+        .context("validation/gate: candidate CHANGELOG.md")?;
+    let staged = guarded_git(worktree, &["add", "CHANGELOG.md"])?;
+    if staged.exit_code != 0 {
+        bail!(
+            "validation/gate: could not stage the composed changelog entry: {}",
+            clipped_redacted(staged.stderr.as_bytes())
+        )
+    }
+    let committed = guarded_git(
+        worktree,
+        &[
+            "commit",
+            "-m",
+            &format!("docs(changelog): compose the unreleased entry for {wave_id}"),
+        ],
+    )?;
+    let head = git_output(worktree, &["rev-parse", "HEAD"])
+        .context("validation/gate: candidate HEAD after the changelog commit")?;
+    let in_tree = git_output(worktree, &["show", &format!("{head}:CHANGELOG.md")])
+        .context("validation/gate: the candidate commit carries no CHANGELOG.md")?;
+    let section = unreleased_section_range(&in_tree)
+        .map(|(start, end)| &in_tree[start..end])
+        .unwrap_or_default();
+    if !section.contains(&format!("- {entry}")) {
+        bail!(
+            "validation/gate: the composed entry is not in candidate {head}'s [Unreleased] section (git commit exited {}: {})",
+            committed.exit_code,
+            clipped_redacted(committed.stderr.as_bytes())
+        )
+    }
+    Ok(head)
+}
+
 fn integrate_wave(
     command: &FleetCommand,
     root: &Path,
@@ -22629,8 +22855,11 @@ fn integrate_wave(
             repository["gate"] = Value::Null;
             repository["candidate"] = Value::Null;
             // Stale preparation evidence from the previous attempt would otherwise be reported as this
-            // attempt's, which is how a retry comes to look like it did work it never did.
+            // attempt's, which is how a retry comes to look like it did work it never did. The same
+            // holds for the composed changelog entry: the retry resets the worktree to its pinned
+            // base, so the previous attempt's entry is no longer in any tree.
             repository["prepare"] = Value::Null;
+            repository["changelog"] = Value::Null;
         }
     }
     let items = wave["items"]
@@ -22754,8 +22983,8 @@ fn integrate_wave(
             })
             .cloned()
             .collect::<Vec<_>>();
-        for item in repo_items {
-            let (item_repository, story_index) = wave_story_indices(&wave, &item)?;
+        for item in &repo_items {
+            let (item_repository, story_index) = wave_story_indices(&wave, item)?;
             let story = &wave["topology"]["repositories"][item_repository]["stories"][story_index];
             let commit = story["handoff"]["commit"]
                 .as_str()
@@ -22835,6 +23064,65 @@ fn integrate_wave(
         if conflicted {
             conflicted = false;
             continue;
+        }
+        // The wave's `## [Unreleased]` entry is composed HERE — once, on the assembled candidate.
+        //
+        // Same point and the same reason as the preparation step below: this is where the inputs are
+        // complete. No single story can write a correct wave-level entry, which is precisely why
+        // story workers are fenced out of `CHANGELOG.md` — `wave-346` became unintegrable because
+        // two of them each appended one. The fence's own note says assembling a wave-level changelog
+        // is the integrator's job, and then nothing in the integrator did it, so v0.59.2 was cut with
+        // an empty version section: `cut-release.sh` rolls `## [Unreleased]` into the version heading
+        // and gets exactly what it was given.
+        //
+        // Before preparation rather than after, so the entry is a commit of its own instead of being
+        // swept into "regenerate derived artifacts", and so anything derived from the changelog is
+        // regenerated with the entry already present.
+        if !command.dry_run {
+            let stories = repo_items
+                .iter()
+                .filter_map(|item| {
+                    let (item_repository, story_index) = wave_story_indices(&wave, item).ok()?;
+                    Some((
+                        item.clone(),
+                        wave["topology"]["repositories"][item_repository]["stories"][story_index]
+                            .clone(),
+                    ))
+                })
+                .collect::<Vec<_>>();
+            let ComposedChangelog {
+                entry,
+                contributions,
+            } = compose_unreleased_entry(&integration_worktree, wave_id, &stories);
+            let composed = if !integration_worktree.join("CHANGELOG.md").is_file() {
+                // Creating a changelog in a repository that keeps none would be inventing a
+                // convention rather than serving one.
+                json!({"composed": false, "reason": "this repository keeps no CHANGELOG.md", "stories": contributions})
+            } else if let Some(entry) = &entry {
+                match commit_unreleased_entry(&integration_worktree, wave_id, entry) {
+                    Ok(commit) => {
+                        json!({"composed": true, "commit": commit, "entry": entry, "stories": contributions})
+                    }
+                    Err(error) => {
+                        // A composed entry that could not be got into the tree is a FAILED
+                        // integration, not a quieter success. The alternative is a candidate that
+                        // reports prose it does not carry, which is the shape of defect this whole
+                        // step exists to stop making.
+                        let reason = redact(&error.to_string());
+                        wave["topology"]["repositories"][repository_index]["changelog"] =
+                            json!({"composed": false, "reason": reason, "stories": contributions});
+                        failures.push(json!({
+                            "repository": repository_id,
+                            "reason": "the wave's changelog entry could not be composed",
+                            "evidence": wave["topology"]["repositories"][repository_index]["changelog"],
+                        }));
+                        continue;
+                    }
+                }
+            } else {
+                json!({"composed": false, "reason": "no accepted story in this repository changed anything user-visible", "stories": contributions})
+            };
+            wave["topology"]["repositories"][repository_index]["changelog"] = composed;
         }
         // The gate and the preparation step are OPERATOR POLICY, so read them from current config and
         // fall back to what the wave snapshotted.

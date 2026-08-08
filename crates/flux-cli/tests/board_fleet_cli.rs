@@ -3995,6 +3995,337 @@ fn two_stories_sharing_one_file_integrate_when_their_commits_combine() {
     fs::remove_dir_all(root).ok();
 }
 
+/// Scaffold a repository whose stories carry a Goal and whose changelog has an empty `[Unreleased]`.
+///
+/// The empty section is the whole point: it is exactly the state `cut-release.sh` rolls into a
+/// version heading, so a fixture that starts with one reproduces how v0.59.2 came to be cut with a
+/// three-line release section over 5977 insertions.
+fn changelog_wave_fixture(name: &str, stories: &[(&str, &str, &str)]) -> PathBuf {
+    let root = fixture(name);
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    for (index, (id, title, goal)) in stories.iter().enumerate() {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: ready\npriority: {}\n---\n\n# {title}\n\n## Goal\n\n{goal}\n\n## Acceptance\n\n- [ ] ship\n",
+                index + 1
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- The first release.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    root
+}
+
+/// The `[Unreleased]` section body, which is what a release cut actually rolls into its heading.
+fn unreleased_section(changelog: &str) -> &str {
+    let start = changelog
+        .find("## [Unreleased]")
+        .expect("fixture changelog has an [Unreleased] heading")
+        + "## [Unreleased]".len();
+    let rest = &changelog[start..];
+    match rest.find("\n## ") {
+        Some(offset) => &rest[..offset],
+        None => rest,
+    }
+}
+
+/// C-743 (failing first): the whole gap in one test.
+///
+/// `.flux/fleet.toml` fences story workers out of `CHANGELOG.md` — correctly, since `wave-346`
+/// became unintegrable when two stories each appended an entry — with the note that assembling a
+/// wave-level changelog is the integrator's job. Nothing in the integrator did it, which is the same
+/// shape as the integrator role itself: configured, and dispatched by nothing until C-730. So
+/// v0.59.2 was tagged with an empty `## [0.59.2]` section and published with empty release notes,
+/// because `cut-release.sh` rolls `## [Unreleased]` into the version heading and an empty section
+/// rolls to an empty section.
+#[test]
+fn integration_composes_one_unreleased_entry_naming_every_user_visible_story() {
+    let root = changelog_wave_fixture(
+        "changelog-composed",
+        &[
+            (
+                "C-1",
+                "An endpoint records the host it is reachable through",
+                "A ClusterIP endpoint looked identical to a public one, and the record could not tell the two apart.",
+            ),
+            (
+                "C-2",
+                "A tag build that publishes nothing is red",
+                "The release workflow reported success while creating no Release at all.",
+            ),
+        ],
+    );
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "repo/C-2",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for (index, marker) in ["endpoint host", "publishing tag"].iter().enumerate() {
+        let worktree = PathBuf::from(stories[index]["worktree"].as_str().unwrap());
+        let source = format!("src/change-{}.txt", index + 1);
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(worktree.join(&source), format!("{marker}\n")).unwrap();
+        assert!(git(&worktree, &["add", &source]).status.success());
+        assert!(git(&worktree, &["commit", "-qm", marker]).status.success());
+        let commit = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let item = format!("repo/C-{}", index + 1);
+        let handoff = flux(
+            &root,
+            &[
+                "fleet",
+                "handoff",
+                "wave-2",
+                &item,
+                "--commit",
+                &commit,
+                "--write-set",
+                &source,
+                "--test-arg",
+                "grep",
+                "--test-arg",
+                "-q",
+                "--test-arg",
+                marker,
+                "--test-arg",
+                &source,
+                "--failing-before",
+                "--passing-after",
+                "--summary",
+                "shipped a user-visible change",
+                "--output",
+                "json",
+            ],
+        );
+        assert!(
+            handoff.status.success(),
+            "{}",
+            String::from_utf8_lossy(&handoff.stdout)
+        );
+        record_passing_review(&root, "wave-2", &item, &commit);
+    }
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let repository = &integrated["data"]["topology"]["repositories"][0];
+    assert_eq!(
+        repository["changelog"]["composed"], true,
+        "integration must report composing the wave's entry: {repository}"
+    );
+
+    let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
+    let on_disk = fs::read_to_string(integration.join("CHANGELOG.md")).unwrap();
+    let section = unreleased_section(&on_disk);
+    // One entry, not one per story: a wave-level entry is the unit no single story could have
+    // written, which is the whole reason the integrator owns it.
+    assert_eq!(
+        section
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .count(),
+        1,
+        "the wave contributes exactly one [Unreleased] entry: {section}"
+    );
+    // The entry is wrapped like every other entry in the file, so match against the unwrapped prose
+    // rather than against one physical line.
+    let prose = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "(C-1, C-2)",
+        "An endpoint records the host it is reachable through (C-1)",
+        "A tag build that publishes nothing is red (C-2)",
+        "A ClusterIP endpoint looked identical to a public one, and the record could not tell the two apart.",
+        "The release workflow reported success while creating no Release at all.",
+    ] {
+        assert!(
+            prose.contains(expected),
+            "the entry must name {expected}: {section}"
+        );
+    }
+    // Wrapped, not one 400-column line that announces itself as machine-written.
+    assert!(
+        section.lines().all(|line| line.chars().count() <= 100),
+        "the composed entry must be wrapped like the rest of the file: {section}"
+    );
+    // Already-released sections are not the integrator's to touch.
+    assert!(on_disk.contains("- The first release."), "{on_disk}");
+
+    // Reported and real are different claims. The entry has to be in the candidate's TREE, which is
+    // what the gate ran against and what an accepted tag would pin — not merely on disk.
+    let in_tree = String::from_utf8(git(&integration, &["show", "HEAD:CHANGELOG.md"]).stdout)
+        .expect("the candidate carries a CHANGELOG.md");
+    assert_eq!(
+        unreleased_section(&in_tree),
+        section,
+        "the composed entry must be committed into the candidate, not left uncommitted"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-743: an entry padded to prove the step ran is worse than no entry.
+///
+/// A story that wrote only its own story document changed nothing a reader of the changelog can
+/// observe, so it contributes no line — and integration says which story it dropped and why, rather
+/// than silently producing an empty section that looks the same as the defect.
+#[test]
+fn a_wave_whose_stories_are_all_internal_composes_no_changelog_entry() {
+    let root = changelog_wave_fixture(
+        "changelog-internal",
+        &[("C-1", "Record the plan", "Write down where this stands.")],
+    );
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let worktree = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    let story_file = "docs/stories/C-1-story.md";
+    let existing = fs::read_to_string(worktree.join(story_file)).unwrap();
+    fs::write(
+        worktree.join(story_file),
+        format!("{existing}\n## Progress\n\n- Recorded the plan.\n"),
+    )
+    .unwrap();
+    assert!(git(&worktree, &["add", story_file]).status.success());
+    assert!(git(&worktree, &["commit", "-qm", "record the plan"])
+        .status
+        .success());
+    let commit = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            story_file,
+            "--test-arg",
+            "grep",
+            "--test-arg",
+            "-q",
+            "--test-arg",
+            "Recorded the plan",
+            "--test-arg",
+            story_file,
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "recorded the plan on the story",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+    record_passing_review(&root, "wave-2", "repo/C-1", &commit);
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let repository = &integrated["data"]["topology"]["repositories"][0];
+    assert_eq!(
+        repository["changelog"]["composed"], false,
+        "an internal-only wave composes nothing: {repository}"
+    );
+    // "Says so" is the acceptance, not just "writes nothing": a silent skip is indistinguishable
+    // from the defect this story exists to close.
+    let dropped = repository["changelog"]["stories"][0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        dropped.contains(story_file),
+        "integration must name what it dropped and why: {repository}"
+    );
+
+    let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
+    let on_disk = fs::read_to_string(integration.join("CHANGELOG.md")).unwrap();
+    assert_eq!(
+        unreleased_section(&on_disk).trim(),
+        "",
+        "no filler line: {on_disk}"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     let (root, story) = one_story_wave("rework-budget");
