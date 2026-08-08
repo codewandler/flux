@@ -12,6 +12,10 @@ note: "C-681 built flux fleet promote and it is idempotent, but no drive tick ca
 
 ## Goal
 
+`flux fleet promote` existed and was idempotent, and no drive tick called it. Integration assembled a
+candidate and `apply` accepted it, but landing on a member's canonical ref stayed a verb a human
+typed — so a fleet left alone finished every wave and delivered none of them. This was the last
+operator-invoked step in the pipeline.
 
 ## Acceptance
 

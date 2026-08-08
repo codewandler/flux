@@ -7723,6 +7723,30 @@ fn has_heading(text: &str, heading: &str) -> bool {
         .any(|line| line.trim().eq_ignore_ascii_case(&format!("## {heading}")))
 }
 
+/// Does this `## ` heading open the named section?
+///
+/// C-737: the match was exact, so `## Acceptance (for the epic)` and `## Acceptance — stage 1` named
+/// a section nothing could read. Ten stories carried criteria that `board done`, `board reconcile`,
+/// `board stats` and C-723's withhold verification all counted as zero — `C-418`, `C-419`, `C-420`
+/// and `C-599` among them, and five `D-*` stories closed through `board done` on that basis.
+///
+/// A qualified heading is the author saying which acceptance this is, not a different section. The
+/// separator must be non-alphanumeric so `## Acceptances` and `## AcceptanceCriteria` still do not
+/// match — a heading that merely starts with the word is a different heading.
+fn heading_opens_section(found: &str, heading: &str) -> bool {
+    let found = found.trim();
+    if found.eq_ignore_ascii_case(heading) {
+        return true;
+    }
+    found
+        .get(..heading.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(heading))
+        && found[heading.len()..]
+            .chars()
+            .next()
+            .is_some_and(|next| !next.is_alphanumeric())
+}
+
 fn checkbox_counts(text: &str, heading: &str) -> (usize, usize, usize) {
     let mut in_section = false;
     let mut done = 0;
@@ -7730,7 +7754,7 @@ fn checkbox_counts(text: &str, heading: &str) -> (usize, usize, usize) {
     for line in text.lines() {
         let trimmed = line.trim();
         if let Some(found) = trimmed.strip_prefix("## ") {
-            in_section = found.trim().eq_ignore_ascii_case(heading);
+            in_section = heading_opens_section(found, heading);
             continue;
         }
         if in_section && trimmed.starts_with("- [") && trimmed.as_bytes().get(4) == Some(&b']') {
@@ -8072,7 +8096,14 @@ fn complete_story(
             story.status
         )
     }
-    let (_, remaining, _) = checkbox_counts(&story.body, "Acceptance");
+    let (_, remaining, total) = checkbox_counts(&story.body, "Acceptance");
+    // C-737: absence and satisfaction are not the same verdict, and this could not tell them apart.
+    // `remaining > 0` is false when `total == 0`, so a story with no `## Acceptance` section closed
+    // with no override and no complaint — which is how `D-08`, `D-14`, `D-15`, `D-16` and `D-17`
+    // shipped. Checked before the remaining count so the message names the real problem.
+    if total == 0 && override_reason.is_none() {
+        bail!("validation/gate: {id} has no Acceptance criteria, so there is nothing its completion could be checked against; write them, or pass --override-reason to record why this story has none")
+    }
     if remaining > 0 && override_reason.is_none() {
         bail!("validation/gate: {id} has {remaining} unchecked Acceptance criterion/criteria; pass --override-reason to record a reasoned override")
     }
@@ -8282,7 +8313,7 @@ fn create_item(
     };
     let body = match kind {
         CreateKind::Story => format!(
-            "---\nid: {id}\ntitle: {}\npillar: {}\nstatus: {status}\n{}{}{}{}{}---\n\n# {title}\n\n## Goal\n\n\n## Acceptance\n\n- [ ] Define acceptance.\n",
+            "---\nid: {id}\ntitle: {}\npillar: {}\nstatus: {status}\n{}{}{}{}{}---\n\n# {title}\n\n## Goal\n\n\n## Acceptance\n\n- [ ] {ACCEPTANCE_PLACEHOLDER}\n",
             yaml_quote(title),
             yaml_quote(pillar),
             priority.map(|p|format!("priority: {p}\n")).unwrap_or_default(),
@@ -8763,6 +8794,47 @@ fn check_board(root: &Path) -> Result<(String, Value, Vec<String>, Option<String
     check_board_with_known_dependencies(root, None)
 }
 
+/// The placeholder `create_item` writes into a new story's Acceptance.
+///
+/// It is written in one place and, until C-736, read in none — so 13 stories reached `main` carrying
+/// it, three of them `ready` and therefore dispatchable. Naming it as a constant is what makes the
+/// two ends the same string.
+const ACCEPTANCE_PLACEHOLDER: &str = "Define acceptance.";
+
+/// What is wrong with the contract this story would be dispatched against, if anything.
+///
+/// Returns problems rather than a bool so the caller can report every one at once: an author fixing
+/// a story should not have to run `check` three times to find three faults.
+fn story_contract_problems(body: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    match markdown_section(body, "Goal") {
+        Some(goal) if !goal.trim().is_empty() => {}
+        _ => problems.push("has no Goal, so nothing states what it delivers".to_string()),
+    }
+    let (_, _, total) = checkbox_counts(body, "Acceptance");
+    if total == 0 {
+        problems.push(
+            "has no Acceptance criteria, so its definition of done does not exist".to_string(),
+        );
+    }
+    // Only when the placeholder IS a criterion. A story that *quotes* it — this epic's own stories
+    // and its design document all do, because describing the defect requires naming it — has a real
+    // contract, and flagging that would teach authors to work around the check instead of using it.
+    let placeholder_is_a_criterion = body.lines().any(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("- [")
+            && trimmed.as_bytes().get(4) == Some(&b']')
+            && trimmed[5..].trim() == ACCEPTANCE_PLACEHOLDER
+    });
+    if placeholder_is_a_criterion {
+        problems.push(format!(
+            "still carries the `{ACCEPTANCE_PLACEHOLDER}` placeholder as a criterion, which is what \
+             a dispatched worker would read as its contract"
+        ));
+    }
+    problems
+}
+
 fn check_board_with_known_dependencies(
     root: &Path,
     known_dependencies: Option<&BTreeSet<String>>,
@@ -8791,6 +8863,28 @@ fn check_board_with_known_dependencies(
         if let Some(design) = story.design.as_deref() {
             if resolve_story_design(root, design).is_err() {
                 errors.push(format!("{} links missing design {design}", story.id));
+            }
+        }
+        // C-736: the contract a story is dispatched against, checked at last. `check` validated
+        // frontmatter, ids, priorities and links and never opened the body — so 13 stories carried
+        // the placeholder `create` writes, 14 had no Goal, and five READY stories had no usable
+        // contract at all. A worker dispatched against one of those is told its definition of done
+        // is "Define acceptance."
+        //
+        // Severity follows status rather than being uniform, because a just-created story is
+        // legitimately incomplete and failing on it would make drafting impossible.
+        for problem in story_contract_problems(&story.body) {
+            let message = format!("{} {problem}", story.id);
+            match story.status.as_str() {
+                // Dispatchable or claimed: a worker can be sent at this now, and would read the
+                // missing part as its contract.
+                "ready" | "in-progress" => errors.push(message),
+                // Closed against a contract that must therefore have existed.
+                "done" => errors.push(message),
+                // `backlog` is drafting. `blocked` is a warning for the same reason: a story can be
+                // blocked *because* it is unspecified, and `ready -> backlog` is not a legal
+                // transition — so making it an error would leave such a story no reachable state.
+                _ => warnings.push(message),
             }
         }
     }

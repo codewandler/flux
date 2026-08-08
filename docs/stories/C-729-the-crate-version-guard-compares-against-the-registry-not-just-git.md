@@ -12,6 +12,12 @@ note: "codewandler-flux-secret 1.3.0 was published during a failed release run, 
 
 ## Goal
 
+`check-crate-versions.sh` asked git whether a crate's version had moved, never crates.io whether that
+version was already spent. `codewandler-flux-secret` moved 1.2.1 -> 1.3.0, 1.3.0 was published by the
+failed v0.59.0 run, and C-709 then added the `host` field under that same number. Git said the version
+moved; the registry had already used it. No workspace build can see this — every first-party crate
+resolves through its `path` dependency, so local content always wins — while `cargo publish` resolves
+from the registry and stopped v0.59.1's closure at `flux-capabilities`.
 
 ## Acceptance
 

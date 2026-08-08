@@ -2,12 +2,12 @@
 id: D-224
 title: "The live demo — flux is invited from Slack, joins the call, speaks, and answers in front of an audience"
 pillar: Agent
-status: ready
-priority: 1
+status: blocked
 design: docs/designs/meeting-rooms.md
 epic: meeting-rooms
 areas: [flux-channels, flux-cli, docs]
 note: "⚠ NOT new capability — the end-to-end scenario as one owned deliverable over D-206/D-208/D-209/D-210/D-211, which already exist. Filed because a demo assembled from five stories that each pass in isolation is exactly the thing that fails live. ⚠ Google Meet has NO path: the sidecar runs lib-jitsi-meet. Brave Talk / JaaS does, and a 2026-07-30 spike already got audible audio out"
+blocked_reason: "The Google Meet contract this story needs does not exist; its historical Jitsi acceptance is explicitly not that contract, so it has nothing to be dispatched against"
 ---
 
 # The demo, as a deliverable rather than a hope

@@ -14,7 +14,13 @@ note: "acceptance pins a candidate against the base it was gated on; landing is 
 
 ## Goal
 
+Landing an accepted candidate on the canonical branch is a separate act from
+accepting it, and needed its own verification rather than the driver's bash approximation.
+Delivered as `flux fleet promote` under C-681/C-732.
 
 ## Acceptance
 
-- [ ] Define acceptance.
+- [x] Superseded by [[C-681]], which shipped `flux fleet promote`: it accumulates each member's
+      accepted candidates, gates them in a throwaway worktree against the canonical ref, and lands
+      by compare-and-swap `update-ref`. C-732 then made the drive tick call it. This story's work
+      exists; it was done under another id.
