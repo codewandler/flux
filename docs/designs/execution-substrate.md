@@ -41,7 +41,7 @@ consequence.
 | TCP dial | `net::DialTarget` / `DialStream` / `dial_scoped` / `dial_scoped_pinned` |
 | Argv-only spawn | one `System::build_command`; env cleared to a non-secret allow-list; output byte-capped |
 | OS sandbox | `sandbox::Backend` — bubblewrap (Linux), Seatbelt (macOS); `SpawnPolicy`, `Confinement` |
-| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`, `port::GuardedWorkspaceFiles`, `port::GuardedNetwork`, plus `ExecutionSystem`; fail-closed defaults; `flux-codegate` enumerates in-repo backends and pins its trait census to `port.rs` |
+| The port seam | `port::GuardedEnv`, `port::GuardedProcess`, `port::GuardedHostFiles`, `port::GuardedWorkspaceFiles`, `port::GuardedNetwork`, `port::GuardedMetrics`, `port::GuardedHttp`, plus `ExecutionSystem`; fail-closed defaults; `flux-codegate` enumerates in-repo backends and pins its trait census to `port.rs` |
 | A delegating backend | `remote::RemoteSystem` + `remote::Loopback` (C-399), with the authenticated HTTPS/WSS production transport from C-475/C-476 and four typed delivery outcomes |
 | Published | yes — `codewandler-flux-system`, lib name `flux_system` |
 

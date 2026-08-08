@@ -23,6 +23,11 @@ only repository policy that must be known before acting. Product documentation s
   non-trivial design decisions in [docs/designs/](docs/designs/).
 - Add a failing-first test for behavioral changes. Keep the story/design and changelogs consistent
   with the finished behavior; user-visible changes also belong in `WHATS-NEW.md`.
+- Anything committed here is shared. **Describe the mechanism, never this machine or this account.**
+  No absolute paths from a developer's home directory (use a placeholder such as `<fleet root>`), no
+  credential file locations, and no assertions about a particular account's provider balance, quota or
+  billing state — those are conditions to check at runtime (`flux auth status`), not facts to record.
+  Reproductions keep the command and the error, not the operator's environment.
 - Before opening a pull request or entering any publication path, regenerate the committed public
   documentation mirror with `scripts/build-embedded-docs.sh`, commit
   `crates/flux-server/assets/public-docs.zip` when it changes, then run
@@ -55,6 +60,11 @@ authorization → approval → guarded IO. Preserve these boundaries:
   and manifest-scoped.
 - Route web egress through the `flux-system` URL guards. Route every OS process through the single
   guarded `System` path with a workspace-pinned cwd, cleared environment, and capped output.
+- A selected execution host is deny-by-default, immutable for the session, and inherited by
+  sub-agents; unattended surfaces never inherit a grant given only to interactive use. A host
+  binding holds a credential *reference*, never a value. Selection failures fail closed — a
+  `sandboxed` host with no usable confinement, or a binding whose endpoint does not exist yet,
+  refuses and names what is missing rather than falling back to the local machine.
 - Keep served HTTP routes authenticated except the documented health/discovery endpoints; never
   permit an unauthenticated non-loopback agent listener.
 - Preserve provider-history validity on every termination path: no empty assistant message, split
@@ -71,7 +81,8 @@ Read the focused contract before changing these areas:
 - Flux-Lang syntax, generated references, or editor mirrors:
   [crates/flux-lang/AGENTS.md](crates/flux-lang/AGENTS.md)
 - Plugins or the nested plugin workspace: [plugins/AUTHORING.md](plugins/AUTHORING.md)
-- Releases and versioning: [crates/flux-sdk/PUBLISHING.md](crates/flux-sdk/PUBLISHING.md)
+- How a release happens and how it gets stuck: [docs/releasing.md](docs/releasing.md)
+- Releases and versioning, and the manual runbook: [crates/flux-sdk/PUBLISHING.md](crates/flux-sdk/PUBLISHING.md)
 - Architecture and crate placement: [docs/architecture.md](docs/architecture.md)
 - The documentation map (what lives where, contributor tree vs website): [docs/README.md](docs/README.md)
 - Product direction: [docs/vision.md](docs/vision.md) and [docs/roadmap.md](docs/roadmap.md)
@@ -110,6 +121,28 @@ FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend
 
 The `plugins/` directory is a separate workspace. If touched, run its checks with
 `--manifest-path plugins/Cargo.toml`, including `cargo fmt --check`.
+
+### Building several worktrees at once
+
+**Never share one `CARGO_TARGET_DIR` between worktrees of this repository.** Every worktree hashes
+to the same Cargo metadata, so each one builds a crate to the same artifact path. Concurrent
+worktrees then overwrite and reuse each other's output: Cargo reports `Finished` without compiling
+the change under test, and a gate passes against a sibling's binary. A green run that never built
+your code is worse than no run, and this failure is silent.
+
+Give every concurrent worktree its own target directory. To keep that affordable, disable debug
+info — this is the difference between tens of gigabytes per worktree and a few:
+
+```bash
+CARGO_TARGET_DIR=<per-worktree dir> CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
+  scripts/release-full-gate.sh
+```
+
+A full workspace target directory is tens of gigabytes. Check free space before fanning out
+parallel work, and budget for one directory per concurrent worktree. The cheapest reclaim is an
+idle worktree's `target/`: it is ignored build output, never source. Confirm `git status
+--porcelain` reports no uncommitted source in that worktree first, and never remove a target
+directory a build is using.
 
 Golden regeneration is armed only by `FLUX_UPDATE_GOLDEN=1`; regeneration intentionally fails after
 writing. Review the diff, then rerun with the variable unset to verify. Never hand-edit generated

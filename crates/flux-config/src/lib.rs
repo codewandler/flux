@@ -154,6 +154,12 @@ pub struct StaticEndpoint {
     /// `plugin/<p>/<i>/<slot>`); optional (unauthenticated when omitted). Never a value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
+    /// The `[[host]]` binding this endpoint is reachable through, by id (C-709). A cluster-internal
+    /// name is meaningless on a laptop and exactly right inside the cluster; this is what tells the
+    /// two apart. Omitting it means "reachable from wherever the caller is". Held as a plain id here
+    /// (this crate stays `flux-secret`-free); the surface crate checks it names a declared binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Non-secret labels (region, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub labels: std::collections::BTreeMap<String, String>,
@@ -162,6 +168,136 @@ pub struct StaticEndpoint {
 impl EndpointConfig {
     fn is_default(&self) -> bool {
         self.cross_plugin_credentials.is_empty() && self.static_endpoints.is_empty()
+    }
+}
+
+/// The closed backend vocabulary for a `[[host]]` declaration (Decision 0018 rule 3). Typed — not a
+/// free string — so an unknown backend kind is a **hard config error** at parse time, unlike the
+/// warn-and-skip semantic validation the string fields get in the surface crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HostBackendKind {
+    Local,
+    Sandboxed,
+    Container,
+    Kubernetes,
+    /// A VM/microVM guest serving the remote protocol (C-677). Declarable with the endpoint its
+    /// guest serves, or without one yet — flux never provisions the guest, so a binding written
+    /// before the endpoint exists is honestly unwired rather than a config error.
+    Microvm,
+    /// An ssh-bootstrapped substrate composing the remote protocol (C-683).
+    Ssh,
+    Remote,
+}
+
+impl HostBackendKind {
+    /// The lowercase wire/display form (matches the serde encoding).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Sandboxed => "sandboxed",
+            Self::Container => "container",
+            Self::Kubernetes => "kubernetes",
+            Self::Microvm => "microvm",
+            Self::Ssh => "ssh",
+            Self::Remote => "remote",
+        }
+    }
+}
+
+/// The `ssh` sub-table of a `[[host]]` declaration (C-683): what the binding declares about the far
+/// machine. `deny_unknown_fields` for the same reason the parent table has it — a silently dropped
+/// typo in a substrate binding is a safety problem. Mirrors `flux_secret::host::HostSsh`; the two
+/// crates may not depend on each other, so the surface crate owns the conversion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostSshEntry {
+    /// The far-side flux binary; absent means `flux` on the far side's `PATH`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+    /// The far-side loopback port the serve binds and the tunnel forwards to; absent means 8790.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serve_port: Option<u16>,
+    /// The far-side workspace root a started serve is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The far-side TLS certificate a started serve is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+    /// The far-side TLS key a started serve is given.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// A local PEM whose roots this binding's client trusts (the `--remote-ca` pinning form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
+    /// A local `known_hosts` file scoping strict host-key verification to this binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_hosts: Option<String>,
+    /// The name the far side's certificate carries; absent means `127.0.0.1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    /// Credential *location* of the serving endpoint's bearer token; absent means
+    /// `env/FLUX_REMOTE_SYSTEM_TOKEN`. Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ref: Option<String>,
+}
+
+/// One `[[host]]` declaration: a named, first-class binding to an execution substrate
+/// (Decision 0018). Mirrors the weak `HostRef` — id + backend kind + bare address + a credential
+/// *reference* + labels — never a secret value. `deny_unknown_fields` because a silently dropped
+/// typo in a substrate binding is a safety problem, not a formatting one. The remaining semantic
+/// validation (credential-free url, parseable credential ref) happens in the surface crate against
+/// the same rules as `flux host add`, keeping this crate a `flux-secret`-free leaf.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostEntry {
+    /// The binding name (a bare name, e.g. `build-farm`).
+    pub id: String,
+    /// Which substrate backend this binding selects.
+    pub backend: HostBackendKind,
+    /// Bare `scheme://host[:port]` for backends with an address — never with embedded credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Credential *location* in `scheme/...` form (`env/FARM_TOKEN`,
+    /// `kubernetes/<ns>/<name>/<key>`, `plugin/<p>/<i>/<slot>`); optional. Never a value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+    /// Filesystem *location* of the private CA certificate (PEM) this binding's endpoint chains to
+    /// — the `[[host]]` equivalent of `--remote-ca` (C-684). Optional; omit for ordinary public
+    /// trust. A CA certificate is public material, so this is a plain path rather than a secret
+    /// reference; what it keeps from `credential_ref` is that the config declares a *location* and
+    /// resolution validates it, failing closed rather than falling back to the default trust store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+    /// Surface classes granted to *select* this binding (`operator`, `unattended`). The default
+    /// is deny (Decision 0018 rule 4): an ungranted binding lists and probes but selects for
+    /// nobody. Held as plain strings here; the surface crate validates the vocabulary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub grant: Vec<String>,
+    /// Non-secret labels (region, cluster, tags) for display/filtering.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
+    /// The far-side bootstrap contract for an `ssh` binding (C-683); meaningless for every other
+    /// backend, which the surface crate refuses rather than ignores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh: Option<HostSshEntry>,
+}
+
+/// The `[exchange]` table — the declared home for the Exchange catalogue binding (C-650). Names a
+/// `[[host]]` binding whose `url` is the Exchange origin and whose `credential_ref` locates the
+/// service-account token. The transitional `FLUX_EXCHANGE_URL`/token environment pair keeps
+/// working and wins while present.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExchangeConfig {
+    /// The `[[host]]` binding name serving the Exchange catalogue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+}
+
+impl ExchangeConfig {
+    fn is_default(&self) -> bool {
+        self.host.is_none()
     }
 }
 
@@ -719,6 +855,12 @@ pub struct Config {
     /// Endpoint-discovery / cross-plugin credential brokerage grants (D-27).
     #[serde(default, skip_serializing_if = "EndpointConfig::is_default")]
     pub endpoint: EndpointConfig,
+    /// Named execution-substrate bindings (`[[host]]`, Decision 0018).
+    #[serde(default, rename = "host", skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<HostEntry>,
+    /// The named home for the Exchange catalogue binding (`[exchange] host = "<binding>"`).
+    #[serde(default, skip_serializing_if = "ExchangeConfig::is_default")]
+    pub exchange: ExchangeConfig,
     /// Opt into the generic `bash` op (the `shell` group). Off by default — the agent works through
     /// the dedicated ops; setting this surfaces `bash` as an escape hatch. The CLI exports
     /// `FLUX_ENABLE_BASH` from this so the runtime's `shell` signal fires.
@@ -1223,6 +1365,40 @@ pub fn render_theme(current: Option<(&str, &str)>, theme: &str) -> Result<String
     toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
 }
 
+/// Re-render `current` (usually `~/.flux/config.toml`) with `host` upserted into the `[[host]]`
+/// table by id, round-tripping every other setting — the pure half of `flux host add` (C-649).
+/// The guarded outer control plane owns the atomic write.
+pub fn render_host_upsert(current: Option<(&str, &str)>, host: HostEntry) -> Result<String> {
+    let mut cfg = current
+        .map(|(source, text)| parse_source(source, text))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(slot) = cfg.hosts.iter_mut().find(|h| h.id == host.id) {
+        *slot = host;
+    } else {
+        cfg.hosts.push(host);
+    }
+    toml::to_string_pretty(&cfg).map_err(|error| Error::Config(error.to_string()))
+}
+
+/// Re-render `current` with the `[[host]]` entry named `id` removed, round-tripping every other
+/// setting — the pure half of `flux host rm` (C-649). `Ok(None)` when no such entry is declared
+/// in this document, so the caller can distinguish "nothing to do here" from a write.
+pub fn render_host_removal(current: Option<(&str, &str)>, id: &str) -> Result<Option<String>> {
+    let mut cfg = current
+        .map(|(source, text)| parse_source(source, text))
+        .transpose()?
+        .unwrap_or_default();
+    let before = cfg.hosts.len();
+    cfg.hosts.retain(|h| h.id != id);
+    if cfg.hosts.len() == before {
+        return Ok(None);
+    }
+    toml::to_string_pretty(&cfg)
+        .map(Some)
+        .map_err(|error| Error::Config(error.to_string()))
+}
+
 /// Merge `project` onto `user`: lists (and policy grants) concatenate (user first), scalars prefer
 /// project, legacy `allow_private_net` is true if either enables it, scoped private-net grants merge.
 fn merge(user: Config, project: Config) -> Config {
@@ -1270,6 +1446,10 @@ fn merge(user: Config, project: Config) -> Config {
                 user.endpoint.static_endpoints,
                 project.endpoint.static_endpoints,
             ),
+        },
+        hosts: merge_hosts(user.hosts, project.hosts),
+        exchange: ExchangeConfig {
+            host: project.exchange.host.or(user.exchange.host),
         },
         enable_shell: user.enable_shell || project.enable_shell,
         permissions: Permissions {
@@ -1525,6 +1705,22 @@ fn merge_static_endpoints(
             *slot = ep;
         } else {
             out.push(ep);
+        }
+    }
+    out
+}
+
+/// Merge `[[host]]` declarations: user first, then project — a project entry with the same `id`
+/// overrides the user's (so a repo can retarget a named binding), otherwise it is appended.
+/// Insertion order is preserved (deterministic display / registry seeding), mirroring
+/// [`merge_static_endpoints`].
+fn merge_hosts(user: Vec<HostEntry>, project: Vec<HostEntry>) -> Vec<HostEntry> {
+    let mut out = user;
+    for host in project {
+        if let Some(slot) = out.iter_mut().find(|h| h.id == host.id) {
+            *slot = host;
+        } else {
+            out.push(host);
         }
     }
     out
@@ -2131,6 +2327,45 @@ url = "http://prom.internal:9090"
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-709: `[[endpoint.static]]` may declare the `[[host]]` binding the endpoint is reachable
+    /// through, by id. A cluster-internal name is meaningless on a laptop and exactly right inside
+    /// the cluster; this is what tells the two apart. Omitting it keeps the pre-existing meaning —
+    /// reachable from wherever the caller is.
+    #[test]
+    fn static_endpoint_declares_the_host_binding_it_is_reachable_through() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[host]]
+id = "k8s-dev"
+backend = "kubernetes"
+
+[[endpoint.static]]
+id = "pg-cluster"
+url = "postgres://db.default.svc.cluster.local:5432/app"
+product = "postgres"
+host = "k8s-dev"
+
+[[endpoint.static]]
+id = "pg-public"
+url = "postgres://db.example.com:5432/app"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.endpoint.static_endpoints.len(), 2);
+        assert_eq!(
+            cfg.endpoint.static_endpoints[0].host.as_deref(),
+            Some("k8s-dev"),
+            "the declaration carries the binding id, not an address"
+        );
+        assert_eq!(
+            cfg.endpoint.static_endpoints[1].host, None,
+            "an endpoint that declares no host stays unbound"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn merge_static_endpoints_project_overrides_user_by_id() {
         let user = vec![
@@ -2156,6 +2391,183 @@ url = "http://prom.internal:9090"
         assert_eq!(merged[0].id, "pg");
         assert_eq!(merged[0].url, "postgres://project-host:5432/app");
         assert_eq!(merged[1].id, "cache");
+    }
+
+    #[test]
+    fn hosts_parse_from_config() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[host]]
+id = "build-farm"
+backend = "remote"
+url = "https://farm.example:8443"
+credential_ref = "env/FARM_TOKEN"
+ca_cert = "/etc/flux/farm-ca.pem"
+labels = { region = "eu" }
+
+[[host]]
+id = "here"
+backend = "local"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.hosts.len(), 2);
+        let farm = &cfg.hosts[0];
+        assert_eq!(farm.id, "build-farm");
+        assert_eq!(farm.backend, HostBackendKind::Remote);
+        assert_eq!(farm.url.as_deref(), Some("https://farm.example:8443"));
+        assert_eq!(farm.credential_ref.as_deref(), Some("env/FARM_TOKEN"));
+        // C-684: the private CA the endpoint chains to is a declarable *location*, so a binding
+        // can reach an operator-managed substrate by name. It parses as an ordinary key rather
+        // than being refused by `deny_unknown_fields`.
+        assert_eq!(farm.ca_cert.as_deref(), Some("/etc/flux/farm-ca.pem"));
+        assert_eq!(farm.labels.get("region").map(String::as_str), Some("eu"));
+        // Omitted is the public-trust default, not an empty string.
+        assert!(cfg.hosts[1].ca_cert.is_none());
+        // A minimal declaration: just a name and a backend kind (the local substrate needs no
+        // address and no credential).
+        assert_eq!(cfg.hosts[1].id, "here");
+        assert_eq!(cfg.hosts[1].backend, HostBackendKind::Local);
+        assert!(cfg.hosts[1].url.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-677: a `microvm` binding is declarable in `[[host]]` — with the endpoint its guest serves,
+    /// or without one yet. Both are legal declarations because flux never provisions the guest: the
+    /// endpoint comes to exist through C-480's VM/microVM profile, and until it does the binding is
+    /// honestly unwired rather than a config error. The entry's own hard errors are unchanged.
+    #[test]
+    fn a_microvm_host_binding_parses_with_or_without_a_served_endpoint() {
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            r#"
+[[host]]
+id = "vm-guest"
+backend = "microvm"
+url = "https://guest.internal:8443"
+credential_ref = "env/GUEST_TOKEN"
+grant = ["operator"]
+
+[[host]]
+id = "vm-planned"
+backend = "microvm"
+"#,
+        );
+        let cfg = load(&dir).unwrap();
+        assert_eq!(cfg.hosts.len(), 2);
+        let served = &cfg.hosts[0];
+        assert_eq!(served.backend.as_str(), "microvm");
+        assert_eq!(served.url.as_deref(), Some("https://guest.internal:8443"));
+        assert_eq!(served.credential_ref.as_deref(), Some("env/GUEST_TOKEN"));
+        // Declared before the guest exists: no address, and that is not a parse error.
+        assert_eq!(cfg.hosts[1].backend.as_str(), "microvm");
+        assert!(cfg.hosts[1].url.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+
+        // The unknown-key hard error is unchanged for the new kind — a dropped typo in a substrate
+        // binding stays a safety problem, not a formatting one.
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            "[[host]]\nid = \"vm\"\nbackend = \"microvm\"\ncredentialref = \"env/X\"\n",
+        );
+        let err = load(&dir).unwrap_err();
+        assert!(err.to_string().contains("credentialref"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_host_backend_kind_is_a_hard_config_error() {
+        // C-648: the backend vocabulary is closed. A typo'd or unknown kind must fail the whole
+        // config parse — a substrate binding silently skipped is a safety problem.
+        let dir = temp_dir();
+        write_project(&dir, "[[host]]\nid = \"warp-farm\"\nbackend = \"warp\"\n");
+        let err = load(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("warp") || msg.contains("unknown variant"),
+            "names the bad kind: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unknown_keys_in_host_entries_are_rejected() {
+        // Unlike `[[endpoint.static]]`, a `[[host]]` entry refuses unknown keys outright: a
+        // dropped `credentialref = …` typo would silently change which substrate a session binds.
+        let dir = temp_dir();
+        write_project(
+            &dir,
+            "[[host]]\nid = \"h\"\nbackend = \"local\"\ncredentialref = \"env/X\"\n",
+        );
+        let err = load(&dir).unwrap_err();
+        assert!(err.to_string().contains("credentialref"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn merge_hosts_project_overrides_user_by_id() {
+        let host = |id: &str, url: &str| HostEntry {
+            id: id.into(),
+            backend: HostBackendKind::Remote,
+            url: Some(url.into()),
+            credential_ref: None,
+            ca_cert: None,
+            grant: Vec::new(),
+            labels: Default::default(),
+            ssh: None,
+        };
+        let user = vec![
+            host("farm", "https://user-farm:8443"),
+            host("gpu", "https://gpu:8443"),
+        ];
+        let project = vec![host("farm", "https://project-farm:8443")];
+        let merged = merge_hosts(user, project);
+        // `farm` retargeted to the project url in place; `gpu` retained; order preserved.
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].id, "farm");
+        assert_eq!(merged[0].url.as_deref(), Some("https://project-farm:8443"));
+        assert_eq!(merged[1].id, "gpu");
+    }
+
+    #[test]
+    fn render_host_upsert_and_removal_round_trip() {
+        let base = "enable_shell = true\n";
+        let entry = HostEntry {
+            id: "farm".into(),
+            backend: HostBackendKind::Remote,
+            url: Some("https://farm.example:8443".into()),
+            credential_ref: Some("env/FARM_TOKEN".into()),
+            ca_cert: None,
+            grant: Vec::new(),
+            labels: Default::default(),
+            ssh: None,
+        };
+        let body = render_host_upsert(Some(("test", base)), entry.clone()).unwrap();
+        assert!(body.contains("enable_shell = true"), "round-trips: {body}");
+        assert!(body.contains("[[host]]"), "{body}");
+
+        // A second upsert with the same id retargets in place rather than appending.
+        let retargeted = HostEntry {
+            url: Some("https://elsewhere.example:8443".into()),
+            ..entry
+        };
+        let body = render_host_upsert(Some(("test", &body)), retargeted).unwrap();
+        assert_eq!(body.matches("[[host]]").count(), 1, "{body}");
+        assert!(body.contains("https://elsewhere.example:8443"), "{body}");
+
+        // Removal drops the entry, keeps everything else, and reports absence as None.
+        let removed = render_host_removal(Some(("test", &body)), "farm")
+            .unwrap()
+            .expect("declared entry removes");
+        assert!(!removed.contains("[[host]]"), "{removed}");
+        assert!(removed.contains("enable_shell = true"), "{removed}");
+        assert!(render_host_removal(Some(("test", &removed)), "farm")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -15,6 +15,23 @@ Native `flux board` landed after v0.55.0. It is available in source installs fro
 packaged-release users need v0.56.0 or newer.
 :::
 
+## Creating an item commits it
+
+`flux board create` commits the document it writes, path-scoped to that one file, and reports the
+commit in its envelope. `--no-commit` opts out.
+
+This is the default rather than a flag because an uncommitted planning item is invisible to the reads
+that matter. A federated board resolves each member's items *at that member's `canonical_ref`* — with
+`git ls-tree` and `git show`, not from the working tree — so a document that exists only on disk does
+not exist as far as the board is concerned. Creating without committing therefore reported success and
+changed nothing schedulable.
+
+The commit goes to the current branch, never a side branch: a side branch would reproduce exactly the
+invisibility being fixed. Item creation is also the one planning mutation that cannot conflict, because
+it only ever adds a path that did not previously exist. Outside a git repository it does nothing, and
+mid-merge or mid-rebase it refuses rather than committing into someone else's operation, naming the
+path it wrote so nothing is lost.
+
 ## Identity and authority
 
 Every operation resolves through a board binding. Every item reference carries both halves:
@@ -226,6 +243,7 @@ flux board get C-549 --output json
 flux board graph --output json
 
 flux board create --kind story --id C-552 --title "Example" --dry-run --output json
+flux board create --kind story --title "Example" --no-commit --output json
 flux board update C-552 --priority 51 --if-revision REV --idempotency-key prioritize-C-552 --output json
 flux board transition C-552 in-progress --dry-run --output json
 flux board start C-552 --if-revision REV --idempotency-key start-C-552 --output json
@@ -242,6 +260,28 @@ of the same recoverable operation.
 ```sh
 flux board done C-552 --changelog "Add the example" --if-revision REV \
   --idempotency-key done-C-552 --output json
+```
+
+### Status that drifted from the tree
+
+`flux board reconcile` reports every item whose status says the work is outstanding while evidence of
+that work is already present. It writes nothing: detection is the whole value, and the repair is a
+transition anyone can make once they know which one.
+
+Two independent signals count as evidence, and each finding names which fired:
+
+- `implementation-landed` — a commit reachable from `HEAD` names the item *and* touches a path
+  outside `docs/stories/`. Commits confined to the board's own documents — adding the item, flipping
+  its status, re-rendering the marker region — are the status record, not the work.
+- `acceptance-complete` — every checkbox under the item's `## Acceptance` heading is ticked.
+
+Each finding carries the profile-valid `transition_path` that would close it. History reading is
+bounded to the most recent commits, and a scan that reaches that ceiling warns rather than reporting
+a partial answer as complete. On a workspace board each member's own history is read, because that is
+where its commits are.
+
+```sh
+flux board reconcile --output json
 ```
 
 ## The stable agent API

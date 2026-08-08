@@ -54,6 +54,17 @@ policy.
 | `sqlite_query` | `db, sql[, limit]` | low | Read-only SQLite query (`limit` caps rows, default 200) |
 | `now` / `cwd` / `home_dir` / `sys_info` | | low | Clock, workspace/home paths, and host metadata — no shell needed |
 
+`http.request` and `web.fetch` ride out a rate limit rather than handing it straight back. A `429 Too
+Many Requests` is retried up to three times, honouring `Retry-After` in either of its forms
+(delta-seconds or an HTTP-date) and otherwise backing off exponentially from 500 ms with a little
+jitter. Retrying is safe for any method, a `POST` included, because a 429 says the far side received
+the request and declined to act on it — which is why a `503` is *not* retried: it makes no such
+promise. Every wait stays inside the request's own `timeout`, so a retry that would overrun the
+budget returns the 429 instead of blocking past it, and cancelling the turn ends the wait
+immediately. When a request did wait, the rendered result says so — `rate-limited, retried 2 times
+over 3.4s` — so the latency is never unexplained. The retry happens wherever the request is made, so
+a selected remote substrate waits next to the service it is calling rather than across the link.
+
 All native web operations share the `[private_net] web` scope. Public destinations are allowed by
 default; private/internal destinations require an explicit grant. Browser operations register in
 every host but are advertised only when a Chromium binary is discoverable. `web.search` is the
@@ -240,6 +251,7 @@ reconcile them later.
 | `fleet.start` | `item[, worktree, context_id, model]` | Start a flux worker for one board item and return the endpoint to dispatch to. `worktree` confines it to an isolated checkout; the returned context id resumes the same worker session later. Reaching the returned endpoint needs `--allow-private-net`, since it is a loopback address |
 | `fleet.worker_status` | `worker_id` | Report whether a worker is starting, live, or dead — with its exit code and the tail of its own output when it died. The worker's liveness, not a task's state |
 | `fleet.stop` | `worker_id` | Stop a worker started by `fleet.start`. An already-exited worker succeeds; an unknown worker id is an error |
+| `fleet.agents` | `[limit]` | On an explicitly attached native Fleet main only, list bounded durable worker admissions and current statuses without requiring known worker ids. This is separate from transient A2A/process workers |
 
 The `worker` address is an argument, not configuration, so it is model-reachable and gated as such.
 Every call resolves the endpoint through the same egress guard as `web.fetch` before any request,
@@ -251,6 +263,35 @@ behind `flux serve`'s bearer token is not reachable yet.
 
 `fleet.status` is never served from the operation cache — observing the change since the last poll is
 the point of a status call.
+
+`fleet.agents` is installed only for the main agent started by `flux tui --fleet`. Its result is
+capped at 100 worker records, reports the untruncated total, and omits worker instructions and turn
+bodies. The validated attachment pre-authorizes this read, while an operator-authored deny rule
+still wins.
+
+That attachment replaces the colliding transient `fleet.status` and `fleet.cancel` tools and closes
+the model-facing catalog to these native coordinator services plus bounded research `task`:
+
+| op | arguments | description |
+|---|---|---|
+| `board.show` | `{}` | Show the authoritative workspace Board and planning documents |
+| `board.get` | `id` | Read one exact namespaced item |
+| `board.next` | `[limit]` | List dependency-satisfied ready items in deterministic order |
+| `board.check` | `{}` | Validate Board configuration and story contracts |
+| `board.start` / `board.unblock` | `id[, guards]` | Apply the exact guarded Board transition |
+| `board.block` | `id, reason[, guards]` | Block an item and record why |
+| `board.comment` / `board.evidence` | `id, text[, guards]` | Append durable item context or evidence |
+| `fleet.status` | `{}` | Read a compact durable lifecycle snapshot without historical turn bodies |
+| `fleet.schedule` | `{}` | Read the dependency-aware schedule derived from the Board |
+| `fleet.run` | `items[, prepare_only, guards]` | Prepare and launch a wave for 1–10 exact Board refs |
+| `fleet.message` | `target, message[, wait, guards]` | Deliver an acknowledged message |
+| `fleet.cancel` / `fleet.resume` | `target[, guards]` | Control one exact durable target |
+
+Safe native reads are pre-authorized unless an operator deny wins. Mutations keep revision,
+idempotency, and acknowledgement guards. The parent has no general coding tools; its `task` child is
+independently limited to read-only workspace and git inspection, without shell, edits, git writes,
+Board/Fleet mutation, or nested delegation. `[main].research_loop` forces the operator-authored
+child loop, overriding generic role-loop defaults such as `create_plan`.
 
 **Work board operations are not in this catalog**, because they do not exist until a program asks for
 them. A first-class `board` declaration generates the board operations named after *that
@@ -272,6 +313,19 @@ was non-empty at session startup. See [Endpoints](../agent/endpoints.md).
 | `endpoint.info` | `id` | Inspect one endpoint record and its credential location |
 | `endpoint.select` | `id` | Return one model-safe `EndpointRef` for reuse in another operation |
 | `endpoint.import` | `id` | Persist a known record to `~/.flux/endpoints.toml` (approval-gated local write) |
+
+## Hosts
+
+Registered as one evidence-gated group, surfaced when named execution-substrate bindings are
+declared (`[[host]]` config or the hosts store). Weak references only: backend kind, address,
+availability and a credential *presence* marker — never a value.
+
+| op | arguments | description |
+|---|---|---|
+| `host.list` | | List the session's named execution-substrate bindings |
+| `host.info` | `id` | Inspect one host binding: backend kind, address, availability, labels |
+| `host.probe` | `id` | Side-effect-free identity check: substrate identity and, for a remote backend, the negotiated protocol version |
+| `host.metrics` | `id` | The binding's own condition — CPU, load, memory, swap, disk, uptime, temperature, fans — as typed readings; an unmeasurable metric is explicitly unavailable, never zero |
 
 ## Agent-invoked commands and skills
 

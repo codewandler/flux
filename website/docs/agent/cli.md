@@ -54,6 +54,7 @@ and [Safety & approvals](./safety.md).
 | `flux wakeups list \| cancel` | list or cancel a session's pending agent-scheduled wake-ups (`schedule_wakeup`) |
 | `flux plugin …` | install, inspect, call, pin, and remove [plugins](../plugins/using-plugins.md) |
 | `flux endpoint …` | inspect/import model-safe [endpoint references](./endpoints.md) |
+| `flux host …` | declare/inspect/probe named execution-substrate bindings (`[[host]]`) |
 | `flux exchange local start\|status\|stop` | enter the managed local Exchange lifecycle surface; until the signed release/lifecycle contract ships, each verb makes no change and returns a typed `unsupported` refusal. The final lifecycle runs only on the two Linux GNU targets; every other target keeps the command and refuses before effects (`--json` for one machine-readable result). |
 | `flux integration connect\|grant\|list\|doctor` | enter labelled Exchange connection management; until the provider connection/grant contracts ship, each command makes no change and returns a typed `unsupported` refusal. Final owner onboarding is Linux-local; the authenticated runtime HTTP client may still use an independently provisioned Linux Exchange from every Flux target. |
 | `flux policy simulate <proposed.toml>` | replay a proposed authorization policy against recorded op history — a diff of what it would have newly blocked and newly allowed, before you adopt it; a pure read, `--sessions N` / `--json` |
@@ -217,12 +218,42 @@ flux run --loop loops/support.flux "triage this request"
 - `--max-tokens` caps the output tokens of a single model-stage call (default: 16384; must be ≥ 1).
   A truncated intent, exploration, repair, or presentation stage fails loudly rather than silently
   stopping.
-- `--turn-budget` bounds cumulative model usage for the turn.
+- `--turn-budget` bounds cumulative model usage for the turn — a hard limit, so the turn stops at the
+  next safe boundary instead of consulting the model again. See
+  [time and token budgets](#time-and-token-budgets).
 - `--max-model-calls` bounds provider consultations across intent, exploration, repairs, and
   decision resumes for one logical adaptive turn (default: 50).
 - `--max-iterations` separately bounds decision/batch iterations in the authored outer loop
   (default: 50; accepted range: 1–1,000).
 - `--skill NAME` explicitly enables a discovered skill. Skills do not activate from prompt keywords.
+
+### Time and token budgets
+
+Budgets use two words, and they do not mean the same thing:
+
+- A **target** is a declared intent. Crossing it warns once and nothing stops:
+
+  ```text
+  ⚠ budget target crossed — run total_tokens 1.6k of 1.0k (hard limit 4.0k) · execution continues
+  ```
+
+- A **limit** is a hard ceiling. Crossing it stops at the next safe boundary and names exactly what
+  was crossed — scope, dimension, spent, limit:
+
+  ```text
+  ⚠ budget limit reached — turn total_tokens 4.6k of 4.0k · stopping at the next safe boundary
+  ```
+
+Both sides are declared per scope (run, session, turn, or one loop segment) over wall time, model
+calls, and input, output and total tokens. `--turn-budget` is the flag-level entry point — a hard
+total-token ceiling for one turn; hosts embedding the SDK can declare the full envelope, including
+targets and a wall-clock deadline.
+
+A model call already in flight is never reported as stopped: its usage is measured and charged first,
+and only then can the next round be refused. The enforcing ledger is also the only accountant — it
+publishes one spent-versus-declared projection that these lines, [the TUI header](./tui.md) and the
+durable event trail all render, so the figure you read is the figure that stops the run. A dimension
+nobody declared shows nothing rather than a zero ceiling.
 
 ## Machine-readable output (`--stream-json`)
 

@@ -5,13 +5,20 @@
 //! Flux AST. Every gathered or approved action still runs through the shared [`Executor`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use flux_core::{DispatchId, Error, Message, Result, Usage};
+use flux_core::{
+    budget::{
+        BudgetAttribution, BudgetEnvelope, BudgetLedger, BudgetOutcome, BudgetProjection,
+        BudgetScope, BudgetSpend, BudgetUsageEvent,
+    },
+    DispatchId, Error, Message, Result, Usage,
+};
 use flux_provider::{Effort, Provider};
 use flux_runtime::{
     CompositeRegisterRequest, CompositeRegistrar, Executor, LoopHost, SkillLoadOutcome,
@@ -60,7 +67,17 @@ pub struct EngineLoopHost {
     /// tallies billed usage for every independent model call regardless of source). Reset to zero
     /// in [`Self::set_turn`] like the rest of turn accounting.
     consult_calls: AtomicU32,
-    token_budget: Mutex<Option<u64>>,
+    /// C-542: the enforced budget ledger — the only place this host's spend is added up. Its
+    /// envelope is host configuration installed by the surface and kept across turns; the charged
+    /// spend resets in [`Self::set_turn`] only when the envelope's scope is turn-local, so a
+    /// run/session-scope hard limit keeps accumulating exactly as its scope implies.
+    budget: Mutex<BudgetLedger>,
+    /// Monotonic id source for budget usage events. The ledger charges one `event_id` once, so a
+    /// re-reported measurement can never double a total.
+    budget_events: AtomicU64,
+    /// When the enforced budget scope started measuring wall time. Wall time is a host-clock gauge;
+    /// the clock-free ledger only ever receives the measured elapsed value.
+    budget_started: Mutex<Instant>,
     adaptive_policy: Mutex<crate::staged::AdaptiveLoopPolicy>,
     conversation_cache: Mutex<HashMap<String, (Vec<Message>, i64)>>,
     receipts: crate::staged::ReceiptBook,
@@ -134,7 +151,9 @@ impl EngineLoopHost {
                 calls: Mutex::new(Vec::new()),
                 stage_failure: Mutex::new(None),
                 consult_calls: AtomicU32::new(0),
-                token_budget: Mutex::new(None),
+                budget: Mutex::new(BudgetLedger::new(BudgetEnvelope::none(BudgetScope::Turn))),
+                budget_events: AtomicU64::new(0),
+                budget_started: Mutex::new(Instant::now()),
                 adaptive_policy: Mutex::new(crate::staged::AdaptiveLoopPolicy::default()),
                 conversation_cache: Mutex::new(HashMap::new()),
                 receipts: crate::staged::ReceiptBook::default(),
@@ -197,8 +216,98 @@ impl EngineLoopHost {
         *self.model.lock().unwrap() = model;
     }
 
+    /// A-10/C-542: the opt-in per-turn hard token ceiling (`--turn-budget` >
+    /// `FLUX_TURN_TOKEN_BUDGET` > `[limits] turn_token_budget`), expressed in the shared budget
+    /// vocabulary as a turn-scope hard limit on total tokens. `None` clears it.
     pub fn set_token_budget(&self, budget: Option<u64>) {
-        *self.token_budget.lock().unwrap() = budget;
+        let mut envelope = BudgetEnvelope::none(BudgetScope::Turn);
+        envelope.limit.total_tokens = budget;
+        self.set_budget_envelope(envelope);
+    }
+
+    /// C-542: install a full budget envelope (soft target beside hard limit, any dimension). A
+    /// run/session-scope envelope accumulates across the turns of that run; a turn/segment-scope one
+    /// starts fresh at every turn boundary.
+    pub fn set_budget_envelope(&self, envelope: BudgetEnvelope) {
+        *self.budget.lock().unwrap() = BudgetLedger::new(envelope);
+        *self.budget_started.lock().unwrap() = Instant::now();
+    }
+
+    /// C-542: the live spent-versus-declared projection. This is the single source every surface
+    /// renders and the only total C-571's durable Fleet ledger consumes; no surface recomputes it.
+    pub fn budget_projection(&self) -> BudgetProjection {
+        self.budget.lock().unwrap().projection()
+    }
+
+    /// Charge one measured model call to the enforced ledger.
+    fn charge_call(&self, usage: &Usage, segment: Option<&str>) -> BudgetOutcome {
+        self.charge(BudgetSpend::for_call(usage), segment)
+    }
+
+    /// Charge the wall clock elapsed so far. Every sample carries its own event id because elapsed
+    /// time folds as a maximum, not as a sum: re-sampling must update the gauge, not be deduped
+    /// away.
+    fn charge_elapsed(&self) -> BudgetOutcome {
+        let elapsed = self.budget_started.lock().unwrap().elapsed().as_millis() as u64;
+        self.charge(BudgetSpend::for_elapsed(elapsed), None)
+    }
+
+    fn charge(&self, spend: BudgetSpend, segment: Option<&str>) -> BudgetOutcome {
+        let seq = self.budget_events.fetch_add(1, Ordering::SeqCst);
+        let (session_id, turn_id) = {
+            let turn = self.turn.lock().unwrap();
+            (
+                turn.session_id.clone(),
+                turn.audit.as_ref().map(|(_, turn_id)| *turn_id),
+            )
+        };
+        let event = BudgetUsageEvent {
+            event_id: format!("{session_id}#{seq}"),
+            scope: BudgetScope::Segment,
+            attribution: BudgetAttribution {
+                run_id: session_id.clone(),
+                session_id: Some(session_id),
+                turn_id,
+                segment: segment.map(str::to_string),
+            },
+            spend,
+            rollup: false,
+        };
+        self.budget.lock().unwrap().record(&event)
+    }
+
+    /// C-542: publish the live projection so a surface renders spend as it accrues, and surface a
+    /// crossed target once. The one-warning rule lives in the ledger, so it holds however many
+    /// calls follow; a crossed hard limit rides the same observation and is enforced at the next
+    /// stage boundary rather than by interrupting an effect in flight.
+    fn publish_budget(&self, outcome: &BudgetOutcome) {
+        let projection = self.budget.lock().unwrap().projection();
+        if !projection.is_declared() {
+            return;
+        }
+        let mut data = json!({ "projection": projection });
+        if let Some(warning) = outcome.warning {
+            data["warning"] = json!(warning);
+        }
+        if let Some(breach) = outcome.exhausted {
+            data["exhausted"] = json!(breach);
+        }
+        let observation = flux_evidence::Observation::new(
+            flux_evidence::KIND_BUDGET_PROJECTION,
+            flux_evidence::Phase::Turn,
+            data,
+        );
+        if let Ok(executor) = self.executor() {
+            executor.observe(observation.clone());
+        }
+        let sink = self.turn.lock().unwrap().sink.clone();
+        // A poisoned surface sink is not worth failing a turn over: the durable observation above is
+        // the record, this is only the live projection. `let … else` keeps the guard out of the
+        // block's tail position so it drops before the `Arc` it borrows.
+        let Ok(mut guard) = sink.lock() else {
+            return;
+        };
+        guard.observation(&observation);
     }
 
     pub fn set_adaptive_policy(&self, policy: crate::staged::AdaptiveLoopPolicy) {
@@ -245,6 +354,16 @@ impl EngineLoopHost {
             audit,
         };
         *self.usage.lock().unwrap() = Usage::default();
+        // C-542: a turn-local envelope's charged spend resets with the turn; a run/session envelope
+        // keeps accumulating, which is what makes a run-scope hard limit mean anything across turns.
+        {
+            let mut budget = self.budget.lock().unwrap();
+            let envelope = *budget.envelope();
+            if matches!(envelope.scope, BudgetScope::Turn | BudgetScope::Segment) {
+                *budget = BudgetLedger::new(envelope);
+                *self.budget_started.lock().unwrap() = Instant::now();
+            }
+        }
         self.calls.lock().unwrap().clear();
         *self.stage_failure.lock().unwrap() = None;
         self.consult_calls.store(0, Ordering::SeqCst);
@@ -283,17 +402,20 @@ impl EngineLoopHost {
     }
 
     pub(crate) fn record_external_call(&self, provider: &str, model: &str, usage: Usage) {
+        let outcome = self.charge_call(&usage, None);
         self.usage.lock().unwrap().accumulate(&usage);
         self.calls.lock().unwrap().push((
             flux_core::canonical_model_spec(Some(provider), model),
             usage,
         ));
+        self.publish_budget(&outcome);
     }
 
     /// Record a model call whose prompt is independent from the adaptive conversation. Cognition
     /// ops each build a fresh single-shot request, so their input/cache counters add rather than
     /// replacing the previous stage call's context snapshot.
     fn record_independent_call(&self, provider: &str, model: &str, usage: Usage) {
+        let outcome = self.charge_call(&usage, None);
         self.usage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -305,21 +427,13 @@ impl EngineLoopHost {
                 flux_core::canonical_model_spec(Some(provider), model),
                 usage,
             ));
+        self.publish_budget(&outcome);
     }
 
     fn record_stage_usages(&self, provider: &str, model: &str, usages: Vec<Usage>) {
         for usage in usages {
             self.record_external_call(provider, model, usage);
         }
-    }
-
-    fn cumulative_billed_tokens(&self) -> u64 {
-        self.calls
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, usage)| usage.total())
-            .sum()
     }
 
     fn executor(&self) -> Result<Arc<Executor>> {
@@ -355,11 +469,12 @@ impl EngineLoopHost {
         };
         advertised.retain(|name| executor.operation_visible(name));
         let conversation = self.load_persisted_conversation(&session_id);
-        let remaining_token_budget = self
-            .token_budget
-            .lock()
-            .unwrap()
-            .map(|budget| budget.saturating_sub(self.cumulative_billed_tokens()));
+        // C-542: sample the wall clock at this stage boundary so the projection the stage enforces
+        // (and every surface renders) is current, then hand the stage the enclosing scope's
+        // spent-versus-declared snapshot instead of a bare remaining-token number.
+        let outcome = self.charge_elapsed();
+        self.publish_budget(&outcome);
+        let budget = self.budget.lock().unwrap().projection();
         Ok((
             crate::staged::StagedContext {
                 provider,
@@ -376,7 +491,7 @@ impl EngineLoopHost {
                 authored_ceiling: None,
                 groups,
                 opts: options,
-                remaining_token_budget,
+                budget,
                 adaptive_policy,
                 steering: self.steering.lock().unwrap().clone(),
             },
@@ -418,6 +533,7 @@ impl EngineLoopHost {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
+            .map(str::to_string)
             .ok_or_else(|| Error::Other("ai_segment: non-empty 'goal' is required".into()))?;
         let tools = input
             .get("tools")
@@ -444,8 +560,57 @@ impl EngineLoopHost {
             .ok_or_else(|| {
                 Error::Other("ai_segment: 'max_rounds' must be greater than zero".into())
             })?;
+        let current_turn = input
+            .get("current_turn")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_tokens = input
+            .get("max_tokens")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        Error::Other("ai_segment: 'max_tokens' must be greater than zero".into())
+                    })
+            })
+            .transpose()?;
+        let max_history_bytes = input
+            .get("max_history_bytes")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        Error::Other(
+                            "ai_segment: 'max_history_bytes' must be greater than zero".into(),
+                        )
+                    })
+            })
+            .transpose()?;
 
         let (mut context, provider, model) = self.adaptive_context()?;
+        let effective_goal = if current_turn {
+            let request = context
+                .conversation
+                .iter()
+                .rev()
+                .find(|message| message.role == flux_core::Role::User)
+                .map(Message::text)
+                .map(|request| request.trim().to_string())
+                .filter(|request| !request.is_empty())
+                .ok_or_else(|| {
+                    Error::Other(
+                        "ai_segment: current_turn requested but the turn has no user message"
+                            .into(),
+                    )
+                })?;
+            format!("{goal}\n\nCurrent request:\n{request}")
+        } else {
+            goal
+        };
         let unavailable = tools
             .iter()
             .filter(|name| !context.advertised.contains(*name))
@@ -459,10 +624,19 @@ impl EngineLoopHost {
         }
         context.advertised = tools;
         context.authored_ceiling = Some(context.advertised.clone());
-        context.conversation = vec![Message::user_text(goal)];
+        // Authored segments never inherit retained conversation implicitly. `current_turn` above
+        // copies only the latest request into this fresh one-message segment.
+        context.conversation = vec![Message::user_text(&effective_goal)];
         context.adaptive_policy.max_model_calls = max_rounds;
         context.adaptive_policy.explore.max_calls = None;
-        let intent = crate::staged::scoped_segment_state(&context, goal)?;
+        // Like `max_rounds`, an authored ceiling wins outright: the author knows how much evidence
+        // this segment legitimately accumulates.
+        context.adaptive_policy.max_history_bytes = max_history_bytes;
+        if let Some(max_tokens) = max_tokens {
+            context.adaptive_policy.explore.max_tokens =
+                Some(max_tokens.min(context.opts.max_tokens.max(1)));
+        }
+        let intent = crate::staged::scoped_segment_state(&context, &effective_goal)?;
         let mut next = json!({ "state": intent["state"].clone() });
         let mut remaining = max_rounds;
 

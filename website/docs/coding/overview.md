@@ -98,9 +98,10 @@ wave, prepares one inheriting story worktree/writer per item, verifies failing-b
 passing-after evidence, obtains a fresh read-only review, allows at most two rework deliveries to
 the same session, integrates accepted commits, and runs one final repository gate.
 
-It does **not** silently publish. A green wave leaves a local `fleet/<wave>` candidate. Only
-`flux fleet apply <wave>` may revalidate and merge it locally. Neither `run` nor `apply` pushes,
-opens a pull request, releases, deploys, or removes a worktree.
+It does **not** silently publish. A green wave leaves a local `fleet/<wave>` candidate, and
+`flux fleet apply <wave>` accepts it by pinning that exact commit with an annotated tag — it does not
+merge, and writing the canonical branch stays a separate step with its own gate. Neither `run` nor
+`apply` pushes, opens a pull request, releases, deploys, or removes a worktree.
 
 Read [Fleet and sub-agents](./fleet.md) for configuration, dispatch, acknowledgements, recovery,
 inspection, and the publication boundary.

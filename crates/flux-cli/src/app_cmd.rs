@@ -88,9 +88,15 @@ pub(super) fn integration_plugin_caps(
     )) as Arc<dyn flux_plugin::HostCapabilities>
 }
 
-/// Surface-neutral result of assembling endpoint/plugin integrations once.
+/// Surface-neutral result of assembling endpoint/host/plugin integrations once. Each tool carries
+/// its declared execution placement so packs with different placements (the host pack is
+/// `LocalControlPlane`; everything else `NativeSystemOnly`) register through one seam.
 pub(super) struct IntegrationAssembly {
-    pub(super) tools: Vec<(String, Arc<dyn flux_runtime::Tool>)>,
+    pub(super) tools: Vec<(
+        String,
+        Arc<dyn flux_runtime::Tool>,
+        flux_runtime::OperationPlacement,
+    )>,
     pub(super) groups: Vec<flux_evidence::ToolGroup>,
     pub(super) ambient_signals: Vec<String>,
     pub(super) live_plugins: LivePluginCatalog,
@@ -143,6 +149,10 @@ pub(super) async fn assemble_integrations(
     backend: Arc<dyn flux_capabilities::DatasourceBackend>,
     datasource_bridge: bool,
     cfg: &flux_config::Config,
+    host_registry: Arc<flux_capabilities::HostRegistry>,
+    // The `[[host]]` binding this session selected, if any (C-709). A host-bound endpoint resolves
+    // only from the substrate it is reachable through; `None` is the native local position.
+    selected_host: Option<String>,
     events: Arc<EventStore>,
     stream: &str,
     redactor: &flux_secret::Redactor,
@@ -153,6 +163,30 @@ pub(super) async fn assemble_integrations(
         ambient_signals: Vec::new(),
         live_plugins: LivePluginCatalog::default(),
     };
+
+    // Host bindings are session substrate state, not a plugin integration — they register even
+    // when no plugins directory exists (C-648). The pack is LocalControlPlane (C-649): the ops
+    // describe and verify substrate bindings and must stay operable when a non-native substrate
+    // is selected. The registry is the caller's session instance (C-650), so a binding selected
+    // or recorded before assembly — the ephemeral `--remote` one included — is listable here.
+    if !host_registry.is_empty() {
+        assembly.ambient_signals.push(HOST_SIGNAL.to_string());
+    }
+    let host_prober = Arc::new(CliHostProber {
+        system: system.clone(),
+    }) as Arc<dyn flux_capabilities::HostProber>;
+    assembly.tools.extend(
+        flux_capabilities::host_tools(host_registry.clone(), host_prober)
+            .into_iter()
+            .map(|tool| {
+                (
+                    "cli host integration".to_string(),
+                    tool,
+                    flux_runtime::OperationPlacement::LocalControlPlane,
+                )
+            }),
+    );
+
     let Some(dir) = plugins_dir() else {
         return Ok(assembly);
     };
@@ -167,8 +201,12 @@ pub(super) async fn assemble_integrations(
             style::dim(&format!("(endpoints store not loaded: {error})"))
         );
     }
-    merge_static_endpoints(&endpoint_registry, cfg);
-    assembly.ambient_signals = session_ambient_signals(&endpoint_registry);
+    // C-709: an endpoint naming an undeclared `[[host]]` binding fails here, at load, naming both —
+    // never at dial time from whatever position the caller happens to occupy.
+    merge_static_endpoints(&endpoint_registry, &host_registry, cfg)?;
+    assembly
+        .ambient_signals
+        .extend(session_ambient_signals(&endpoint_registry));
 
     // The session redactor, not a fresh one (C-403): the broker's `endpoint.discover` fan-out is a
     // credential-boundary ingest surface, and the registered-value pass — the only thing that can
@@ -178,10 +216,11 @@ pub(super) async fn assemble_integrations(
         flux_capabilities::HostProviderInvoker::new(plugin_registry.clone())
             .with_redactor(redactor.clone()),
     );
-    let static_resolver = Arc::new(flux_capabilities::StaticResolver::new(
-        system.clone(),
-        endpoint_registry.config_bindings(),
-    ));
+    let static_resolver = Arc::new(
+        flux_capabilities::StaticResolver::new(system.clone(), endpoint_registry.config_bindings())
+            // C-709: a host-bound endpoint is dialled through its binding or not at all.
+            .with_selected_host(selected_host),
+    );
     let cross_plugin_audit: Arc<dyn flux_capabilities::CrossPluginAudit> =
         Arc::new(EventStoreCrossPluginAudit {
             store: events.clone(),
@@ -202,7 +241,13 @@ pub(super) async fn assemble_integrations(
     assembly.tools.extend(
         flux_capabilities::endpoint_tools(broker.clone(), endpoint_registry)
             .into_iter()
-            .map(|tool| ("cli endpoint integration".to_string(), tool)),
+            .map(|tool| {
+                (
+                    "cli endpoint integration".to_string(),
+                    tool,
+                    flux_runtime::OperationPlacement::NativeSystemOnly,
+                )
+            }),
     );
 
     let (plugins, stale) = split_stale_plugins(flux_plugin::discover(&dir));
@@ -291,13 +336,15 @@ pub(super) async fn assemble_integrations(
                 if let Some(group) = implicit_plugin_group(&loaded.manifest, &specs) {
                     assembly.groups.push(group);
                 }
-                assembly.tools.extend(
-                    loaded
-                        .tools
-                        .iter()
-                        .cloned()
-                        .map(|tool| (format!("plugin:{plugin_name}"), tool)),
-                );
+                assembly
+                    .tools
+                    .extend(loaded.tools.iter().cloned().map(|tool| {
+                        (
+                            format!("plugin:{plugin_name}"),
+                            tool,
+                            flux_runtime::OperationPlacement::NativeSystemOnly,
+                        )
+                    }));
                 assembly.live_plugins.insert(plugin_name, loaded);
             }
             Err(error) => eprintln!(
@@ -732,11 +779,20 @@ pub(super) async fn run_app(
     // future Jira/Trello providers—extend this seam without entering the datasource catalogue.
     let ProgramBoards { execution: boards } =
         build_program_boards(&program.boards, &program_dir, &system)?;
-    let mut extra_tools: Vec<(String, Arc<dyn flux_runtime::Tool>)> =
-        flux_capabilities::datasource_tools(backend.clone())
-            .into_iter()
-            .map(|tool| ("app datasource integration".to_string(), tool))
-            .collect();
+    let mut extra_tools: Vec<(
+        String,
+        Arc<dyn flux_runtime::Tool>,
+        flux_runtime::OperationPlacement,
+    )> = flux_capabilities::datasource_tools(backend.clone())
+        .into_iter()
+        .map(|tool| {
+            (
+                "app datasource integration".to_string(),
+                tool,
+                flux_runtime::OperationPlacement::NativeSystemOnly,
+            )
+        })
+        .collect();
     // The app-path event store + this run's stream identity (D-65): built here, BEFORE `App`, so the
     // plugin/endpoint wiring below can install the SAME audit/secret-sink hooks the `build_agent` path
     // installs (`with_egress_audit`/`with_cross_plugin_audit`/the credential secret sink) — then handed
@@ -758,6 +814,9 @@ pub(super) async fn run_app(
         backend,
         true,
         &cfg,
+        session_host_registry(&cfg),
+        // `flux app run` selects no named binding of its own; it runs from the local position.
+        None,
         app_events.clone(),
         &app_run_stream,
         &redactor,
@@ -784,12 +843,8 @@ pub(super) async fn run_app(
         })
         .transpose()?;
     let mut integration_registry = ToolRegistry::new();
-    for (source, tool) in extra_tools {
-        integration_registry.try_register_from_with_placement(
-            source,
-            tool,
-            flux_runtime::OperationPlacement::NativeSystemOnly,
-        )?;
+    for (source, tool, placement) in extra_tools {
+        integration_registry.try_register_from_with_placement(source, tool, placement)?;
     }
     // The declared work boards (A-113's port). `try_register_work_board` *derives* the generated op
     // set from the port itself, so an operation added to `WorkBoard` reaches a Program through this
@@ -966,15 +1021,44 @@ impl flux_tui::ModelResolver for CliTuiModelResolver {
 /// Built-in TUI slash commands (D-186): a file command sharing one of these names is dropped at
 /// load (with a warning) rather than shadowing it — mirrors `flux-tui`'s `BUILTIN_COMMANDS` names.
 const TUI_BUILTIN_COMMANDS: &[&str] = &[
-    "help", "usage", "clear", "new", "model", "effort", "quit", "exit", "compact", "shell",
-    "tools", "evidence", "session", "sessions", "resume", "queue", "insights", "fleet", "board",
+    "help",
+    "usage",
+    "clear",
+    "new",
+    "model",
+    "effort",
+    "quit",
+    "restart",
+    "fleet:restart",
+    "fleet:refresh",
+    "exit",
+    "compact",
+    "shell",
+    "tools",
+    "evidence",
+    "session",
+    "sessions",
+    "resume",
+    "queue",
+    "insights",
+    "fleet",
+    "board",
 ];
 
 pub(super) async fn run_tui(
-    flags: AgentFlags,
+    mut flags: AgentFlags,
     fleet_root: Option<std::path::PathBuf>,
+    attach: Option<AttachSelection>,
 ) -> Result<()> {
     let auto_approve = flags.yes;
+    // C-686: connect before assembling anything. An attachment that cannot be reached is a startup
+    // error the operator reads in their shell, not a blank pane inside a terminal takeover — and
+    // the local engine below is only the surface's shell, so building it first would be work done
+    // for an agent that is never going to run a turn.
+    let attached = match attach.as_ref() {
+        Some(selection) => Some(connect_attachment(selection).await?),
+        None => None,
+    };
     // C-305: the pane channel is minted HERE, before the agent exists, and that ordering is the
     // whole story. `flux_tui::run_with_options` does not create the surface until after the agent is
     // assembled, but whether the `pane.*` ops are in the catalog at all has to be decided while the
@@ -984,6 +1068,9 @@ pub(super) async fn run_tui(
     let panes = flux_tui::PaneQueue::new();
     let interactions = flux_tui::InteractionQueue::new();
     let fleet = fleet_root.as_deref().map(prepare_fleet_tui).transpose()?;
+    if let Some(fleet) = fleet.as_ref() {
+        flags.agent_loop = Some(fleet.agent_loop.clone());
+    }
     let (agent, session_id, model_spec, _spawner) = if let Some(fleet) = fleet.as_ref() {
         build_agent_with_surface_at(
             &flags,
@@ -993,6 +1080,7 @@ pub(super) async fn run_tui(
             AgentBuildLocation {
                 workspace_root: fleet.root.clone(),
                 store_dir: fleet.store.clone(),
+                fleet_main: true,
             },
         )
         .await?
@@ -1006,8 +1094,16 @@ pub(super) async fn run_tui(
         .map(|fleet| fleet.root.as_path())
         .unwrap_or(cwd.as_path());
     let mut options = tui_options(auto_approve, model_spec, surface_cwd, panes, interactions);
+    options.attached = attached;
     if let Some(fleet) = fleet.as_ref() {
         let attached = fleet.source.attach_session(&session_id)?;
+        let mut initial_snapshot = fleet.initial_snapshot.clone();
+        initial_snapshot.main_session = Some(session_id.clone());
+        if let Ok(revision) = attached.revision.parse() {
+            initial_snapshot.revision = revision;
+        }
+        options.operations_initial_snapshot = Some(initial_snapshot);
+        options.operations_refresh_token = Some(fleet.source.refresh_token()?);
         options.operations_source = Some(fleet.source.clone());
         options.workspace_root = Some(fleet.root.display().to_string());
         options.execution_target = Some(format!(

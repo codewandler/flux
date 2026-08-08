@@ -21,6 +21,7 @@ mod usage;
 mod a2a_cmd;
 mod app_cmd;
 mod args;
+mod attach_cmd;
 mod auth_cmd;
 mod dispatch;
 mod docs_cmd;
@@ -28,6 +29,7 @@ mod doctor;
 mod execution;
 mod export_cmd;
 mod flow_cmd;
+mod host_cmd;
 mod insights_cmd;
 mod integration_projection;
 mod lab_cmd;
@@ -38,6 +40,7 @@ mod review;
 mod review_progress;
 mod session;
 mod splash;
+mod ssh_host;
 mod stream_json;
 mod system_cmd;
 mod user_interaction;
@@ -46,6 +49,7 @@ mod wakeup_cmd;
 use a2a_cmd::*;
 use app_cmd::*;
 use args::*;
+use attach_cmd::*;
 use auth_cmd::*;
 use board_fleet_cmd::*;
 use catalog_cmd::*;
@@ -56,6 +60,7 @@ use doctor::*;
 use execution::*;
 use export_cmd::*;
 use flow_cmd::*;
+use host_cmd::*;
 use insights_cmd::*;
 use lab_cmd::*;
 use plugin_cmd::*;
@@ -116,15 +121,17 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_datasources, build_invoke_input, coerce_arg_value, cost_annotation,
-        credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts, fleet_status_line,
-        format_evidence, implicit_plugin_group, integration_plugin_caps, loop_machinery_label,
+        backend_under_floor, build_datasources, build_invoke_input, coerce_arg_value,
+        cost_annotation, credential_location, direct_flow_runtime_turn, endpoint_ref_from_parts,
+        exchange_binding_from_config, fleet_status_line, format_evidence, host_ref_from_parts,
+        implicit_plugin_group, integration_plugin_caps, loop_machinery_label, merge_config_hosts,
         merge_static_endpoints, new_render_suffix, parse_labels, plugin_binaries_in,
-        plugin_status_one, redact_plugin_echo, render_endpoint_row, render_review_markdown,
+        plugin_status_one, record_ephemeral_remote, redact_plugin_echo, render_endpoint_resolution,
+        render_endpoint_row, render_host_row, render_review_markdown, resolve_named_host,
         resolve_plugin_operation_name, run_endpoint_in, run_plugin_in, run_usage_with, should_fail,
-        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill,
-        EndpointAction, EventStore, EventStoreCrossPluginAudit, EventStoreEgressAudit, Liveness,
-        PluginAction, RedactorSecretSink, ReviewSeverity,
+        tool_preview, truncate, url_has_userinfo, usage_annotation, write_generated_skill, Cli,
+        CliHostProber, EndpointAction, EventStore, EventStoreCrossPluginAudit,
+        EventStoreEgressAudit, Liveness, PluginAction, RedactorSecretSink, ReviewSeverity,
     };
     use flux_flow::AgentSink;
     use flux_provider::{ChunkStream, Provider, Request};
@@ -476,12 +483,14 @@ mod tests {
             Some(Commands::Context {
                 action:
                     ContextAction::Show {
+                        layer,
                         profile,
                         tools,
                         body,
                         json,
                     },
             }) => {
+                assert_eq!(layer, None, "no positional layer was given");
                 assert_eq!(profile, ContextProfile::General);
                 assert_eq!(tools, ["read", "edit"]);
                 assert!(body);
@@ -1078,6 +1087,7 @@ mod tests {
                 protocol: Some("postgres".into()),
                 credential_ref: Some("env/PGPASSWORD".into()),
                 labels: vec!["region=eu".into()],
+                host: None,
             },
         )
         .unwrap();
@@ -1135,6 +1145,156 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// C-709: `flux endpoint add --host <binding>` records the `[[host]]` binding the endpoint is
+    /// reachable through, the store keeps it, and `list`/`resolve` render it. The `resolve`
+    /// diagnostic answers "from where" alongside the credential *location* it already answers
+    /// "as whom" with.
+    #[test]
+    fn endpoint_add_records_and_renders_the_host_it_is_reachable_through() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-host-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        run_endpoint_in(
+            &path,
+            EndpointAction::Add {
+                id: "pg-cluster".into(),
+                url: "postgres://db.default.svc.cluster.local:5432/app".into(),
+                product: Some("postgres".into()),
+                protocol: Some("postgres".into()),
+                credential_ref: Some("env/PGPASSWORD".into()),
+                labels: vec![],
+                host: Some("k8s-dev".into()),
+            },
+        )
+        .unwrap();
+
+        let reg = EndpointRegistry::with_path(path.clone());
+        reg.load().unwrap();
+        let rec = reg.resolve("pg-cluster").expect("added ref persisted");
+        assert_eq!(
+            rec.endpoint.host.as_deref(),
+            Some("k8s-dev"),
+            "the store keeps the binding the endpoint is reachable through"
+        );
+        assert!(
+            std::fs::read_to_string(&path).unwrap().contains("k8s-dev"),
+            "and it survives to disk"
+        );
+
+        // The list row says where it is reachable from, not just what it is.
+        let row = render_endpoint_row(&rec);
+        assert!(row.contains("host=k8s-dev"), "{row}");
+
+        // `resolve` answers "from where" and "as whom" in the same block.
+        let block = render_endpoint_resolution(&rec);
+        assert!(block.contains("k8s-dev"), "reports the host: {block}");
+        assert!(
+            block.contains("env/PGPASSWORD"),
+            "still reports the credential location: {block}"
+        );
+
+        // An endpoint with no binding renders as reachable from wherever the caller is, and never
+        // grows a bogus host column.
+        let unbound = flux_secret::endpoint::EndpointRecord::config(
+            flux_secret::endpoint::EndpointRef::named(
+                "pg-public",
+                "postgres://db.example.com:5432/app",
+            ),
+        );
+        assert!(!render_endpoint_row(&unbound).contains("host="));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-709: an `[[endpoint.static]]` naming a `[[host]]` binding that was never declared is a
+    /// **load-time** error naming both, not a dial-time surprise. A substrate reference that does
+    /// not resolve is the same class of problem as an unknown backend kind — the endpoint would
+    /// otherwise be silently dialled from wherever the caller happens to be.
+    #[test]
+    fn an_endpoint_naming_an_undeclared_host_binding_is_a_load_time_error() {
+        use flux_capabilities::{EndpointRegistry, HostRegistry};
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+
+        let hosts = HostRegistry::new();
+        hosts.put(HostRecord::config(HostRef::declared(
+            "k8s-dev",
+            HostBackend::Kubernetes,
+        )));
+
+        let cfg_with = |host: &str| flux_config::Config {
+            endpoint: flux_config::EndpointConfig {
+                static_endpoints: vec![flux_config::StaticEndpoint {
+                    id: "pg-cluster".into(),
+                    url: "postgres://db.default.svc.cluster.local:5432/app".into(),
+                    host: Some(host.into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = merge_static_endpoints(&EndpointRegistry::new(), &hosts, &cfg_with("k8s-prod"))
+            .expect_err("an undeclared binding must not load");
+        let err = err.to_string();
+        assert!(err.contains("pg-cluster"), "names the endpoint: {err}");
+        assert!(err.contains("k8s-prod"), "names the binding: {err}");
+        assert!(
+            err.contains("k8s-dev"),
+            "names the bindings that do exist: {err}"
+        );
+
+        // A declared binding loads, and the wired record carries it through to the resolver table.
+        let reg = EndpointRegistry::new();
+        merge_static_endpoints(&reg, &hosts, &cfg_with("k8s-dev")).expect("a declared binding");
+        assert_eq!(
+            reg.config_bindings()["pg-cluster"].host.as_deref(),
+            Some("k8s-dev")
+        );
+    }
+
+    /// C-709 acceptance 5: `import` preserves the host an endpoint was discovered through, so the
+    /// discover → import → use loop keeps the fact rather than dropping it. (Stamping it at
+    /// discovery is C-715's half; this pins that the import path does not erase it.)
+    #[test]
+    fn endpoint_import_preserves_the_host_binding() {
+        use flux_capabilities::EndpointRegistry;
+        let dir = std::env::temp_dir().join(format!("flux-ep-import-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("endpoints.toml");
+
+        let discovered = flux_secret::endpoint::EndpointRef {
+            host: Some("k8s-dev".into()),
+            ..flux_secret::endpoint::EndpointRef::discovered(
+                "pg-1",
+                "postgres://db.default.svc.cluster.local:5432/app",
+                "postgres",
+            )
+        };
+        run_endpoint_in(
+            &path,
+            EndpointAction::Import {
+                id: discovered.id.clone(),
+                from_json: Some(serde_json::to_string(&discovered).unwrap()),
+            },
+        )
+        .unwrap();
+
+        let reg = EndpointRegistry::with_path(path.clone());
+        reg.load().unwrap();
+        assert_eq!(
+            reg.resolve(&discovered.id)
+                .expect("imported")
+                .endpoint
+                .host
+                .as_deref(),
+            Some("k8s-dev"),
+            "import kept the host it was discovered through"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// D-116: `flux endpoint add` rejects a credential-bearing URL, an `@endpoint/` id, and an
     /// unparseable credential ref — and leaves the store untouched on rejection.
     #[test]
@@ -1154,6 +1314,7 @@ mod tests {
                 protocol: None,
                 credential_ref: None,
                 labels: vec![],
+                host: None,
             },
         )
         .unwrap_err();
@@ -1173,6 +1334,7 @@ mod tests {
                 protocol: None,
                 credential_ref: None,
                 labels: vec![],
+                host: None,
             },
         )
         .is_err());
@@ -1187,6 +1349,7 @@ mod tests {
                 protocol: None,
                 credential_ref: Some("not-a-ref".into()),
                 labels: vec![],
+                host: None,
             },
         )
         .is_err());
@@ -1208,12 +1371,29 @@ mod tests {
             None,
             None,
             None,
+            None,
             parse_labels(&[]).unwrap(),
         )
         .unwrap();
         assert_eq!(r.id, "m");
         assert_eq!(r.source, flux_secret::endpoint::SourceKind::Config);
         assert!(r.credential_ref.is_none());
+        assert!(
+            r.host.is_none(),
+            "no host declared means reachable anywhere"
+        );
+
+        // C-709: a blank host binding is a mistake, not a way to spell "anywhere" — omit the key.
+        assert!(endpoint_ref_from_parts(
+            "m",
+            "http://prom:9090",
+            None,
+            None,
+            None,
+            Some("  "),
+            Default::default()
+        )
+        .is_err());
 
         // Userinfo detection: authority `@` is a credential, a path `@` is not.
         assert!(url_has_userinfo("postgres://u:p@host:5432/db"));
@@ -1221,10 +1401,19 @@ mod tests {
         assert!(!url_has_userinfo("https://host/path@thing"));
 
         // Empty id / empty url are rejected.
+        assert!(endpoint_ref_from_parts(
+            "",
+            "http://x",
+            None,
+            None,
+            None,
+            None,
+            Default::default()
+        )
+        .is_err());
         assert!(
-            endpoint_ref_from_parts("", "http://x", None, None, None, Default::default()).is_err()
+            endpoint_ref_from_parts("m", "  ", None, None, None, None, Default::default()).is_err()
         );
-        assert!(endpoint_ref_from_parts("m", "  ", None, None, None, Default::default()).is_err());
         // A malformed label is rejected at parse time.
         assert!(parse_labels(&["novalue".to_string()]).is_err());
     }
@@ -1257,7 +1446,7 @@ mod tests {
             ..Default::default()
         };
         let reg = EndpointRegistry::new();
-        merge_static_endpoints(&reg, &cfg);
+        merge_static_endpoints(&reg, &flux_capabilities::HostRegistry::new(), &cfg).unwrap();
         let bindings = reg.config_bindings();
         assert!(
             bindings.contains_key("pg-prod"),
@@ -1265,6 +1454,1162 @@ mod tests {
         );
         assert!(!bindings.contains_key("bad"), "invalid entry skipped");
         assert_eq!(bindings["pg-prod"].url, "postgres://db.example:5432/app");
+    }
+
+    /// C-648: no configuration path accepts an inline secret value — a credential-bearing URL and
+    /// an unparseable credential ref are refused with a remediation pointer, and a backend/address
+    /// mismatch is named. A refused part never becomes a `HostRef`, so nothing can register it.
+    #[test]
+    fn host_parts_reject_inline_secrets_and_misplaced_addresses() {
+        use flux_secret::host::HostBackend;
+        let labels = std::collections::BTreeMap::new;
+
+        let err = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://user:secret@farm.example:8443"),
+            None,
+            None,
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("must not embed credentials"), "got: {msg}");
+        assert!(msg.contains("credential_ref"), "points at the fix: {msg}");
+
+        // The credential field takes a *location* in the existing reference vocabulary — a raw
+        // value does not parse as one.
+        let err = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://farm.example:8443"),
+            Some("hunter2-not-a-ref"),
+            None,
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid credential ref"), "{err}");
+
+        // A remote binding without an address is unusable; a local one with an address is a lie.
+        let err = host_ref_from_parts("farm", HostBackend::Remote, None, None, None, &[], labels())
+            .unwrap_err();
+        assert!(err.to_string().contains("needs a `url`"), "{err}");
+        let err = host_ref_from_parts(
+            "here",
+            HostBackend::Local,
+            Some("https://somewhere.example"),
+            None,
+            None,
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no address"), "{err}");
+
+        // All three reference schemes are accepted — the existing vocabulary, nothing new.
+        for scheme in [
+            "env/FARM_TOKEN",
+            "plugin/k8s/main/token",
+            "kubernetes/ns/name/key",
+        ] {
+            host_ref_from_parts(
+                "farm",
+                HostBackend::Remote,
+                Some("https://farm.example:8443"),
+                Some(scheme),
+                None,
+                &[],
+                labels(),
+            )
+            .unwrap_or_else(|e| panic!("`{scheme}` is a valid location: {e}"));
+        }
+
+        // C-684: a declared CA is a *location*, so only its shape is judged here — whether the
+        // file is readable and holds a usable anchor is a resolution-time question. An empty
+        // declaration is a mistake, and one on a substrate that terminates no TLS is dead config,
+        // refused for the same reason a `url` on one is.
+        let err = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://farm.example:8443"),
+            Some("env/FARM_TOKEN"),
+            Some("   "),
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("`ca_cert` must not be empty"),
+            "{err}"
+        );
+
+        let err = host_ref_from_parts(
+            "here",
+            HostBackend::Local,
+            None,
+            None,
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("terminates no TLS"), "{err}");
+
+        // C-683 landed an ssh-local anchor at `[host.ssh] ca`. `ca_cert` means the same thing on
+        // every kind that dials TLS, so an ssh binding accepts it here rather than refusing the
+        // word; which anchor an ssh bootstrap uses is settled at resolution, where both are
+        // visible.
+        let reference = host_ref_from_parts(
+            "builder",
+            HostBackend::Ssh,
+            Some("ssh://build@builder.example"),
+            Some("env/FARM_TOKEN"),
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .expect("`ca_cert` is the binding-level anchor on every TLS-dialling kind");
+        assert_eq!(reference.ca_cert.as_deref(), Some("/etc/flux/ca.pem"));
+
+        // A path is accepted as-is: it is not parsed as a secret ref, and it is not read here.
+        let reference = host_ref_from_parts(
+            "farm",
+            HostBackend::Remote,
+            Some("https://farm.example:8443"),
+            Some("env/FARM_TOKEN"),
+            Some("/etc/flux/ca.pem"),
+            &[],
+            labels(),
+        )
+        .expect("a CA location is a plain path, not a secret reference");
+        assert_eq!(reference.ca_cert.as_deref(), Some("/etc/flux/ca.pem"));
+    }
+
+    /// C-648: `[[host]]` declarations register in the session `HostRegistry` at startup — list/get
+    /// answer by binding name, entries expose backend kind and address for display, and an invalid
+    /// entry is skipped without sinking the rest.
+    #[test]
+    fn host_config_merges_into_the_session_registry() {
+        use flux_secret::host::HostBackend;
+        let cfg = flux_config::Config {
+            hosts: vec![
+                flux_config::HostEntry {
+                    id: "build-farm".into(),
+                    backend: flux_config::HostBackendKind::Remote,
+                    url: Some("https://farm.example:8443".into()),
+                    credential_ref: Some("env/FARM_TOKEN".into()),
+                    ca_cert: None,
+                    grant: vec!["operator".into()],
+                    labels: Default::default(),
+                    ssh: None,
+                },
+                flux_config::HostEntry {
+                    id: "here".into(),
+                    backend: flux_config::HostBackendKind::Local,
+                    url: None,
+                    credential_ref: None,
+                    ca_cert: None,
+                    grant: Vec::new(),
+                    labels: Default::default(),
+                    ssh: None,
+                },
+                // Invalid (credential-bearing URL) — must be skipped, not abort the merge.
+                flux_config::HostEntry {
+                    id: "bad".into(),
+                    backend: flux_config::HostBackendKind::Remote,
+                    url: Some("https://u:p@farm.example".into()),
+                    credential_ref: None,
+                    ca_cert: None,
+                    grant: Vec::new(),
+                    labels: Default::default(),
+                    ssh: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let reg = flux_capabilities::HostRegistry::new();
+        merge_config_hosts(&reg, &cfg);
+        let farm = reg.get("build-farm").expect("valid binding registered");
+        assert_eq!(farm.host.backend, HostBackend::Remote);
+        assert_eq!(farm.host.display_address(), "https://farm.example:8443");
+        assert_eq!(
+            farm.host.credential_ref.as_ref().map(ToString::to_string),
+            Some("env/FARM_TOKEN".into())
+        );
+        assert!(reg.get("bad").is_none(), "invalid entry skipped");
+        assert_eq!(reg.known_names(), ["build-farm", "here"]);
+    }
+
+    /// C-654, acceptance 2: `flux host metrics <name>` is a real command, and JSON is its
+    /// automation API rather than a scrape of the human rendering.
+    #[test]
+    fn host_metrics_is_a_command_whose_json_output_is_the_automation_api() {
+        use super::{AgentOutput, Cli, Commands, HostAction};
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["flux", "host", "metrics", "build-farm"])
+            .expect("`flux host metrics <name>` parses");
+        match cli.command {
+            Some(Commands::Host {
+                action: HostAction::Metrics { id, output },
+            }) => {
+                assert_eq!(id, "build-farm");
+                assert!(matches!(output, AgentOutput::Human));
+            }
+            other => panic!("expected the host metrics action, got {other:?}"),
+        }
+        Cli::try_parse_from(["flux", "host", "metrics", "build-farm", "--output", "json"])
+            .expect("`--output json` is the automation API");
+    }
+
+    /// C-654, acceptance 2 and 4: the command renders what the substrate measured, keeps an
+    /// instrument this machine lacks explicitly unavailable rather than zero, and marks a remote
+    /// binding's readings as remotely reported. The JSON face is checked as *data* — raw numbers in
+    /// their declared units — because that is what an automation consumer parses.
+    #[test]
+    fn host_metrics_render_typed_readings_and_never_a_fabricated_zero() {
+        use flux_capabilities::{metric_answer_json, render_metric_answer};
+        use flux_system::metrics::{
+            FanSensor, MetricAnswer, MetricKind, MetricReading, MetricSnapshot, MetricUnavailable,
+        };
+
+        let served = MetricAnswer::Served(MetricSnapshot {
+            sampled_at: std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_000),
+            reading: MetricReading::FanSpeed(vec![FanSensor {
+                label: "coretemp/fan1".into(),
+                rpm: 1200,
+            }]),
+            remotely_reported: true,
+        });
+        assert_eq!(
+            render_metric_answer(&served),
+            "fan: coretemp/fan1 1200 rpm",
+            "a served reading renders its unit-bearing value"
+        );
+        let document = metric_answer_json(&served);
+        assert_eq!(document["status"], "served");
+        assert_eq!(document["remotely_reported"], true);
+        assert_eq!(document["sampled_at_ms"], 1_700_000_000_000u64);
+        assert_eq!(
+            document["reading"][0]["rpm"], 1200,
+            "automation reads the number, not the rendered line: {document}"
+        );
+
+        let absent =
+            MetricAnswer::unavailable_for(MetricKind::Swap, MetricUnavailable::NoInstrument);
+        let line = render_metric_answer(&absent);
+        assert!(line.contains("swap: unavailable"), "{line}");
+        assert!(
+            !line.contains('0'),
+            "an absent instrument must not render any number at all: {line}"
+        );
+        let document = metric_answer_json(&absent);
+        assert_eq!(document["status"], "unavailable");
+        assert_eq!(document["reason"], "no_instrument");
+        assert!(
+            document.get("reading").is_none(),
+            "there is no reading to report: {document}"
+        );
+    }
+
+    /// C-654: the running local substrate answers `flux host metrics` about itself, and says so —
+    /// nothing it measured on this machine may claim remote provenance.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn host_metrics_measure_a_local_binding_and_mark_it_locally_observed() {
+        use flux_capabilities::{HostMetrics, HostProber};
+        use flux_secret::host::{HostBackend, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-metrics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+
+        match prober
+            .read_metrics(&HostRef::declared("here", HostBackend::Local))
+            .await
+            .expect("the local substrate measures itself")
+        {
+            HostMetrics::Served {
+                remotely_reported,
+                answers,
+            } => {
+                assert!(!remotely_reported, "this machine read itself");
+                assert!(!answers.is_empty());
+                for answer in &answers {
+                    if let Some(snapshot) = answer.served() {
+                        assert!(!snapshot.remotely_reported, "{:?}", snapshot.kind());
+                    }
+                }
+            }
+            other => panic!("a native Linux host serves metrics, got {other:?}"),
+        }
+
+        // An unwired backend is typed, exactly as it is for `probe`.
+        match prober
+            .read_metrics(&HostRef::declared("box", HostBackend::Container))
+            .await
+        {
+            Err(flux_capabilities::HostProbeFailure::BackendUnwired { backend }) => {
+                assert_eq!(backend, "container")
+            }
+            other => panic!("expected BackendUnwired, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-649: the host group manifest gates every registered host op — the manifest is what
+    /// config-based reassignment edits, so the explicit list must stay complete — and each op
+    /// self-declares the group.
+    #[test]
+    fn host_group_manifest_matches_host_tools() {
+        use std::sync::Arc;
+        struct NoProbe;
+        #[async_trait::async_trait]
+        impl flux_capabilities::HostProber for NoProbe {
+            async fn probe(
+                &self,
+                _host: &flux_secret::host::HostRef,
+            ) -> std::result::Result<
+                flux_capabilities::HostProbeReport,
+                flux_capabilities::HostProbeFailure,
+            > {
+                Err(flux_capabilities::HostProbeFailure::BackendUnwired {
+                    backend: "test".to_string(),
+                })
+            }
+        }
+        let tools = flux_capabilities::host_tools(
+            Arc::new(flux_capabilities::HostRegistry::new()),
+            Arc::new(NoProbe),
+        );
+        let mut op_names: Vec<String> = tools.iter().map(|t| t.spec().name).collect();
+        op_names.sort();
+        let group = flux_tools::groups::builtin_groups()
+            .into_iter()
+            .find(|g| g.name == "host")
+            .expect("host group exists");
+        let mut listed = group.tools.clone();
+        listed.sort();
+        assert_eq!(
+            listed, op_names,
+            "the host group manifest must gate every registered host op"
+        );
+        for t in &tools {
+            assert_eq!(t.spec().group.as_deref(), Some("host"), "{}", t.spec().name);
+        }
+    }
+
+    /// C-649: `flux host add` upserts a validated `[[host]]` entry in the user config, `rm`
+    /// removes it, and a second add with the same id retargets in place — all round-tripping
+    /// every other setting.
+    #[test]
+    fn host_add_and_rm_edit_the_user_host_table() {
+        let home = std::env::temp_dir().join(format!("flux-host-user-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let env = flux_runtime::metadata::DiscoveryEnv::empty().with_home(&home);
+
+        let entry = |url: &str| flux_config::HostEntry {
+            id: "build-farm".into(),
+            backend: flux_config::HostBackendKind::Remote,
+            url: Some(url.into()),
+            credential_ref: Some("env/FARM_TOKEN".into()),
+            ca_cert: None,
+            grant: vec!["operator".into()],
+            labels: Default::default(),
+            ssh: None,
+        };
+        flux_runtime::metadata::persist_user_host_in(entry("https://one.example:8443"), &env)
+            .unwrap();
+        flux_runtime::metadata::persist_user_host_in(entry("https://two.example:8443"), &env)
+            .unwrap();
+        let config_path = home.join(".flux").join("config.toml");
+        let body = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(
+            body.matches("build-farm").count(),
+            1,
+            "upsert, not append: {body}"
+        );
+        assert!(body.contains("https://two.example:8443"), "{body}");
+        assert!(
+            body.contains("env/FARM_TOKEN"),
+            "location, never a value: {body}"
+        );
+
+        assert!(
+            flux_runtime::metadata::remove_user_host_in("build-farm", &env).unwrap(),
+            "declared binding removes"
+        );
+        assert!(
+            !flux_runtime::metadata::remove_user_host_in("build-farm", &env).unwrap(),
+            "an absent binding reports false rather than erroring"
+        );
+        let body = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!body.contains("build-farm"), "{body}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// C-649: rows render id, backend kind, address, availability and the credential *location* —
+    /// never a value, even when the referenced environment variable is set.
+    #[test]
+    fn host_rows_render_reference_only() {
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+        std::env::set_var("ROW_TOKEN", "sk-row-secret");
+        let record = HostRecord::config(HostRef {
+            url: Some("https://farm.example:8443".into()),
+            credential_ref: Some(flux_secret::Ref::env("ROW_TOKEN")),
+            ..HostRef::declared("build-farm", HostBackend::Remote)
+        });
+        let row = render_host_row(&record);
+        assert!(row.contains("build-farm"), "{row}");
+        assert!(row.contains("[remote]"), "{row}");
+        assert!(row.contains("https://farm.example:8443"), "{row}");
+        assert!(row.contains("declared"), "availability rendered: {row}");
+        assert!(row.contains("env/ROW_TOKEN"), "the location column: {row}");
+        assert!(!row.contains("sk-row-secret"), "never a value: {row}");
+        std::env::remove_var("ROW_TOKEN");
+    }
+
+    /// C-649: probing a `local` binding reports the running substrate's identity (native,
+    /// locally observed, no protocol version) without executing anything on it, and remote-probe
+    /// failures are typed — a missing credential and an unreachable endpoint each carry their
+    /// class, not a stringly panic.
+    #[tokio::test]
+    async fn host_probe_reports_identity_and_types_failures() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+
+        let report = prober
+            .probe(&HostRef::declared("here", HostBackend::Local))
+            .await
+            .expect("the local substrate always has an identity");
+        assert_eq!(report.kind, "native");
+        assert!(!report.remotely_reported);
+        assert!(report.protocol_version.is_none());
+
+        let no_credential = HostRef {
+            url: Some("https://farm.example:8443".into()),
+            ..HostRef::declared("farm", HostBackend::Remote)
+        };
+        match prober.probe(&no_credential).await.unwrap_err() {
+            HostProbeFailure::CredentialUnavailable { .. } => {}
+            other => panic!("expected CredentialUnavailable, got {other:?}"),
+        }
+
+        let unwired = HostRef::declared("box", HostBackend::Container);
+        match prober.probe(&unwired).await.unwrap_err() {
+            HostProbeFailure::BackendUnwired { backend } => assert_eq!(backend, "container"),
+            other => panic!("expected BackendUnwired, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-650: `--host <name>` resolution is deny-by-default and typed at startup — an unknown
+    /// name lists the known bindings, an ungranted binding refuses, an `operator` grant does not
+    /// cover an unattended surface (no silent widening), a granted `local` binding selects with
+    /// its name and no system override, and an unwired backend fails closed.
+    #[tokio::test]
+    async fn named_host_selection_enforces_grants_and_fails_closed() {
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-sel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        // The supervised floor imposes no confinement of its own, so every backend below resolves
+        // exactly as its binding declares it (C-651's raising is pinned separately).
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("here", HostBackend::Local)
+        }));
+        reg.put(HostRecord::config(HostRef::declared(
+            "ungranted",
+            HostBackend::Local,
+        )));
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("boxed", HostBackend::Container)
+        }));
+
+        let err = resolve_named_host("nope", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("known bindings"), "{err}");
+        assert!(err.to_string().contains("here"), "names them: {err}");
+
+        let err = resolve_named_host("ungranted", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not granted"), "{err}");
+        assert!(
+            err.to_string().contains("deny"),
+            "states the posture: {err}"
+        );
+
+        // An unattended surface never inherits the operator grant — no silent widening.
+        let err = resolve_named_host("here", &reg, HostGrant::Unattended, &local, floor)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not granted"), "{err}");
+        assert!(err.to_string().contains("unattended"), "{err}");
+
+        let selected = resolve_named_host("here", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .expect("a granted local binding selects");
+        assert_eq!(selected.binding, "here");
+        assert!(
+            selected.system.is_none(),
+            "a local binding keeps the native workspace-following path"
+        );
+
+        let err = resolve_named_host("boxed", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("fails closed"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-651 (acceptance 3, second half): a posture's `SandboxFloor` may force selection of the
+    /// sandboxed backend. `raise_mode` already made a floor able to tighten the spawn-time
+    /// *modifier*; this is the same tightest-wins rule applied to the *backend*, so a posture that
+    /// will not run unconfined does not quietly select a bare native substrate when a binding is
+    /// named. It raises `local` only, never lowers anything, and never redirects a backend whose
+    /// boundary lives somewhere else.
+    #[test]
+    fn a_require_posture_floor_raises_a_local_binding_to_the_confinement_peer() {
+        use flux_runtime::AutonomyPosture;
+        use flux_secret::host::HostBackend;
+
+        for posture in [
+            AutonomyPosture::BoundedAutonomy,
+            AutonomyPosture::Exploratory,
+        ] {
+            let floor = posture.sandbox_floor();
+            assert_eq!(
+                backend_under_floor(HostBackend::Local, floor),
+                HostBackend::Sandboxed,
+                "`{posture}` will not run unconfined, so it must select the confinement peer"
+            );
+            // A floor tightens; it never re-points a binding whose boundary is elsewhere.
+            for elsewhere in [
+                HostBackend::Remote,
+                HostBackend::Container,
+                HostBackend::Kubernetes,
+                HostBackend::Microvm,
+            ] {
+                assert_eq!(backend_under_floor(elsewhere, floor), elsewhere);
+            }
+            assert_eq!(
+                backend_under_floor(HostBackend::Sandboxed, floor),
+                HostBackend::Sandboxed
+            );
+        }
+
+        for posture in [AutonomyPosture::Supervised, AutonomyPosture::Refusing] {
+            let floor = posture.sandbox_floor();
+            assert_eq!(
+                backend_under_floor(HostBackend::Local, floor),
+                HostBackend::Local,
+                "`{posture}` imposes no confinement floor, so it selects nothing"
+            );
+            assert_eq!(
+                backend_under_floor(HostBackend::Sandboxed, floor),
+                HostBackend::Sandboxed,
+                "and it may never lower an explicitly declared backend"
+            );
+        }
+    }
+
+    /// C-651: a `sandboxed` binding is a **wired** backend — selecting it either installs the
+    /// confinement peer (which reports its own kind) or refuses because this platform has no usable
+    /// confinement backend. Both outcomes are asserted because which one a machine takes is a
+    /// property of the machine; what must never happen again is the third one, "the backend has no
+    /// selectable implementation", which is what this asserted at the merge base.
+    ///
+    /// The deterministic halves of this behaviour — the refusal face and the truthful confinement
+    /// report — are pinned in `flux-system`'s own `sandboxed` tests, where the resolved `Sandbox`
+    /// can be supplied rather than discovered.
+    #[tokio::test]
+    async fn a_sandboxed_binding_selects_the_confinement_peer_or_fails_closed() {
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let dir = std::env::temp_dir().join(format!("flux-host-boxed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("boxed", HostBackend::Sandboxed)
+        }));
+
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        match resolve_named_host("boxed", &reg, HostGrant::Operator, &local, floor).await {
+            Ok(selected) => {
+                assert_eq!(selected.binding, "boxed");
+                let system = selected
+                    .system
+                    .expect("the confinement peer is a system override, not the native path");
+                let identity =
+                    flux_system::port::ExecutionIdentity::substrate_identity(system.as_ref());
+                assert_eq!(identity.kind, "sandboxed");
+                assert!(
+                    !identity.remotely_reported,
+                    "the peer observes locally: {identity:?}"
+                );
+                assert!(
+                    !identity.confinement.contains("off")
+                        && !identity.confinement.contains("unavailable"),
+                    "a selected peer must never report an unconfined posture: {identity:?}"
+                );
+            }
+            Err(error) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("fails closed"),
+                    "an unusable confinement backend must refuse, in those words: {text}"
+                );
+                assert!(
+                    !text.contains("no selectable implementation"),
+                    "the `sandboxed` backend is wired now — this is the merge-base refusal: {text}"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `microvm` binding with no served endpoint yet (C-677, acceptance 1).
+    ///
+    /// This is the honest half of the story's boundary: flux never provisions a VM, so a microvm
+    /// binding declared before C-480's guest profile has served one names a *gap*, not a substrate.
+    /// It must list as unwired and refuse selection saying why — the same honesty the `container`
+    /// and `kubernetes` arms already keep — rather than resolving to this machine or to nothing.
+    #[tokio::test]
+    async fn a_microvm_binding_without_an_endpoint_lists_unwired_and_fails_closed() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let backend: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+
+        let dir = std::env::temp_dir().join(format!("flux-host-microvm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("vm-planned", backend)
+        });
+
+        // `ls`/`show` render it, and the availability column says unwired rather than implying a
+        // probe would settle it.
+        let row = render_host_row(&record);
+        assert!(row.contains("[microvm]"), "the kind renders: {row}");
+        assert!(
+            row.contains("unwired"),
+            "with no endpoint the static answer is unwired: {row}"
+        );
+
+        // Selection fails closed, and the refusal names the gap — an operator must learn that the
+        // endpoint is theirs to bring into existence, not flux's to create.
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(record);
+        let err = resolve_named_host("vm-planned", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("endpoint") && text.contains("microvm"),
+            "the refusal must name the missing endpoint: {text}"
+        );
+
+        // The probe distinguishes "this binding has no endpoint" from "flux cannot do microvm at
+        // all": the backend *is* wired, so it is not `BackendUnwired`.
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+        match prober
+            .probe(&HostRef::declared("vm-planned", backend))
+            .await
+            .unwrap_err()
+        {
+            HostProbeFailure::BackendUnavailable { backend, detail } => {
+                assert_eq!(backend, "microvm");
+                assert!(detail.contains("endpoint"), "{detail}");
+            }
+            other => panic!("expected BackendUnavailable naming the endpoint gap, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `microvm` binding *with* an endpoint is the delivered remote protocol (C-677,
+    /// acceptance 2).
+    ///
+    /// Decision 0018 rule 3 composes rather than invents, so this asserts sameness rather than
+    /// new behaviour: for identical inputs a microvm binding and a remote one must produce the
+    /// identical typed outcome, because they are one code path. The failure classes are the
+    /// observable proof that admission runs the protocol handshake with the declared credential
+    /// *reference* — a missing credential never reaches the wire, and a present one gets no
+    /// further than the transport when no guest is listening.
+    #[tokio::test]
+    async fn a_microvm_binding_with_an_endpoint_admits_through_the_remote_protocol() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+        let microvm: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+
+        let dir = std::env::temp_dir().join(format!("flux-host-microvm-up-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+        // A loopback address the private-network guard refuses by default: the handshake is
+        // attempted and cannot complete, with no egress off this machine.
+        let endpoint = "https://127.0.0.1:1";
+        let served = |backend, credential| HostRef {
+            url: Some(endpoint.into()),
+            credential_ref: credential,
+            ..HostRef::declared("vm-guest", backend)
+        };
+
+        // The credential is a *reference*; a binding that names none is refused before the wire,
+        // exactly as the remote backend is.
+        for backend in [microvm, HostBackend::Remote] {
+            match prober.probe(&served(backend, None)).await.unwrap_err() {
+                HostProbeFailure::CredentialUnavailable { .. } => {}
+                other => panic!("{backend}: expected CredentialUnavailable, got {other:?}"),
+            }
+        }
+
+        // With a credential, admission gets as far as the protocol handshake and no further —
+        // the identity check is what admits, so an unreachable guest is a `Connect` class and
+        // never a report.
+        std::env::set_var("C677_GUEST_TOKEN", "guest-token");
+        let credential = Some(flux_secret::Ref::env("C677_GUEST_TOKEN"));
+        for backend in [microvm, HostBackend::Remote] {
+            match prober
+                .probe(&served(backend, credential.clone()))
+                .await
+                .unwrap_err()
+            {
+                HostProbeFailure::Connect { .. } => {}
+                other => panic!("{backend}: expected Connect, got {other:?}"),
+            }
+        }
+
+        // And selection composes the same client: the refusal is a connection failure, never
+        // "this backend has no selectable implementation".
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            grant: vec![HostGrant::Operator],
+            ..served(microvm, credential)
+        }));
+        let text = resolve_named_host("vm-guest", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("connect host `vm-guest`"),
+            "an endpoint-bearing microvm binding resolves through the remote client: {text}"
+        );
+        assert!(
+            !text.contains("no selectable implementation"),
+            "the merge-base refusal must be gone: {text}"
+        );
+        std::env::remove_var("C677_GUEST_TOKEN");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A throwaway self-signed CA, committed as a *test anchor* only. A CA certificate is public
+    /// material — it is the location that is declared and the parse that is validated, not a value
+    /// to redact — so pinning one here leaks nothing. No private key exists for it in this
+    /// repository, and nothing outside these tests trusts it.
+    #[cfg(test)]
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----
+MIIDHzCCAgegAwIBAgIUfYtFEfUAVt6NnkLSm1Ioz3xxNmMwDQYJKoZIhvcNAQEL
+BQAwHzEdMBsGA1UEAwwUZmx1eCB0ZXN0IHByaXZhdGUgQ0EwHhcNMjYwODA3MTIw
+NzQwWhcNNDYwODAyMTIwNzQwWjAfMR0wGwYDVQQDDBRmbHV4IHRlc3QgcHJpdmF0
+ZSBDQTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAKHpnT77d63x2Df/
+Jn2jzTU95yXyJJmPObF2AjhqxrSfzGtyFTwBjCIxJRWDA25Twsu4D1aaF5WNGQO/
+qCYWtAdULeHQVLnT1ECKeaScqGkseQNohyEopOSdJUHDuAr22e+fVM9iG+SCMWl6
+hNw8wsFzPju5tevX3SRS1adJAtcMvZePV3tAxo+ZbOhaHsv5lqYQkkIRb+3Tkitg
+cykCvjW8oUM+oKW+VmzgxKTEZ5TOAE5Goam0YzG6M7sKrlcXlupaat8AJIXN6dO7
+sdvn+Yf3swh0IPLo6/+AoTyDaOHwbX0jL1f8eWyYDBz/7ynKw4/gdC9GCnE+x7Lm
+Mn8/d6cCAwEAAaNTMFEwHQYDVR0OBBYEFFtOcxU1PRyyIsy7ZLWxJKUdl6w0MB8G
+A1UdIwQYMBaAFFtOcxU1PRyyIsy7ZLWxJKUdl6w0MA8GA1UdEwEB/wQFMAMBAf8w
+DQYJKoZIhvcNAQELBQADggEBAF+3Wnzqc8k6Ucbe2wnPqT4rOkhOWaQ/J+1J+2uM
+LODUI/PWtQRsIownYAyvZc++t2/zpvzwi5WLGNZzq2h0L44x8hmkLwKmh9oukiQi
+dUtUAuxYzeBtWaapzJEFWvncGfshPtPExc2VbQlmnha8RP4/KC7f1QhT7sKqjwsX
+fDc9wdteGTrGPotkSLOu2Ea37k4qrvhnWBYCaOAYAMeXHDwBPFaXiQrofUBS9Lp4
+pfYXTVi7LeICBLa622RTzN6DNbH0ypmbEQlrTXIQ5bAU8ycJqFGLinEnNxsG41Nw
+sqR3JAysdJBljWp4mVhFw3iPuGfa6RI5keoUH/fk23Lbsgs=
+-----END CERTIFICATE-----
+";
+
+    /// C-684, acceptances 1 and 2: a named binding declares its own private CA, and **all three**
+    /// binding-resolution paths consult it — selection, probe and the metrics read.
+    ///
+    /// The proof is ordering, not plumbing. A declared CA is read and parsed *before* the client is
+    /// built, so a binding whose trust anchor is unusable never reaches the wire: an unreadable or
+    /// malformed `ca_cert` refuses with the binding and the file named, while the same binding with
+    /// no CA at all — or with a usable one — gets as far as the transport and fails there. Those
+    /// two outcomes are distinguishable exactly because the CA is not silently dropped in favour of
+    /// the default trust store, which is the failure mode this story exists to prevent.
+    #[tokio::test]
+    async fn a_binding_declaring_a_private_ca_fails_closed_on_every_resolution_path() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+
+        let dir = std::env::temp_dir().join(format!("flux-host-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The CA lives inside the workspace because it is read through the guarded `System`, the
+        // same jailed read `--remote-ca` has always used. Parity with the flag is the point.
+        let good_ca = dir.join("ca.pem");
+        std::fs::write(&good_ca, TEST_CA_PEM).unwrap();
+        let junk_ca = dir.join("junk.pem");
+        std::fs::write(&junk_ca, b"-----BEGIN CERTIFICATE-----\nnot base64\n").unwrap();
+        let absent_ca = dir.join("no-such-ca.pem");
+
+        std::env::set_var("C684_CA_TOKEN", "guest-token");
+        // A loopback address nothing listens on: admission gets to the transport and no further.
+        let binding = |ca: Option<&std::path::Path>| HostRef {
+            url: Some("https://127.0.0.1:1".into()),
+            credential_ref: Some(flux_secret::Ref::env("C684_CA_TOKEN")),
+            ca_cert: ca.map(|p| p.to_string_lossy().into_owned()),
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("private-ca-host", HostBackend::Remote)
+        };
+
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&dir).unwrap(),
+            )),
+        };
+        let local = flux_system::System::new(flux_system::Workspace::new(&dir).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let registry = |host: HostRef| {
+            let reg = flux_capabilities::HostRegistry::new();
+            reg.put(HostRecord::config(host));
+            reg
+        };
+
+        // Face one: an unusable CA refuses at resolution, naming the binding and the file — on the
+        // probe, on selection and on the metrics read alike.
+        for (ca, what) in [(&junk_ca, "malformed"), (&absent_ca, "unreadable")] {
+            let host = binding(Some(ca));
+            let file = ca.to_string_lossy().into_owned();
+
+            match prober.probe(&host).await.unwrap_err() {
+                HostProbeFailure::BackendUnavailable { detail, .. } => {
+                    assert!(
+                        detail.contains("private-ca-host") && detail.contains(&file),
+                        "{what} CA: the refusal must name the binding and the file: {detail}"
+                    );
+                }
+                other => panic!("{what} CA: expected a fail-closed CA refusal, got {other:?}"),
+            }
+
+            match prober.read_metrics(&host).await.unwrap_err() {
+                HostProbeFailure::BackendUnavailable { detail, .. } => {
+                    assert!(
+                        detail.contains("private-ca-host") && detail.contains(&file),
+                        "{what} CA: the metrics read must refuse the same way: {detail}"
+                    );
+                }
+                other => panic!("{what} CA: expected a fail-closed CA refusal, got {other:?}"),
+            }
+
+            let text = resolve_named_host(
+                "private-ca-host",
+                &registry(host),
+                HostGrant::Operator,
+                &local,
+                floor,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                text.contains("private-ca-host") && text.contains(&file),
+                "{what} CA: selection must refuse naming the binding and the file: {text}"
+            );
+        }
+
+        // Face two: the ordinary public-trust path is untouched when no CA is declared, and a
+        // *usable* declared CA is accepted and carried to the client rather than rejected here.
+        // Both reach the transport, which is the only thing left to fail.
+        for ca in [None, Some(good_ca.as_path())] {
+            let host = binding(ca);
+            match prober.probe(&host).await.unwrap_err() {
+                HostProbeFailure::Connect { .. } => {}
+                other => panic!("declared_ca={ca:?}: expected a transport failure, got {other:?}"),
+            }
+            let text = resolve_named_host(
+                "private-ca-host",
+                &registry(host),
+                HostGrant::Operator,
+                &local,
+                floor,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(
+                text.contains("connect host `private-ca-host`"),
+                "declared_ca={ca:?}: selection reached the client: {text}"
+            );
+        }
+
+        std::env::remove_var("C684_CA_TOKEN");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-684 review: one declared field, one reachability envelope.
+    ///
+    /// A CA certificate is public material that lives where the deployment put it — `/etc/flux`,
+    /// `~/.kube`, a path chosen by the cluster, never inside the project being worked on. Reading
+    /// it through the workspace jail would mean the documented `ca_cert = "/etc/flux/guest-ca.pem"`
+    /// refuses on a `microvm` binding while the identical declaration works on an `ssh` one, which
+    /// has always used the scoped host-file port. That split is the same class of defect this story
+    /// was filed to remove, so it is pinned here rather than left to the docs to apologise for.
+    ///
+    /// The grant stays exactly one file: the scope is the declared path itself, so this widens
+    /// *which* path an operator may name, never how many.
+    #[tokio::test]
+    async fn a_declared_ca_outside_the_workspace_is_readable_on_every_kind() {
+        use flux_capabilities::{HostProbeFailure, HostProber};
+        use flux_secret::host::{HostBackend, HostGrant, HostRecord, HostRef};
+
+        let base = std::env::temp_dir().join(format!("flux-host-ca-out-{}", std::process::id()));
+        let workspace = base.join("project");
+        let elsewhere = base.join("etc-flux");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // Deliberately a sibling of the workspace, never under it: this is the whole point.
+        let ca = elsewhere.join("guest-ca.pem");
+        std::fs::write(&ca, TEST_CA_PEM).unwrap();
+
+        std::env::set_var("C684_OUT_TOKEN", "guest-token");
+        let host = HostRef {
+            url: Some("https://127.0.0.1:1".into()),
+            credential_ref: Some(flux_secret::Ref::env("C684_OUT_TOKEN")),
+            ca_cert: Some(ca.to_string_lossy().into_owned()),
+            grant: vec![HostGrant::Operator],
+            ..HostRef::declared("vm-guest", HostBackend::Microvm)
+        };
+
+        let prober = CliHostProber {
+            system: std::sync::Arc::new(flux_system::System::new(
+                flux_system::Workspace::new(&workspace).unwrap(),
+            )),
+        };
+        // The anchor is accepted, so the only thing left to fail is the transport. A jailed read
+        // would refuse here with "cannot be read" and never reach the wire at all.
+        match prober.probe(&host).await.unwrap_err() {
+            HostProbeFailure::Connect { .. } => {}
+            other => panic!("a CA outside the workspace must still be readable, got {other:?}"),
+        }
+
+        let local = flux_system::System::new(flux_system::Workspace::new(&workspace).unwrap());
+        let floor = flux_runtime::AutonomyPosture::Supervised.sandbox_floor();
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(host));
+        let text = resolve_named_host("vm-guest", &reg, HostGrant::Operator, &local, floor)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            text.contains("connect host `vm-guest`"),
+            "selection reads the same anchor and reaches the client: {text}"
+        );
+        assert!(
+            !text.contains("cannot be read"),
+            "the workspace jail must not be what decides where a CA may live: {text}"
+        );
+
+        std::env::remove_var("C684_OUT_TOKEN");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// C-677, acceptance 4 — the pin C-651 made for the confinement peer, made here for the guest.
+    ///
+    /// C-652's `Executor::non_native_target` reads `kind != "native" || remotely_reported` as "a
+    /// substrate selection is in force" and hides `browser.*` / `web.crawl` on that basis. A
+    /// microvm binding passes the *guest's own* `SubstrateIdentity` through (acceptance 2 asks for
+    /// the guest's identity, not a stamped one), and a guest is an ordinary machine: it will
+    /// commonly report `kind = "native"`. So the guarantee cannot rest on the kind string — it
+    /// rests on provenance, and the client must assert that provenance itself rather than accept
+    /// the far side's word for it. A guest claiming to be this machine would otherwise silently
+    /// re-expose a local browser under a selection that asked for a VM.
+    #[test]
+    fn a_microvm_selection_can_never_report_a_native_target() {
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+        use flux_system::port::{ExecutionIdentity, SubstrateIdentity};
+        use flux_system::remote::RemoteSystem;
+        let microvm: HostBackend = "microvm"
+            .parse()
+            .expect("`microvm` is a declarable host backend kind");
+
+        // First, that a served microvm binding really is remote-shaped — if it were not, the
+        // client below would be the wrong thing to pin. Same id, same address, same everything
+        // but the word: the two must be indistinguishable to `ls`/`show`.
+        let served = |backend| {
+            HostRecord::config(HostRef {
+                url: Some("https://guest.internal:8443".into()),
+                ..HostRef::declared("g", backend)
+            })
+        };
+        assert_eq!(
+            render_host_row(&served(microvm)).replace("[microvm]", "[remote]"),
+            render_host_row(&served(HostBackend::Remote)),
+            "a microvm binding that names its guest endpoint is the remote protocol under a \
+             different word; anything else means a second implementation crept in"
+        );
+
+        let dir = std::env::temp_dir().join(format!("flux-host-microvm-id-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let inner = std::sync::Arc::new(flux_system::System::new(
+            flux_system::Workspace::new(&dir).unwrap(),
+        ));
+
+        for (label, system) in [
+            ("an honest guest", RemoteSystem::loopback(inner.clone())),
+            (
+                "a guest reporting the ordinary native kind of its own machine",
+                RemoteSystem::identified(
+                    RemoteSystem::loopback(inner.clone()).delegate().clone(),
+                    SubstrateIdentity {
+                        kind: "native".into(),
+                        workspace: "/srv/work".into(),
+                        confinement: "off".into(),
+                        remotely_reported: true,
+                    },
+                ),
+            ),
+            (
+                "a guest claiming this machine observed it",
+                RemoteSystem::identified(
+                    RemoteSystem::loopback(inner.clone()).delegate().clone(),
+                    SubstrateIdentity {
+                        kind: "native".into(),
+                        workspace: "/srv/work".into(),
+                        confinement: "off".into(),
+                        remotely_reported: false,
+                    },
+                ),
+            ),
+        ] {
+            let identity = system.substrate_identity();
+            assert!(
+                identity.kind != "native" || identity.remotely_reported,
+                "{label}: the executor would treat this as an unselected native target and \
+                 re-expose `browser.*` / `web.crawl`: {identity:?}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// C-650: the anonymous `--remote <url>` selection records as the session's ephemeral
+    /// `@session/remote` binding — listable, session-owned, carrying the token *reference* — and
+    /// the `@` prefix is reserved: no declared binding can claim it.
+    #[test]
+    fn ephemeral_remote_records_a_session_binding() {
+        use flux_secret::host::{HostBackend, HostSource};
+        let reg = flux_capabilities::HostRegistry::new();
+        record_ephemeral_remote(
+            &reg,
+            "https://farm.example:8443",
+            "FLUX_REMOTE_SYSTEM_TOKEN",
+            None,
+        );
+        let record = reg.get("@session/remote").expect("recorded");
+        assert_eq!(record.host.source, HostSource::Ephemeral);
+        assert_eq!(record.owner, "session");
+        assert_eq!(record.host.backend, HostBackend::Remote);
+        assert_eq!(
+            record.host.credential_ref.as_ref().map(ToString::to_string),
+            Some("env/FLUX_REMOTE_SYSTEM_TOKEN".into())
+        );
+
+        let err = host_ref_from_parts(
+            "@session/mine",
+            HostBackend::Local,
+            None,
+            None,
+            None,
+            &[],
+            Default::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    /// C-650: with the transitional environment pair absent, `[exchange] host = "<binding>"`
+    /// resolves the Exchange origin and token *reference* from the named binding; a missing or
+    /// misdeclared binding disables the catalogue rather than failing startup.
+    #[test]
+    fn exchange_binding_resolves_origin_and_token_reference() {
+        use flux_secret::host::{HostBackend, HostRecord, HostRef};
+        let reg = flux_capabilities::HostRegistry::new();
+        reg.put(HostRecord::config(HostRef {
+            url: Some("https://exchange.example:8443".into()),
+            credential_ref: Some(flux_secret::Ref::env("EXCHANGE_SA_TOKEN")),
+            ..HostRef::declared("corp-exchange", HostBackend::Remote)
+        }));
+        let cfg = flux_config::Config {
+            exchange: flux_config::ExchangeConfig {
+                host: Some("corp-exchange".into()),
+            },
+            ..Default::default()
+        };
+        let (name, url, reference) =
+            exchange_binding_from_config(&cfg, &reg).expect("declared binding resolves");
+        assert_eq!(name, "corp-exchange");
+        assert_eq!(url, "https://exchange.example:8443");
+        assert_eq!(reference.to_string(), "env/EXCHANGE_SA_TOKEN");
+
+        // No [exchange] declaration, or a binding the registry does not know: no catalogue.
+        assert!(exchange_binding_from_config(&flux_config::Config::default(), &reg).is_none());
+        let cfg = flux_config::Config {
+            exchange: flux_config::ExchangeConfig {
+                host: Some("gone".into()),
+            },
+            ..Default::default()
+        };
+        assert!(exchange_binding_from_config(&cfg, &reg).is_none());
+    }
+
+    /// C-650: `--host` and `--remote` are mutually exclusive at parse time — one explicit
+    /// selection per session.
+    #[test]
+    fn host_and_remote_flags_conflict_at_parse_time() {
+        use clap::Parser;
+        let err = Cli::try_parse_from([
+            "flux",
+            "run",
+            "--host",
+            "build-farm",
+            "--remote",
+            "https://farm.example:8443",
+            "hi",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"), "{err}");
     }
 
     /// D-116 e2e (gated on `TEST_POSTGRES_URL`, like the pg backend tests): an operator-added
@@ -1318,6 +2663,7 @@ mod tests {
                 protocol: Some("postgres".into()),
                 credential_ref: Some(format!("env/{cred_key}")),
                 labels: vec![],
+                host: None,
             },
         )
         .unwrap();

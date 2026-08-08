@@ -122,6 +122,13 @@ pub(super) struct AgentFlags {
     #[arg(long = "remote-ca", value_name = "PEM", requires = "remote")]
     pub(super) remote_ca: Option<std::path::PathBuf>,
 
+    /// Execute guarded tool effects on the named `[[host]]` binding. The binding must be granted
+    /// to this surface class — the default posture is deny — and the selected target is immutable
+    /// for the session and inherited by sub-agents. `--remote` remains as sugar for an ephemeral
+    /// unnamed binding.
+    #[arg(long, value_name = "NAME", conflicts_with = "remote")]
+    pub(super) host: Option<String>,
+
     /// Ask capable providers/models to expose adaptive thinking for every call owned by this agent.
     #[arg(long)]
     pub(super) think: bool,
@@ -135,6 +142,16 @@ pub(super) struct AgentFlags {
     /// when named here; `.flux/agent-loop.flux` has no implicit effect.
     #[arg(long = "loop", value_name = "ADAPTIVE|FILE")]
     pub(super) agent_loop: Option<String>,
+
+    /// Internal source-free receipt for a snapshotted `--loop`. Fleet uses this to reconstruct the
+    /// exact admitted binding on message/resume/rework; ordinary callers should select `--loop`.
+    #[arg(
+        long = "resolved-loop-binding",
+        value_name = "FILE",
+        hide = true,
+        requires = "agent_loop"
+    )]
+    pub(super) resolved_loop_binding: Option<String>,
 
     /// Maximum tokens per model-stage call. A truncated intent, exploration, repair, or presentation
     /// stage fails loudly rather than silently stopping. Zero would fail at the provider, so it is
@@ -237,6 +254,18 @@ pub(super) struct AgentFlags {
     #[arg(long)]
     pub(super) resume: bool,
 
+    /// Host-owned exact session continuation. Fleet uses this instead of "latest" because the
+    /// coordinator's correlated research children intentionally share its audit store and may be
+    /// newer sessions than the coordinator itself.
+    #[arg(
+        long = "resume-session",
+        value_name = "SESSION",
+        hide = true,
+        conflicts_with_all = ["continue_", "resume"],
+        requires = "operation_ceiling"
+    )]
+    pub(super) resume_session: Option<String>,
+
     /// Host-owned marker for an exact operation ceiling. Fleet supplies this only to admitted
     /// worker subprocesses; ordinary CLI users should declare capabilities in authored programs.
     #[arg(long = "operation-ceiling", hide = true)]
@@ -251,6 +280,17 @@ pub(super) struct AgentFlags {
         requires = "operation_ceiling"
     )]
     pub(super) admitted_operations: Vec<String>,
+
+    /// Host-owned marker for the durable native Fleet main coordinator subprocess. This selects a
+    /// closed native Board/Fleet catalog; it is not a general user capability flag.
+    #[arg(long = "native-fleet-main", hide = true)]
+    pub(super) native_fleet_main: bool,
+
+    /// Host-owned marker for the dedicated wave-integrator subprocess. This selects a closed
+    /// two-operation catalog (assemble a wave, read Fleet status) that is disjoint from the
+    /// coordinator's; it is not a general user capability flag.
+    #[arg(long = "native-fleet-integrator", hide = true)]
+    pub(super) native_fleet_integrator: bool,
 
     /// Dev mode: enables hot-reload (`flux_reload` tool) and other developer tools.
     #[arg(long)]
@@ -441,6 +481,41 @@ pub(super) enum Commands {
             require_equals = true
         )]
         fleet: Option<std::path::PathBuf>,
+
+        /// Attach to an agent that lives on a served host: the WHOLE agent runs there — planning,
+        /// model calls, tools, session and approvals — and this terminal is a window onto it.
+        ///
+        /// Takes a served agent's URL (`https://agent.internal:8787`) or the id of an
+        /// `[[endpoint.static]]` binding declared with `protocol = "a2a"`, whose `credential_ref`
+        /// supplies the bearer credential.
+        ///
+        /// ⚠ This is NOT `--remote`/`--host`. Those keep the agent here and land its *effects*
+        /// elsewhere, so you still approve on this machine. With `--attach` the approval stage
+        /// moved too, and the conversation lives in the remote's session store — it will not appear
+        /// in `flux sessions` or `flux replay` here. They are refused together for that reason.
+        #[arg(
+            long,
+            value_name = "URL|NAME",
+            conflicts_with_all = ["remote", "host", "fleet"]
+        )]
+        attach: Option<String>,
+
+        /// Name of the environment variable holding the attached agent's bearer token. The token is
+        /// never accepted as a command-line value. Ignored when `--attach` names a binding that
+        /// carries its own `credential_ref`.
+        #[arg(
+            long = "attach-token-env",
+            value_name = "ENV",
+            default_value = "FLUX_A2A_TOKEN",
+            requires = "attach"
+        )]
+        attach_token_env: String,
+
+        /// Continue an existing conversation on the attached agent instead of starting a new one.
+        /// A served flux agent maps one context id to one session, so the same value reaches the
+        /// same remote session — including from a different machine.
+        #[arg(long = "attach-context", value_name = "ID", requires = "attach")]
+        attach_context: Option<String>,
     },
     /// Fork a recorded session at a decision point (A-46): the prefix replays hermetically from
     /// the cassette (no side effects), then the tail DIVERGES live through the real approval
@@ -708,6 +783,12 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: EndpointAction,
     },
+    /// Inspect and operate the named execution-substrate bindings (`[[host]]`). Operator-only,
+    /// weak refs only — never prints a secret value.
+    Host {
+        #[command(subcommand)]
+        action: HostAction,
+    },
     /// Install and operate the separately released local Exchange authority.
     Exchange {
         #[command(subcommand)]
@@ -941,6 +1022,11 @@ pub(super) enum IntegrationAction {
 pub(super) enum ContextAction {
     /// Show the ordered context manifest. Bodies are omitted unless explicitly requested.
     Show {
+        /// Show one layer instead of all of them: its manifest row and its body, without needing
+        /// `--body`. Accepts the layer id (`git`) or an unambiguous prefix of one. `--json` carries
+        /// every manifest field.
+        #[arg(value_name = "LAYER")]
+        layer: Option<String>,
         /// Agent behavior profile to include after the universal harness protocol.
         #[arg(long, value_enum, default_value_t)]
         profile: ContextProfile,
@@ -1409,6 +1495,11 @@ pub(super) enum EndpointAction {
         /// Repeatable non-secret label `key=value` (region, tags) for display/filtering.
         #[arg(long = "label", value_name = "K=V")]
         labels: Vec<String>,
+        /// The `[[host]]` binding this endpoint is reachable through (e.g. `k8s-dev`). Omit for an
+        /// endpoint reachable from wherever the caller is. A binding that is not declared is
+        /// refused here, not at dial time.
+        #[arg(long, value_name = "NAME")]
+        host: Option<String>,
     },
     /// List the persisted endpoint records (id, product, bare URL, owner, ttl/health, credential
     /// location) — never a secret value.
@@ -1432,6 +1523,89 @@ pub(super) enum EndpointAction {
         /// A weak `EndpointRef` (JSON) to import directly when the id is not already in the store.
         #[arg(long, value_name = "JSON")]
         from_json: Option<String>,
+    },
+}
+
+/// `flux host …` — the operator mirror of the agent's `host.*` ops over the session's named
+/// execution-substrate bindings (Decision 0018 / C-649). Every path is reference-only: it shows
+/// the credential *location*, never a value.
+#[derive(clap::Subcommand, Debug)]
+pub(super) enum HostAction {
+    /// List the session's host bindings: id, backend kind, address and availability.
+    #[command(alias = "list")]
+    Ls {
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
+    },
+    /// Show one binding in full by name (still reference-only).
+    Show {
+        /// Binding name (e.g. `build-farm`).
+        id: String,
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
+    },
+    /// Declare a named binding: upsert one `[[host]]` entry in `~/.flux/config.toml`. The
+    /// credential is a *location* (`--credential-ref`), never a value; the URL must be
+    /// credential-free. The declarative alternative is a `[[host]]` block in either config layer.
+    Add {
+        /// The binding name (a bare name, e.g. `build-farm`).
+        id: String,
+        /// Backend kind: `local`, `sandboxed`, `container`, `kubernetes`, `microvm`, `ssh` or
+        /// `remote`. An `ssh` binding's far-side contract (`[[host]].ssh`) is declarative only —
+        /// declare the binding here, then add the sub-table if it needs more than the defaults.
+        #[arg(long)]
+        backend: String,
+        /// Bare `scheme://host[:port]` for backends with an address — no embedded credentials.
+        #[arg(long)]
+        url: Option<String>,
+        /// Credential *location*: `env/KEY`, `kubernetes/<ns>/<name>/<key>`, or
+        /// `plugin/<p>/<i>/<slot>`. Omit for an unauthenticated binding. Never a value.
+        #[arg(long, value_name = "REF")]
+        credential_ref: Option<String>,
+        /// Path to the PEM certificate of the private CA this binding's endpoint chains to — the
+        /// binding-scoped equivalent of `--remote-ca`. Omit for ordinary public trust. An
+        /// unreadable or malformed certificate refuses the binding; it never downgrades to the
+        /// default trust store.
+        #[arg(long = "ca-cert", value_name = "PEM")]
+        ca_cert: Option<String>,
+        /// Repeatable surface class granted to *select* this binding: `operator` (attended
+        /// sessions, the default — your explicit add is the grant) and/or `unattended` (serving
+        /// and `--yes` surfaces; grant deliberately, widening is an escalation). A `[[host]]`
+        /// entry written by hand defaults to deny instead.
+        #[arg(long = "grant", value_name = "CLASS", default_values_t = [String::from("operator")])]
+        grant: Vec<String>,
+        /// Repeatable non-secret label `key=value` (region, cluster, tags) for display/filtering.
+        #[arg(long = "label", value_name = "K=V")]
+        labels: Vec<String>,
+    },
+    /// Remove a binding declared in `~/.flux/config.toml` (a project-declared binding is reported,
+    /// not removed — edit the project config where it lives).
+    Rm {
+        /// Binding name to remove.
+        id: String,
+    },
+    /// Verify one binding by its backend's side-effect-free identity check: substrate identity
+    /// (kind, workspace, confinement, remotely_reported) and, for a remote-shaped backend
+    /// (`remote`, `microvm`), the negotiated protocol version. Executes nothing on the substrate.
+    Probe {
+        /// Binding name to probe.
+        id: String,
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
+    },
+    /// Read one binding's own condition: CPU, load, memory, swap, disk, uptime, temperature and
+    /// fans, measured by that substrate about itself. A metric it cannot measure is reported as
+    /// explicitly unavailable with a reason — never as zero — and a remote binding's readings are
+    /// marked as remotely reported.
+    Metrics {
+        /// Binding name to measure.
+        id: String,
+        /// Output encoding. JSON, not human prose, is the automation API.
+        #[arg(long, value_enum, default_value_t)]
+        output: AgentOutput,
     },
 }
 
@@ -1542,6 +1716,9 @@ pub(super) fn adaptive_loop_policy(
             .unwrap_or(flux_flow::DEFAULT_ADAPTIVE_MODEL_CALLS),
         intent: adaptive_stage_policy("intent", &config.adaptive.intent)?,
         explore: adaptive_stage_policy("explore", &config.adaptive.explore)?,
+        // Only an authored `ai_segment` may raise the retained-history ceiling; an ordinary adaptive
+        // turn keeps the fixed default.
+        max_history_bytes: None,
     })
 }
 

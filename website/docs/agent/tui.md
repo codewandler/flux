@@ -16,9 +16,20 @@ flux tui -m opus               # pick a model for the session
 flux tui --yes                 # auto-approve every admitted tool call (no approval sheet)
 flux tui -c                    # continue the most recent session
 flux tui --remote https://worker.example:8790  # approve here; effects land there
+flux tui --attach https://agent.internal:8787  # the whole agent lives there; watch and steer it
 flux tui --fleet               # attach to the Fleet rooted in the current directory
 flux tui --fleet=../roadmap    # attach to an explicit Fleet root
 ```
+
+:::warning `--remote` and `--attach` are opposite
+`--remote` (and `--host`) keep the agent **here** and land its effects there, so you still approve
+on this machine and the session is stored in your local event store. `--attach` moves the **whole**
+agent — planning, model calls, tools, approvals and the session — to a served host, and this
+terminal becomes a window onto it. flux refuses the two together. See
+[attaching the TUI to a served agent](./a2a.md#client--flux-tui---attach-urlname) for what an
+attached surface can do, which affordances the protocol does not carry, and — importantly — which
+session artifacts live on which machine.
+:::
 
 `flux tui` takes the same turn-control flags as `flux run` — see [CLI](./cli.md#turn-controls) for
 `-m`, `--effort`, `--max-tokens`, `--turn-budget`, `--loop`, `--skill`, and the rest, and
@@ -27,6 +38,22 @@ flux tui --fleet=../roadmap    # attach to an explicit Fleet root
 In remote mode the header continuously shows the endpoint and canonical remote workspace. It is not
 a startup notice that scrolls away. The directory where the TUI started remains the local control
 plane; flux does not synchronize it with the remote tree.
+
+When a budget is declared, the header also carries a live budget segment — `budget Σ1.6k/4.0k tok`,
+`budget 3/10 calls`, `budget 12.0s/1.0m` — showing spend against the declared figure and updating as
+spend accrues. It shows the dimension closest to its ceiling, marks a crossed target `over target`
+and a crossed hard ceiling `limit`, and shows nothing at all when no budget is declared. The figures
+come from the enforcing ledger, not from a second tally kept by the UI — see
+[time and token budgets](./cli.md#time-and-token-budgets).
+
+The header also names the loop the agent runs — `loop adaptive@1 8f3c…`, the resolved profile,
+revision and abbreviated source digest, never a filename. `F3` opens the loop selector: it rescans
+the workspace's `.flux/loops` directory on every open (so a loop authored while the TUI runs appears
+without a restart) and always offers the shipped `adaptive@1` preset. Type to filter, `Enter`
+selects, `Esc` closes. Selecting raises a short overlay showing the loop's description and its outer
+structure, and the choice takes effect on the next start. A session that has already run a turn has
+admitted its loop: the selector then refuses and names the new-session/re-admission path instead of
+switching a running agent.
 
 ## Board and Fleet operations
 
@@ -56,10 +83,16 @@ assignment, session, worktree, handoff, review, rework, activity, and error evid
 say `unavailable`. Capacity distinguishes configured, desired, active, draining, and registered;
 desired/draining likewise remain unavailable until the Fleet's durable state records them.
 
-The Board view includes ready, active, blocked, and completed stories, dependencies, linked planning
-documents, decision lifecycles, and the exact `flux.board-stats/v1` ratios/history used by
-`flux board stats`. Lists and text are bounded before rendering; a refresh error keeps the last good
-snapshot and marks it stale instead of inventing an empty Fleet.
+The Board view renders each item as a collapsed bordered box carrying only its id, title, status,
+and priority, grouped by status and ordered by ascending priority inside a group — the same order
+`flux board next` returns for ready work. A box whose item the Fleet has in flight is additionally
+marked `◆ <wave>`; that marker comes from Fleet state (a live worker's assignment or active-wave
+membership), never from the Board's own status. Only the boxes the viewport shows are built, so a
+board of a thousand-plus items pages to the selection instead of rendering every box. The view also
+includes ready, active, blocked, and completed stories, dependencies, linked planning documents,
+decision lifecycles, and the exact `flux.board-stats/v1` ratios/history used by `flux board stats`.
+Lists and text are bounded before rendering; a refresh error keeps the last good snapshot and marks
+it stale instead of inventing an empty Fleet.
 
 Conversation input is durably acknowledged as `accepted`, `delivered`, then `completed` or `failed`.
 Those recent acknowledgements reconstruct after restart together with the main transcript. Viewing
@@ -94,6 +127,7 @@ runs.
 | `Ctrl-D` | Quit — only when the session is idle **and** the composer is empty. |
 | `F1` | Open the help overlay (`F1`, `Esc`, `q`, or `Enter` closes it). |
 | `F2` | Open/close the attached Board + Fleet operations view. No effect in standalone chat. |
+| `F3` | Open the loop selector: the live set of `*.flux` loops plus the built-in preset. Type to filter, `Enter` switches the agent's loop for its next start and shows the loop's structure and description, `Esc` closes. |
 | `Esc` | Dismiss the active popup, cancel a queue edit, or clear a half-typed slash command. |
 
 ### Terminal support for the newline keys

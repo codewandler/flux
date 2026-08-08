@@ -16,7 +16,7 @@ edition.workspace = true
 # `a_reported_shape_and_a_changed_text_are_the_same_fact`. Nothing was removed or renamed and the
 # secret-purpose wire vocabulary did not move, so a plugin pinned to `1` keeps resolving.
 # 1.2.1 (D-249): documentation removes the retired AMI example; no API or wire behavior changes.
-version = "1.2.1"
+version = "1.3.0"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

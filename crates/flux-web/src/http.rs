@@ -12,11 +12,10 @@
 //! result travels as canonical JSON with a human `view` beside it, rather than widening
 //! `ToolResult` itself.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{HeaderName, HeaderValue};
 use serde_json::{json, Value};
 
 use flux_core::{percent_encode_component, Error, Result};
@@ -26,9 +25,12 @@ use flux_spec::{
     IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
+use flux_system::port::{
+    GuardedHttp, HeaderValue as PortHeaderValue, HttpRequest, HttpSecretScope,
+};
 use flux_system::secret_scope::{Destination, InjectionSite, Refusal, SecretAllowlist, SecretUse};
 
-use crate::{egress, WebOptions};
+use crate::{NativeHttp, WebOptions};
 
 /// Cap on the response body handed to the model (bytes, cut on a char boundary). Mirrors the
 /// `web.fetch` `MAX_BYTES` precedent.
@@ -40,14 +42,15 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// Ceiling on the caller-supplied timeout.
 const MAX_TIMEOUT_SECS: u64 = 300;
 
-/// The `http.request` tool. Holds its own `reqwest::Client`, the resolved `web`-scope egress
-/// allow-list, and an optional audit sink — the `WebFetchTool` shape, extended with the audit hook
-/// tier 1 needs.
+/// The `http.request` tool. Holds the resolved `web`-scope egress allow-list and its own reviewed
+/// native HTTP backend — the `WebFetchTool` shape, extended with the secret allow-list tier 1 needs.
+///
+/// Since C-652 the request itself is a **port** operation: the send goes to the operator's selected
+/// execution substrate when they selected one, and to [`NativeHttp`] — the same client, guard and
+/// pin this op always used — when they did not.
 pub struct HttpRequestTool {
-    http: reqwest::Client,
+    native: NativeHttp,
     private_net: PrivateNetAllow,
-    audit: Option<Arc<dyn flux_plugin::EgressAudit>>,
-    grant_source: String,
     /// Env-var names this tool may resolve via `{"$secret": "NAME"}`, each with the scope it
     /// carries. Fail-closed on both axes: a name not on this list is refused before its value is
     /// read (C-76), and a name whose grant declares a destination, a principal or an injection site
@@ -59,30 +62,13 @@ pub struct HttpRequestTool {
 impl HttpRequestTool {
     pub fn new(opts: &WebOptions) -> Self {
         Self {
-            http: egress::redirect_disabled_client(),
+            native: NativeHttp::new(opts),
             private_net: opts.private_net.clone(),
-            audit: opts.audit.clone(),
-            grant_source: opts
-                .grant_source
-                .clone()
-                .unwrap_or_else(|| "config:web".to_string()),
             allowed_secrets: SecretAllowlist::parse(
                 opts.allowed_secrets
                     .clone()
                     .unwrap_or_else(secret_allowlist_from_env),
             ),
-        }
-    }
-
-    /// Emit the `PrivateNetAdmit` audit event when the guard just let a request through to a
-    /// private/internal host (i.e. the `web` grant admitted what the bare SSRF guard would refuse).
-    /// Mirrors the plugin host's `audit_admit`: gated on `host_resolves_private` so only genuine
-    /// private admits are recorded.
-    fn audit_admit(&self, host: &str) {
-        if let Some(audit) = &self.audit {
-            if flux_system::net::host_resolves_private(host) {
-                audit.record_private_admit("web:http.request", host, &self.grant_source);
-            }
         }
     }
 
@@ -97,12 +83,12 @@ impl HttpRequestTool {
     fn authorize_secret(
         &self,
         name: &str,
-        destination: &Result<Destination>,
+        destination: &std::result::Result<&Destination, String>,
         principal: Option<&str>,
         site: InjectionSite,
     ) -> std::result::Result<(), String> {
         let use_ = SecretUse {
-            destination: destination.as_ref().map_err(|why| why.to_string()),
+            destination: destination.clone(),
             principal,
             site,
         };
@@ -218,7 +204,11 @@ impl Tool for HttpRequestTool {
         // authority, so nothing about the SSRF decision changes, and it buys the ordering above
         // without a second DNS resolution (which would reopen the very TOCTOU the pinning closes).
         let guarded = flux_system::net::guard_url_scoped_for_secret(raw, &self.private_net)?;
-        let (base_url, pinned, destination) = guarded.into_parts();
+        // Borrowed rather than split: the URL, its pins and the destination token are only
+        // trustworthy together, and since C-652 the whole correlated value travels to the substrate
+        // that will send the request. Splitting it here would hand three separately-assertable
+        // values across the port.
+        let destination = guarded.destination();
         // Held as a `Result` rather than propagated: only a grant that *declares* a destination
         // scope needs a vetted address, so an unscoped secret bound for an unresolvable host still
         // behaves exactly as it did before scoping existed (it fails at connect, not here).
@@ -268,6 +258,8 @@ impl Tool for HttpRequestTool {
         // against, so it may not have moved. It cannot — `append_query` only writes a
         // percent-encoded query ahead of the fragment — and this refuses rather than trusting that
         // argument: the alternative to checking is re-resolving, which is the TOCTOU itself.
+        //
+        let base_url = guarded.url();
         if (url.scheme(), url.host_str(), url.port_or_known_default())
             != (
                 base_url.scheme(),
@@ -291,26 +283,38 @@ impl Tool for HttpRequestTool {
 
         // Headers — resolving `{"$secret": "ENV"}` markers to their env values and seeding the
         // redactor so a token in a header never surfaces readable in output or persisted events.
-        let mut request_headers = HeaderMap::new();
+        //
+        // Validated here rather than at the substrate so the operator-facing message names the
+        // header the *caller* wrote; the port carries the validated text.
+        //
+        // The value goes onto the request inside a `port::HeaderValue`, which names the `$secret`
+        // it materialized and refuses to print or serialize itself (C-674). That is what makes the
+        // credential visible to per-hop re-authorization on whichever substrate follows the chain,
+        // without a second list that can drift out of step with the headers themselves.
+        let mut request_headers: Vec<(String, PortHeaderValue)> = Vec::new();
         if let Some(headers) = params.get("headers").and_then(Value::as_object) {
             for (name, val) in headers {
-                let resolved = match as_secret_ref(val) {
+                let (resolved, secret_name) = match as_secret_ref(val) {
                     Some(secret) => {
                         authorize(secret, InjectionSite::Header)?;
                         carried.push((secret.to_string(), InjectionSite::Header));
-                        resolve_secret_env(secret, ctx)?
+                        (resolve_secret_env(secret, ctx)?, Some(secret.to_string()))
                     }
-                    None => plain_header_value(val)?,
+                    None => (plain_header_value(val)?, None),
                 };
                 let name = HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
                     Error::Other(format!("http.request: invalid header name `{name}`: {e}"))
                 })?;
-                let value = HeaderValue::from_str(&resolved).map_err(|e| {
+                HeaderValue::from_str(&resolved).map_err(|e| {
                     Error::Other(format!(
                         "http.request: invalid value for header `{name}`: {e}"
                     ))
                 })?;
-                request_headers.insert(name, value);
+                let carriage = match secret_name {
+                    Some(secret) => PortHeaderValue::secret(secret, resolved),
+                    None => PortHeaderValue::literal(resolved),
+                };
+                request_headers.push((name.as_str().to_string(), carriage));
             }
         }
         let body = params
@@ -318,69 +322,80 @@ impl Tool for HttpRequestTool {
             .and_then(Value::as_str)
             .map(|body| body.as_bytes().to_vec());
 
-        let response = egress::send_guarded(
-            &self.http,
-            egress::GuardedRequest {
-                url,
-                pinned,
-                method,
-                headers: request_headers,
-                body,
-                timeout: Duration::from_secs(timeout),
+        // The request as the *port* states it. `with_url` keeps the admission and the URL to send
+        // one value, so what crosses the port is a target the egress guard vetted rather than a
+        // (url, pins) pair a caller asserted.
+        let request = HttpRequest {
+            operation: "http.request".into(),
+            method: method.as_str().to_string(),
+            target: guarded.with_url(url)?,
+            headers: request_headers,
+            body,
+            timeout: Duration::from_secs(timeout),
+            max_response_bytes: MAX_BODY_BYTES,
+            // Every redirect hop is re-admitted against the scope of every secret this request
+            // carries, and the substrate that follows the chain is the only place that can do it.
+            //
+            // Deliberately conservative: a cross-origin hop already clears the caller's headers, so
+            // a header-placed secret does not physically travel — but a query-placed one is in the
+            // URL, and a `Location` that echoes the query carries it to a host the operator never
+            // named. Rather than reason per-hop about which bytes survive, the whole redirect chain
+            // has to stay inside the scope. An operator who wants the hop adds its host to the `to=`
+            // list; the failure direction is a refused redirect, not a credential at an unnamed host.
+            secrets: HttpSecretScope {
+                allowlist: self.allowed_secrets.clone(),
+                carried,
+                principal,
             },
-            "http.request",
-            |raw| {
-                let guarded =
-                    flux_system::net::guard_url_scoped_for_secret(raw, &self.private_net)?;
-                let (url, pinned, destination) = guarded.into_parts();
-                // Every hop is re-admitted against the scope of every secret this request carries.
-                //
-                // Deliberately conservative: a cross-origin hop already clears the caller's headers,
-                // so a header-placed secret does not physically travel — but a query-placed one is
-                // in the URL, and a `Location` that echoes the query carries it to a host the
-                // operator never named. Rather than reason per-hop about which bytes survive, the
-                // whole redirect chain has to stay inside the scope. An operator who wants the hop
-                // adds its host to the `to=` list; the failure direction is a refused redirect, not
-                // a credential at an unnamed host.
-                if !carried.is_empty() {
-                    // Only the HOST is quoted, never the hop URL: a query-placed secret lives in
-                    // the URL, and a `Location` the server chose can echo it back.
-                    let hop = url.host_str().unwrap_or("the redirect target").to_string();
-                    for (name, site) in &carried {
-                        self.authorize_secret(name, &destination, principal.as_deref(), *site)
-                            .map_err(|why| {
-                                Error::Http(format!(
-                                    "http.request: refusing the redirect to {hop} — {why}"
-                                ))
-                            })?;
-                    }
-                }
-                Ok((url, pinned))
-            },
-            |url| {
-                if let Some(host) = url.host_str() {
-                    self.audit_admit(host);
-                }
-            },
-        )
-        .await?;
+        };
 
-        let status = response.status();
+        // The effect lands wherever the operator said it lands. A selected substrate answers for
+        // itself — including by refusing, which is what a substrate with no HTTP wire support does
+        // — and only an *unselected* run reaches this op's own reviewed native backend.
+        let response = match ctx.selected_execution_system() {
+            Some(substrate) => substrate.http_request(&request, &self.private_net).await?,
+            None => {
+                self.native
+                    .http_request(&request, &self.private_net)
+                    .await?
+            }
+        };
+        // A private-destination admission that happened on another substrate lands in *this* turn's
+        // audit trail, stamped with where it happened (C-674). An admit made here already reached
+        // the sink at the hop, so this adds nothing for an unselected run.
+        self.native
+            .record_reported_admits("http.request", &response.admits);
+
+        // Rebuilt from the port's numeric status so the rendered view keeps its reason phrase
+        // ("HTTP 200 OK"): the port carries a status code, not one client's status type.
+        let status = reqwest::StatusCode::from_u16(response.status).map_err(|e| {
+            Error::Http(format!(
+                "http.request: the substrate reported an invalid status {}: {e}",
+                response.status
+            ))
+        })?;
         // One walk over the response headers produces BOTH the record's map and the rendered block,
         // under one shared budget — so the two can never disagree about what was kept.
-        let headers = collect_headers(response.headers(), |value| ctx.redactor.redact(value));
-        let capped = egress::read_body_capped(response, MAX_BODY_BYTES, "http.request").await?;
+        let headers = collect_headers(&response.headers, |value| ctx.redactor.redact(value));
         let mut body = cap_str(
-            String::from_utf8_lossy(&capped.bytes).into_owned(),
+            String::from_utf8_lossy(&response.body).into_owned(),
             MAX_BODY_BYTES,
         );
-        if capped.truncated && !body.ends_with("…[truncated]") {
+        if response.truncated && !body.ends_with("…[truncated]") {
             body.push_str("\n…[truncated]");
         }
+        // Latency the operator paid has to be explainable (C-701). The note goes in the *view* and
+        // not the record: the record's shape is declared (`{status, headers, body}`) and a flow
+        // selects fields out of it, while the view is the human surface where "why did that take
+        // eleven seconds" is asked. A request answered first time renders exactly as before.
+        let retried = match response.retries.note() {
+            Some(note) => format!("{note}\n"),
+            None => String::new(),
+        };
         // A completed request is a successful op: the HTTP status (incl. 4xx/5xx) is *data* in the
         // record — never a tool-level error.
         let view = format!(
-            "HTTP {status}\n{}\n{}",
+            "HTTP {status}\n{retried}{}\n{}",
             headers.rendered,
             ctx.redactor.redact(&body)
         );
@@ -477,24 +492,27 @@ struct ResponseHeaders {
 ///
 /// `redact` is passed as a closure rather than the `Redactor` itself so `flux-web` needs no direct
 /// dependency on `flux-secret` for one call.
-fn collect_headers(headers: &HeaderMap, redact: impl Fn(&str) -> String) -> ResponseHeaders {
+fn collect_headers(
+    headers: &[(String, String)],
+    redact: impl Fn(&str) -> String,
+) -> ResponseHeaders {
     let mut map = serde_json::Map::new();
     let mut rendered = String::new();
     for (name, value) in headers {
-        let value = redact(value.to_str().unwrap_or("<binary>"));
+        let value = redact(value);
         let line = format!("{name}: {value}\n");
         if rendered.len() + line.len() > MAX_HEADER_BYTES {
             rendered.push_str("…[headers truncated]\n");
             break;
         }
         rendered.push_str(&line);
-        match map.get_mut(name.as_str()) {
+        match map.get_mut(name) {
             Some(Value::String(existing)) => {
                 existing.push_str(", ");
                 existing.push_str(&value);
             }
             _ => {
-                map.insert(name.as_str().to_string(), Value::String(value));
+                map.insert(name.clone(), Value::String(value));
             }
         }
     }
@@ -764,7 +782,7 @@ mod tests {
     use flux_runtime::ToolContext;
     use flux_system::System;
     use flux_system::Workspace;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn ctx() -> ToolContext {
@@ -826,6 +844,95 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// A loopback server that answers a scripted sequence of raw responses, one per connection —
+    /// the fixture a retry needs, since "it was retried" is "the second answer is the one returned".
+    async fn scripted(script: Vec<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut turn = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let answer = script.get(turn).or_else(|| script.last()).cloned();
+                turn += 1;
+                let _ = sock.write_all(answer.unwrap_or_default().as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// C-701, acceptance 4 — a rate-limited request explains its latency where a person reads it,
+    /// and nothing else about the result moves.
+    ///
+    /// The note goes in the `view` rather than the record on purpose: the record's shape is declared
+    /// (`{status, headers, body}`) and an authored flow selects fields out of it, so widening it
+    /// would be a contract change to explain a latency. The view is the human surface, which is
+    /// exactly where "why did that take a second" gets asked.
+    #[tokio::test]
+    async fn a_retried_request_explains_the_wait_in_the_view_and_leaves_the_record_alone() {
+        let base = scripted(vec![
+            "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 4\r\nconnection: close\r\n\r\nwait".into(),
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 6\r\nconnection: close\r\n\r\nserved".into(),
+        ])
+        .await;
+
+        let result = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .expect("a rate-limited request that succeeds on the retry is a successful op");
+
+        let view = result
+            .view
+            .as_deref()
+            .expect("a record result carries a view");
+        assert!(
+            view.starts_with("HTTP 200 OK\nrate-limited, retried 1 time over "),
+            "the wait is explained right under the status line: {view}"
+        );
+        let record = record(&result);
+        let mut fields: Vec<&str> = record
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["body", "headers", "status"],
+            "the declared record shape is unchanged by a retry: {record}"
+        );
+        assert_eq!(record["status"], 200, "{record}");
+        assert_eq!(record["body"], "served", "{record}");
+    }
+
+    /// …and a request that was not retried renders exactly as it always did — no empty line, no
+    /// note, nothing for a reader to wonder about.
+    #[tokio::test]
+    async fn a_request_that_was_not_retried_renders_exactly_as_before() {
+        let base = one_shot_with_headers(
+            "200 OK",
+            vec!["content-type: text/plain".into()],
+            "served".into(),
+        )
+        .await;
+        let result = tool(PrivateNetAllow::Any)
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .unwrap();
+        let view = result
+            .view
+            .as_deref()
+            .expect("a record result carries a view");
+        assert!(
+            view.starts_with("HTTP 200 OK\ncontent-type: text/plain\n"),
+            "the header block still follows the status line directly: {view}"
+        );
+        assert!(!view.contains("rate-limited"), "{view}");
     }
 
     /// The result record a completed request produces (`content` is canonical JSON since C-304).
@@ -1017,6 +1124,72 @@ mod tests {
         assert_eq!(calls[0].0, "web:http.request", "caller label");
         assert_eq!(calls[0].1, "127.0.0.1", "the private host reached");
         assert_eq!(calls[0].2, "cli:--allow-private-net", "grant source label");
+    }
+
+    /// C-652, the story's behavioral test: a **selected** substrate answers for the effect, and a
+    /// refusal is a refusal.
+    ///
+    /// Placement moving to `SelectedExecutionSystem` keeps `http.request` visible under a selected
+    /// host, and that visibility is only honest if the effect actually follows the selection. A
+    /// `RemoteSystem` whose delegate serves no HTTP answers `Unserved`; the op must surface that.
+    /// C-674 gave the protocol a frame, so what is missing here is the delegate's family rather
+    /// than the wire — and the refusal is checked structurally, which is how it is meant to be
+    /// classified.
+    ///
+    /// The loopback server is live and reachable on purpose. If the op still held a local client on
+    /// this path it would answer `200 OK` and the test would pass for the wrong reason — so the
+    /// assertion is on the refusal, and the server standing untouched is what makes it meaningful.
+    #[tokio::test]
+    async fn a_selected_substrate_that_serves_no_http_refuses_rather_than_sending_locally() {
+        struct ServesNothing;
+        impl flux_system::remote::Delegate for ServesNothing {}
+
+        let base = one_shot("200 OK", "this body must never be read").await;
+        let tool = HttpRequestTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+        let selected = Arc::new(flux_system::remote::RemoteSystem::new(Arc::new(
+            ServesNothing,
+        )));
+        let ctx = ctx().with_execution_system(selected);
+
+        let error = tool
+            .execute(&ctx, json!({ "url": format!("{base}/v1") }))
+            .await
+            .expect_err("a selected substrate that serves no HTTP must refuse the effect");
+
+        let message = error.to_string();
+        assert_eq!(
+            flux_system::remote::failure_mode(&error),
+            Some(flux_system::remote::FailureMode::Unserved),
+            "the operator must be told the substrate cannot carry this, not handed a local \
+             answer: {message}"
+        );
+        assert!(
+            !message.contains("this body must never be read"),
+            "the request reached the network from the coordinator's process: {message}"
+        );
+    }
+
+    /// C-652 — and the *unselected* run is unchanged: the op reaches its own reviewed native
+    /// backend, through the same guard, pin and cap it always used.
+    #[tokio::test]
+    async fn an_unselected_run_still_reaches_the_native_backend() {
+        let base = one_shot("200 OK", "{\"ok\":true}").await;
+        let tool = HttpRequestTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+
+        let result = tool
+            .execute(&ctx(), json!({ "url": format!("{base}/v1") }))
+            .await
+            .expect("no substrate selected means the native backend serves");
+        let record: Value = serde_json::from_str(&result.content).unwrap();
+
+        assert_eq!(record["status"], 200);
+        assert_eq!(record["body"]["ok"], true);
     }
 
     /// Build a tool with an explicit secret allowlist (bypasses the `FLUX_WEB_SECRET_ALLOW` env

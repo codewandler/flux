@@ -11,6 +11,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub mod endpoint;
+pub mod host;
 
 // ---------------------------------------------------------------------------
 // Reference

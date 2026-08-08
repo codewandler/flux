@@ -6,7 +6,7 @@ edition.workspace = true
 # wire vocabulary changes — scripts/cut-release.sh never touches it.
 # 1.1.0 (C-298): additive only — `EvidenceLog`'s retained-payload ceiling and the elision marker.
 # The serialized record's shape is unchanged, so a plugin built against 1.0 keeps resolving.
-version = "1.1.0"
+version = "1.2.0"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true

@@ -169,6 +169,11 @@ execute writes while reasoning.
 otherwise the operation prompts. Entries may be operation names (`read`, `search`) or scoped shell
 subjects such as `Bash(git:*)`. Reads are pre-allowed by the local defaults.
 
+Deny rules reach sub-agents: a `task`-delegated child inherits the **denials only** (never the allow
+list, which would widen a child past what the operator granted its parent), and they descend through
+bounded nested delegation. A sub-agent runs non-interactively, so a subject that merely *prompts* for
+the top-level agent is auto-approved for the child — only a deny rule refuses it there.
+
 For `flux app run`, these host rules are evaluated **inside** any `permissions` ceiling declared by
 the `.flux` program and its owning agent. A local deny still wins; a local allow can approve a scoped
 invocation but cannot restore an operation the app source removed.
@@ -307,6 +312,11 @@ dispatched directly too — so a cached plan or a resumed session can't call it 
 control. If the two ever disagree, the policy wins: `[tools] disable` narrows what is offered and
 dispatchable, never what an already-granted call may do.
 
+**It binds delegated work too.** The list travels into every `task`-spawned sub-agent (and, through
+bounded nested delegation, into their children), where it is re-resolved against that child's own
+narrowed catalog — so a disabled op is neither advertised to a sub-agent's model nor dispatchable by
+it. Before this it stopped at the delegation boundary.
+
 ## Second opinion (`[consult]`)
 
 `[consult] model` names the default target the `consult` op — a second-opinion adviser that asks a
@@ -437,11 +447,255 @@ consumer any provider. The default is deny. This is only one part of the gate: f
 approval and is audited.
 
 Each `[[endpoint.static]]` table declares a named, weak endpoint reference. `id` and a
-credential-free `url` are required; `product`, `protocol`, `credential_ref`, and non-secret
+credential-free `url` are required; `product`, `protocol`, `credential_ref`, `host`, and non-secret
 `labels` are optional. A credential reference is a location such as `env/PGPASSWORD`,
 `kubernetes/<namespace>/<secret>/<key>`, or `plugin/<plugin>/<instance>/<slot>`—never a secret
 value. Project declarations override user declarations with the same id. Use `flux endpoint add`
 when you want the equivalent imperative surface. See [Endpoints](../agent/endpoints.md).
+
+`host` names the `[[host]]` binding the endpoint is reachable *through*, by id—the endpoint's
+locality. `postgres://db.default.svc.cluster.local:5432` is meaningless on a laptop and exactly
+right inside the cluster, and without this the record cannot tell the two apart:
+
+```toml
+[[host]]
+id = "k8s-dev"
+backend = "kubernetes"
+grant = ["operator"]
+
+[[endpoint.static]]
+id = "pg-cluster"
+url = "postgres://db.default.svc.cluster.local:5432/app"
+host = "k8s-dev"
+```
+
+Naming a binding that is not declared is a **load-time error** that names both, not a dial-time
+surprise—the same posture as an unknown `[[host]]` backend kind, because a typo'd binding name
+would otherwise silently widen where the endpoint is dialled from. A host-bound endpoint resolves
+only when that binding is the one the session selected (`flux --host k8s-dev …`); from any other
+position it is refused naming both, never quietly dialled from here. Omitting `host` keeps the
+prior meaning—reachable from wherever the caller is—so an endpoint without one behaves exactly as
+it always has. `flux endpoint add --host <name>` sets the same field imperatively, and
+`flux endpoint list`/`show`/`resolve` render it.
+
+## Host bindings (`[[host]]`)
+
+Each `[[host]]` table declares a named binding to an execution substrate. `id` and a `backend`
+kind (`local`, `sandboxed`, `container`, `kubernetes`, `microvm`, `ssh` or `remote`) are required;
+an unknown backend kind is a hard config error, and an unknown key in a `[[host]]` entry is refused
+rather than dropped. A `remote` binding needs a credential-free `url`; `credential_ref` is a
+location (the same reference forms as endpoints), never a secret value; non-secret `labels` are
+optional.
+
+`ca_cert` is the path to the PEM certificate of the private CA the binding's endpoint chains to —
+the binding-scoped equivalent of `--remote-ca`, and what makes a Kubernetes pod, a VM guest or a
+container with an operator-issued certificate reachable *by name*. Omit it for ordinary public
+trust. It is a filesystem location, not a secret reference: a CA certificate is public material, so
+it is neither redacted nor addressed through the secret schemes, and `flux host ls` shows which
+anchor a binding uses. What it borrows from `credential_ref` is that the config declares a location
+and resolution validates it — an unreadable or malformed certificate refuses the binding, naming
+the binding and the file, and **never** falls back to the default trust store. There is no flag
+that relaxes this; an endpoint whose certificate does not chain to the declared CA is refused with
+the TLS failure named.
+
+The path may be absolute and outside the workspace — `/etc/flux/ca.pem`, a path under `~`, wherever
+your deployment put it — because a CA belongs to the machine or the cluster, not to the project you
+happen to be working in. Flux reads exactly the file you named and nothing else, so naming one does
+not open a directory. This is the same rule for `ca_cert`, `[host.ssh] ca` and `--remote-ca`: one
+field, one meaning, one set of paths it can name.
+
+Project declarations override user declarations with the same id. `flux host add`/`rm` edit the
+user layer imperatively, and `flux host ls`/`show`/`probe` inspect and verify bindings.
+
+**The vocabulary is ahead of the wiring, deliberately, and says so.** `local`, `sandboxed`,
+`microvm`, `ssh` and `remote` resolve to a substrate today. `container` and `kubernetes` are
+declarable and will validate, list and render — but nothing wires them yet, so `flux host ls`
+reports them as `unwired (selection fails closed)` and selecting one refuses by name instead of
+falling back to your own machine. Declaring one ahead of its implementation is legal and useful
+for recording intent; just do not expect it to run anything. The same is true of a `microvm`
+binding that names no served endpoint yet.
+
+Selecting a binding (`flux --host <name> …`) is granted, never ambient: `grant` lists the surface
+classes allowed to select it — `operator` (attended sessions) and/or `unattended` (serving and
+`--yes` surfaces) — and the default is deny. The classes are exact: an unattended surface never
+inherits an `operator` grant. A granted `remote` binding executes guarded effects on its serving
+endpoint; `--remote <url>` keeps working as sugar for an ephemeral, session-only binding.
+
+A granted `sandboxed` binding runs guarded effects on this machine under OS confinement
+(bubblewrap or Seatbelt). It is the `--sandbox` posture as a *substrate* rather than a flag, so it
+fails closed: on a platform with no usable confinement backend the binding refuses at startup and
+names the reason, instead of quietly running unconfined. `flux host probe <id>` reports whether
+this machine can serve it, and which backend it would use. An autonomy posture that will not run
+unconfined (`bounded-autonomy`, `exploratory`) selects this backend for a named `local` binding —
+a posture may tighten a selection, never loosen one.
+
+Four consequences are worth stating plainly before you declare one.
+
+- **A bare `FLUX_SANDBOXED` marker does not satisfy it.** A flux running inside a flux sandbox is
+  confined by that outer sandbox and a `sandboxed` binding inherits it — but only where the run's
+  own sandbox posture established it (`FLUX_SANDBOX=on|require`, `[sandbox]`, or an unattended
+  profile), which is also what makes flux print the auditable "trusting FLUX_SANDBOXED=1" startup
+  line. A marker left in the environment with confinement otherwise off is refused by name, so a
+  stale one is a clear error rather than a silent claim of confinement.
+- **`--no-sandbox` does not disable an explicitly selected `sandboxed` binding.** The flag governs
+  the spawn-time sandbox, which it still turns off exactly as before; a binding you selected by
+  name is a separate, explicit request, and confinement resolves tightest-wins everywhere in flux.
+  To run unconfined, select a different binding (or none) rather than expecting the flag to
+  override the selection.
+- **Selecting any substrate pins the workspace.** A selected binding — `sandboxed` or `remote` —
+  is resolved once at startup, so guarded effects continue against the root it was selected with
+  even after a worktree transition (`git_worktree_enter`, `fleet.isolate`) moves the native path.
+  With no `--host`, nothing is pinned and the native path follows transitions as it always has.
+- **It serves HTTP; browser operations stay hidden.** A `sandboxed` binding makes web requests
+  through the same guarded egress path, redirect rules and private-network audit trail an
+  unselected run uses — the request is made in this process against this machine's network, which
+  is what confinement of *spawned* work already implied. A substrate that genuinely cannot make
+  requests (a remote binding, until HTTP rides the wire) still refuses rather than sending from
+  the calling process behind your back. `browser.*` and `web.crawl` remain withheld while any
+  selection is in force, because they drive a browser and a crawl frontier in this process; use a
+  binding-free run for those.
+
+```toml
+[[host]]
+id = "build-farm"
+backend = "remote"
+url = "https://farm.internal:8443"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+grant = ["operator"]
+labels = { region = "eu" }
+```
+
+A granted `microvm` binding is a VM or microVM guest that serves that same remote protocol: the
+same authenticated client, the same handshake, the same credential *reference*. Flux never
+creates, starts, stops or destroys a guest — the binding consumes an endpoint that already exists.
+That endpoint comes to exist through the [VM or microVM guest
+profile](../remote-system-deployment.md#vm-or-microvm-profile) — a hardened service unit, an
+idempotent install contract and a cloud-init bootstrap in
+[`deploy/vm/`](https://github.com/codewandler/flux/tree/main/deploy/vm) — whose daemon binds
+`0.0.0.0:8790` inside the guest.
+
+```toml
+[[host]]
+id = "vm-guest"
+backend = "microvm"
+url = "https://guest.internal:8790"
+credential_ref = "env/FLUX_REMOTE_SYSTEM_TOKEN"
+ca_cert = "/etc/flux/guest-ca.pem"
+grant = ["operator"]
+```
+
+That guest profile installs a certificate at `/etc/flux/tls/tls.crt`, and the Kubernetes profile
+takes one as a `tls` Secret; both are normally issued by an operator-managed CA rather than a
+public one. `ca_cert` is where the client names that CA, so the binding reaches the substrate by
+name instead of only through `--remote … --remote-ca`.
+
+Declared without a `url`, a `microvm` binding is still legal, and honestly **unwired**: `flux host
+ls` says so and selection fails closed naming the missing endpoint, because that gap is closed by
+deploying the guest rather than by retrying. With one, `flux host probe <id>` reports the
+negotiated protocol version and the guest's own substrate identity, marked as remotely reported —
+the guest measured itself; this machine did not.
+
+### The `ssh` binding
+
+An `ssh` binding reaches the substrate almost every operator already has: a machine with sshd on
+it. **ssh is the bootstrap, not the substrate.** Selecting the binding forwards a local port to the
+far machine's loopback, makes sure `flux system serve` is running there, and then rides the ordinary
+remote protocol through that forward — same TLS, same bearer token, same version negotiation, same
+handshake. Guarded operations are never mapped onto remote shell commands: the far side is still the
+flux binary enforcing its own capabilities, which is the whole reason a remote substrate can be
+trusted at all.
+
+```toml
+[[host]]
+id = "devbox"
+backend = "ssh"
+url = "ssh://build@devbox.internal:22"      # where sshd is; `build` is a login name, not a secret
+credential_ref = "env/FLUX_DEVBOX_KEY"      # holds the *path* of the private key to offer
+grant = ["operator"]
+ssh = { binary = "/usr/local/bin/flux", serve_port = 8790, workspace = "/srv/flux/workspace", cert = "/run/flux-tls/tls.crt", key = "/run/flux-tls/tls.key", ca = "/etc/flux/devbox-ca.pem" }
+```
+
+| `ssh` key | Meaning |
+|---|---|
+| `binary` | The far-side flux binary. Default `flux`, resolved on the far side's `PATH`. |
+| `serve_port` | The far-side loopback port the serve binds and the forward lands on. Default `8790`. |
+| `workspace` | The far-side workspace root a started serve is given. |
+| `cert` / `key` | Far-side TLS material. **Both are required to *start* a serve**; a binding without them may only attach to one you run yourself. |
+| `ca` | A **local** PEM whose roots this binding trusts — the same pinning `--remote-ca` does, not a TLS bypass. |
+| `known_hosts` | A **local** `known_hosts` file scoping host-key verification to this binding. Verification is strict either way; this only says which record. |
+| `server_name` | The name the far side's certificate carries. Default `127.0.0.1`, the address the forward lands on. |
+| `token_ref` | Location of the serving endpoint's bearer token. Default `env/FLUX_REMOTE_SYSTEM_TOKEN`. Never a value. |
+
+**What must already exist on the far machine.** Installing flux there is your step, exactly as it is
+for a `remote` binding — see [Remote system deployment](../remote-system-deployment.md) and the
+shipped `deploy/` artifacts. This binding starts or attaches to what is there; it never installs
+anything. Concretely the far machine needs the flux binary at `binary` (or on `PATH`), the TLS
+certificate and key at `cert`/`key` if you want flux to start the serve, and a way to obtain its
+bearer token: either it already holds it (a systemd `EnvironmentFile`, as `deploy/vm` ships), or its
+sshd accepts the variable (`AcceptEnv FLUX_REMOTE_SYSTEM_TOKEN`) so the local side can hand it over
+through the ssh channel. The token is never passed as a command-line argument on either machine,
+because arguments are visible in a process table to everyone on the box.
+
+**The far machine also needs a way to confine what it serves.** `flux system serve` is an unattended
+surface, so its confinement floor is `require`: on a machine with no usable backend (no bubblewrap
+on Linux, no `sandbox-exec` on macOS) it refuses to start rather than serving your work unconfined
+by accident. flux reports that as its own failure — *"the far side's flux … refused to start because
+that machine has no usable confinement backend"* — and it is deliberately **not** the same message
+as a missing binary, because the fix is different and it lives over there. You have two honest
+options, both on the far machine: install a confinement backend, or point `binary` at a small
+launcher of your own that accepts unconfined operation explicitly.
+
+```sh
+#!/bin/sh
+# /usr/local/bin/flux-serve — this machine has no bubblewrap; accept that deliberately.
+exec /usr/local/bin/flux --no-sandbox "$@"
+```
+
+The binding declares *which* binary to run; the far machine's startup posture stays the far
+machine's to declare. flux will not pass `--no-sandbox` on your behalf — bypassing confinement is an
+escalation, and an escalation you did not write down is one nobody can audit.
+
+**What the tunnel does and does not do.** It carries the connection; it does not authenticate it.
+The bearer token still authenticates every request, the certificate is still verified against
+`server_name`, and a version mismatch still refuses to pair — a far side reached over ssh is admitted
+by exactly the checks a directly addressed one is. And because those answers come from another trust
+boundary, an ssh binding is a *non-native* selection like any other: it serves no local HTTP, and
+`browser.*` / `web.crawl` are withheld while it is in force.
+
+Four more things worth knowing before you declare one.
+
+- **Nothing prompts, ever.** Host-key checking is strict and `BatchMode` is on, so an unknown or
+  changed host key is a named refusal rather than a question — an unattended run has nobody to
+  answer one. Password and keyboard-interactive authentication are off, agent forwarding and
+  connection multiplexing are off, and `-F none` means neither your `~/.ssh/config` nor the
+  system-wide one is consulted. The `[[host]]` entry is the whole declaration — which also means
+  **`ProxyJump` is not supported**: a machine reachable only through a jump host cannot be reached
+  by an ssh binding today, because no binding field declares one. Point the binding at a directly
+  reachable target, or serve that machine and use a `remote` binding.
+- **Nothing reaps a far-side serve.** If flux started `flux system serve` on the far machine, it
+  keeps running after your session ends — that is deliberate, because the next session attaches to
+  it instead of starting another, and because killing a process on someone else's build machine is
+  not a thing a client should do implicitly. Stop it the way you stop any other service there.
+- **The key is a reference, and it stays a file.** `credential_ref` resolves to the private key's
+  *path*; openssh opens it and flux never reads the material. An `ssh://user:pass@host` url is
+  refused — an ssh binding authenticates by key.
+- **Every failure names its piece.** No sshd reachable, a host key that is not the one on record, a
+  key sshd declined, no flux binary at the declared path, a flux that is there and refused to start
+  (with its own words, and its own face when the reason is confinement), nothing serving and no
+  certificate to start one with, a refused handshake — each is a distinct message. "Not installed"
+  and "installed and would not start" are told apart by the far side's exit status rather than by
+  its wording, so they stay distinct whatever login shell that machine uses. Nothing ever falls back
+  to running the effect on your own machine.
+- **Two sessions do not fight.** Starting a serve is idempotent because the far side's bind address
+  is the arbiter: a second session that tries loses the bind, its attempt exits, and it attaches to
+  the serve that won. `flux host probe` never starts one at all — a probe is side-effect-free, so
+  against a far side with nothing serving it reports that rather than launching a process on your
+  build machine.
+
+`[exchange] host = "<binding>"` names the `[[host]]` entry serving the Exchange catalogue — the
+declared home for what the transitional `FLUX_EXCHANGE_URL`/token environment pair configures.
+The pair keeps working and wins while present; the named binding's `url` is the origin and its
+`credential_ref` locates the service-account token.
 
 ## Scheduled wake-ups (`[wakeup]`)
 

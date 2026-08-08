@@ -24,7 +24,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use flux_core::{Message, Usage};
+use flux_core::{AgentLoopBindingMetadata, Message, Usage};
 use flux_lang::ast::RunEvent;
 
 use crate::context::EventContext;
@@ -56,7 +56,13 @@ pub enum EventKind {
 
     /// A user turn started. The `global_seq` of this event is the `turn_id` that scopes the
     /// turn's [`EventKind::PlanAttempted`] / [`EventKind::TurnEnded`] events.
-    TurnStarted { user_input: String, model: String },
+    TurnStarted {
+        user_input: String,
+        model: String,
+        /// Resolved behavior harness for this turn. Absent only on pre-binding/legacy writes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loop_binding: Option<AgentLoopBindingMetadata>,
+    },
     /// One planning attempt within a turn. `outcome` is one of `"accepted"`, `"chat"`,
     /// `"compile_error"`, `"rejected"` (the user declined the plan); `error` carries the diagnostic
     /// when it is `"compile_error"`. For an accepted plan, `fingerprint` is the SHA-256 of the plan
@@ -98,6 +104,9 @@ pub enum EventKind {
         answer: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         usage: Option<Usage>,
+        /// Repeated at the terminal boundary so a bounded receipt is self-contained.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loop_binding: Option<AgentLoopBindingMetadata>,
     },
 
     /// One provider call's token usage, attributed to the `model` that was **actually active** for

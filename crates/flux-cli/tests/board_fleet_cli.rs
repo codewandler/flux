@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
@@ -44,6 +44,36 @@ fn fixture(name: &str) -> PathBuf {
     root
 }
 
+const TEST_FLEET_LOOP_POLICY: &str = r#"
+[loop_profiles.implementation]
+revision = "1"
+source = ".flux/fleet/loops/implementation.flux"
+entry = "work"
+
+[loop_profiles.research]
+revision = "1"
+source = ".flux/fleet/loops/research.flux"
+entry = "research"
+
+[loop_policy]
+implementation = "implementation"
+research = "research"
+"#;
+
+fn install_test_fleet_loops(root: &Path) {
+    fs::create_dir_all(root.join(".flux/fleet/loops")).unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/implementation.flux"),
+        "flow work -> string\n  $turn = ai_segment({ goal: \"implement the exact assignment\", tools: [\"read\", \"write\"], max_rounds: 8, current_turn: true })\n  return $turn.result\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/research.flux"),
+        "flow research -> string\n  $turn = ai_segment({ goal: \"research the exact request\", tools: [\"read\"], max_rounds: 4, current_turn: true })\n  return $turn.result\n",
+    )
+    .unwrap();
+}
+
 fn flux(root: &PathBuf, args: &[&str]) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_flux"));
     command
@@ -66,6 +96,12 @@ fn shell_words(line: &str) -> Vec<String> {
             (Some(expected), found) if expected == found => quote = None,
             (Some(_), found) => word.push(found),
             (None, '"' | '\'') => quote = Some(character),
+            // An unquoted `#` at the start of a word opens a shell comment, exactly as a shell would
+            // read it. The skill examples are documentation as much as they are executable, and the
+            // trailing note on `board next --independent` — that it returns a wave-safe set rather
+            // than a priority prefix — is the reason a coordinator reaches for the flag at all.
+            // Without this the example only stays runnable by being stripped of what it teaches.
+            (None, '#') if word.is_empty() => break,
             (None, found) if found.is_whitespace() => {
                 if !word.is_empty() {
                     words.push(std::mem::take(&mut word));
@@ -101,6 +137,30 @@ fn skill_examples(markdown: &str) -> Vec<Vec<String>> {
     examples
 }
 
+#[test]
+fn a_skill_example_may_carry_a_trailing_comment_without_becoming_unrunnable() {
+    assert_eq!(
+        shell_words("flux board next --limit 8 --independent  # a wave-safe set"),
+        vec!["flux", "board", "next", "--limit", "8", "--independent"]
+    );
+    // Only a `#` that opens a word is a comment. One inside a word, or inside quotes, is data — a
+    // reason string or an issue reference must survive intact, or the stripping would silently
+    // rewrite the very command the example promises is executable.
+    assert_eq!(
+        shell_words("flux fleet park wave-7 --reason \"blocked on #42\" --tag a#b"),
+        vec![
+            "flux",
+            "fleet",
+            "park",
+            "wave-7",
+            "--reason",
+            "blocked on #42",
+            "--tag",
+            "a#b"
+        ]
+    );
+}
+
 fn git(root: &PathBuf, args: &[&str]) -> std::process::Output {
     Command::new("git")
         .current_dir(root)
@@ -118,9 +178,10 @@ fn one_story_wave(name: &str) -> (PathBuf, PathBuf) {
     )
     .unwrap();
     fs::create_dir_all(root.join(".flux")).unwrap();
+    install_test_fleet_loops(&root);
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -262,6 +323,7 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     )
     .unwrap();
     fs::create_dir_all(fleet_root.join(".flux/fleet/agents")).unwrap();
+    fs::create_dir_all(fleet_root.join(".flux/fleet/loops")).unwrap();
     fs::write(
         fleet_root.join(".flux/fleet/main.md"),
         "Coordinate the offline fixture.\n",
@@ -273,8 +335,23 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     )
     .unwrap();
     fs::write(
+        fleet_root.join(".flux/fleet/loops/main.flux"),
+        "flow fleet-main -> string\n  return \"fixture main\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet/loops/research.flux"),
+        "flow fleet-research -> string\n  return \"fixture research\"\n",
+    )
+    .unwrap();
+    fs::write(
+        fleet_root.join(".flux/fleet/loops/implementation.flux"),
+        "flow work -> string\n  return \"fixture worker\"\n",
+    )
+    .unwrap();
+    fs::write(
         fleet_root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ntask_kind = \"implementation\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 1\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&fleet_root, &["init", "-q"]).status.success());
@@ -391,8 +468,121 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
             }
         }
     }
-    assert!(fleet_root.join("result.txt").is_file());
+    // C-619: the documented examples end at `fleet apply`, which accepts rather than merges — so the
+    // merged file must be absent and the accepted tag present. Asserting the tag keeps this test's
+    // point (the whole documented sequence really runs end to end) without asserting the one step the
+    // contract deliberately no longer performs.
+    assert!(
+        !fleet_root.join("result.txt").is_file(),
+        "apply must not merge into the source checkout"
+    );
+    let tags = git(
+        &fleet_root,
+        &["tag", "--list", &format!("fleet/accepted/{wave}/*")],
+    );
+    assert!(
+        !String::from_utf8_lossy(&tags.stdout).trim().is_empty(),
+        "apply must pin the candidate with an accepted tag"
+    );
     fs::remove_dir_all(fleet_root).ok();
+}
+
+/// Failing first: creating a planning item commits it, path-scoped, and `--no-commit` opts out.
+///
+/// Items are resolved at a git ref wherever a board is federated — a workspace member's stories are read
+/// with `ls-tree`/`show` at its `canonical_ref` — so an uncommitted document is invisible to every read
+/// that matters. Twenty-seven stories were filed, reported as created, and could not be scheduled: the
+/// command had succeeded and nothing had happened. Committing is therefore the default, and it must
+/// never sweep in unrelated dirt from the checkout it happens to run in.
+#[test]
+fn creating_a_planning_item_commits_exactly_that_document() {
+    let root = fixture("create-commits");
+    // git records no empty directory, so the fixture needs one tracked file to have a first commit.
+    fs::write(root.join("docs/stories/README.md"), "# Board\n").unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "board@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Board Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+
+    // Unrelated uncommitted work that must survive untouched.
+    fs::write(root.join("UNRELATED.md"), "someone else's work\n").unwrap();
+
+    let created = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Committed on creation",
+            "--status",
+            "ready",
+            "--priority",
+            "7",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stdout)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let sha = created["data"]["commit"]
+        .as_str()
+        .expect("creation must report the commit it made")
+        .to_string();
+    let file = created["data"]["file"].as_str().unwrap().to_string();
+
+    // The commit exists, and contains exactly the new document.
+    let named =
+        String::from_utf8(git(&root, &["show", "--name-only", "--pretty=format:", &sha]).stdout)
+            .unwrap();
+    let touched = named
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(touched.len(), 1, "path-scoped commit, got {touched:?}");
+    assert!(file.ends_with(touched[0]), "{file} vs {}", touched[0]);
+
+    // The unrelated file was neither committed nor staged.
+    let status = String::from_utf8(git(&root, &["status", "--porcelain"]).stdout).unwrap();
+    assert_eq!(status.trim(), "?? UNRELATED.md", "status was {status:?}");
+
+    // `--no-commit` writes the document and leaves it untracked, which is the invisible state.
+    let uncommitted = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Left uncommitted",
+            "--no-commit",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(uncommitted.status.success());
+    let uncommitted: serde_json::Value = serde_json::from_slice(&uncommitted.stdout).unwrap();
+    assert!(
+        uncommitted["data"]["commit"].is_null(),
+        "--no-commit must report no commit"
+    );
+    let status = String::from_utf8(git(&root, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(
+        status.contains("docs/stories/"),
+        "the opted-out document stays untracked: {status:?}"
+    );
+    fs::remove_dir_all(root).ok();
 }
 
 #[test]
@@ -1475,6 +1665,7 @@ fn session_board_cli_reopens_the_event_projection_and_conflicts_stale_writers() 
 #[test]
 fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
     let root = fixture("agent-admission");
+    install_test_fleet_loops(&root);
     fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
     fs::write(
         root.join(".flux/fleet/main.md"),
@@ -1488,7 +1679,7 @@ fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\ncapabilities = [\"read\"]\nmax_instances = 1\n",
+        format!("schema = \"flux.fleet/v1\"\nmax_workers = 3\nmax_wave = 10\nmax_rework = 2\nallow_ad_hoc_agents = true\n\n[main]\ninstructions = \".flux/fleet/main.md\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"scout\"\nrole = \"researcher\"\ntask_kind = \"research\"\ninstructions = \".flux/fleet/agents/scout.md\"\nmode = \"read-only\"\ncapabilities = [\"read\"]\nmax_instances = 1\n"),
     )
     .unwrap();
     assert!(flux(&root, &["fleet", "start"]).status.success());
@@ -1556,6 +1747,7 @@ fn fleet_admits_configured_and_on_the_fly_agents_but_never_a_second_main() {
 #[test]
 fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() {
     let root = fixture("missing-worker-capabilities");
+    install_test_fleet_loops(&root);
     fs::create_dir_all(root.join(".flux/fleet/agents")).unwrap();
     fs::write(
         root.join(".flux/fleet/agents/story-worker.md"),
@@ -1564,7 +1756,7 @@ fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() 
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\"]\nmax_instances = 1\n",
+        format!("schema = \"flux.fleet/v1\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ntask_kind = \"implementation\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\"]\nmax_instances = 1\n"),
     )
     .unwrap();
 
@@ -1582,6 +1774,7 @@ fn fleet_rejects_a_template_with_exact_missing_capability_names_before_launch() 
 #[test]
 fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
     let root = fixture("wave-topology");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     fs::write(
         root.join("docs/stories/C-1-story.md"),
@@ -1591,7 +1784,7 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
     fs::create_dir_all(root.join(".flux")).unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -1627,9 +1820,48 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
         String::from_utf8_lossy(&dispatched.stderr)
     );
     let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    assert_eq!(dispatched["data"]["agents"].as_array().unwrap().len(), 1);
+    assert_eq!(dispatched["data"]["agents"][0]["id"], "wave-2-worker-1");
+    assert_eq!(dispatched["data"]["agents"][0]["role"], "writer");
+    assert_eq!(
+        dispatched["data"]["agents"][0]["task_kind"],
+        "implementation"
+    );
+    assert_eq!(
+        dispatched["data"]["agents"][0]["loop_binding"]["profile"],
+        "implementation"
+    );
+    assert_eq!(
+        dispatched["data"]["agents"][0]["loop_binding"]["source_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
     let repository = &dispatched["data"]["topology"]["repositories"][0];
     assert_eq!(repository["base_commit"], base);
     assert_eq!(repository["stories"][0]["base_commit"], base);
+
+    let census = flux(&root, &["fleet", "agents", "--output", "json"]);
+    assert!(census.status.success());
+    let census: serde_json::Value = serde_json::from_slice(&census.stdout).unwrap();
+    assert_eq!(census["data"]["schema"], "flux.fleet-agents/v1");
+    assert_eq!(census["data"]["workers_total"], 1);
+    assert_eq!(
+        census["data"]["workers"]["wave-2-worker-1"]["id"],
+        "wave-2-worker-1"
+    );
+    assert_eq!(
+        census["data"]["workers"]["wave-2-worker-1"]["task_kind"],
+        "implementation"
+    );
+    assert!(census["data"]["workers"]["wave-2-worker-1"]
+        .get("instructions")
+        .is_none());
+    assert!(census["data"]["workers"]["wave-2-worker-1"]
+        .get("last_turn")
+        .is_none());
+
     let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
     let story = PathBuf::from(repository["stories"][0]["worktree"].as_str().unwrap());
     assert!(integration.is_dir());
@@ -1647,11 +1879,110 @@ fn fleet_dispatch_creates_a_pinned_wave_and_inheriting_story_worktrees() {
         base
     );
     assert_eq!(repository["stories"][0]["board_ref"], "repo/C-1");
+    assert_eq!(repository["stories"][0]["wave"], "wave-2");
+}
+
+/// Failing first: `fleet repair` rebuilds the structure a wave's topology names and disk lacks.
+///
+/// Reclamation removed an integration worktree an unfinished wave still needed, and putting it back
+/// took a hand-written `git worktree add` against a base read out of `state.json` — the same class of
+/// hand repair as the `git reset --hard <base>` an integration worktree needed before handoffs would
+/// verify. Both facts are recorded; neither had a verb.
+///
+/// The three assertions below are the whole contract. A missing checkout returns **on its own
+/// branch**, so a worker's delivered commit survives the repair. A worktree holding an uncommitted
+/// change is refused rather than reset, because the only place that change exists is the one this
+/// verb would overwrite. And once nothing would be discarded, a derived worktree goes back to the
+/// base it is pinned to, leaving every story commit alone.
+#[test]
+fn fleet_repair_rebuilds_missing_structure_without_discarding_work() {
+    fn head_of(worktree: &PathBuf) -> String {
+        String::from_utf8(git(worktree, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+    fn entry_for(repaired: &serde_json::Value, worktree: &Path) -> serde_json::Value {
+        repaired["data"]["worktrees"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .find(|entry| entry["worktree"] == worktree.display().to_string())
+            .cloned()
+            .unwrap_or_else(|| panic!("{} is missing from {repaired}", worktree.display()))
+    }
+
+    let (root, story) = one_story_wave("wave-repair");
+    let base = head_of(&root);
+    let delivered = commit_result(&story, "delivered");
+    let integration = story
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("integration");
+    assert!(integration.is_dir());
+
+    fs::remove_dir_all(&story).unwrap();
+    let repaired = flux(&root, &["fleet", "repair", "wave-2", "--output", "json"]);
+    assert!(
+        repaired.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&repaired.stdout),
+        String::from_utf8_lossy(&repaired.stderr)
+    );
+    let repaired: serde_json::Value = serde_json::from_slice(&repaired.stdout).unwrap();
+    assert_eq!(repaired["data"]["wave"], "wave-2");
+    assert_eq!(
+        entry_for(&repaired, &story)["repair"]["action"],
+        "recreated"
+    );
+    assert!(story.is_dir(), "the checkout the topology names is back");
+    assert_eq!(
+        head_of(&story),
+        delivered,
+        "rebuilt on its recorded branch, so the delivered commit came back with it"
+    );
+
+    assert!(git(
+        &integration,
+        &["commit", "--allow-empty", "-qm", "assembly"]
+    )
+    .status
+    .success());
+    let assembled = head_of(&integration);
+    fs::write(integration.join("scratch.txt"), "unsaved\n").unwrap();
+    let refused = flux(&root, &["fleet", "repair", "wave-2", "--output", "json"]);
+    assert!(refused.status.success());
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(
+        entry_for(&refused, &integration)["repair"]["action"],
+        "refused"
+    );
+    assert_eq!(
+        head_of(&integration),
+        assembled,
+        "a refusal leaves the worktree exactly as it was"
+    );
+    assert!(integration.join("scratch.txt").is_file());
+
+    fs::remove_file(integration.join("scratch.txt")).unwrap();
+    let reset = flux(&root, &["fleet", "repair", "wave-2", "--output", "json"]);
+    assert!(reset.status.success());
+    let reset: serde_json::Value = serde_json::from_slice(&reset.stdout).unwrap();
+    assert_eq!(entry_for(&reset, &integration)["repair"]["action"], "reset");
+    assert_eq!(head_of(&integration), base, "back on its pinned base");
+    assert_eq!(
+        head_of(&story),
+        delivered,
+        "repairing the assembly never touches a story's commits"
+    );
 }
 
 #[test]
 fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     let root = fixture("wave-integration");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     fs::write(
         root.join("docs/stories/C-1-story.md"),
@@ -1661,7 +1992,7 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     fs::create_dir_all(root.join(".flux")).unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\nfences = [\".flux/fleet/**\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\nfences = [\".flux/fleet/**\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -1765,19 +2096,38 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
         String::from_utf8_lossy(&applied.stderr)
     );
     let applied: serde_json::Value = serde_json::from_slice(&applied.stdout).unwrap();
-    assert_eq!(applied["data"]["merged_locally"], true);
+    // C-619: apply ACCEPTS the candidate, it does not merge it.
+    //
+    // The old contract merged in the repository's source checkout, which Fleet keeps DETACHED at the
+    // pinned base — so the merge commit landed on no branch, `main` never moved, and the only thing
+    // reachable from it was that worktree's HEAD. Acceptance now pins the candidate with an annotated
+    // tag that outlives the wave, the integration branch and worktree reclamation; `main` is written
+    // exactly once, later, by the gated accumulation snapshot.
+    assert_eq!(applied["data"]["accepted"], true);
+    assert_eq!(applied["data"]["merged_locally"], false);
     assert_eq!(applied["data"]["pushed"], false);
     assert_eq!(applied["data"]["released"], false);
     assert_eq!(applied["data"]["deployed"], false);
-    assert_eq!(
-        fs::read_to_string(root.join("result.txt")).unwrap(),
-        "implemented\n"
+    assert!(
+        !root.join("result.txt").exists(),
+        "apply must not merge into the source checkout"
     );
+    // What acceptance must guarantee is that the work cannot be lost: the tag resolves, and the story's
+    // content is reachable through it even though no branch points at the candidate.
+    let tag = "fleet/accepted/wave-2/repo";
+    let shown = git(&root, &["show", &format!("{tag}:result.txt")]);
+    assert!(
+        shown.status.success(),
+        "accepted tag {tag} must resolve: {}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&shown.stdout), "implemented\n");
 }
 
 #[test]
 fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate() {
     let root = fixture("combined-only-red");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     for (id, title, priority) in [("C-1", "One", 1), ("C-2", "Two", 2)] {
         fs::write(
@@ -1791,7 +2141,7 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
     fs::create_dir_all(root.join(".flux")).unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"test ! -f one.txt || test ! -f two.txt\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"test ! -f one.txt || test ! -f two.txt\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -1908,6 +2258,702 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
         !retry.status.success(),
         "a red wave cannot spend a second gate run"
     );
+
+    // Failing first: a wave that failed integration can be RETRIED once the cause is fixed, but a retry
+    // that recomputes the identical candidate must not spend a second gate run.
+    //
+    // `conflict` and `red` used to be terminal, so a wave that failed kept a memory of failing and no
+    // later `fleet integrate` would touch it. That made fixing the cause pointless: three delivered
+    // stories stayed unreachable after the defect that stranded them was fixed and installed, refused
+    // with "not ready for integration". The guard worth keeping belongs to the candidate, not the wave.
+    let reretry = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        !reretry.status.success(),
+        "an unchanged candidate must not be re-gated"
+    );
+    let reretry: serde_json::Value = serde_json::from_slice(&reretry.stdout).unwrap();
+    assert_eq!(reretry["error"]["class"], "validation/gate");
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "integration",
+            "wave-2",
+            "--output",
+            "json",
+        ],
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    let gate = &inspected["data"]["data"]["repositories"][0]["gate"];
+    assert_eq!(
+        gate["runs"], 1,
+        "still exactly one gate run for this candidate: {gate}"
+    );
+    assert!(
+        gate["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unchanged"),
+        "and the refusal says why rather than repeating the old verdict: {gate}"
+    );
+
+    // Failing first: a NAMED apply is judged per repository, not by the wave rollup.
+    //
+    // Integration assembles and gates one candidate per repository, so a wave can hold a green candidate
+    // beside a conflicted one — and apply demanding the whole wave be green stranded that green candidate
+    // behind a collision it had no part in. The two refusals must therefore be distinguishable: the
+    // whole-wave apply is refused by the rollup, while `--only` reaches the per-repository gate check and
+    // is refused by THAT. Here the one repository is genuinely red, so both refuse — but for different,
+    // observable reasons, which is exactly the contract change.
+    let whole = flux(&root, &["fleet", "apply", "wave-2", "--output", "json"]);
+    assert!(!whole.status.success());
+    let whole: serde_json::Value = serde_json::from_slice(&whole.stdout).unwrap();
+    assert!(
+        whole["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has no recorded green final gate"),
+        "whole-wave apply is refused by the rollup: {}",
+        whole["error"]["message"]
+    );
+
+    let named = flux(
+        &root,
+        &[
+            "fleet", "apply", "wave-2", "--only", "repo", "--output", "json",
+        ],
+    );
+    assert!(!named.status.success());
+    let named: serde_json::Value = serde_json::from_slice(&named.stdout).unwrap();
+    assert!(
+        named["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("lacks exactly one recorded green final gate"),
+        "a named apply must reach the per-repository gate check: {}",
+        named["error"]["message"]
+    );
+
+    // Naming a repository the wave does not contain is a not-found, not a silent no-op that reports
+    // success for accepting nothing.
+    let absent = flux(
+        &root,
+        &[
+            "fleet", "apply", "wave-2", "--only", "absent", "--output", "json",
+        ],
+    );
+    assert!(!absent.status.success());
+    let absent: serde_json::Value = serde_json::from_slice(&absent.stdout).unwrap();
+    assert_eq!(absent["error"]["class"], "not-found");
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// Failing first: concurrent handoffs against one wave all land.
+///
+/// A handoff writes the wave record and its worker's record, and at width every worker reaches that point
+/// at once. The write used to be computed from the snapshot the call started with, so the loser of the
+/// compare-and-set lost its whole handoff — evidence, write set and commit — and the wave then looked as
+/// though that story had never been delivered. Two lost updates already cost a dispatch and a completed
+/// integration with a SINGLE worker running; N workers is the contention this closes.
+#[test]
+fn concurrent_handoffs_against_one_wave_all_land() {
+    let root = fixture("concurrent-handoffs");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    let ids = ["C-1", "C-2", "C-3", "C-4"];
+    for (index, id) in ids.iter().enumerate() {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: Story {index}\nstatus: ready\npriority: {}\n---\n\n# Story {index}\n\n## Acceptance\n\n- [ ] ship\n",
+                index + 1
+            ),
+        )
+        .unwrap();
+    }
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"true\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let items: Vec<String> = ids.iter().map(|id| format!("repo/{id}")).collect();
+    let mut argv: Vec<&str> = vec!["fleet", "run"];
+    argv.extend(items.iter().map(String::as_str));
+    argv.extend(["--prepare-only", "--output", "json"]);
+    let dispatched = flux(&root, &argv);
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(stories.len(), 4);
+
+    // Each story commits its own file, so the handoffs are independent in content and simultaneous in time.
+    let mut prepared = Vec::new();
+    for (index, story) in stories.iter().enumerate() {
+        let worktree = PathBuf::from(story["worktree"].as_str().unwrap());
+        let name = format!("file-{index}.txt");
+        fs::write(worktree.join(&name), "done\n").unwrap();
+        assert!(git(&worktree, &["add", &name]).status.success());
+        assert!(git(&worktree, &["commit", "-qm", &name]).status.success());
+        let commit = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        prepared.push((
+            story["board_ref"].as_str().unwrap().to_string(),
+            name,
+            commit,
+        ));
+    }
+
+    // Fire them at once. Any one losing its compare-and-set is the defect.
+    let handles: Vec<_> = prepared
+        .into_iter()
+        .map(|(item, name, commit)| {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let output = flux(
+                    &root,
+                    &[
+                        "fleet",
+                        "handoff",
+                        "wave-2",
+                        &item,
+                        "--commit",
+                        &commit,
+                        "--write-set",
+                        &name,
+                        "--test-arg",
+                        "test",
+                        "--test-arg",
+                        "-f",
+                        "--test-arg",
+                        &name,
+                        "--failing-before",
+                        "--passing-after",
+                        "--summary",
+                        "one file",
+                        "--output",
+                        "json",
+                    ],
+                );
+                (
+                    item,
+                    output.status.success(),
+                    String::from_utf8_lossy(&output.stdout).to_string(),
+                )
+            })
+        })
+        .collect();
+    let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    for (item, ok, out) in &results {
+        assert!(ok, "{item} lost its handoff: {out}");
+    }
+
+    // And every one is recorded, not merely reported: the wave must hold four accepted handoffs.
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "integration",
+            "wave-2",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(inspected.status.success());
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    // The system's own aggregate is the strongest assertion available: a wave only reaches
+    // `handoffs-ready` when EVERY story in it holds an accepted handoff. Had any of the four lost its
+    // compare-and-set, the wave would still be waiting on that story.
+    assert_eq!(
+        inspected["data"]["data"]["status"], "handoffs-ready",
+        "every concurrent handoff must survive in state: {}",
+        inspected["data"]["data"]
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// Failing first: a derived artifact is regenerated on the CANDIDATE, once, before the gate.
+///
+/// Some checked-in artifacts are derived from many stories at once — a documentation mirror, a generated
+/// index. They belong to the candidate, not to any one story: two stories regenerating the same artifact
+/// collide, and regenerating it on either branch alone yields an artifact missing the other's
+/// contribution. `wave-346`'s flux gate refused a candidate with `embedded docs are stale` for exactly
+/// that reason, with both stories correct in isolation.
+#[test]
+fn a_derived_artifact_is_regenerated_on_the_candidate_before_the_gate() {
+    let root = fixture("candidate-prepare");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: One\nstatus: ready\npriority: 1\n---\n\n# One\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    // `INDEX` is derived from every `part-*` file. The gate demands it be current; only a step that runs
+    // after all stories are cherry-picked can make that true.
+    fs::write(root.join("INDEX"), "").unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\nprepare = [\"sh\", \"-c\", \"ls part-* > INDEX\"]\ngate = [\"sh\", \"-c\", \"ls part-* | diff - INDEX\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(dispatched.status.success());
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let story = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    // The story adds its part and deliberately does NOT touch the derived index.
+    fs::write(story.join("part-a"), "a\n").unwrap();
+    assert!(git(&story, &["add", "part-a"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "add part-a"])
+        .status
+        .success());
+    let commit = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "part-a",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "part-a",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "one part",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "preparation must make the derived artifact current: stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let integration = PathBuf::from(
+        integrated["data"]["topology"]["repositories"][0]["integration"]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    assert_eq!(
+        fs::read_to_string(integration.join("INDEX"))
+            .unwrap()
+            .trim(),
+        "part-a",
+        "the regenerated artifact is part of the candidate"
+    );
+    // And it is committed, not left dirty — an uncommitted change would not survive into the tag.
+    let dirt = String::from_utf8(git(&integration, &["status", "--porcelain"]).stdout).unwrap();
+    assert!(dirt.trim().is_empty(), "candidate left dirty: {dirt:?}");
+    fs::remove_dir_all(root).ok();
+}
+
+/// Failing first: a story that made several commits integrates all of them.
+///
+/// A handoff names one commit and a worker legitimately makes several — implementation then
+/// documentation is the shape the contract asks for. Integration cherry-picked the single cited commit,
+/// so it applied only the LAST one and silently dropped the rest: on one real wave a two-commit story
+/// contributed only its docs commit, and a five-commit story likewise. That surfaced as a conflict,
+/// which was luck; a clean apply would have produced a candidate documenting code that was not in it.
+///
+/// The evidence already assumed the range — handoff verification computes the write set with
+/// `diff <base> <commit>` — so the record described a range the integration never applied.
+#[test]
+fn a_story_that_made_several_commits_integrates_all_of_them() {
+    let (root, story) = one_story_wave("multi-commit-story");
+    // Two commits, exactly as a worker is asked to produce: the change, then its record. Only the
+    // second is cited by the handoff.
+    fs::write(story.join("result.txt"), "implemented\n").unwrap();
+    assert!(git(&story, &["add", "result.txt"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "implement the thing"])
+        .status
+        .success());
+    fs::write(story.join("EVIDENCE.md"), "why it is right\n").unwrap();
+    assert!(git(&story, &["add", "EVIDENCE.md"]).status.success());
+    assert!(git(&story, &["commit", "-qm", "record the evidence"])
+        .status
+        .success());
+    let cited = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &cited,
+            "--write-set",
+            "result.txt",
+            "--write-set",
+            "EVIDENCE.md",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "two commits, one handoff",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let integration = PathBuf::from(
+        integrated["data"]["topology"]["repositories"][0]["integration"]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    // The IMPLEMENTATION must be there, not only the commit that was named.
+    assert!(
+        integration.join("result.txt").is_file(),
+        "the cited commit's ancestor carried the implementation and must have been applied too"
+    );
+    assert!(integration.join("EVIDENCE.md").is_file());
+    fs::remove_dir_all(root).ok();
+}
+
+/// Failing first: a handoff derives the write set and the owning worker from the story worktree.
+///
+/// Both facts are already recorded — the range `base..HEAD` in that worktree, and the agent whose
+/// assignment names it — yet every handoff restated them by hand. Harvesting six delivered stories in
+/// one evening meant reading `state.json` to find the owning worker for each and running
+/// `git diff base..HEAD` to retype its write set. A retyped write set is not a typo when it is wrong,
+/// it is false evidence; and a story attempted by more than one wave made the item-wide worker lookup
+/// "ambiguous" even though the wave records exactly which worker was given this worktree.
+#[test]
+fn handoff_derives_the_write_set_and_the_owning_worker_from_the_worktree() {
+    let (root, story) = one_story_wave("handoff-from-worktree");
+    let commit = commit_result(&story, "derived");
+    // A second wave holding an attempt at the same item, which is what made the identity ambiguous:
+    // two agents now carry `repo/C-1`, and only the one assigned THIS worktree owns this handoff.
+    let second = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        second.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--from-worktree",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "Derived the write set and the owning worker",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    // The range proves the write set; nothing was claimed by hand.
+    assert_eq!(
+        handoff["data"]["write_set"],
+        serde_json::json!(["result.txt"])
+    );
+    // And the worker is the one this wave gave the worktree, not merely one that carries the item.
+    assert_eq!(handoff["data"]["worker"], "wave-2-worker-1");
+    assert_eq!(
+        handoff["data"]["worktree"],
+        story.to_string_lossy().as_ref()
+    );
+
+    // A hand-typed claim and a derived one are mutually exclusive: one handoff, one source of truth.
+    let both = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--from-worktree",
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--summary",
+            "both at once",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !both.status.success(),
+        "a derived handoff must refuse a hand-typed write set: {}",
+        String::from_utf8_lossy(&both.stdout)
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// Failing first: two stories in ONE repository that both write the SAME file integrate, as long as
+/// their commits actually combine.
+///
+/// Integration used to refuse the wave outright whenever two write sets intersected. That is a proxy
+/// for "these commits will not combine", and within one repository it is wrong far more often than it
+/// is right: `wave-346` was parked because two delivered stories each appended an entry to one
+/// changelog, exactly as the worker contract told them to. Nearly every harness story also edits the
+/// same hub module, so the proxy made more than one story per repository per wave impossible — the
+/// width the fleet exists to provide.
+///
+/// The real test is the cherry-pick that follows, which fails on a genuine conflict and records the
+/// conflicting files and git's own stderr. Disjoint edits to one file must therefore reach the gate.
+#[test]
+fn two_stories_sharing_one_file_integrate_when_their_commits_combine() {
+    let root = fixture("shared-path-combines");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    for (id, title, priority) in [("C-1", "One", 1), ("C-2", "Two", 2)] {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: ready\npriority: {priority}\n---\n\n# {title}\n\n## Acceptance\n\n- [ ] ship\n"
+            ),
+        )
+        .unwrap();
+    }
+    // A shared append-only ledger, long enough that edits at opposite ends are separated by more than
+    // git's three lines of diff context — which is precisely the shape of a changelog.
+    let filler = (1..=20)
+        .map(|n| format!("- entry {n}\n"))
+        .collect::<String>();
+    fs::write(root.join("LEDGER.md"), format!("# Ledger\n\n{filler}")).unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"sh\", \"-c\", \"grep -q 'from one' LEDGER.md && grep -q 'from two' LEDGER.md\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "repo/C-2",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for (index, marker) in ["from one", "from two"].iter().enumerate() {
+        let story = PathBuf::from(stories[index]["worktree"].as_str().unwrap());
+        let ledger = story.join("LEDGER.md");
+        let text = fs::read_to_string(&ledger).unwrap();
+        // One story edits the head of the file, the other its tail.
+        let edited = if index == 0 {
+            text.replacen("# Ledger\n", &format!("# Ledger\n\n- {marker}\n"), 1)
+        } else {
+            format!("{text}- {marker}\n")
+        };
+        fs::write(&ledger, edited).unwrap();
+        assert!(git(&story, &["add", "LEDGER.md"]).status.success());
+        assert!(git(&story, &["commit", "-qm", marker]).status.success());
+        let commit = String::from_utf8(git(&story, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let item = format!("repo/C-{}", index + 1);
+        let handoff = flux(
+            &root,
+            &[
+                "fleet",
+                "handoff",
+                "wave-2",
+                &item,
+                "--commit",
+                &commit,
+                // The identical write set for both stories: the case that used to be refused.
+                "--write-set",
+                "LEDGER.md",
+                "--test-arg",
+                "grep",
+                "--test-arg",
+                "-q",
+                "--test-arg",
+                marker,
+                "--test-arg",
+                "LEDGER.md",
+                "--failing-before",
+                "--passing-after",
+                "--summary",
+                "appended one ledger entry",
+                "--output",
+                "json",
+            ],
+        );
+        assert!(
+            handoff.status.success(),
+            "{}",
+            String::from_utf8_lossy(&handoff.stdout)
+        );
+    }
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "a shared path is not a conflict: stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    assert_eq!(
+        integrated["data"]["topology"]["repositories"][0]["gate"]["runs"],
+        1
+    );
+    // Both entries are in the one candidate, so the combination really happened rather than one story
+    // silently winning.
+    let integration = PathBuf::from(
+        integrated["data"]["topology"]["repositories"][0]["integration"]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    let combined = fs::read_to_string(integration.join("LEDGER.md")).unwrap();
+    assert!(combined.contains("- from one"), "{combined}");
+    assert!(combined.contains("- from two"), "{combined}");
     fs::remove_dir_all(root).ok();
 }
 
@@ -2008,6 +3054,183 @@ fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     );
 }
 
+/// C-631 (R-10, failing first): harvest before the pause. A worker that commits its deliverable and
+/// then runs out of turn leaves that work in a worktree nothing has recorded; parking on top of it
+/// buries a finished story under a decision — three separate waves once held the same completed story,
+/// were parked as failures, and a human dug the commits out days later. `park` records what the
+/// worktrees already prove, and says what it harvested.
+#[test]
+fn parking_a_wave_harvests_committed_work_before_the_pause() {
+    let (root, story) = one_story_wave("park-harvest");
+    let commit = commit_result(&story, "delivered");
+
+    let parked = flux(
+        &root,
+        &[
+            "fleet",
+            "park",
+            "wave-2",
+            "--reason",
+            "waiting on the API decision",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        parked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parked.stdout)
+    );
+    let parked: serde_json::Value = serde_json::from_slice(&parked.stdout).unwrap();
+    assert_eq!(parked["data"]["status"], "parked");
+    let harvested = parked["data"]["harvested"]
+        .as_array()
+        .expect("the park reports what it harvested");
+    let recorded = harvested
+        .iter()
+        .find(|report| report["item"] == "repo/C-1")
+        .unwrap_or_else(|| panic!("the parked wave's story is reported: {harvested:?}"));
+    assert_eq!(recorded["recorded"], true, "{recorded}");
+    assert_eq!(recorded["commit"], commit);
+
+    // The harvest is journalled, so the commit the pause could have buried survives a restart as a
+    // recorded handoff rather than as an unread worktree.
+    let events = flux(
+        &root,
+        &["fleet", "events", "--limit", "200", "--output", "json"],
+    );
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert!(
+        events["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "wave.park.harvested"),
+        "the harvest is journalled: {}",
+        events["data"]["events"]
+    );
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-639: parking used to live in a driver-owned text file — invisible to `fleet status`, so a parked
+/// wave was re-decided every minute, and unparking meant editing text. Parking is a lifecycle state of
+/// the wave, with a reason, and returning from it is a verb.
+#[test]
+fn parking_a_wave_records_the_reason_and_unparking_restores_the_state_it_held() {
+    let (root, _story) = one_story_wave("park-lifecycle");
+
+    let parked = flux(
+        &root,
+        &[
+            "fleet",
+            "park",
+            "wave-2",
+            "--reason",
+            "waiting on a human decision",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        parked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&parked.stdout)
+    );
+    let parked: serde_json::Value = serde_json::from_slice(&parked.stdout).unwrap();
+    assert_eq!(parked["data"]["wave"], "wave-2");
+    assert_eq!(parked["data"]["status"], "parked");
+    assert_eq!(
+        parked["data"]["park"]["reason"],
+        "waiting on a human decision"
+    );
+    assert_eq!(parked["data"]["park"]["previous_status"], "accepted");
+    assert!(parked["data"]["park"]["revision"].is_number());
+
+    // The whole point: the pause and its reason are visible without reading `state.json`.
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let wave = status["data"]["waves"]["listed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|wave| wave["id"] == "wave-2")
+        .expect("the parked wave is listed");
+    assert_eq!(wave["status"], "parked");
+    assert_eq!(wave["park"]["reason"], "waiting on a human decision");
+    let human = flux(&root, &["fleet", "status"]);
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).unwrap();
+    assert!(
+        human.contains("parked: waiting on a human decision"),
+        "the human status must name the park reason: {human}"
+    );
+
+    // A second park is a typed conflict, never a silent overwrite of the recorded reason.
+    let again = flux(
+        &root,
+        &[
+            "fleet",
+            "park",
+            "wave-2",
+            "--reason",
+            "another reason",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(again.status.code(), Some(4));
+
+    let unparked = flux(&root, &["fleet", "unpark", "wave-2", "--output", "json"]);
+    assert!(
+        unparked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unparked.stdout)
+    );
+    let unparked: serde_json::Value = serde_json::from_slice(&unparked.stdout).unwrap();
+    assert_eq!(unparked["data"]["status"], "accepted");
+    assert_eq!(unparked["data"]["previous_status"], "parked");
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let wave = status["data"]["waves"]["listed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|wave| wave["id"] == "wave-2")
+        .expect("the unparked wave is listed");
+    assert_eq!(wave["status"], "accepted");
+    assert!(wave["park"].is_null(), "the park record is cleared");
+
+    // Unparking a wave that is not parked, and parking one that does not exist, are typed failures.
+    let twice = flux(&root, &["fleet", "unpark", "wave-2", "--output", "json"]);
+    assert_eq!(twice.status.code(), Some(4));
+    let missing = flux(
+        &root,
+        &[
+            "fleet", "park", "wave-404", "--reason", "absent", "--output", "json",
+        ],
+    );
+    assert_eq!(missing.status.code(), Some(3));
+
+    // Both verbs are journalled, so the pause survives a restart with its reason.
+    let events = flux(
+        &root,
+        &["fleet", "events", "--limit", "200", "--output", "json"],
+    );
+    let events: serde_json::Value = serde_json::from_slice(&events.stdout).unwrap();
+    let kinds = events["data"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert!(kinds.contains(&"wave.parked"), "{kinds:?}");
+    assert!(kinds.contains(&"wave.unparked"), "{kinds:?}");
+
+    fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
     let (root, _story) = one_story_wave("scriptless-inspection");
@@ -2020,6 +3243,7 @@ fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
         ("activity", None),
         ("worktree", None),
         ("integration", Some("wave-2")),
+        ("gate", Some("wave-2")),
         ("source", Some("repo")),
         ("search", Some("wave")),
         ("story", Some("repo/C-1")),
@@ -2086,15 +3310,25 @@ fn scriptless_inspection_and_report_surfaces_are_bounded_and_deterministic() {
 #[test]
 fn fleet_delivers_to_a_real_durable_main_agent_session() {
     let root = fixture("durable-main-turn");
-    fs::create_dir_all(root.join(".flux/fleet")).unwrap();
+    fs::create_dir_all(root.join(".flux/fleet/loops")).unwrap();
     fs::write(
         root.join(".flux/fleet/main.md"),
         "Act as the only main coordinator and acknowledge the request.\n",
     )
     .unwrap();
     fs::write(
+        root.join(".flux/fleet/loops/main.flux"),
+        "flow fleet-main -> string\n  result = task({ role: \"scout\", task: \"read-only fixture research\" })\n  return result\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/research.flux"),
+        "flow fleet-research -> string\n  return \"acknowledged\"\n",
+    )
+    .unwrap();
+    fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\n",
+        "schema = \"flux.fleet/v1\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n",
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -2129,6 +3363,7 @@ fn fleet_delivers_to_a_real_durable_main_agent_session() {
     );
     let first: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
     assert_eq!(first["data"]["receipt"]["ack"], "completed");
+    assert_eq!(first["data"]["receipt"]["answer"], "acknowledged");
     assert_eq!(first["data"]["receipt"]["session"], "s_1");
     assert!(first["data"]["receipt"]["events"]
         .as_array()
@@ -2171,6 +3406,7 @@ fn fleet_delivers_to_a_real_durable_main_agent_session() {
 #[test]
 fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     let root = fixture("real-story-agent");
+    install_test_fleet_loops(&root);
     fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
     fs::write(
         root.join("docs/stories/C-1-story.md"),
@@ -2190,7 +3426,7 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     .unwrap();
     fs::write(
         root.join(".flux/fleet.toml"),
-        "schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n",
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[agent_templates]]\nid = \"story-worker\"\nrole = \"writer\"\ntask_kind = \"implementation\"\ninstructions = \".flux/fleet/agents/story-worker.md\"\nmodel = \"mock\"\nmode = \"write\"\ncapabilities = [\"read\", \"edit\", \"git\", \"shell\"]\nmax_instances = 3\n\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
     )
     .unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
@@ -2226,6 +3462,14 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     assert_eq!(receipts[1]["context_origin"]["session_mode"], "fresh");
     assert_ne!(receipts[0]["store"], receipts[1]["store"]);
     for receipt in receipts {
+        assert_eq!(receipt["loop_binding"]["profile"], "implementation");
+        assert_eq!(
+            receipt["loop_binding"]["source_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
         let context = serde_json::to_string(&receipt["context_origin"]).unwrap();
         assert!(!context.contains("Work only in the assigned story worktree"));
         assert!(!context.contains("flux-mock"));
@@ -2319,7 +3563,54 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     let status = flux(&root, &["fleet", "status", "--output", "json"]);
     assert!(status.status.success());
     let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    let admitted = &status["data"]["state"]["agents"][first_agent];
+    // C-562: the default projection is bounded operational truth. It names the worker, its exact
+    // BoardRef and its session, and never copies the raw agent record, its instruction body or its
+    // admitted operation catalogue out of durable state.
+    assert_eq!(status["data"]["schema"], "flux.fleet-status/v1");
+    assert_eq!(status["data"]["bounded"], true);
+    assert!(
+        status["data"]["state"].is_null(),
+        "default status embedded raw Fleet state: {status}"
+    );
+    let listed = status["data"]["workers"]["listed"].as_array().unwrap();
+    let row = listed
+        .iter()
+        .find(|worker| worker["id"] == first_agent)
+        .unwrap_or_else(|| panic!("{first_agent} missing from {listed:?}"));
+    assert_eq!(row["board_ref"], receipts[0]["context_origin"]["board_ref"]);
+    let projected = status.to_string();
+    assert!(
+        !projected.contains("Work only in the assigned story worktree"),
+        "default status embedded the worker instruction body: {projected}"
+    );
+    assert!(
+        !projected.contains("read_roots"),
+        "default status embedded the admitted operation scope: {projected}"
+    );
+
+    // Detail remains reachable through the explicitly bounded inspect route.
+    let inspected = flux(
+        &root,
+        &[
+            "fleet",
+            "inspect",
+            "worker",
+            first_agent,
+            "--limit",
+            "50",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        inspected.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&inspected.stdout),
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["data"]["bounded"], true);
+    let admitted = &inspected["data"]["data"];
     assert_eq!(
         admitted["capabilities"],
         serde_json::json!(["edit", "git", "read", "shell"])
@@ -2438,6 +3729,205 @@ fn fleet_run_launches_a_real_local_story_agent_in_its_child_worktree() {
     assert!(
         git(&root, &["status", "--short"]).stdout.is_empty(),
         "the source checkout remains untouched"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-642: quiescing before an install is a verb, and it is safe in the order it does its two jobs.
+///
+/// The window is recorded before liveness is inspected, so the refusal that follows a live worker
+/// cannot be raced by a dispatch; and the verb itself fails while a worker turn is in flight, so
+/// `flux fleet quiesce && install` cannot walk past one the way a process-table scan did.
+#[test]
+fn fleet_quiesce_stops_dispatch_and_refuses_to_confirm_while_a_worker_is_in_flight() {
+    let root = fixture("quiesce-install-window");
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n## Acceptance\n\n- [ ] ship\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/main.md"),
+        "Act as the only main coordinator and acknowledge the request.\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/main.flux"),
+        "flow fleet-main -> string\n  result = task({ role: \"scout\", task: \"read-only fixture research\" })\n  return result\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet/loops/main-research.flux"),
+        "flow fleet-research -> string\n  return \"acknowledged\"\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n\n[main]\ninstructions = \".flux/fleet/main.md\"\nmodel = \"mock\"\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/main-research.flux\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&dispatched.stderr)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let worker = dispatched["data"]["agents"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A prepared worker has no turn behind it, so record the state an operator actually installs
+    // into by mistake: a worker that is genuinely mid-turn, with no terminal receipt to settle it.
+    let state_path = root.join(".flux/fleet/state.json");
+    let set_worker_status = |status: &str| {
+        let mut state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&state_path).unwrap()).unwrap();
+        state["agents"][worker.as_str()]["status"] = serde_json::json!(status);
+        fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    };
+    set_worker_status("working");
+
+    let refused = flux(
+        &root,
+        &[
+            "fleet",
+            "quiesce",
+            "--reason",
+            "install a new binary",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "quiesce confirmed while a worker was in flight: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["class"], "conflict/precondition");
+    let refusal = refused["error"]["message"].as_str().unwrap();
+    assert!(
+        refusal.contains(&worker),
+        "refusal did not name the live worker: {refusal}"
+    );
+
+    // ...and dispatch stopped anyway, because the window is recorded before liveness is inspected.
+    let blocked = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !blocked.status.success(),
+        "a quiesced fleet dispatched a wave: {}",
+        String::from_utf8_lossy(&blocked.stdout)
+    );
+    let blocked: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["error"]["class"], "conflict/precondition");
+    let blocked = blocked["error"]["message"].as_str().unwrap();
+    assert!(
+        blocked.contains("quiesced") && blocked.contains("install a new binary"),
+        "dispatch refusal did not name the recorded window: {blocked}"
+    );
+
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["data"]["quiesce"]["reason"], "install a new binary");
+
+    // Once the worker settles, the same command confirms instead of refusing.
+    set_worker_status("completed");
+    let confirmed = flux(
+        &root,
+        &[
+            "fleet",
+            "quiesce",
+            "--reason",
+            "install a new binary",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        confirmed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&confirmed.stdout),
+        String::from_utf8_lossy(&confirmed.stderr)
+    );
+    let confirmed: serde_json::Value = serde_json::from_slice(&confirmed.stdout).unwrap();
+    assert_eq!(confirmed["data"]["safe_to_install"], true);
+    assert_eq!(confirmed["data"]["in_flight"].as_array().unwrap().len(), 0);
+
+    // `resume` is the inverse: it lifts the recorded window and dispatch works again.
+    let resumed = flux(&root, &["fleet", "resume", "--output", "json"]);
+    assert!(
+        resumed.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let resumed: serde_json::Value = serde_json::from_slice(&resumed.stdout).unwrap();
+    assert_eq!(
+        resumed["data"]["quiesce_lifted"]["reason"],
+        "install a new binary"
+    );
+
+    let status = flux(&root, &["fleet", "status", "--output", "json"]);
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        status["data"]["quiesce"].is_null(),
+        "resume left the window recorded: {status}"
+    );
+
+    let redispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        redispatched.status.success(),
+        "dispatch stayed refused after resume: stdout={} stderr={}",
+        String::from_utf8_lossy(&redispatched.stdout),
+        String::from_utf8_lossy(&redispatched.stderr)
     );
     fs::remove_dir_all(root).ok();
 }

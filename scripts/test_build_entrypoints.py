@@ -36,7 +36,17 @@ RUBY_NON_EXECUTABLE_LITERAL_LINE = re.compile(
     rf"[A-Za-z_]\w*\.include\?\(\s*{RUBY_STRING_LITERAL}\s*\)"
     rf"|{RUBY_ASSIGNMENT_TARGET}\s*=\s*[A-Za-z_]\w*\.sub\(\s*"
     rf"(?:{RUBY_REGEX_LITERAL}|{RUBY_STRING_LITERAL})\s*,\s*"
-    rf"{RUBY_STRING_LITERAL}\s*\))\s*(?:#.*)?$"
+    rf"{RUBY_STRING_LITERAL}\s*\)"
+    # A string literal that is the *continued* body of a multi-line assignment: the literal alone
+    # plus a trailing `\`. The mutation fixtures in check-release-integrity.sh build a rejected
+    # `run:` block this way, so the literal names a command the checker exists to REFUSE.
+    #
+    # The trailing backslash is load-bearing, not decoration. This masker runs over every scanned
+    # file, not only Ruby, and a bare quoted line in a shell script *does* attempt execution — so
+    # matching a lone literal would blind the scanner there. A literal-plus-continuation is
+    # unambiguously data being concatenated, and anything that would execute it (`system`,
+    # backticks, `eval`, an interpolating call) puts a token on the line and stops matching.
+    rf"|{RUBY_STRING_LITERAL}\s*\\)\s*(?:#.*)?$"
 )
 OWNED_SPELLINGS = (
     "owned_cargo",
@@ -175,11 +185,24 @@ def self_test() -> None:
                 'system(run.sub(/owned wrapper/, "dist build"))\n'
             ),
             "crates/fixture/nested-build.py": 'subprocess.run(["cargo", "check"])\n',
+            # A lone quoted build line has no continuation, so the multi-line-literal mask must not
+            # reach it: in a shell file that line really does attempt an execution.
+            "scripts/bare-quoted-build.sh": '"cargo build --release --bin flux"\n',
+            # A sink keeps its token on the line even when the line is continued.
+            "scripts/continued-sink.sh": 'system("cargo build --release") \\\n',
         }
         safe_fixtures = {
             "scripts/release-integrity-fixture.sh": (
                 'next unless run.include?("-- dist build")\n'
                 'step["run"] = run.sub(/build_ownership\\.py shared -- dist build/, "dist build")\n'
+            ),
+            # The multi-line mutation fixtures in check-release-integrity.sh assign a rejected
+            # `run:` block as concatenated literals; the command named there is one the checker
+            # exists to REFUSE, not one this repository runs.
+            "scripts/release-integrity-multiline.sh": (
+                'container.fetch("steps").fetch(index)["run"] =\n'
+                '  "cargo build --release --bin flux\\n" \\\n'
+                '  "deploy/container/build-image.sh --binary target/release/flux\\n"\n'
             ),
         }
         for relative, content in {**fixtures, **safe_fixtures}.items():

@@ -14,6 +14,225 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **Say which machine an endpoint is reachable from.** A service that only answers inside your
+  cluster and one that answers from anywhere used to look identical once written down, so flux
+  would happily try a cluster-internal address from your laptop and fail at dial time. An endpoint
+  can now name the host it is reachable through — `host = "k8s-dev"` in its config, or
+  `flux endpoint add --host k8s-dev` — and `list`, `show` and `resolve` all show it, so `resolve`
+  now tells you *from where* as well as *as whom*. Endpoints that do not name a host keep working
+  exactly as before, meaning reachable from wherever you happen to be. Two things get caught early
+  instead of late: naming a host that does not exist is reported when the config loads, listing the
+  hosts that do exist, and asking for a host-bound endpoint while working from somewhere else is
+  refused up front, naming both sides, before any credential is unlocked.
+
+## [0.59.0] - 2026-08-07
+
+### Action needed
+
+- **Upgrade `flux system serve` daemons together with their clients.** This release changes the
+  remote execution protocol twice over — host metrics and guarded HTTP both cross the wire now —
+  and the two ends check that they agree before doing anything. A daemon from an older release and
+  a client from this one will refuse to pair at all, saying so plainly rather than degrading. If
+  you run the serving daemon anywhere (a container, a pod, a VM guest, a build box reached over
+  ssh), update it in the same step you update the machines that talk to it.
+
+### New
+
+- **Name the machines your work runs on.** A new `[[host]]` config section declares named execution
+  hosts — your local machine, or a remote one served over the secure remote protocol — with the
+  credential kept as a reference to where it lives, never pasted into config. Manage them with
+  `flux host ls / show / add / rm`, and verify one end-to-end with `flux host probe`, which checks
+  the host's identity without running anything on it. Declared hosts also become visible to the
+  agent, which can list, inspect and probe them (never reading a credential value).
+
+- **Run on a named host with `--host <name>`.** Instead of pasting a URL every time, select a
+  declared host by name and the session executes its effects there; the audit trail records which
+  host every action ran on. Selection is permission-gated: each host says who may use it
+  (interactive sessions, unattended automation, both — or nobody, the default), and automation
+  never silently inherits a permission granted only to interactive use. `--remote <url>` still
+  works for one-off connections.
+
+- **Web requests actually run on the host you select.** Fetching a page or calling an API now
+  travels to the execution host you picked with `--host` and leaves *that* machine's network, with
+  that machine's address — not the one your agent happens to be sitting on. The remote host applies
+  its own egress guard to every hop, enforces the response size limit itself, and re-checks each
+  `$secret` grant at every redirect it follows, so a `Location` pointing outside a grant's `to=`
+  list is refused on the machine that would have followed it. If that host admits a request to a
+  private or internal address, the admission appears in your session's audit trail naming the host
+  it happened on. A credential your request carries is necessarily visible to the host that sends
+  it — scope it with `NAME;to=<host>` so the grant, not the network, decides where it can travel.
+  A host started without web support says so up front and refuses, rather than quietly running the
+  request locally. Browser automation and site crawling still run locally, since they drive a local
+  browser.
+
+- **Confinement is now a host you can name.** `[[host]] backend = "sandboxed"` declares a host that
+  runs guarded effects under the operating-system sandbox (bubblewrap on Linux, Seatbelt on macOS)
+  — and it fails closed: on a machine with no usable confinement, selecting it refuses at startup
+  and names the reason, instead of quietly running unconfined. A forged or stale "already confined"
+  environment marker is refused the same way. `flux host probe` reports which backend a sandboxed
+  host would use, and an autonomy posture that must not run unconfined selects it automatically for
+  named local work. `--sandbox`/`--no-sandbox` behave exactly as before, with one deliberate limit:
+  they never lower an explicitly selected sandboxed host.
+
+- **Ask a named host how it is doing.** `flux host metrics <name>` reports a machine's own
+  condition — CPU, load, memory, swap, disk, uptime, temperature and fan speed — as typed
+  readings, with JSON output as the automation API and the same view available to the agent. A
+  metric the machine cannot measure is reported as explicitly unavailable with a reason, never as
+  zero, and readings that came from a remote machine are marked as reported by it rather than
+  observed locally.
+
+- **Choosing a confined host no longer costs you the web.** Fetches and HTTP requests made under
+  a selected host now go out through the same reviewed, guarded egress path an ordinary run uses,
+  with the same private-network audit trail — and a host that genuinely cannot make requests
+  still refuses plainly instead of quietly sending them from somewhere else. Sub-agents now
+  inherit exactly the host their parent was running on, and nothing else.
+
+- **Deploy the remote execution system from shipped, published artifacts.** Flux now ships a
+  container image that runs only the serving daemon as a non-root user with no secrets in any
+  layer, a Kubernetes Kustomize base (one replica per workspace, persistent volume, TLS and bearer
+  Secrets, a default-deny network policy), and a hardened VM/microVM guest unit with a cloud-init
+  install contract. Upgrade, rollback and version-mismatch behavior are documented per profile.
+
+  The image is published per release at `ghcr.io/codewandler/flux-system:<version>` — the released
+  binary repacked rather than rebuilt, so the image and the release archive describe the same
+  bytes — and both Kubernetes profiles point at it, restamped by the cut so the manifests you apply
+  and the binary they run can never name different versions. Check where it came from before you
+  run it:
+
+  ```sh
+  gh attestation verify oci://ghcr.io/codewandler/flux-system:<version> --repo codewandler/flux
+  ```
+
+  Building locally still works, for an air-gapped registry or a different base. Flux still never
+  provisions your Docker hosts, clusters or VMs — the artifacts run where you already have
+  somewhere to run them.
+
+- **A VM or microVM guest is a host you can name.** Declare `backend = "microvm"` in a `[[host]]`
+  entry pointing at a guest that runs the serving daemon, and `--host <name>` runs guarded effects
+  inside it — same authenticated protocol, same handshake, same credential *reference* as a remote
+  host. `flux host probe` reports the negotiated protocol version and the guest's own substrate
+  identity, marked as reported by it. Flux still never creates, starts, stops or destroys a guest:
+  the binding consumes an endpoint that already exists, and the VM/microVM deployment profile is
+  how you make one. A binding declared before its guest exists is legal and says so — it lists as
+  unwired and refuses selection naming the missing endpoint, instead of quietly falling back to
+  your machine.
+
+- **Deploy the agent itself, not just the machine it acts on.** Alongside the serving-daemon
+  profiles, Flux now ships Kubernetes manifests that run the agent surface from the same released
+  image — the HTTP/A2A endpoint you talk to with `flux a2a`, with its bearer token and model
+  credential as Secret references, a persistent session volume, and network policy that denies by
+  default in both directions. The manifests cannot express an unauthenticated public listener: a
+  bind that reaches beyond loopback without a token fails the shipped checks, and the running
+  daemon refuses it too.
+
+- **A clearer answer when a remote machine will not start.** If an `ssh` host binding cannot bring
+  up flux on the far machine, the message names the problem you actually have. A machine with no
+  sandbox available says so, and points at the fix on *that* machine, instead of claiming flux is
+  not installed there when it plainly is. "Not installed" and "installed but refused to start" are
+  told apart by the far side's exit status rather than by how its shell happens to word things, so
+  the distinction holds whatever shell that machine runs.
+
+- **Use the dev box you already have.** Declare an `ssh` host binding and flux reaches a machine
+  that has nothing on it but sshd: it opens a port-forward, makes sure flux is serving on the other
+  side, and runs your work there over the same secure protocol a `remote` host uses — same
+  authentication, same version check, same approval gates. ssh only gets you there; it never
+  becomes the way your work runs, so the far machine keeps enforcing its own permissions. Nothing
+  prompts: host-key checking is strict, a changed key is a refusal you can read rather than a
+  question in an unattended run, and your key stays a reference to a file flux never opens. Every
+  failure names the piece that is missing — no sshd, an unrecognised host key, a key that was
+  declined, no flux binary over there — and none of them quietly falls back to your own machine.
+
+- **Watch an agent that lives on a server, from your own terminal.**
+  `flux tui --attach https://agent.internal:8787` points the full chat UI at an agent served by
+  `flux app run --serve`: its turns stream into the ordinary transcript, your messages go into the
+  live session, and reconnecting replays what happened while you were away, read from the agent's
+  own history. The bearer token is always named by reference, never typed on the command line. The
+  UI is honest about the seams — anything the protocol does not carry (tool call details, for now)
+  is shown as unavailable with the reason, and the conversation lives in the server's session
+  store, so it deliberately does not appear in your local `flux sessions`.
+
+- **Web requests ride out rate limits.** When an API answers `429 Too Many Requests`, fetches and
+  HTTP requests now wait and try again — honouring `Retry-After` in either of its forms, or backing
+  off gently when the server names no delay — instead of handing the error straight to your
+  program. Every wait stays inside the timeout you set, cancelling a turn ends it immediately, and
+  the result says what happened: `rate-limited, retried 2 times over 3.4s`. On a remote host the
+  waiting happens next to the service being called, not on your machine. A `503` is deliberately
+  *not* retried: a 429 tells you the server received your request and declined to act on it, which
+  is what makes retrying safe even for a POST, while a 503 makes no such promise.
+
+- **Reach your own cluster by name.** A `[[host]]` binding can now name the private CA its endpoint
+  uses (`ca_cert = "/etc/flux/ca.pem"`), so a Kubernetes pod, VM guest or container with a
+  certificate from your own CA is reachable as `flux --host cluster …` rather than only through
+  `--remote … --remote-ca`. The CA is read as one exactly-named file — naming it grants that file
+  and nothing else in its directory — and if it is missing, unreadable or too large the binding
+  refuses and tells you which file. It never quietly falls back to public trust, and there is no
+  flag to skip the check.
+
+- **See and switch the loop your agent runs, without leaving the terminal UI.** The loop driving
+  the current agent is now always shown, a hotkey opens a selector listing the `*.flux` loops
+  available to you, and choosing one raises a short overlay that visualizes the outer loop's
+  structure and renders its description — so "what is this agent actually doing, and can I run it
+  differently" is answerable in place. A loop authored while the UI is running appears without a
+  restart.
+
+- **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
+  terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
+  no retyping the command you started with.
+
+- **`/fleet:restart` applies fleet configuration changes without leaving the terminal UI.** Edit your fleet
+  settings, type `/fleet:restart`, and the fleet stops and starts so the new configuration, loops and limits
+  take effect. It waits rather than interrupting: if a worker is still running it tells you instead of
+  restarting underneath it. `/fleet:refresh` re-reads fleet state when you want the current picture now.
+
+- **When a fleet goes wrong, you can now ask it what happened.** Diagnosing a stuck run used to mean
+  reading the fleet's internal state file by hand. Now each question has a command: `flux fleet doctor`
+  reports whether the running system is actually healthy — not just whether its configuration is valid
+  — and names things like a worker recorded as working with no process behind it. `flux fleet inspect
+  gate <wave>` shows why a run went red by printing the gate's own output, newest first, so the verdict
+  is the part you see. `flux board reconcile` tells you which items already have their work in the
+  tree while their status still says otherwise, so nobody is sent to build something twice; it reports
+  and never changes anything.
+
+- **Pausing, repairing and pausing-for-upgrade are commands now, not procedures.** `flux fleet park
+  <wave> --reason` pauses a run and records *why*, and `flux fleet unpark` resumes it — the pause and
+  its reason show up in `flux fleet status`, so a paused run stays paused instead of being reconsidered
+  every minute. `flux fleet repair` rebuilds working directories a run expects but disk no longer has.
+  And `flux fleet quiesce` stops new work and confirms nothing is still running, so you can install a
+  new version safely; `flux fleet resume` lifts it. Each replaces a hand-run sequence that was easy to
+  get half-right.
+
+## [0.58.0] - 2026-08-07
+
+### New
+
+- **A run's time and token budget is now visible while the run happens.** When a budget is set, the
+  terminal UI header shows how much of it has been spent against what was declared and keeps updating as
+  spend accrues; plain `flux run` says when a line is crossed. The two kinds of line stay distinct: a
+  target is guidance you can pass, a limit stops the run.
+- **The board view groups work the way you read it.** Items appear as collapsed boxes grouped by status
+  and ordered exactly as "what should I do next" orders them, so the top of the list is the answer. Wide
+  boards stay responsive because only the rows on screen are built.
+
+### Improved
+
+- **`flux fleet status` stays small and says what to do next.** It used to grow without bound by copying
+  whole turn receipts and event histories into itself — megabytes for one command. It now reports the
+  shape of things within a fixed size, names the single most useful next command for the state it found,
+  and says plainly when it left something out. Full detail is still one `flux fleet inspect` away.
+- **A fleet worker is offered the toolchain its own repository has.** Previously the tools a worker could
+  use were derived from wherever the coordinator was started, so a worker could be handed a toolchain that
+  did not exist where it was working.
+
+### Fixed
+
+- **Turning off a tool or denying a permission now applies to helper agents too.** A `deny` rule or a
+  disabled tool used to stop at the first agent and not reach the agents it delegated to, including
+  nested ones. It now travels the whole way down.
+
+## [0.57.0] - 2026-08-06
+
+### New
+
 - **A workspace can now carry its complete cross-repository program in `.flux/board.toml`.** Plain
   `flux board` selects the configured workspace, validates every repository story and dependency,
   and reports the active milestone, ordered work and configured waves. `flux fleet schedule` reads
@@ -31,10 +250,40 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### Improved
 
+- **The Fleet main agent is now a coordinator, not a general coding agent.** It can read and manage
+  the configured Board and Fleet, list all durable workers, and delegate bounded read-only research.
+  It no longer receives shell, file-editing, git-writing, web/plugin, pane, evaluation, or transient
+  process-worker tools. Safe status and planning reads do not ask for approval, and Fleet status is
+  compact even when old waves have accumulated. Free-form questions use the Fleet's authored loop
+  with only the current request instead of growing an adaptive history budget.
+
+- **Fleet workers now run the loop their task kind selected at admission.** Operator-authored loop
+  profiles replace the general adaptive explorer for implementation, research, review, repair and
+  decision work. Flux validates that loop against the worker's tools before starting and preserves
+  its exact digest across messages, restart, resume and rework. Status and terminal receipts show
+  the bounded loop identity, and dispatch responses include the worker ids the coordinator needs.
+
+- **Fleet supervision opens immediately, even in a large workspace.** Board and Fleet views load in
+  the background, so refreshing them no longer freezes typing or rendering. If a later refresh
+  fails, the last working view stays visible and is clearly marked stale.
+
 - **Board and Fleet terminology is documented from planning through release.** The guides explain
   epics, stories, milestones, program lanes, configured versus dispatched waves, workers, handoffs,
   review, gates and apply. Concepts now appears before Coding, and compact diagrams show the
   eligibility, worktree, rework and publication boundaries.
+
+### Action needed
+
+- **Fleet configurations must name the main coordinator loop.** Add
+  `loop = ".flux/fleet/loops/main-coordinator.flux"` and
+  `research_loop = ".flux/fleet/loops/research.flux"` under `[main]`, and keep both Flux-Lang files
+  in the Fleet root. `flux tui --fleet` now refuses a missing or invalid binding rather than
+  falling back to the general adaptive agent loop for either the coordinator or its research task.
+
+- **Fleet worker templates must declare loop policy.** Add operator-authored `[loop_profiles.*]`
+  entries, map each supported task kind under `[loop_policy]`, and set `task_kind` on each agent
+  template. Flux refuses an unbound or capability-incompatible worker before creating its worktree
+  or making a model request.
 
 ## [0.56.0] - 2026-08-05
 
@@ -184,6 +433,11 @@ This is the same customer changelog embedded in the binary. From a terminal, use
   footer, docs overview, and README instead of hiding behind the playground.
 
 ### Fixed
+
+- **New Node, Vue, and React projects can use the Node tools before package files exist.** Requests
+  that explicitly mention npm, package.json, JavaScript, TypeScript, Vue, Vuex, or React now expose
+  the dedicated Node operations instead of leaving the agent with an unusable process route. The
+  generic shell remains opt-in.
 
 - **Workspace Board checks and cross-repository Fleet runs now operate on the repositories you
   configured.** Board validation includes every workspace member and understands namespaced

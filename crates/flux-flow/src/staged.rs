@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use flux_core::{ContentBlock, Error, Message, Result, Usage};
+use flux_core::{ContentBlock, Error, Message, Result, ToolResultContent, Usage};
 use flux_evidence::{Observation, Phase as EvidencePhase, ToolGroup, KIND_TURN_INTENT};
 use flux_lang::ast::{DraftAst, Node, SymbolName};
 use flux_provider::{Effort, Provider, Request, RequestTrace, SystemSegment, ToolDef};
@@ -53,6 +53,49 @@ Do not select cognition/model families merely \
 to reason, calculate, summarize, cite, or write an answer: you already do those things. Select them \
 only when the user explicitly asks for a separate model-backed operation.";
 
+/// The execution contract for an operator-authored `ai_segment`.
+///
+/// [`EXPLORE_SYSTEM`] is the *planner's* contract: it tells the model to hand a plan back for someone
+/// else to run. That framing is correct for the adaptive CLI path but wrong here, because
+/// `EngineLoopHost::run_scoped_segment` consumes a finalized batch itself — `approve_batch` then
+/// `execute_batch` — and loops with the execution report, so an authored segment can act, observe the
+/// result, and keep going within one turn.
+///
+/// What it must NOT do is deny the staging step. An effectful call is not run inline: it is captured
+/// into `state.proposed` with the tool result "captured as proposed action N; not executed", and only
+/// `FINALIZE_PLAN` turns that batch into real execution. A first attempt at this prompt asserted that
+/// effects "REALLY EXECUTE" and told the model not to hand back a plan; a live Fleet worker then made
+/// 68 calls, staged its writes, never called `finalize_plan`, and finished having changed nothing —
+/// worse than the planner prompt it replaced, which at least taught the ritual.
+///
+/// So this contract states both halves: staging is real, and finalizing executes for real. The
+/// evidence discipline is copied from [`EXPLORE_SYSTEM`] verbatim; only the execution contract
+/// differs.
+const SEGMENT_SYSTEM: &str = "You are Flux executing an authored segment. The tools below are the \
+only operations available to you and each carries its real input schema. They are the operations \
+the segment's author chose for this exact assignment; if the assignment needs one that is absent, \
+say so rather than working around it. Use gather tools to inspect evidence before acting; cite exact \
+source identifiers from tool calls/results and never invent facts or paths. A filesystem path is \
+known only when the request supplied it or a tool result listed it. If no exact relevant path is \
+known, first inventory the workspace once with `glob`, set `pattern` to `*`, and omit `path`; never \
+guess a likely filename. Keep a checklist of every input fact and governing rule the assignment \
+needs, and read an authoritative source for each. Search hits only locate sources--read the source \
+itself. Minimize provider rounds without skipping evidence: emit independent gather calls together \
+in one response. Batch only independent gather calls; never batch writes or destructive work. \
+A gather call runs immediately and returns its real result. An effectful call — a write, edit, \
+command or commit — is STAGED instead: its tool result says `captured as proposed action N; not \
+executed`. That is normal and expected, not a refusal and not a permission problem. Staged work runs \
+only when you call `finalize_plan` by itself, with no other call in the same response. \
+Doing so executes the whole staged batch for real against the workspace, and the execution report \
+comes back to you, so you can inspect what happened and continue working in this same turn. Stage \
+and finalize as many times as the assignment needs. \
+You are here to carry the assignment to its stated completion, not to propose it to someone else: if \
+you have staged actions and stop without calling `finalize_plan`, nothing you staged will ever \
+happen and the assignment fails silently. Never report a staged action as if it had already \
+happened — finalize it, read the report, then report what actually occurred with the evidence that \
+proves it. If the assignment genuinely cannot be completed, stop and state precisely which fact, \
+operation or decision is missing.";
+
 const EXPLORE_SYSTEM: &str = "You are Flux's staged planning agent. The tools below are the only \
 operations selected for this request and each carries its real input schema. Use gather tools to \
 inspect evidence before answering; cite exact source identifiers from tool calls/results and never \
@@ -99,8 +142,12 @@ pub(crate) struct StagedContext {
     pub authored_ceiling: Option<HashSet<String>>,
     pub groups: Vec<ToolGroup>,
     pub opts: StageOptions,
-    /// Remaining billed-token budget when this stage call began.
-    pub remaining_token_budget: Option<u64>,
+    /// C-542: what the enclosing run/turn budget envelope had already spent, and what it declares,
+    /// when this stage began. [`ensure_stage_budget`] charges this segment's finished rounds on top
+    /// of it, so a stop names the enclosing scope's real spent/limit rather than a stage-local
+    /// remainder. An empty envelope (the default) means no budget is declared and nothing is
+    /// enforced.
+    pub budget: flux_core::BudgetProjection,
     /// Logical-run and per-stage cognition policy. Counts live in [`AdaptiveState`] so an `await`
     /// and process restart cannot reset them.
     pub adaptive_policy: AdaptiveLoopPolicy,
@@ -134,6 +181,10 @@ pub struct AdaptiveLoopPolicy {
     pub max_model_calls: usize,
     pub intent: AgentStagePolicy,
     pub explore: AgentStagePolicy,
+    /// Retained-history ceiling in bytes. `None` keeps [`ADAPTIVE_HISTORY_LIMIT`]. An authored
+    /// `ai_segment` may raise it for a long implementation loop, where many in-budget tool results
+    /// accumulate legitimately — the same way `max_rounds` overrides the model-call budget outright.
+    pub max_history_bytes: Option<usize>,
 }
 
 impl Default for AdaptiveLoopPolicy {
@@ -142,6 +193,7 @@ impl Default for AdaptiveLoopPolicy {
             max_model_calls: DEFAULT_ADAPTIVE_MODEL_CALLS,
             intent: AgentStagePolicy::default(),
             explore: AgentStagePolicy::default(),
+            max_history_bytes: None,
         }
     }
 }
@@ -201,6 +253,11 @@ struct IntentDeclaration {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     uncertainties: Vec<String>,
     families: Vec<String>,
+    /// The families came from an operator-authored `ai_segment` ceiling rather than from the intent
+    /// router's model call, so [`MAX_FAMILIES`] — a bound on what the *model* may select — does not
+    /// apply. Defaults to `false`, so a state serialized by an older runtime stays capped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    scoped: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -485,6 +542,109 @@ fn bound_adaptive_tool_result(result: String) -> (String, Option<AdaptiveToolRes
 
 const ADAPTIVE_HISTORY_LIMIT: usize = 512 * 1024;
 const ADAPTIVE_REQUEST_LIMIT: usize = 1024 * 1024;
+/// Trailing messages an authored-segment elision never touches, so the model always retains the
+/// exchange it is mid-way through. Matches the engine compactor's `keep = 2` for the same reason.
+const SEGMENT_HISTORY_KEEP_RECENT: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SegmentHistoryElision {
+    before_bytes: usize,
+    after_bytes: usize,
+    elided_results: usize,
+}
+
+/// Replace the oldest retained tool-result payloads with payload-free receipts until the retained
+/// history fits `limit`, and report what was dropped.
+///
+/// This is [`bound_adaptive_tool_result`]'s shape applied one level up: an oversized *single* result
+/// is already replaced by a `tool_result_omitted` receipt at gather time, but a long authored segment
+/// can exceed the history ceiling through the sheer *number* of in-budget results. Eliding the oldest
+/// ones keeps the loop running with its recent context intact instead of destroying a turn whose work
+/// may already be committed. Only tool results are touched — the model's own turns, the goal, and the
+/// most recent [`SEGMENT_HISTORY_KEEP_RECENT`] messages are preserved verbatim, so the conversation
+/// stays valid for every provider.
+fn elide_segment_history(messages: &mut [Message], limit: usize) -> Option<SegmentHistoryElision> {
+    let before_bytes = adaptive_history_bytes(&messages);
+    if before_bytes <= limit {
+        return None;
+    }
+    let elidable = messages.len().saturating_sub(SEGMENT_HISTORY_KEEP_RECENT);
+    let mut elided_results = 0usize;
+    for index in 0..elidable {
+        for block in messages[index].content.iter_mut() {
+            let ContentBlock::ToolResult {
+                content, is_error, ..
+            } = block
+            else {
+                continue;
+            };
+            // An error result is the loop's own diagnostic and is small; keep it legible.
+            if *is_error {
+                continue;
+            }
+            let mut replaced = false;
+            for entry in content.iter_mut() {
+                let ToolResultContent::Text { text } = entry else {
+                    continue;
+                };
+                // Already a receipt — re-eliding would only grow the digest chain.
+                if text.starts_with(r#"{"type":"tool_result_omitted""#) {
+                    continue;
+                }
+                *text = json!({
+                    "type": "tool_result_omitted",
+                    "reason": "segment_history_budget",
+                    "actual_bytes": text.len(),
+                    "limit_bytes": limit,
+                    "sha256": digest(text),
+                })
+                .to_string();
+                replaced = true;
+            }
+            if replaced {
+                elided_results += 1;
+            }
+        }
+        if adaptive_history_bytes(&messages) <= limit {
+            break;
+        }
+    }
+    if elided_results == 0 {
+        return None;
+    }
+    Some(SegmentHistoryElision {
+        before_bytes,
+        after_bytes: adaptive_history_bytes(&messages),
+        elided_results,
+    })
+}
+
+/// The report an authored segment returns when its history cannot be brought under budget. The turn
+/// ends, but it ends as a *result* carrying what was established — not as an error that discards it.
+fn segment_history_summary(state: &AdaptiveState, history_bytes: usize, limit: usize) -> String {
+    let operations = state
+        .gathered
+        .iter()
+        .map(|evidence| evidence.op.as_str())
+        .collect::<Vec<_>>();
+    format!(
+        "The authored segment ended early: retained history reached {history_bytes} bytes against a \
+         {limit}-byte ceiling and could not be reduced further. {} gather \
+         operation(s) completed{}{}. Any side effect already performed — including a commit — stands \
+         and must be verified directly rather than inferred from this turn.",
+        operations.len(),
+        if operations.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", operations.join(", "))
+        },
+        if state.last_error.is_empty() {
+            String::new()
+        } else {
+            format!("; last issue: {}", state.last_error)
+        }
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AdaptiveRequestBytes {
@@ -590,6 +750,7 @@ pub(crate) fn scoped_segment_state(ctx: &StagedContext, goal: &str) -> Result<Va
     let declaration = IntentDeclaration {
         intent: goal.to_string(),
         families: families.keys().cloned().collect(),
+        scoped: true,
         ..Default::default()
     };
     let selected = selected_specs(&declaration, &families, &ambient)?;
@@ -1246,7 +1407,11 @@ async fn explore_stage_inner(
         ));
     }
 
-    observe(ctx, "loop.phase", json!({"phase": "explore"}));
+    observe(
+        ctx,
+        "loop.phase",
+        json!({"phase": if ctx.authored_ceiling.is_some() { "segment" } else { "explore" }}),
+    );
     adaptive_explore(ctx, state, usages).await
 }
 
@@ -1376,6 +1541,16 @@ async fn adaptive_explore(
     let specs = live_visible_specs(ctx);
     let families = build_families(&specs, &ctx.groups, &ctx.advertised);
     let ambient = ambient_specs(&specs, &ctx.groups);
+    let authored_segment = ctx.authored_ceiling.is_some();
+    let model_stage = if authored_segment {
+        "segment"
+    } else {
+        "explore"
+    };
+    let history_limit = ctx
+        .adaptive_policy
+        .max_history_bytes
+        .unwrap_or(ADAPTIVE_HISTORY_LIMIT);
     for _round in 1..=round_limit {
         ensure_stage_budget(ctx, usages)?;
         ensure_model_call_budget(ctx, state.intent_calls, state.explore_calls, "explore")?;
@@ -1397,7 +1572,11 @@ async fn adaptive_explore(
             ctx,
             &ctx.adaptive_policy.explore,
             state.messages.clone(),
-            ctx.opts.max_tokens.min(8_192),
+            if authored_segment {
+                ctx.opts.max_tokens
+            } else {
+                ctx.opts.max_tokens.min(8_192)
+            },
         );
         req.system_segments = explore_segments(ctx, &state.declaration);
         req.tools = selected
@@ -1409,30 +1588,82 @@ async fn adaptive_explore(
                 capability_signal_tool(&families),
             ])
             .collect();
-        let history_bytes = adaptive_history_bytes(&req.messages);
+        let mut history_bytes = adaptive_history_bytes(&req.messages);
         let system_text = req.system_text();
-        let request_bytes = adaptive_request_bytes(
+        let mut request_bytes = adaptive_request_bytes(
             system_text.as_deref().unwrap_or_default(),
             &req.messages,
             &req.tools,
         );
         if let Some(diagnostic) = adaptive_budget_diagnostic(
-            "adaptive_history",
+            if authored_segment {
+                "segment_history"
+            } else {
+                "adaptive_history"
+            },
             history_bytes,
-            ADAPTIVE_HISTORY_LIMIT,
+            history_limit,
             None,
         ) {
             observe(ctx, "turn.budget", diagnostic);
         }
-        if history_bytes > ADAPTIVE_HISTORY_LIMIT {
+        // An authored segment reaching the ceiling is a retention problem, not a fatal one: the loop
+        // may already have committed. Shed the oldest tool-result payloads and keep going.
+        if authored_segment && history_bytes > history_limit {
+            if let Some(elision) = elide_segment_history(&mut state.messages, history_limit) {
+                observe(
+                    ctx,
+                    "turn.budget",
+                    json!({
+                        "budget": "segment_history",
+                        "status": "elided",
+                        "actual_bytes": elision.before_bytes,
+                        "limit_bytes": history_limit,
+                        "resulting_bytes": elision.after_bytes,
+                        "elided_results": elision.elided_results,
+                    }),
+                );
+                req.messages = state.messages.clone();
+                history_bytes = adaptive_history_bytes(&req.messages);
+                request_bytes = adaptive_request_bytes(
+                    system_text.as_deref().unwrap_or_default(),
+                    &req.messages,
+                    &req.tools,
+                );
+            }
+        }
+        if history_bytes > history_limit {
+            // Elision could not free enough. End the segment as a *result* carrying the evidence
+            // ledger, not as an error that discards it along with any commit already made.
+            if authored_segment {
+                observe(
+                    ctx,
+                    "turn.budget",
+                    json!({
+                        "budget": "segment_history",
+                        "status": "terminated",
+                        "actual_bytes": history_bytes,
+                        "limit_bytes": history_limit,
+                    }),
+                );
+                return adaptive_result(
+                    "chat",
+                    &state,
+                    json!({"text": segment_history_summary(&state, history_bytes, history_limit)}),
+                );
+            }
             return Err(Error::Other(adaptive_budget_refusal(
                 "history",
                 history_bytes,
-                ADAPTIVE_HISTORY_LIMIT,
+                history_limit,
             )));
         }
         if let Some(diagnostic) = adaptive_budget_diagnostic(
-            "adaptive_request",
+            if authored_segment {
+                "segment_request"
+            } else {
+                "adaptive_request"
+            },
             request_bytes.total_bytes,
             ADAPTIVE_REQUEST_LIMIT,
             Some(request_bytes),
@@ -1440,14 +1671,21 @@ async fn adaptive_explore(
             observe(ctx, "turn.budget", diagnostic);
         }
         if request_bytes.total_bytes > ADAPTIVE_REQUEST_LIMIT {
-            return Err(Error::Other(adaptive_budget_refusal(
-                "request",
-                request_bytes.total_bytes,
-                ADAPTIVE_REQUEST_LIMIT,
-            )));
+            return Err(Error::Other(if authored_segment {
+                format!(
+                    "authored segment request budget exceeded: actual_bytes={} limit_bytes={ADAPTIVE_REQUEST_LIMIT}",
+                    request_bytes.total_bytes
+                )
+            } else {
+                adaptive_budget_refusal(
+                    "request",
+                    request_bytes.total_bytes,
+                    ADAPTIVE_REQUEST_LIMIT,
+                )
+            }));
         }
         let repair_attempt = state.explore_calls;
-        correlate_request(ctx, &mut req, "explore", state.explore_calls + 1);
+        correlate_request(ctx, &mut req, model_stage, state.explore_calls + 1);
         let request_model = req.model.clone();
         let (result, usage, metrics) =
             consult_model(ctx.provider.as_ref(), ctx.sink.clone(), req).await;
@@ -1455,7 +1693,7 @@ async fn adaptive_explore(
         observe_model_call(
             ctx,
             ModelCallObservation {
-                stage: "explore",
+                stage: model_stage,
                 round: state.explore_calls,
                 repair_attempt,
                 model: &request_model,
@@ -1489,7 +1727,12 @@ async fn adaptive_explore(
                 )
             };
             state.messages.push(Message::user_text(format!(
-                "Adaptive exploration is incomplete: {}.",
+                "{} is incomplete: {}.",
+                if authored_segment {
+                    "The authored model segment"
+                } else {
+                    "Adaptive exploration"
+                },
                 state.last_error
             )));
             continue;
@@ -2212,6 +2455,8 @@ fn parse_intent(
         constraints,
         uncertainties,
         families: selected,
+        // A model-declared routing selection; the router cap applies.
+        scoped: false,
     })
 }
 
@@ -2287,16 +2532,21 @@ fn selected_specs(
     families: &BTreeMap<String, Family>,
     ambient: &[ToolSpec],
 ) -> Result<Vec<ToolSpec>> {
-    let distinct_family_count = declaration
-        .families
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>()
-        .len();
-    if distinct_family_count > MAX_FAMILIES {
-        return Err(Error::Other(format!(
-            "adaptive capability declaration selected {distinct_family_count} distinct families; the maximum is {MAX_FAMILIES}"
-        )));
+    // `MAX_FAMILIES` bounds what the intent router's model call may select. An authored ceiling was
+    // fixed by the operator before any model ran, so narrowing it would silently drop capability the
+    // author named explicitly. The operation/schema budgets below still bound both paths.
+    if !declaration.scoped {
+        let distinct_family_count = declaration
+            .families
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>()
+            .len();
+        if distinct_family_count > MAX_FAMILIES {
+            return Err(Error::Other(format!(
+                "adaptive capability declaration selected {distinct_family_count} distinct families; the maximum is {MAX_FAMILIES}"
+            )));
+        }
     }
     let mut selected: BTreeMap<String, ToolSpec> = ambient
         .iter()
@@ -2851,17 +3101,51 @@ fn ensure_model_call_budget(
     Ok(())
 }
 
+/// C-542: the segment-scope budget check, run at the stage's **safe boundary** — after the round
+/// that just finished has been measured and reported, and before the next model call is dispatched.
+/// An effect in flight is therefore never reported stopped while it is still finishing: its usage
+/// arrives in `usages` and is charged first, and only then can the ledger refuse the next round.
+///
+/// The ledger is the single accounting path: the enclosing scope's spend enters as one event and
+/// this stage's rounds as segment events, so the typed [`flux_core::BudgetBreach`] names the real
+/// scope, dimension, spent and limit. A declared *target* never stops a stage — only a hard limit
+/// does.
 fn ensure_stage_budget(ctx: &StagedContext, usages: &[Usage]) -> Result<()> {
-    let Some(remaining) = ctx.remaining_token_budget else {
-        return Ok(());
+    let envelope = flux_core::BudgetEnvelope {
+        scope: ctx.budget.scope,
+        target: ctx.budget.target,
+        limit: ctx.budget.limit,
     };
-    let used = usages.iter().map(Usage::total).sum::<u64>();
-    if used < remaining {
-        Ok(())
-    } else {
-        Err(Error::Other(format!(
-            "turn token budget exhausted before the next model round ({used} stage tokens used; {remaining} remained)"
-        )))
+    if envelope.limit.is_empty() {
+        return Ok(());
+    }
+    let attribution = flux_core::BudgetAttribution {
+        run_id: ctx.session_id.clone(),
+        session_id: Some(ctx.session_id.clone()),
+        turn_id: ctx.audit.as_ref().map(|(_, turn_id)| *turn_id),
+        segment: None,
+    };
+    let mut ledger = flux_core::BudgetLedger::new(envelope);
+    ledger.record(&flux_core::BudgetUsageEvent {
+        event_id: "enclosing-spend".into(),
+        scope: envelope.scope,
+        attribution: attribution.clone(),
+        spend: ctx.budget.spent,
+        rollup: false,
+    });
+    for (round, usage) in usages.iter().enumerate() {
+        ledger.record(&flux_core::BudgetUsageEvent::for_call(
+            format!("segment-round-{round}"),
+            flux_core::BudgetScope::Segment,
+            attribution.clone(),
+            usage,
+        ));
+    }
+    match ledger.exhausted() {
+        None => Ok(()),
+        Some(breach) => Err(Error::Other(format!(
+            "budget exhausted before the next model round: {breach} (hard limit, stopped at the stage boundary)"
+        ))),
     }
 }
 
@@ -2906,8 +3190,14 @@ fn intent_contract_json(declaration: &IntentDeclaration) -> Value {
 }
 
 fn explore_segments(ctx: &StagedContext, declaration: &IntentDeclaration) -> Vec<SystemSegment> {
+    // An authored segment executes; the adaptive planner proposes. Same signal `adaptive_explore`
+    // uses for `authored_segment`.
     let mut segments = vec![SystemSegment {
-        text: EXPLORE_SYSTEM.into(),
+        text: if ctx.authored_ceiling.is_some() {
+            SEGMENT_SYSTEM.into()
+        } else {
+            EXPLORE_SYSTEM.to_string()
+        },
         cache: true,
     }];
     if let Some(base) = ctx.base_system.as_ref().filter(|s| !s.trim().is_empty()) {
@@ -3954,7 +4244,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
@@ -4051,7 +4341,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
@@ -4172,7 +4462,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };
@@ -5336,6 +5626,51 @@ mod tests {
         assert_eq!(families["plugin.slack"].specs[0].name, "slack.send");
     }
 
+    /// A-149: the production Node manifest must carry a greenfield request all the way through the
+    /// staged family index and ordinary evidence surfacing without activating the shell escape
+    /// hatch. This deliberately uses the real built-in registry and groups rather than a reduced
+    /// fixture that could drift from production assembly.
+    #[test]
+    fn greenfield_node_intent_reaches_dedicated_tools_without_shell_fallback() {
+        let mut registry = ToolRegistry::new();
+        flux_tools::try_register_builtins(&mut registry).unwrap();
+        let specs = registry.specs();
+        let groups = flux_tools::groups::builtin_groups();
+
+        let families = build_families(&specs, &groups, &HashSet::new());
+        let node = &families["node"];
+        assert_eq!(
+            node.specs
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node_run", "npm"]
+        );
+        assert!(!families.contains_key("shell"));
+        let index = family_index(&families);
+        assert!(index.contains("- node (2 operations; e.g. node_run, npm):"));
+        assert!(index.contains(
+            "Routing hints: javascript, node.js, npm, package.json, react, typescript, vue, vuex."
+        ));
+
+        let observations = flux_evidence::turn_intent_observations(
+            &groups,
+            "Create a greenfield Vue app and run its npm tests",
+        );
+        let active = flux_evidence::resolve_active_groups(&groups, &observations);
+        assert!(active.contains("node"));
+        assert!(!active.contains("shell"));
+        let advertised = registry
+            .active_specs(&groups, &active)
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<HashSet<_>>();
+        assert!(advertised.contains("npm"));
+        assert!(advertised.contains("node_run"));
+        assert!(!advertised.contains("bash"));
+        assert!(!advertised.contains("proc.run"));
+    }
+
     #[test]
     fn virtual_family_index_never_hides_a_registered_operation() {
         let specs = (0..12)
@@ -5504,6 +5839,102 @@ mod tests {
             requests.lock().unwrap().len(),
             2,
             "resume must stop before a third provider request"
+        );
+    }
+
+    /// C-542: an enclosing hard limit stops the stage at its safe boundary and the refusal names
+    /// scope, dimension, spent and limit. The round that just finished is charged *before* the
+    /// ledger is consulted, so a call still in flight is never reported as stopped.
+    #[test]
+    fn a_hard_token_limit_stops_at_the_stage_boundary_with_a_typed_breach() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.budget = flux_core::BudgetProjection {
+            scope: flux_core::BudgetScope::Run,
+            spent: flux_core::BudgetSpend {
+                total_tokens: 100,
+                ..Default::default()
+            },
+            target: flux_core::BudgetLimits::default(),
+            limit: flux_core::BudgetLimits::with_total_tokens(300),
+            warnings: Vec::new(),
+            exhausted: None,
+            attribution: None,
+        };
+
+        ensure_stage_budget(&context, &[]).expect("under the limit the stage may continue");
+
+        let finished = Usage {
+            input_tokens: 150,
+            output_tokens: 60,
+            ..Default::default()
+        };
+        let error = ensure_stage_budget(&context, &[finished])
+            .expect_err("the hard limit must stop the next round")
+            .to_string();
+        assert!(error.contains("run budget total_tokens"), "{error}");
+        assert!(error.contains("310"), "{error}");
+        assert!(error.contains("300"), "{error}");
+    }
+
+    /// C-542: a target with no hard limit is a warning line, not a stop line — the stage keeps
+    /// running however far past it the run has spent.
+    #[test]
+    fn a_target_without_a_hard_limit_never_stops_a_stage() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        context.budget = flux_core::BudgetProjection {
+            scope: flux_core::BudgetScope::Run,
+            spent: flux_core::BudgetSpend {
+                total_tokens: 9_000,
+                ..Default::default()
+            },
+            target: flux_core::BudgetLimits::with_total_tokens(100),
+            limit: flux_core::BudgetLimits::default(),
+            warnings: Vec::new(),
+            exhausted: None,
+            attribution: None,
+        };
+        let usage = Usage {
+            input_tokens: 5_000,
+            ..Default::default()
+        };
+        ensure_stage_budget(&context, &[usage]).expect("a target must not stop execution");
+    }
+
+    /// C-542: an already-exhausted envelope refuses at the boundary *before* any provider call, so
+    /// the stop never interrupts an effect and never charges usage it did not measure.
+    #[tokio::test]
+    async fn an_exhausted_budget_stops_a_stage_before_any_provider_call() {
+        let TestHarness {
+            mut context,
+            requests,
+            ..
+        } = staged_context(vec![prose("this response must never be requested")]);
+        context.budget = flux_core::BudgetProjection {
+            scope: flux_core::BudgetScope::Turn,
+            spent: flux_core::BudgetSpend {
+                total_tokens: 400,
+                ..Default::default()
+            },
+            target: flux_core::BudgetLimits::default(),
+            limit: flux_core::BudgetLimits::with_total_tokens(300),
+            warnings: Vec::new(),
+            exhausted: None,
+            attribution: None,
+        };
+
+        let run = detect_intent_stage(context).await;
+        let error = run.result.expect_err("the turn limit is hard").to_string();
+        assert!(error.contains("budget exhausted"), "{error}");
+        assert!(error.contains("turn budget total_tokens"), "{error}");
+        assert!(
+            run.usages.is_empty(),
+            "no call was in flight, so nothing was charged: {:?}",
+            run.usages
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            0,
+            "the stop happens at the boundary, never by interrupting a dispatched call"
         );
     }
 
@@ -5879,6 +6310,211 @@ mod tests {
         assert!(error.contains("maximum is 4"), "error was: {error}");
         assert_eq!(state.declaration.families, initial_families);
         assert_eq!(state.selected, initial_selected);
+    }
+
+    /// C-597 (failing first): an authored segment executes its effects, so it must not inherit the
+    /// planner's capture contract. A live Fleet worker read that contract and complied — 35
+    /// read-only calls, no effect attempted, and a reply that it "captures actions for approval
+    /// instead of executing them" while holding write/edit/bash/git_commit in its ceiling.
+    #[test]
+    fn an_authored_segment_is_told_its_effects_execute_not_that_they_are_captured() {
+        let TestHarness { mut context, .. } = staged_context(Vec::new());
+        let declaration = IntentDeclaration::default();
+
+        let adaptive = explore_segments(&context, &declaration);
+        let adaptive_text = adaptive[0].text.clone();
+
+        context.authored_ceiling = Some(HashSet::from(["inspect".to_string()]));
+        let authored = explore_segments(&context, &declaration);
+        let authored_text = authored[0].text.clone();
+
+        assert_ne!(
+            authored_text, adaptive_text,
+            "an authored segment gets its own contract"
+        );
+        // The planner's deferral language must be absent — it is what suppressed the effects.
+        for planner_only in [
+            "may capture an action instead of executing it",
+            "call finalize_plan",
+            "Never claim a captured action already happened",
+        ] {
+            assert!(
+                !authored_text.contains(planner_only),
+                "authored segment must not be told `{planner_only}`"
+            );
+        }
+        // The contract must teach the staging ritual, because effectful calls really are captured
+        // and only `finalize_plan` executes them. A prompt that merely asserts "effects execute"
+        // makes the model stage writes and stop, changing nothing (observed on Fleet wave-275).
+        assert!(
+            authored_text.contains(FINALIZE_PLAN),
+            "the authored contract must name `{FINALIZE_PLAN}`, or staged work never runs"
+        );
+        assert!(
+            authored_text.contains("STAGED"),
+            "the authored contract must say effectful calls are staged, not run inline"
+        );
+        assert!(
+            authored_text.contains("captured as proposed action"),
+            "the contract should quote the exact tool result the model will see"
+        );
+        // Evidence discipline is preserved, not traded away for execution.
+        for kept in [
+            "never invent facts or paths",
+            "Search hits only locate sources",
+        ] {
+            assert!(authored_text.contains(kept), "`{kept}` must survive");
+        }
+        // The adaptive planner is untouched.
+        assert!(adaptive_text.contains("may capture an action instead of executing it"));
+    }
+
+    /// C-595 (failing first): an authored segment that crosses the retained-history ceiling must
+    /// shed the oldest tool-result payloads and keep running. Fleet wave-257 lost `flux/C-562` to
+    /// the old behavior — the loop committed its complete deliverable, the next round measured
+    /// 526 544 bytes against the 524 288-byte ceiling, and the whole turn was destroyed 0.43% over.
+    #[test]
+    fn an_authored_segment_over_budget_elides_old_results_instead_of_failing() {
+        let big = "x".repeat(4096);
+        let mut messages = vec![Message::user_text("goal")];
+        for index in 0..8 {
+            messages.push(Message::user(vec![ContentBlock::tool_result_text(
+                format!("call-{index}"),
+                big.clone(),
+                false,
+            )]));
+        }
+        // A ceiling that the untouched history exceeds but an elided history fits.
+        let limit = adaptive_history_bytes(&messages) / 2;
+
+        let elision = elide_segment_history(&mut messages, limit)
+            .expect("an over-budget history reports what it shed");
+
+        assert!(elision.elided_results > 0, "something was actually elided");
+        assert!(
+            elision.after_bytes < elision.before_bytes,
+            "elision shrank the history: {} -> {}",
+            elision.before_bytes,
+            elision.after_bytes
+        );
+        assert!(
+            adaptive_history_bytes(&messages) <= limit,
+            "history was brought under the ceiling"
+        );
+        // The trailing exchange the model is mid-way through is never touched.
+        let tail = &messages[messages.len() - SEGMENT_HISTORY_KEEP_RECENT..];
+        for message in tail {
+            for block in &message.content {
+                if let ContentBlock::ToolResult { content, .. } = block {
+                    for entry in content {
+                        let ToolResultContent::Text { text } = entry else {
+                            continue;
+                        };
+                        assert_eq!(text, &big, "the most recent results stay verbatim");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A history already inside its ceiling is left byte-for-byte alone — elision is a relief valve,
+    /// not a routine rewrite.
+    #[test]
+    fn an_authored_segment_within_budget_is_never_rewritten() {
+        let mut messages = vec![
+            Message::user_text("goal"),
+            Message::user(vec![ContentBlock::tool_result_text(
+                "call-0", "small", false,
+            )]),
+        ];
+        let before = messages.clone();
+
+        assert_eq!(elide_segment_history(&mut messages, 1024 * 1024), None);
+        assert_eq!(messages, before, "an in-budget history is untouched");
+    }
+
+    /// An operator-authored `ai_segment` names its exact tool ceiling, so `scoped_segment_state`
+    /// selects every family inside that ceiling deterministically — there is no model choice to
+    /// narrow. `MAX_FAMILIES` bounds what the *intent router* may select; applying it to an authored
+    /// ceiling makes a legitimate five-family loop (read + write + git + shell + one more)
+    /// unrunnable, which is how the Fleet story-implementation loop failed every worker. The
+    /// operation/schema budgets still apply and remain the real ceiling.
+    #[test]
+    fn scoped_authored_ceiling_admits_more_families_than_the_intent_router_cap() {
+        let families = (0..6)
+            .map(|index| {
+                let family_name = format!("plugin.fixture-{index}");
+                let operation = format!("fixture_{index}.inspect");
+                (
+                    family_name.clone(),
+                    Family {
+                        name: family_name,
+                        description: format!("Fixture family {index}"),
+                        specs: vec![spec(&operation, vec![Effect::Read], Vec::new(), None)],
+                        exhaustive_members: false,
+                        routing_signals: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        // The same six families are rejected for a model-declared (router) selection...
+        let routed = IntentDeclaration {
+            intent: "inspect six fixture families".into(),
+            families: families.keys().cloned().collect(),
+            ..Default::default()
+        };
+        let error = selected_specs(&routed, &families, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("6 distinct families"), "error was: {error}");
+        assert!(error.contains("maximum is 4"), "error was: {error}");
+
+        // ...and admitted when the author already fixed the ceiling.
+        let authored = IntentDeclaration {
+            scoped: true,
+            ..routed
+        };
+        let selected = selected_specs(&authored, &families, &[])
+            .expect("an authored ceiling is not narrowed by the intent-router family cap");
+        assert_eq!(selected.len(), 6, "every authored family expands");
+    }
+
+    /// The authored-ceiling exemption is scoped to the family cap only. The operation/schema budget
+    /// is an independent host limit and must still reject an oversized authored ceiling.
+    #[test]
+    fn scoped_authored_ceiling_still_obeys_the_operation_budget() {
+        let families = (0..MAX_NATIVE_TOOLS + 1)
+            .map(|index| {
+                let family_name = format!("plugin.fixture-{index}");
+                let operation = format!("fixture_{index}.inspect");
+                (
+                    family_name.clone(),
+                    Family {
+                        name: family_name,
+                        description: format!("Fixture family {index}"),
+                        specs: vec![spec(&operation, vec![Effect::Read], Vec::new(), None)],
+                        exhaustive_members: false,
+                        routing_signals: Vec::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let authored = IntentDeclaration {
+            intent: "an oversized authored ceiling".into(),
+            families: families.keys().cloned().collect(),
+            scoped: true,
+            ..Default::default()
+        };
+
+        let error = selected_specs(&authored, &families, &[])
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            error.contains("schema budget"),
+            "the operation budget still applies; error was: {error}"
+        );
     }
 
     /// A-84 (failing first): the durable state boundary must not trust a family union produced by
@@ -6524,7 +7160,7 @@ mod tests {
             authored_ceiling: None,
             groups: Vec::new(),
             opts: StageOptions::default(),
-            remaining_token_budget: None,
+            budget: flux_core::BudgetProjection::default(),
             adaptive_policy: AdaptiveLoopPolicy::default(),
             steering: None,
         };

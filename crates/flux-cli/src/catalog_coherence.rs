@@ -75,6 +75,11 @@ const FLEET_OP_SOURCE: &str = "flux-cli fleet dispatch";
 /// lumped them under one label could not say which of the two a registration widened.
 const FLEET_LIFECYCLE_SOURCE: &str = "flux-cli fleet lifecycle";
 
+/// The attached native Fleet main's durable-control-plane pack. The source scanner sees this
+/// constant identifier at the registration seam; the runtime value lives beside the production
+/// assembly in `execution.rs`.
+const NATIVE_FLEET_MAIN_SOURCE: &str = "NATIVE_FLEET_MAIN_SOURCE";
+
 /// The domain the census binds a representative work board under (A-131).
 ///
 /// A board's real domain is the Program's `datasource` name, so no fixed name is *the* production
@@ -141,6 +146,11 @@ fn production_catalog() -> ToolRegistry {
         &events,
     )
     .expect("the CLI tool packs register");
+    crate::execution::install_native_fleet_main_tools(
+        &mut registry,
+        crate::board_fleet_cmd::native_fleet_main_tools_for_catalog(),
+    )
+    .expect("the attached native Fleet-main pack installs over legacy name collisions");
 
     let backend: Arc<dyn flux_capabilities::DatasourceBackend> =
         Arc::new(flux_capabilities::MemoryBackend::new());
@@ -194,6 +204,30 @@ fn production_catalog() -> ToolRegistry {
     ));
     flux_capabilities::try_register_endpoint_ops(&mut registry, broker, endpoints)
         .expect("the endpoint ops register");
+
+    // The host ops, as `assemble_integrations` builds them (C-649). A refusing prober stands in
+    // for the CLI's: the census pins specs and placement, never live probing.
+    struct CensusProber;
+    #[async_trait::async_trait]
+    impl flux_capabilities::HostProber for CensusProber {
+        async fn probe(
+            &self,
+            _host: &flux_secret::host::HostRef,
+        ) -> std::result::Result<
+            flux_capabilities::HostProbeReport,
+            flux_capabilities::HostProbeFailure,
+        > {
+            Err(flux_capabilities::HostProbeFailure::BackendUnwired {
+                backend: "census".to_string(),
+            })
+        }
+    }
+    flux_capabilities::try_register_host_ops(
+        &mut registry,
+        Arc::new(flux_capabilities::HostRegistry::new()),
+        Arc::new(CensusProber),
+    )
+    .expect("the host ops register");
 
     // A config-authored model stage. Every `[agent.stages.*]` entry lowers through this one
     // registrar with a caller-supplied name and schema, so one representative stage covers the
@@ -554,6 +588,7 @@ fn the_census_is_strictly_wider_than_the_builtin_pack() {
         ("browser.close", "flux-web browser tier"),
         ("search", "datasource"),
         ("endpoint.import", "endpoint"),
+        ("host.probe", "host"),
         ("task", "sub-agent delegation"),
         ("fleet.dispatch", "outbound A2A fleet dispatch"),
         ("census_board.claim", "declared work boards"),
@@ -590,6 +625,68 @@ fn every_production_operation_declares_execution_placement() {
         undeclared.is_empty(),
         "production operations missing deliberate execution placement: {undeclared:?}"
     );
+}
+
+/// C-652, the placement census for the web pack: HTTP is on the guarded port, so a web *effect*
+/// follows the operator's selected substrate instead of being pinned to the coordinator's process.
+///
+/// Deliberately per-operation rather than per-pack. `flux-web` registers three tiers through one
+/// registrar and they do **not** share a placement: `http.request` and `web.fetch` are guarded HTTP
+/// and nothing else, so they are `SelectedExecutionSystem`; `browser.*` owns a live Chromium child,
+/// a CDP pipe and a session registry in *this* process, so it stays `NativeSystemOnly` and is
+/// hidden rather than mis-served under a selected substrate. `web.crawl` stays native-only too —
+/// it drives its own frontier across many fetches and Decision 0018 rule 5 moves only the
+/// operations "where their semantics allow", which this story reads as the two it names.
+///
+/// This pins the decision so a later pack-wide edit cannot silently promote `browser.*` (which
+/// would claim a remote substrate can drive a local browser) or demote the two HTTP tiers back.
+#[test]
+fn web_effect_operations_declare_the_placement_http_on_the_port_gives_them() {
+    let catalog = production_catalog();
+    for (operation, expected) in [
+        (
+            "http.request",
+            flux_runtime::OperationPlacement::SelectedExecutionSystem,
+        ),
+        (
+            "web.fetch",
+            flux_runtime::OperationPlacement::SelectedExecutionSystem,
+        ),
+        (
+            "web.crawl",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.open",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.goto",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.snapshot",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.act",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "browser.close",
+            flux_runtime::OperationPlacement::NativeSystemOnly,
+        ),
+        (
+            "html_to_markdown",
+            flux_runtime::OperationPlacement::LocalControlPlane,
+        ),
+    ] {
+        assert_eq!(
+            catalog.declared_placement(operation),
+            Some(expected),
+            "`{operation}` no longer declares the placement C-652 decided for it"
+        );
+    }
 }
 
 /// A-131, the named failing-first test: A-116 landed `fleet.dispatch` / `.status` / `.cancel`, but
@@ -652,6 +749,7 @@ const COVERED_REGISTRATION_SEAMS: &[&str] = &[
     "try_register_flows",
     "try_register_render",
     "try_register_datasource_ops",
+    "try_register_host_ops",
     "try_register_work_board",
     "try_register_fleet",
     "try_register_web",
@@ -689,12 +787,13 @@ struct RegistrationCall {
     arguments: Vec<String>,
 }
 
-fn covered_registration_sources() -> [String; 6] {
+fn covered_registration_sources() -> [String; 7] {
     [
         "\"flux-cli cognition pack\"".to_string(),
         format!("{TASK_OP_SOURCE:?}"),
         format!("{FLEET_OP_SOURCE:?}"),
         format!("{FLEET_LIFECYCLE_SOURCE:?}"),
+        NATIVE_FLEET_MAIN_SOURCE.to_string(),
         "ConsultTool".to_string(),
         "WakeupTool".to_string(),
     ]

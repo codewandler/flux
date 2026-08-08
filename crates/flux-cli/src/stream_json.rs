@@ -36,6 +36,8 @@ pub(super) enum ProtocolLine {
         session: String,
         model: String,
         input: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loop_binding: Option<flux_core::AgentLoopBindingMetadata>,
     },
     /// From `Observation{kind: "action_batch.proposed"}` — see [`AgentSink::observation`]'s match
     /// arm for why that (not `flow.plan`) is the real source.
@@ -97,6 +99,8 @@ pub(super) enum ProtocolLine {
         answer: String,
         usage: Option<Usage>,
         cost_usd: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        loop_binding: Option<flux_core::AgentLoopBindingMetadata>,
     },
     /// From `run_turn`/`run_turn_cancellable` returning `Err` — see the design doc's note on why
     /// this is narrower than "every failure inside a turn".
@@ -148,6 +152,7 @@ fn bounded_protocol_text(
             "outcome": original.get("outcome").cloned().unwrap_or(serde_json::Value::Null),
             "usage": original.get("usage").cloned().unwrap_or(serde_json::Value::Null),
             "cost_usd": original.get("cost_usd").cloned().unwrap_or(serde_json::Value::Null),
+            "loop_binding": original.get("loop_binding").cloned().unwrap_or(serde_json::Value::Null),
             "answer": "",
             "payload_omitted": {
                 "reason": "event_too_large",
@@ -207,6 +212,7 @@ pub(super) struct StreamJsonSink {
     /// `AgentSink::turn_end` arrives before `run_turn` returns its machine outcome. Hold its usage
     /// until the caller can emit one self-consistent final `turn_end` plus (on failure) `error`.
     pending_usage: Option<Option<Usage>>,
+    loop_binding: Option<flux_core::AgentLoopBindingMetadata>,
 }
 
 impl StreamJsonSink {
@@ -219,6 +225,7 @@ impl StreamJsonSink {
             answer: String::new(),
             pending_timing: None,
             pending_usage: None,
+            loop_binding: None,
         }
     }
 
@@ -229,6 +236,14 @@ impl StreamJsonSink {
     ) -> Self {
         self.model_spec = Some(model_spec);
         self.pricing = Some(pricing);
+        self
+    }
+
+    pub(super) fn with_loop_binding(
+        mut self,
+        binding: flux_core::AgentLoopBindingMetadata,
+    ) -> Self {
+        self.loop_binding = Some(binding);
         self
     }
 
@@ -244,6 +259,7 @@ impl StreamJsonSink {
             session: self.session.clone(),
             model: model.to_string(),
             input: input.to_string(),
+            loop_binding: self.loop_binding.clone(),
         });
     }
 
@@ -279,6 +295,7 @@ impl StreamJsonSink {
             answer,
             usage,
             cost_usd,
+            loop_binding: self.loop_binding.clone(),
         });
     }
 }
@@ -383,7 +400,9 @@ pub(super) async fn run_stream_json(flags: AgentFlags, prompt: Vec<String>) -> R
         .then(|| agent.executor.push_cap_scope(&flags.admitted_operations));
     let redactor = agent.executor.context().redactor.clone();
     let pricing = flux_credentials::load_pricing_table();
-    let mut sink = StreamJsonSink::new(session_id.clone(), redactor).with_cost(model_spec, pricing);
+    let mut sink = StreamJsonSink::new(session_id.clone(), redactor)
+        .with_cost(model_spec, pricing)
+        .with_loop_binding(agent.agent_loop_binding.metadata().clone());
     sink.turn_start(&agent.model, &prompt);
     let initial_rules = agent.executor.allow_rules();
     let outcome = agent.run_turn(&session_id, &prompt, &mut sink).await;
@@ -516,7 +535,8 @@ pub(super) async fn run_stream_json_conversation(
             },
         };
         let mut sink = StreamJsonSink::new(session_id.clone(), redactor.clone())
-            .with_cost(model_spec.clone(), pricing.clone());
+            .with_cost(model_spec.clone(), pricing.clone())
+            .with_loop_binding(agent.agent_loop_binding.metadata().clone());
         sink.turn_start(&agent.model, &input);
         turn_in_flight.store(true, Ordering::Release);
         let outcome = agent.run_turn(&session_id, &input, &mut sink).await;
@@ -550,6 +570,26 @@ fn validate_admitted_operation_ceiling(agent: &FlowEngine, flags: &AgentFlags) -
         bail!(
             "admitted capability operations are unavailable: {}",
             missing.join(", ")
+        );
+    }
+    let admitted = flags
+        .admitted_operations
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let missing_for_loop = agent
+        .agent_loop_binding
+        .metadata()
+        .required_operations
+        .iter()
+        .filter(|operation| !admitted.contains(operation.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_for_loop.is_empty() {
+        bail!(
+            "admitted capability ceiling is incompatible with loop profile `{}`; missing operations: {}",
+            agent.agent_loop_binding.metadata().profile,
+            missing_for_loop.join(", ")
         );
     }
     Ok(())
@@ -670,6 +710,7 @@ mod tests {
             answer: answer_marker.clone(),
             usage: Some(usage.clone()),
             cost_usd: Some(1.25),
+            loop_binding: None,
         };
         let original = protocol_line_text(&line, &redactor);
         let replacement = bounded_protocol_text(&line, &redactor, Some(LIMIT)).unwrap();
@@ -706,6 +747,7 @@ mod tests {
             answer: "done".into(),
             usage: None,
             cost_usd: None,
+            loop_binding: None,
         };
         let mut buf: Vec<u8> = Vec::new();
         write_line(&mut buf, &line, &redactor);

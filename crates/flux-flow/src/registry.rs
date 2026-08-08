@@ -32,6 +32,7 @@ pub struct OpRegistry<'a> {
     tools: &'a ToolRegistry,
     composites: Cow<'a, [CompositeOpDecl]>,
     advertised: Option<HashSet<String>>,
+    assumed: HashSet<String>,
 }
 
 impl<'a> OpRegistry<'a> {
@@ -41,7 +42,42 @@ impl<'a> OpRegistry<'a> {
             tools,
             composites: Cow::Borrowed(&[]),
             advertised: None,
+            assumed: HashSet::new(),
         }
+    }
+
+    /// Resolve `names` even when no tool backs them, with an unconstrained signature.
+    ///
+    /// This exists for **analysis without assembly**: some operations are only registered once a
+    /// live agent is assembled — the datasource pack (`search`/`get`/`sources`/…) needs configured
+    /// sources, and the language toolchains surface on a workspace signal — so a static catalog
+    /// cannot decide whether they exist. A caller that already holds an authoritative grant for
+    /// those names (a Fleet capability ceiling, say) supplies them here so analysis reports real
+    /// defects instead of false "unknown operation" noise.
+    ///
+    /// Assumed names carry no parameter or type information, so argument checks on them degrade to
+    /// permissive. Everything structural — symbol binding, `match` subjects, control flow — is still
+    /// checked, and a tool-backed op always wins over an assumed one.
+    pub fn with_assumed_ops(mut self, names: HashSet<String>) -> Self {
+        self.assumed = names;
+        self
+    }
+
+    fn assumed_signature(&self, name: &str) -> Option<OpSignature> {
+        if !self.assumed.contains(name) {
+            return None;
+        }
+        Some(OpSignature::from_spec(&flux_spec::ToolSpec {
+            name: name.to_string(),
+            description: format!("assumed operation `{name}` (granted, not statically registered)"),
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            effects: Vec::new(),
+            risk: Risk::Medium,
+            idempotency: flux_spec::Idempotency::NonIdempotent,
+            access: Vec::new(),
+            group: None,
+        }))
     }
 
     /// Add module-local composite ops to the catalog. Tool lookup still wins on name collision; callers
@@ -119,6 +155,7 @@ impl<'a> OpRegistry<'a> {
                     .find(|c| c.name == name)
                     .map(composite_signature)
             })
+            .or_else(|| self.assumed_signature(name))
     }
 }
 

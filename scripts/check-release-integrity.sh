@@ -52,10 +52,27 @@ attest_permissions = attest_job.fetch("permissions")
   abort "attest permission #{permission} must be write" unless attest_permissions[permission] == "write"
 end
 
+# C-696 — the attestation-identity allowlist, and why it has two names rather than one.
+#
+# `attestations`/`id-token: write` is the identity that mints a provenance statement. It was
+# confined to `attest` because nothing else produced an artifact to attest. Publishing the container
+# image does: the image is a second artifact, and it comes into existence AFTER `attest` has already
+# run against `artifacts/*` and finished. Its statement therefore cannot be minted there.
+#
+# The alternative was to widen `attest` into a job that also holds `packages: write` and an
+# authenticated registry session — which would put the release archives' signing identity in the
+# same job as a registry push, and give a defect in the image build reach over the archive
+# attestation. A separate job is strictly narrower, so the image publisher is named here instead.
+#
+# The rule is unchanged in kind: exactly the jobs that publish an attestation, and no other. Every
+# name on this list is checked structurally below for being the thing it claims to be. A third name
+# is a decision to take deliberately, not a formatting change.
+ATTESTING_JOBS = %w[attest publish-container-image].freeze
+
 jobs.each do |name, job|
   granted = job.fetch("permissions", {})
   abort "repository write permission escaped into job #{name}" if granted["contents"] == "write"
-  next if name == "attest"
+  next if ATTESTING_JOBS.include?(name)
 
   %w[attestations id-token].each do |permission|
     abort "publication permission #{permission}: write escaped into job #{name}" if granted[permission] == "write"
@@ -84,6 +101,54 @@ abort "the attest job must contain exactly one SHA-pinned actions/attest step" u
 attest_step = attest_steps.fetch(attest.fetch(0))
 abort "attestation step may not be conditional or disabled" if attest_step.key?("if")
 abort "attestation subject must be artifacts/*" unless attest_step.fetch("with", {})["subject-path"] == "artifacts/*"
+
+# C-696 — the second name on ATTESTING_JOBS has to be the container publisher, and has to publish
+# the binary the release already attested. Without these, "publish-container-image" would be a name
+# any job could take to obtain the attestation identity.
+container_job = jobs.fetch("publish-container-image") do
+  abort "container image publication must be its own job `publish-container-image` (C-696)"
+end
+container_permissions = container_job.fetch("permissions")
+%w[attestations id-token packages].each do |permission|
+  abort "publish-container-image permission #{permission} must be write" unless
+    container_permissions[permission] == "write"
+end
+container_steps = container_job.fetch("steps")
+abort "publish-container-image does not consume the checked asset set" unless
+  container_steps.any? do |step|
+    step.fetch("uses", "").start_with?("actions/download-artifact@") &&
+      step.fetch("with", {})["name"] == "release-staged-assets"
+  end
+# The whole provenance claim rests on this: the image carries the archive the release published, so
+# a compile here — or a build from a loose binary — would put an unattested binary in the layer
+# while every downstream check still reported green.
+container_steps.each do |step|
+  run = step.fetch("run", "")
+  abort "publish-container-image compiles the binary it publishes instead of repacking the released one (C-696)" if
+    run.match?(/(?:^|\s)(?:cargo|dist)\s+build\b/)
+  abort "publish-container-image builds the image from an unreleased binary (C-696)" if
+    run.match?(/build-image\.sh[^\n]*--binary/)
+end
+abort "publish-container-image does not repack the staged release archive (C-696)" unless
+  container_steps.any? { |step| step.fetch("run", "").match?(%r{deploy/container/build-image\.sh[^\n]*--staged}) }
+image_attestations = container_steps.select do |step|
+  step.fetch("uses", "").match?(%r{\Aactions/attest-build-provenance@[0-9a-f]{40}\z})
+end
+abort "publish-container-image must contain exactly one SHA-pinned image provenance attestation" unless
+  image_attestations.length == 1
+image_attestation = image_attestations.fetch(0)
+abort "the image attestation may not be conditional or disabled" if image_attestation.key?("if")
+image_attestation_with = image_attestation.fetch("with", {})
+# By digest: a tag is mutable, so an attestation naming one would describe whatever that tag points
+# at later rather than the bytes this run pushed.
+abort "the image attestation must name the pushed manifest digest, not a mutable tag" unless
+  image_attestation_with["subject-digest"].to_s.include?("steps.push.outputs.digest")
+abort "the image attestation is not pushed to the registry beside the image" unless
+  image_attestation_with["push-to-registry"] == true
+%w[host attest publish-github-release].each do |dependency|
+  abort "publish-container-image does not wait for #{dependency}" unless
+    Array(container_job["needs"]).include?(dependency)
+end
 
 publish_steps = publish_job.fetch("steps")
 release_index = publish_steps.index { |step| step["name"] == "Create GitHub Release" }
@@ -288,6 +353,28 @@ when "release-token-escapes-the-publication-job"
   jobs.fetch("host")["env"]["GH_TOKEN"] = "${{ secrets.RELEASE_TOKEN }}"
 when "attestation-write-escapes-into-a-build-job"
   jobs.fetch("build-global-artifacts")["permissions"] = { "attestations" => "write" }
+when "container-image-built-from-source"
+  # The regression that makes the whole provenance claim false while every job still goes green:
+  # the image is built, tagged and attested exactly as before, from a binary nothing attested.
+  container = jobs.fetch("publish-container-image")
+  index = step_index(container) { |step| step.fetch("run", "").include?("build-image.sh --staged") }
+  container.fetch("steps").fetch(index)["run"] =
+    "cargo build --release --bin flux\n" \
+    "deploy/container/build-image.sh --binary target/release/flux --tag \"$REFERENCE\"\n"
+when "container-image-published-without-attestation"
+  container = jobs.fetch("publish-container-image")
+  index = step_index(container) { |step| step.fetch("uses", "").start_with?("actions/attest-build-provenance@") }
+  container.fetch("steps").delete_at(index)
+when "container-image-attested-by-tag"
+  # A mutable tag as the attestation subject: the statement stops describing these bytes the next
+  # time anything moves the tag.
+  container = jobs.fetch("publish-container-image")
+  index = step_index(container) { |step| step.fetch("uses", "").start_with?("actions/attest-build-provenance@") }
+  container.fetch("steps").fetch(index).fetch("with")["subject-digest"] = "${{ steps.image.outputs.reference }}"
+when "container-image-published-before-the-release"
+  # An image pushed for a release that then failed to publish is the one publication that cannot be
+  # withdrawn.
+  jobs.fetch("publish-container-image")["needs"] = %w[plan host attest]
 else
   raise "unknown fixture #{fixture}"
 end
@@ -327,7 +414,11 @@ if [ "${1:-}" = "--self-test" ]; then
     candidate-bytes-consumed-before-verification \
     promotion-source-downloaded-by-pattern \
     release-token-escapes-the-publication-job \
-    attestation-write-escapes-into-a-build-job
+    attestation-write-escapes-into-a-build-job \
+    container-image-built-from-source \
+    container-image-published-without-attestation \
+    container-image-attested-by-tag \
+    container-image-published-before-the-release
   do
     mutate_release "$fixture" "$tmp/bad.yml"
     if check_workflow_semantics "$tmp/bad.yml" >/dev/null 2>&1; then

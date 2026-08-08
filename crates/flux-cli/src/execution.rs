@@ -1,6 +1,9 @@
 use super::*;
 use flux_agent::resolve_compact_threshold_env;
 
+/// Audit label for operations available only to an explicitly attached native Fleet main.
+pub(super) const NATIVE_FLEET_MAIN_SOURCE: &str = "flux-cli attached native Fleet main";
+
 // Codex/Anthropic model resolution is backend knowledge owned by each provider crate
 // (`flux_providers::codex::resolve_model`, `flux_providers::anthropic::resolve_model`) so every
 // surface — CLI, SDK, server, TUI, the L3 sub-agent spawner — shares one owner instead of each
@@ -1193,13 +1196,23 @@ pub(super) type LiveAgentBuild = (
 pub(super) struct AgentBuildLocation {
     pub(super) workspace_root: std::path::PathBuf,
     pub(super) store_dir: std::path::PathBuf,
+    /// Explicit specialized-surface marker. A location alone never grants coordinator authority.
+    pub(super) fleet_main: bool,
 }
 
 pub(super) async fn build_agent(
     flags: &AgentFlags,
 ) -> Result<(FlowEngine, String, String, Arc<dyn flux_runtime::Spawner>)> {
-    let (agent, session, spec, spawner, _) =
-        build_agent_with(flags, true, None, None, None, None, None).await?;
+    let (agent, session, spec, spawner, _) = build_agent_with(
+        flags,
+        true,
+        flags.resume_session.clone(),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await?;
     Ok((agent, session, spec, spawner))
 }
 
@@ -1301,7 +1314,31 @@ pub(super) fn workspace_with_flow_roots(
     cwd: &std::path::Path,
     create_global: bool,
 ) -> Result<Workspace> {
+    workspace_with_flow_roots_scoped(cwd, create_global, true)
+}
+
+/// As [`workspace_with_flow_roots`], but able to withhold the host-global roots entirely.
+///
+/// C-608: `~/.flux/flows` and `~/.flux/ops` are registered as `@named` roots, and named roots are
+/// **write-capable** — they sit alongside the primary root in the write path, and
+/// `SpawnPolicy::for_workspace` adds them to the sandbox writable set too. For a host running several
+/// confined agents concurrently that is a shared read/write channel that lives outside every
+/// workspace, is invisible to any commit diff, and needs only `read`+`edit` to use
+/// (`write("@global_flows/x")`).
+///
+/// An agent under an enforced operation ceiling cannot author global flows or ops anyway — `flow_*`
+/// and `op.register` are not in any capability bundle it can hold — so the roots buy it nothing and
+/// cost isolation. Withhold them rather than trying to make a named root read-only, which the
+/// `Workspace` model has no way to express.
+pub(super) fn workspace_with_flow_roots_scoped(
+    cwd: &std::path::Path,
+    create_global: bool,
+    global_roots: bool,
+) -> Result<Workspace> {
     let mut workspace = Workspace::from_env(cwd).context("workspace")?;
+    if !global_roots {
+        return Ok(workspace);
+    }
     if let Some(home) = std::env::var_os("HOME") {
         let flux_dir = std::path::PathBuf::from(home).join(".flux");
         for (name, sub) in [("global_flows", "flows"), ("global_ops", "ops")] {
@@ -1348,6 +1385,229 @@ pub(super) async fn resolve_agent_loop(
     AgentLoopSpec::parse(&source).map_err(|error| anyhow::anyhow!("{error}"))
 }
 
+/// Resolve the executable selector together with an optional host-snapshotted binding receipt.
+/// The latter is used by Fleet continuation paths so a mutable config/role file cannot silently
+/// change a live worker's behavior.
+async fn resolve_agent_loop_binding(
+    selection: Option<&str>,
+    binding_receipt: Option<&str>,
+    system: &System,
+) -> Result<flux_agent::AgentLoopBinding> {
+    if let Some(binding_receipt) = binding_receipt {
+        let selection = selection
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("--resolved-loop-binding requires an explicit --loop source snapshot")?;
+        let metadata_text = system
+            .read_file(binding_receipt)
+            .await
+            .with_context(|| format!("read resolved agent loop binding `{binding_receipt}`"))?;
+        let metadata: flux_core::AgentLoopBindingMetadata = serde_json::from_str(&metadata_text)
+            .with_context(|| format!("parse resolved agent loop binding `{binding_receipt}`"))?;
+        let source = system
+            .read_file(selection)
+            .await
+            .with_context(|| format!("read explicit agent loop `{selection}`"))?;
+        return flux_agent::AgentLoopBinding::from_metadata_and_source(metadata, source)
+            .map_err(|error| anyhow::anyhow!(error.to_string()));
+    }
+    resolve_agent_loop(selection, system)
+        .await
+        .map(flux_agent::AgentLoopBinding::from_spec)
+}
+
+fn agent_loop_cache_root(store_dir: Option<&std::path::Path>) -> Result<std::path::PathBuf> {
+    Ok(store_dir
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or(flux_store_dir()?)
+        .join("agent-loops"))
+}
+
+fn agent_loop_cache_path(
+    store_dir: Option<&std::path::Path>,
+    digest: &str,
+) -> Result<std::path::PathBuf> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid admitted agent loop source digest `{digest}`");
+    }
+    Ok(agent_loop_cache_root(store_dir)?.join(format!("{digest}.flux")))
+}
+
+fn persist_agent_loop_source(
+    store_dir: Option<&std::path::Path>,
+    binding: &flux_agent::AgentLoopBinding,
+) -> Result<()> {
+    let path = agent_loop_cache_path(store_dir, &binding.metadata().source_sha256)?;
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if flux_lang::runtime::sha256_hex(&existing) != binding.metadata().source_sha256 {
+            bail!(
+                "cached agent loop source digest mismatch at {}; remove the corrupt cache before retrying",
+                path.display()
+            )
+        }
+        return Ok(());
+    }
+    std::fs::create_dir_all(path.parent().expect("agent loop cache path has a parent"))?;
+    let temp = path.with_extension(format!("flux.tmp-{}", std::process::id()));
+    std::fs::write(&temp, binding.source())?;
+    match std::fs::rename(&temp, &path) {
+        Ok(()) => Ok(()),
+        Err(error) if path.is_file() => {
+            let _ = std::fs::remove_file(&temp);
+            let existing = std::fs::read_to_string(&path)?;
+            if flux_lang::runtime::sha256_hex(&existing) == binding.metadata().source_sha256 {
+                Ok(())
+            } else {
+                Err(error).with_context(|| format!("persist agent loop cache {}", path.display()))
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(error).with_context(|| format!("persist agent loop cache {}", path.display()))
+        }
+    }
+}
+
+async fn resolve_session_agent_loop_binding(
+    selection: Option<&str>,
+    explicit_selection: bool,
+    binding_receipt: Option<&str>,
+    system: &System,
+    events: &EventStore,
+    session_id: &str,
+    store_dir: Option<&std::path::Path>,
+) -> Result<flux_agent::AgentLoopBinding> {
+    let selected = resolve_agent_loop_binding(selection, binding_receipt, system).await?;
+    let admitted = events
+        .turns(session_id)
+        .ok()
+        .and_then(|turns| turns.last().and_then(|turn| turn.loop_binding.clone()));
+    let binding = if let Some(admitted) = admitted {
+        if explicit_selection && !selected.metadata().equivalent_to(&admitted) {
+            bail!(
+                "agent loop binding change from `{}`@{} to `{}`@{} requires a new session",
+                admitted.profile,
+                admitted.revision,
+                selected.metadata().profile,
+                selected.metadata().revision
+            )
+        }
+        let path = agent_loop_cache_path(store_dir, &admitted.source_sha256)?;
+        let source = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "admitted agent loop source snapshot is missing at {}; resume requires the original binding",
+                path.display()
+            )
+        })?;
+        flux_agent::AgentLoopBinding::from_metadata_and_source(admitted, source)
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?
+    } else {
+        selected
+    };
+    persist_agent_loop_source(store_dir, &binding)?;
+    Ok(binding)
+}
+
+#[cfg(test)]
+mod loop_binding_session_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resume_reconstructs_admitted_source_while_explicit_switch_requires_new_session() {
+        let root = std::env::temp_dir().join(format!(
+            "flux-loop-resume-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let store = root.join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("first.flux"),
+            "flow first -> string\n  return \"first\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("second.flux"),
+            "flow second -> string\n  return \"second\"\n",
+        )
+        .unwrap();
+        let system = System::new(Workspace::new(&root).unwrap());
+        let events = EventStore::in_memory().unwrap();
+        let session = events.create_session("mock").unwrap();
+
+        let first = resolve_session_agent_loop_binding(
+            Some("first.flux"),
+            false,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let mut legacy_metadata = first.metadata().clone();
+        legacy_metadata.required_operations.reverse();
+        legacy_metadata.required_runtime_features.reverse();
+        let turn = events
+            .begin_turn_with_loop_binding(&session, "start", "mock", Some(legacy_metadata.clone()))
+            .unwrap();
+        events
+            .end_turn_with_loop_binding(
+                &session,
+                turn,
+                "ok",
+                1,
+                "done",
+                None,
+                Some(legacy_metadata),
+            )
+            .unwrap();
+
+        let explicitly_same = resolve_session_agent_loop_binding(
+            Some("first.flux"),
+            true,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        assert!(explicitly_same.metadata().equivalent_to(first.metadata()));
+
+        let resumed = resolve_session_agent_loop_binding(
+            Some("second.flux"),
+            false,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        assert!(resumed.metadata().equivalent_to(first.metadata()));
+        assert_eq!(resumed.source(), first.source());
+
+        let error = resolve_session_agent_loop_binding(
+            Some("second.flux"),
+            true,
+            None,
+            &system,
+            &events,
+            &session,
+            Some(&store),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("requires a new session"), "{error}");
+        std::fs::remove_dir_all(root).ok();
+    }
+}
+
 /// Register the model-facing operation packs onto the top-level registry, in the order that lets the
 /// name-collision checks fire deterministically: the cognition pack (when a sibling provider was
 /// built), the second-opinion `consult` op (when a target is configured), then eval/self-improvement,
@@ -1368,7 +1628,7 @@ pub(super) async fn resolve_agent_loop(
 /// This is a bound on the *grant*, never a substitute for the guard: every `fleet.*` op resolves its
 /// caller-supplied endpoint through `guard_url_scoped` before any request either way (A-116), and
 /// each reports the worker's origin as its permission subject.
-fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
+pub(super) fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
     if private_net_cli_override() {
         flux_system::net::PrivateNetAllow::Any
     } else {
@@ -1378,10 +1638,35 @@ fn fleet_private_net() -> flux_system::net::PrivateNetAllow {
 
 /// Resolve the explicit execution target. Absence is meaningful: the environment then follows its
 /// native [`WorkspaceContext`], preserving local worktree transitions exactly as before.
+///
+/// C-650: `--host <name>` resolves a registered, granted binding through the session registry;
+/// `--remote <url>` remains as sugar constructing an ephemeral unnamed binding, recorded in the
+/// registry as `@session/remote` so it lists and probes like any named one.
+///
+/// C-651: `floor` is the resolved posture's confinement floor, and it participates in *which
+/// backend a named binding resolves to* — see `backend_under_floor`. It deliberately does not
+/// manufacture a selection where the operator made none: with no `--host`/`--remote`, absence
+/// stays meaningful and the native workspace-following path is preserved, exactly as C-650
+/// shipped it. The spawn-time modifier still confines that path through `apply_sandbox_env`,
+/// which this touches in no way.
+///
+/// C-675: `local` is the session system **with the native HTTP backend attached** (see the call
+/// site). Only a substrate composed from it inherits that backend — a `local` binding installs no
+/// override at all, and a `remote` one is a different address space that answers the family for
+/// itself — so the attachment reaches exactly the substrates that run in this process and were
+/// deliberately selected.
 async fn resolve_selected_execution_system(
     flags: &AgentFlags,
     local: &System,
-) -> Result<Option<Arc<dyn flux_system::port::ExecutionSystem>>> {
+    hosts: &flux_capabilities::HostRegistry,
+    surface: flux_secret::host::HostGrant,
+    floor: flux_runtime::SandboxFloor,
+) -> Result<Option<SelectedSubstrate>> {
+    if let Some(name) = flags.host.as_deref() {
+        return Ok(Some(
+            resolve_named_host(name, hosts, surface, local, floor).await?,
+        ));
+    }
     let Some(endpoint) = flags.remote.as_deref() else {
         return Ok(None);
     };
@@ -1396,8 +1681,11 @@ async fn resolve_selected_execution_system(
         })?;
     let private_net = fleet_private_net();
     let remote = if let Some(path) = flags.remote_ca.as_deref() {
-        let pem = local
-            .read_file_bytes(path.to_string_lossy().as_ref())
+        // C-684: the same reachability envelope the named bindings use. A CA lives where the
+        // deployment put it (`/etc/flux`, `~/.kube`), so the flag and the binding must not disagree
+        // about which paths are nameable — that asymmetry is the bug this story was filed against,
+        // and reintroducing it in the other direction would be no better.
+        let pem = read_ca_pem(local, path.to_string_lossy().as_ref())
             .await
             .with_context(|| format!("read remote-system CA `{}`", path.display()))?;
         flux_server::system::connect_remote_system_with_ca_pem(endpoint, token, &private_net, &pem)
@@ -1406,7 +1694,20 @@ async fn resolve_selected_execution_system(
         flux_server::system::connect_remote_system(endpoint, token, &private_net).await
     }
     .with_context(|| format!("connect remote execution system `{endpoint}`"))?;
-    Ok(Some(Arc::new(remote)))
+    let session_ca = flags
+        .remote_ca
+        .as_deref()
+        .map(|path| path.to_string_lossy());
+    record_ephemeral_remote(
+        hosts,
+        endpoint,
+        &flags.remote_token_env,
+        session_ca.as_deref(),
+    );
+    Ok(Some(SelectedSubstrate {
+        binding: "@session/remote".to_string(),
+        system: Some(Arc::new(remote)),
+    }))
 }
 
 /// The whole fleet surface, in one place: worker **lifecycle** (C-243) plus outbound A2A **dispatch**
@@ -1621,6 +1922,110 @@ fn resolve_permissions(
     }
 }
 
+/// Pre-authorize the native Fleet main's own bounded durable census.
+///
+/// The operation is registered only after the explicit Fleet root has been validated and captures
+/// that root in its host-owned tool instance, so model input cannot widen this grant to another
+/// file or workspace. Operator-authored deny rules still win in [`PermissionManager::check`].
+#[cfg(test)]
+mod evidence_scope_tests {
+    use super::*;
+
+    /// C-608 (failing first): the host-global flow/op roots are `@named` roots, which are
+    /// write-capable and shared by every concurrent agent on the host — a cross-agent read/write
+    /// channel outside every workspace and invisible to any commit diff. A ceiling-confined agent
+    /// must not receive them.
+    #[test]
+    fn a_ceiling_confined_agent_gets_no_host_global_roots() {
+        let cwd = std::env::temp_dir();
+
+        let confined = workspace_with_flow_roots_scoped(&cwd, false, false)
+            .expect("a confined workspace builds");
+        assert!(
+            confined.named_roots().next().is_none(),
+            "a confined agent must hold no writable named root"
+        );
+
+        // An ordinary agent is unchanged: it still gets the roots when HOME provides them.
+        let ordinary = workspace_with_flow_roots_scoped(&cwd, false, true)
+            .expect("an ordinary workspace builds");
+        if std::env::var_os("HOME")
+            .is_some_and(|home| std::path::PathBuf::from(home).join(".flux/flows").is_dir())
+        {
+            assert!(
+                ordinary.named_roots().next().is_some(),
+                "an unconfined agent keeps its global flow roots"
+            );
+        }
+    }
+}
+
+fn preauthorize_attached_native_fleet_main(perms: &mut PermissionManager) {
+    for operation in super::board_fleet_cmd::native_fleet_main_read_operations() {
+        perms.add_allow(operation);
+    }
+    // `task` is safe to run without a prompt only on this specialized surface because the child
+    // registry below is independently reduced to read-only research operations before the spawner
+    // exists. An operator-authored deny remains authoritative.
+    perms.add_allow("task");
+}
+
+pub(super) fn install_native_fleet_main_tools(
+    registry: &mut ToolRegistry,
+    tools: Vec<Arc<dyn flux_runtime::Tool>>,
+) -> Result<()> {
+    for tool in tools {
+        let name = tool.spec().name;
+        if registry.get(&name).is_some() {
+            registry.replace_from_with_placement(
+                NATIVE_FLEET_MAIN_SOURCE,
+                tool,
+                flux_runtime::OperationPlacement::LocalControlPlane,
+            )?;
+        } else {
+            registry.try_register_from_with_placement(
+                NATIVE_FLEET_MAIN_SOURCE,
+                tool,
+                flux_runtime::OperationPlacement::LocalControlPlane,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod attached_native_fleet_permissions_tests {
+    use super::*;
+    use flux_runtime::PermDecision;
+
+    #[test]
+    fn attached_safe_reads_and_research_never_prompt_but_an_operator_deny_still_wins() {
+        let state = "/workspace/.flux/fleet/state.json".to_string();
+        let mut allowed = PermissionManager::new();
+        preauthorize_attached_native_fleet_main(&mut allowed);
+        assert_eq!(
+            allowed.check("fleet.agents", std::slice::from_ref(&state)),
+            PermDecision::Allow
+        );
+        assert_eq!(
+            allowed.check("board.next", &["/workspace".to_string()]),
+            PermDecision::Allow
+        );
+        assert_eq!(
+            allowed.check("fleet.schedule", &["/workspace".to_string()]),
+            PermDecision::Allow
+        );
+        assert_eq!(
+            allowed.check("task", &["scout".to_string()]),
+            PermDecision::Allow
+        );
+
+        let mut denied = PermissionManager::from_rules(&[], &["fleet.agents".to_string()]);
+        preauthorize_attached_native_fleet_main(&mut denied);
+        assert_eq!(denied.check("fleet.agents", &[state]), PermDecision::Deny);
+    }
+}
+
 /// The engine-assembly inputs produced by the middle of [`build_agent_with`]: the provider +
 /// executor + event store, plus the resolved model, prompt, evidence-gated groups, ambient signals,
 /// config-authored model stages, and the validated iteration cap.
@@ -1696,6 +2101,7 @@ async fn assemble_engine(
     flags: &AgentFlags,
     system: &System,
     store_dir: Option<&std::path::Path>,
+    session_id: &str,
 ) -> Result<FlowEngine> {
     let EngineParts {
         provider,
@@ -1714,6 +2120,19 @@ async fn assemble_engine(
         catalog_refresher,
     } = parts;
     let flow = open_flow_store_in(events.clone(), store_dir)?;
+    let agent_loop_binding = resolve_session_agent_loop_binding(
+        flags
+            .agent_loop
+            .as_deref()
+            .or(cfg.agent.loop_spec.as_deref()),
+        flags.agent_loop.is_some() || flags.resolved_loop_binding.is_some(),
+        flags.resolved_loop_binding.as_deref(),
+        system,
+        events.as_ref(),
+        session_id,
+        store_dir,
+    )
+    .await?;
     let spec = AgentSpec {
         model,
         profile: flux_agent::AgentProfile::Coding,
@@ -1725,14 +2144,8 @@ async fn assemble_engine(
         max_iterations,
         thinking: flags.think,
         effort: flags.effort.map(Into::into),
-        agent_loop: resolve_agent_loop(
-            flags
-                .agent_loop
-                .as_deref()
-                .or(cfg.agent.loop_spec.as_deref()),
-            system,
-        )
-        .await?,
+        agent_loop: agent_loop_binding.spec().clone(),
+        agent_loop_binding: Some(agent_loop_binding),
         groups,
         adaptive_policy: adaptive_loop_policy(flags, &cfg.agent)?,
         ambient_signals,
@@ -1789,6 +2202,17 @@ pub(super) async fn build_agent_with(
     user_interaction: Option<Arc<dyn flux_runtime::UserInteraction>>,
     location: Option<AgentBuildLocation>,
 ) -> Result<LiveAgentBuild> {
+    let attached_native_fleet_main = flags.native_fleet_main
+        || location
+            .as_ref()
+            .is_some_and(|location| location.fleet_main);
+    let attached_native_fleet_integrator = flags.native_fleet_integrator;
+    if attached_native_fleet_main && attached_native_fleet_integrator {
+        anyhow::bail!(
+            "validation/gate: an agent cannot attach as both the Fleet coordinator and the wave \
+             integrator; those catalogues are deliberately disjoint"
+        );
+    }
     // Guarded system rooted at the current directory; layered config loaded from it.
     let cwd = match location.as_ref() {
         Some(location) => location.workspace_root.clone(),
@@ -1842,10 +2266,38 @@ pub(super) async fn build_agent_with(
     // Global roots for agent-reusable definitions: `~/.flux/flows` is the home for flows +
     // composite ops (discovered by `flow_list`, run by `flow_run`, ops auto-loaded); `~/.flux/ops`
     // is the legacy location, still read during the ops→flows unification.
+    // An agent running under an enforced operation ceiling (a Fleet worker) gets no host-global
+    // flow/op roots: they are write-capable named roots shared by every concurrent agent on the host,
+    // and a ceiling-confined agent cannot author flows or ops regardless. See C-608.
     let system = Arc::new(
-        System::new(workspace_with_flow_roots(&cwd, true)?).with_sandbox(resolved_sandbox()),
+        System::new(workspace_with_flow_roots_scoped(
+            &cwd,
+            !flags.operation_ceiling,
+            !flags.operation_ceiling,
+        )?)
+        .with_sandbox(resolved_sandbox()),
     );
-    let selected_execution_system = resolve_selected_execution_system(flags, &system).await?;
+    let fleet_research_loop = if attached_native_fleet_main {
+        let selection = super::board_fleet_cmd::configured_main_research_loop(&cwd)?;
+        Some(resolve_agent_loop(Some(&selection), system.as_ref()).await?)
+    } else {
+        None
+    };
+    // One session host registry (C-648..C-650): substrate selection, the host op pack and the
+    // ambient signal all read the same instance, so an ephemeral `--remote` binding is listable.
+    let host_registry = session_host_registry(&cfg);
+    // Rule-4 surface classification: anything that runs without a human approving each effect —
+    // `--yes`, an attached fleet coordinator/integrator, an enforced operation ceiling — is the
+    // `unattended` class, and it never inherits an `operator` grant.
+    let host_surface = if flags.yes
+        || flags.operation_ceiling
+        || attached_native_fleet_main
+        || attached_native_fleet_integrator
+    {
+        flux_secret::host::HostGrant::Unattended
+    } else {
+        flux_secret::host::HostGrant::Operator
+    };
     // C-122: the session's workspace handle, created BEFORE plugin loading so the plugin host
     // capabilities and the executor's context share one view of worktree transitions.
     let session_workspace = flux_runtime::WorkspaceContext::new(system.clone());
@@ -1888,6 +2340,21 @@ pub(super) async fn build_agent_with(
     // as an isolated sub-agent — bounded by the same authorization policy (no blanket allow).
     let mut child_base = ToolRegistry::new();
     flux_tools::try_register_builtins(&mut child_base)?;
+    if attached_native_fleet_main {
+        let ceiling = super::board_fleet_cmd::native_fleet_research_operation_ceiling();
+        let missing = ceiling
+            .iter()
+            .filter(|name| child_base.get(name).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "validation/gate: attached Fleet research ceiling names unavailable operations: {}",
+                missing.join(", ")
+            )
+        }
+        child_base = child_base.subset(Some(&ceiling));
+    }
     let factory: ProviderFactory = {
         let spec = model_spec.clone();
         Arc::new(move || provider_for(&spec).map_err(|e| flux_core::Error::Other(e.to_string())))
@@ -1896,7 +2363,7 @@ pub(super) async fn build_agent_with(
     // `SubAgents::into_spawner` builds the spawner; we register `TaskTool` into the top-level registry
     // below. Sub-agents inherit the same authorization floor as the top-level agent, and audit into
     // the shared event store by default (A-08) — each child gets its own correlated session stream.
-    let spawner: Arc<dyn flux_runtime::Spawner> =
+    let mut sub_agents =
         SubAgents::new(roles, child_base, factory, model.clone(), flags.max_tokens)
             .with_reasoning(flags.think, flags.effort.map(Into::into))
             .with_authorization_cell(policy.clone(), identity.clone())
@@ -1905,8 +2372,30 @@ pub(super) async fn build_agent_with(
             // before this, a sub-agent ran on an unbounded executor. Each child gets an independent
             // copy of these ceilings (same numbers, own concurrency budget); sharing one budget
             // across the delegation boundary deadlocks, see `ResourceLimits::independent_copy`.
-            .with_resource_limits(resource_limits.clone())
-            .into_spawner(system.clone());
+            .with_resource_limits(resource_limits.clone());
+    // C-612: the operator's `[permissions] deny` list must survive delegation. Children inherit
+    // **denials only** — never the allow list, which would widen a child beyond what the operator
+    // granted the parent. A child executor previously got an empty `PermissionManager`, which
+    // resolves every subject to `Ask`, and `SubAgentApprover` allows anything non-destructive; a deny
+    // rule therefore evaporated at this boundary while still reading as enforced.
+    if !cfg.permissions.deny.is_empty() {
+        sub_agents = sub_agents.with_permissions(Arc::new(PermissionManager::from_rules(
+            &[],
+            &cfg.permissions.deny,
+        )));
+    }
+    // C-612 (the other half of the same boundary): `[tools] disable` must bind delegated work too.
+    // The child executor carried no disabled set, so an op the operator disabled stayed advertised to
+    // every sub-agent's model and dispatched for real. The ORIGINAL expressions travel, not this
+    // executor's resolved names — a child's catalog is narrowed by role ∩ scope, so the spawner
+    // resolves them against the registry the child actually gets.
+    if !cfg.tools.disable.is_empty() {
+        sub_agents = sub_agents.with_disabled_patterns(cfg.tools.disable.clone());
+    }
+    if let Some(agent_loop) = fleet_research_loop {
+        sub_agents = sub_agents.with_agent_loop(agent_loop);
+    }
+    let spawner: Arc<dyn flux_runtime::Spawner> = sub_agents.into_spawner(system.clone());
 
     // Tools + permissions: from config (deny/allow rules); if no allow rules are configured,
     // reads are pre-allowed by default so the common case needs no config. Mutating tools prompt
@@ -1958,6 +2447,26 @@ pub(super) async fn build_agent_with(
         &canonical_spec,
         &events,
     )?;
+    // An explicit Fleet-main attachment receives the native durable Fleet projection. Keep this
+    // out of ordinary CLI/TUI agents and out of story workers: `fleet.agents` reads admission state
+    // owned by the attached Fleet root, whereas the always-registered `fleet.worker_status` reads
+    // transient process workers owned by this one agent runtime.
+    if attached_native_fleet_main {
+        install_native_fleet_main_tools(
+            &mut registry,
+            super::board_fleet_cmd::native_fleet_main_tools(cwd.clone())?,
+        )?;
+    }
+
+    // The dedicated wave integrator carries a closed two-operation catalogue that is disjoint from
+    // the coordinator's. It is mutually exclusive with the coordinator attachment: one subprocess
+    // assembles a wave, another schedules work, and neither inherits the other's authority.
+    if attached_native_fleet_integrator {
+        install_native_fleet_main_tools(
+            &mut registry,
+            super::board_fleet_cmd::native_fleet_integrator_tools(cwd.clone())?,
+        )?;
+    }
 
     // Auto-index workspace docs (markdown/text, capped & cheap) into the knowledge datasource, and
     // register the retrieval ops (`search`/`get`/`list`/`relation`/`batch_get`/`sources`). The
@@ -1992,27 +2501,52 @@ pub(super) async fn build_agent_with(
     // (tier 2), all under the family-wide `[private_net] web` egress scope. Registered here — after
     // the session is resolved — because the `PrivateNetAdmit` audit sink needs the event store +
     // session id, and `web.fetch` contributes `web.page` records to the datasource backend.
-    {
+    let web_options = {
         let web_audit: Arc<dyn flux_plugin::EgressAudit> = Arc::new(EventStoreEgressAudit {
             store: events.clone(),
             stream: session_id.clone(),
         });
-        flux_web::try_register_web(
-            &mut registry,
-            &flux_web::WebOptions {
-                private_net: flux_system::net::PrivateNetAllow::from_hosts(
-                    effective_web_private_hosts(&cfg),
-                ),
-                audit: Some(web_audit),
-                grant_source: Some(web_grant_source()),
-                records: Some(Arc::new(BackendRecordSink {
-                    backend: backend.clone(),
-                })),
-                browser_bin: cfg.browser_bin.clone(),
-                allowed_secrets: cfg.web.allowed_secrets.clone(),
-            },
-        )?;
-    }
+        flux_web::WebOptions {
+            private_net: flux_system::net::PrivateNetAllow::from_hosts(
+                effective_web_private_hosts(&cfg),
+            ),
+            audit: Some(web_audit),
+            grant_source: Some(web_grant_source()),
+            records: Some(Arc::new(BackendRecordSink {
+                backend: backend.clone(),
+            })),
+            browser_bin: cfg.browser_bin.clone(),
+            allowed_secrets: cfg.web.allowed_secrets.clone(),
+        }
+    };
+    flux_web::try_register_web(&mut registry, &web_options)?;
+
+    // C-675: **the composition site.** This layer holds both halves — the one reviewed egress
+    // client (`flux_web::NativeHttp`, built from the very wiring the ops just registered with) and
+    // the substrate a selection installs — so it is the only place that can join them without a
+    // lower layer reaching up for a client it may not depend on. A native-composed substrate
+    // (the confinement peer today, a container backend next) then serves web effects through the
+    // same client, the same egress guard and the same audit sink an unselected run uses.
+    //
+    // The attachment rides on a *clone* of the session system handed to selection, never on the
+    // session's own: an unselected run, and a named `local` binding that installs no override, stay
+    // on the bare native path where the family is fail-closed exactly as C-652 shipped it.
+    //
+    // Selection therefore resolves here rather than beside the other startup refusals: the audit
+    // sink is a session-scoped value (event store + session id) and the private-net scope is the
+    // resolved `[private_net] web` one, neither of which exists earlier. A refusal from an unknown,
+    // ungranted or unconfinable binding is still a startup refusal, just after the session opens.
+    let selection_local = (*system)
+        .clone()
+        .with_http(Arc::new(flux_web::NativeHttp::new(&web_options)));
+    let selected_substrate = resolve_selected_execution_system(
+        flags,
+        &selection_local,
+        &host_registry,
+        host_surface,
+        posture.sandbox_floor(),
+    )
+    .await?;
 
     let integrations = assemble_integrations(
         system.clone(),
@@ -2022,18 +2556,20 @@ pub(super) async fn build_agent_with(
         backend.clone(),
         false,
         &cfg,
+        host_registry.clone(),
+        // C-709: the binding this session selected, so a host-bound endpoint resolves only from the
+        // substrate it is reachable through rather than from wherever this process happens to run.
+        selected_substrate
+            .as_ref()
+            .map(|selected| selected.binding.clone()),
         events.clone(),
         &session_id,
         &redactor,
     )
     .await?;
     let live_plugins = Arc::new(integrations.live_plugins);
-    for (source, tool) in integrations.tools {
-        registry.try_register_from_with_placement(
-            source,
-            tool,
-            flux_runtime::OperationPlacement::NativeSystemOnly,
-        )?;
+    for (source, tool, placement) in integrations.tools {
+        registry.try_register_from_with_placement(source, tool, placement)?;
     }
     let plugin_groups = integrations.groups;
     let mut ambient_signals = integrations.ambient_signals;
@@ -2045,40 +2581,34 @@ pub(super) async fn build_agent_with(
     // unavailable binding leaves core Flux intact and advertises no Exchange operation; the
     // turn-boundary refresher retries and publishes only complete effective generations through
     // C-318's live catalogue.
-    let catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> = match (
+    // C-650: the transitional environment pair wins while present; with the pair absent, a
+    // `[exchange] host = "<binding>"` declaration resolves the same origin + token through a
+    // named `[[host]]` binding (the token stays a reference — an env-var name — resolved here).
+    let exchange_origin: Option<(String, String)> = match (
         std::env::var("FLUX_EXCHANGE_URL").ok(),
         std::env::var("FLUX_EXCHANGE_SERVICE_ACCOUNT_TOKEN").ok(),
     ) {
         (Some(url), Some(token)) if !url.trim().is_empty() && !token.trim().is_empty() => {
-            match flux_web::exchange::ExchangeClient::new(&url, &token, redactor.clone()) {
-                Ok(client) => {
-                    let client = Arc::new(client);
-                    if let Err(error) = client.refresh_registry(&mut registry).await {
-                        eprintln!(
-                            "{}",
-                            style::dim(&format!(
-                                "(Exchange catalogue unavailable at startup: {})",
-                                redactor.redact(&error.to_string())
-                            ))
-                        );
-                    }
-                    Some(Arc::new(flux_web::exchange::ExchangeCatalogRefresher::new(
-                        client,
-                    )))
-                }
-                Err(error) => {
+            Some((url, token))
+        }
+        (None, None) => exchange_binding_from_config(&cfg, &host_registry).and_then(
+            |(name, url, reference)| match std::env::var(&reference.slot)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(token) => Some((url, token)),
+                None => {
                     eprintln!(
                         "{}",
                         style::dim(&format!(
-                            "(Exchange binding refused: {})",
-                            redactor.redact(&error.to_string())
+                            "(exchange host `{name}`: token environment variable `{}` is unset                              or empty; catalogue disabled)",
+                            reference.slot
                         ))
                     );
                     None
                 }
-            }
-        }
-        (None, None) => None,
+            },
+        ),
         _ => {
             eprintln!(
                 "{}",
@@ -2090,6 +2620,39 @@ pub(super) async fn build_agent_with(
             None
         }
     };
+    let mut catalog_refresher: Option<Arc<dyn flux_runtime::CatalogRefresher>> =
+        match exchange_origin {
+            Some((url, token)) => {
+                match flux_web::exchange::ExchangeClient::new(&url, &token, redactor.clone()) {
+                    Ok(client) => {
+                        let client = Arc::new(client);
+                        if let Err(error) = client.refresh_registry(&mut registry).await {
+                            eprintln!(
+                                "{}",
+                                style::dim(&format!(
+                                    "(Exchange catalogue unavailable at startup: {})",
+                                    redactor.redact(&error.to_string())
+                                ))
+                            );
+                        }
+                        Some(Arc::new(flux_web::exchange::ExchangeCatalogRefresher::new(
+                            client,
+                        )))
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            style::dim(&format!(
+                                "(Exchange binding refused: {})",
+                                redactor.redact(&error.to_string())
+                            ))
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
     // A-96: the `consult` op's group surfaces only when a target is configured, exactly like the
     // `endpoint` ambient signal above — computed once here from config, never re-probed per turn,
     // so surfacing can't churn the prompt prefix mid-session (A-95).
@@ -2149,11 +2712,54 @@ pub(super) async fn build_agent_with(
         );
     }
 
+    if attached_native_fleet_integrator {
+        let ceiling = super::board_fleet_cmd::native_fleet_integrator_operation_ceiling();
+        let missing = ceiling
+            .iter()
+            .filter(|name| registry.get(name).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "validation/gate: attached wave integrator ceiling names unavailable operations: {}",
+                missing.join(", ")
+            )
+        }
+        registry = registry.subset(Some(&ceiling));
+        model_stages.clear();
+        // Same reasoning as the coordinator below: a turn-boundary Exchange/plugin refresh must not
+        // widen a deliberately closed catalogue after assembly.
+        catalog_refresher = None;
+    }
+
+    if attached_native_fleet_main {
+        let ceiling = super::board_fleet_cmd::native_fleet_main_operation_ceiling();
+        let missing = ceiling
+            .iter()
+            .filter(|name| registry.get(name).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            anyhow::bail!(
+                "validation/gate: attached Fleet main ceiling names unavailable operations: {}",
+                missing.join(", ")
+            )
+        }
+        registry = registry.subset(Some(&ceiling));
+        model_stages.clear();
+        // A turn-boundary Exchange/plugin refresh must not widen the deliberately closed
+        // coordinator catalog after assembly.
+        catalog_refresher = None;
+    }
+
     let ResolvedPermissions {
-        perms,
+        mut perms,
         approver,
         hooks,
     } = resolve_permissions(&cwd, &cfg, posture, approver_override);
+    if attached_native_fleet_main {
+        preauthorize_attached_native_fleet_main(&mut perms);
+    }
 
     let mut environment = assemble_cli_execution_environment(
         system.clone(),
@@ -2170,8 +2776,13 @@ pub(super) async fn build_agent_with(
         resource_limits,
     )
     .with_workspace(session_workspace);
-    if let Some(selected) = selected_execution_system {
-        environment = environment.with_execution_system(selected);
+    if let Some(selected) = selected_substrate {
+        if let Some(selected_system) = selected.system {
+            environment = environment.with_execution_system(selected_system);
+        }
+        // A named `local` binding installs no system override — the native workspace-following
+        // path is preserved — but its name still rides every dispatch record's provenance.
+        environment = environment.with_execution_binding(selected.binding);
     }
     let executor = environment.into_executor();
     // C-162: resolve `[tools] disable` against the now-final registry (exact op names or
@@ -2267,6 +2878,7 @@ pub(super) async fn build_agent_with(
         location
             .as_ref()
             .map(|location| location.store_dir.as_path()),
+        &session_id,
     )
     .await?;
     Ok((agent, session_id, canonical_spec, spawner, live_plugins))

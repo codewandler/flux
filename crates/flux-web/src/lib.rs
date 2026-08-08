@@ -34,8 +34,11 @@ mod egress;
 pub mod exchange;
 pub mod fetch;
 pub mod http;
+pub mod native_http;
+mod retry;
 
 pub use browser::{browser_group, chromium_present};
+pub use native_http::NativeHttp;
 
 /// Sink for datasource records contributed by web ops. Fetched HTML pages become `web.page` records
 /// (title/url/content) so read content is groundable later — the `websearch` → `web.result` pattern.
@@ -131,12 +134,26 @@ pub fn try_register_web(registry: &mut ToolRegistry, opts: &WebOptions) -> Resul
             .unwrap_or_else(|| "config:web".to_string()),
     };
     let mut assembled = registry.clone();
+    // Tiers 1 and 2 are guarded HTTP and nothing else, and since C-652 HTTP is on the guarded port —
+    // so these two effects follow the operator's selected substrate instead of being pinned to the
+    // coordinator's process (Decision 0018 rule 5). A substrate that does not serve HTTP refuses
+    // them in the port's own words; neither op falls back to a local client.
     assembled.try_register_all_from_with_placement(
         "flux-web native capability pack",
         vec![
             Arc::new(http::HttpRequestTool::new(opts)) as Arc<dyn Tool>,
             Arc::new(fetch::WebFetchTool::new(opts)),
-            Arc::new(crawl::WebCrawlTool::new(opts)),
+        ],
+        OperationPlacement::SelectedExecutionSystem,
+    )?;
+    // `web.crawl` drives its own frontier across many fetches and `browser.*` owns a live Chromium
+    // child, a CDP pipe and a session registry in *this* process. Rule 5 moves web operations "where
+    // their semantics allow", and theirs do not: they stay native-only and are hidden rather than
+    // mis-served under a selected substrate.
+    assembled.try_register_all_from_with_placement(
+        "flux-web native capability pack",
+        vec![
+            Arc::new(crawl::WebCrawlTool::new(opts)) as Arc<dyn Tool>,
             Arc::new(browser::BrowserOpenTool {
                 registry: registry_ref.clone(),
                 config,

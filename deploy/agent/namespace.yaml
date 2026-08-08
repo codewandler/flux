@@ -1,0 +1,11 @@
+# A namespace of its own, separate from the substrate profile's `flux-system`. The two axes are
+# different deployments with different blast radii — the substrate executes effects an operator
+# approved on their own machine, this one runs the whole agent — and a cluster may well run both.
+# Sharing a namespace would mean sharing one default-deny NetworkPolicy across both.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flux-agent
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

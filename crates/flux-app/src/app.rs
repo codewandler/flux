@@ -918,7 +918,12 @@ impl Engine {
                 ) {
                     registration_error.borrow_mut().get_or_insert(error);
                 }
-                sa.with_audit(events.clone()).into_spawner(system.clone())
+                // C-612: `[tools] disable` binds delegated work too — the same authored expressions
+                // resolved below for this engine's own executor, carried into every sub-agent and
+                // re-resolved there against the child's own narrowed catalog.
+                sa.with_audit(events.clone())
+                    .with_disabled_patterns(disabled.clone())
+                    .into_spawner(system.clone())
             });
             // C-183: resolve `[tools] disable` against the now-FULLY-assembled registry (built-ins +
             // cognition + orchestration ops + the surface's contributed catalog + `task`) — the same

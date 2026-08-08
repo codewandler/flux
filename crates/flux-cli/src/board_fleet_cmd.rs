@@ -45,6 +45,134 @@ fn guarded_run(root: &Path, argv: &[String]) -> Result<flux_system::ProcessOutpu
     })
 }
 
+/// [`guarded_run`] with caller-chosen environment entries, through the same guarded boundary.
+fn guarded_run_with_env(
+    root: &Path,
+    argv: &[String],
+    env: &[(String, String)],
+) -> Result<flux_system::ProcessOutput> {
+    if argv.is_empty() {
+        bail!("input/schema: process argv cannot be empty")
+    }
+    let system = guarded_system(root)?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(system.run_with_env(argv, env, CONTROL_PROCESS_TIMEOUT))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    })
+}
+
+/// [`guarded_run`] with a document on standard input, through the same guarded boundary.
+fn guarded_run_with_stdin(
+    root: &Path,
+    argv: &[String],
+    stdin: &[u8],
+) -> Result<flux_system::ProcessOutput> {
+    if argv.is_empty() {
+        bail!("input/schema: process argv cannot be empty")
+    }
+    let system = guarded_system(root)?;
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(system.run_with_stdin(argv, stdin, CONTROL_PROCESS_TIMEOUT))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))
+    })
+}
+
+/// How many bytes of blob content one `git cat-file --batch` may be asked for.
+///
+/// The guarded port caps a child's captured output at 1 MiB. Ask for more and the tail is dropped,
+/// the batch framing stops lining up, and the read falls back to one process per file — silently,
+/// which is exactly what the first version of this did: the 5.5 MB flux member never once took the
+/// fast path while the 141-story exchange member always did, so the change measured as no
+/// improvement at all. Sized well under the cap to leave room for the per-object header lines.
+const GIT_BATCH_BUDGET_BYTES: usize = 512 * 1024;
+
+/// Read many blobs from one `git cat-file --batch` instead of one `git show` per file.
+///
+/// Resolving a workspace member spawned one guarded process per story. Across this workspace's
+/// four members that is ~1,690 forks on **every** board call — including `board get`, which needs
+/// exactly one story and took eight seconds to produce 759 bytes. Every native coordinator
+/// operation pays it twice over, because each one shells out to a nested CLI that resolves the
+/// board again.
+///
+/// Returns `None` when the framing does not line up, so the caller falls back to the per-file path
+/// instead of risking mis-sliced content. The port hands back `String`, so a story that was not
+/// valid UTF-8 would be converted lossily and the declared sizes would stop matching the bytes: a
+/// framed protocol that guesses is worse than a slow one that does not.
+fn git_cat_file_batch(root: &Path, reference: &str, paths: &[&str]) -> Option<Vec<Option<String>>> {
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let argv = ["git", "cat-file", "--batch"]
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect::<Vec<_>>();
+    let spec = paths
+        .iter()
+        .map(|path| format!("{reference}:{path}\n"))
+        .collect::<String>();
+    let output = guarded_run_with_stdin(root, &argv, spec.as_bytes()).ok()?;
+    if output.exit_code != 0 {
+        return None;
+    }
+
+    let bytes = output.stdout.as_bytes();
+    let mut cursor = 0usize;
+    let mut blobs = Vec::with_capacity(paths.len());
+    for _ in paths {
+        let newline = bytes
+            .get(cursor..)?
+            .iter()
+            .position(|byte| *byte == b'\n')?
+            + cursor;
+        let header = std::str::from_utf8(bytes.get(cursor..newline)?).ok()?;
+        cursor = newline + 1;
+        // `<input> missing` for anything unresolvable; an object line is `<oid> <type> <size>`.
+        // Read the trailer from the right, so a path containing a space cannot shift the fields.
+        if header.ends_with(" missing") {
+            blobs.push(None);
+            continue;
+        }
+        let mut trailer = header.rsplit(' ');
+        let size: usize = trailer.next()?.parse().ok()?;
+        if trailer.next()? != "blob" {
+            return None;
+        }
+        let end = cursor.checked_add(size)?;
+        let content = std::str::from_utf8(bytes.get(cursor..end)?)
+            .ok()?
+            .to_string();
+        // The batch protocol writes exactly one newline after each object.
+        cursor = end + 1;
+        blobs.push(Some(content));
+    }
+    Some(blobs)
+}
+
+/// Split `sized` into runs whose combined content stays inside [`GIT_BATCH_BUDGET_BYTES`].
+///
+/// A file larger than the whole budget gets a chunk to itself; it will overflow the cap and fail
+/// framing on its own, which the per-file fallback then handles without dragging its neighbours
+/// down with it.
+fn size_bounded_chunks<'a>(sized: &[(usize, &'a str)]) -> Vec<Vec<&'a str>> {
+    let mut chunks: Vec<Vec<&'a str>> = Vec::new();
+    let mut current: Vec<&'a str> = Vec::new();
+    let mut used = 0usize;
+    for (size, path) in sized {
+        if !current.is_empty() && used + size > GIT_BATCH_BUDGET_BYTES {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += size;
+        current.push(path);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 /// Retain only complete newest lines within `limit` bytes.
 ///
 /// Agent stream events are one JSON object per line. Cutting bytes from the front of an oversized
@@ -89,6 +217,165 @@ fn guarded_git(root: &Path, args: &[&str]) -> Result<flux_system::ProcessOutput>
     guarded_run(root, &argv)
 }
 
+/// Did this validation run execute zero tests?
+///
+/// A filtered-to-nothing run is not a pass and not a failure — it is "the cited test does not exist
+/// here". Detected from the runner's own summary rather than the exit code, because `cargo test`
+/// reports `0 passed; 0 failed; N filtered out` and exits 0. Recognises the libtest summary shared by
+/// `cargo test`/`cargo nextest`; an unrecognised runner simply reports `false` and keeps the strict
+/// exit-code contract.
+///
+/// **Every summary is counted, not the presence of one string.** `cargo test -p <pkg> <filter>` runs the
+/// package's lib unittests *and* each of its integration-test binaries, so a filter that matches one
+/// target emits a real summary for that target and `0 passed; 0 failed; N filtered out` for every other.
+/// A substring search over the combined output therefore reported "no tests ran" for a run in which a
+/// test genuinely ran and passed — which silently refused a correct handoff and parked a wave holding
+/// delivered work. The question is whether ANY target executed a test, so the counts are summed.
+fn ran_no_tests(evidence: &Value) -> bool {
+    let haystack = format!(
+        "{}{}",
+        evidence["stdout"].as_str().unwrap_or_default(),
+        evidence["stderr"].as_str().unwrap_or_default()
+    );
+    /// Read the integer immediately preceding `marker` (`"4 passed"` → `4`).
+    fn count_before(line: &str, marker: &str) -> Option<u64> {
+        let head = &line[..line.find(marker)?];
+        let digits = head
+            .trim_end()
+            .rsplit(|c: char| !c.is_ascii_digit())
+            .next()?;
+        digits.parse().ok()
+    }
+    let mut recognised = false;
+    let mut executed = 0u64;
+    for line in haystack.lines() {
+        // libtest: `test result: ok. 1 passed; 0 failed; 293 filtered out; ...`
+        if line.contains("test result:") {
+            recognised = true;
+            executed += count_before(line, " passed").unwrap_or(0);
+            executed += count_before(line, " failed").unwrap_or(0);
+        }
+        // nextest: `Summary [ 0.1s] 4 tests run: 4 passed, 0 skipped` / `Starting 4 tests across ...`
+        else if line.contains(" tests run") {
+            recognised = true;
+            executed += count_before(line, " tests run").unwrap_or(0);
+        } else if line.contains("Starting ") && line.contains(" tests") {
+            recognised = true;
+            executed += count_before(line, " tests").unwrap_or(0);
+        }
+    }
+    recognised && executed == 0
+}
+
+/// Sidecar carrying live worker activity, relative to the Fleet root.
+///
+/// A wave writes `state.json` exactly twice — once before the first worker starts, once after the
+/// last joins — so for the whole wave a surface has nothing new to render and an operator watching
+/// `flux tui --fleet` sees a frozen panel. The worker's NDJSON is already arriving on stdout; this
+/// file is where the supervisor lands a bounded projection of it as it arrives, so a surface can
+/// tail one path instead of deriving five per-worker store paths.
+pub(super) const FLEET_ACTIVITY_SIDECAR: &str = ".flux/fleet/activity.ndjson";
+/// Keep the sidecar bounded: it is a live view, not an archive. Full fidelity stays in each worker's
+/// own session store and in the turn receipt.
+const FLEET_ACTIVITY_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Append one bounded activity record for `agent_id`.
+///
+/// Deliberately structural only — event type, operation name, and a coarse outcome. Tool inputs and
+/// result bodies are never read, so a worker's secrets cannot reach this file through a field it does
+/// not touch (the same property A-79's `SpawnActivity` relies on). Best-effort: a surface losing an
+/// activity line must never fail a worker's turn, so every error here is swallowed.
+fn append_worker_activity(fleet_root: &Path, agent_id: &str, line: &str) {
+    let Ok(event) = serde_json::from_str::<Value>(line) else {
+        return;
+    };
+    let kind = event["type"].as_str().unwrap_or("event");
+    // `turn_start` carries the whole prompt; it is stripped from receipts too. Skip it entirely.
+    if kind == "turn_start" {
+        return;
+    }
+    let subject = ["name", "operation", "stage", "original_type"]
+        .into_iter()
+        .find_map(|key| event[key].as_str())
+        .unwrap_or("—");
+    let outcome = if event["is_error"].as_bool() == Some(true) {
+        "error"
+    } else {
+        event["outcome"].as_str().unwrap_or("ok")
+    };
+    let record = json!({
+        "schema": "flux.fleet-activity/v1",
+        "agent": agent_id,
+        "type": kind,
+        "operation": bounded_text(subject, 80),
+        "outcome": outcome,
+    });
+    let path = fleet_root.join(FLEET_ACTIVITY_SIDECAR);
+    if std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0) > FLEET_ACTIVITY_MAX_BYTES {
+        let _ = std::fs::remove_file(&path);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{record}");
+    }
+}
+
+/// Read the activity sidecar into the last few lines per worker, newest last.
+///
+/// Best-effort and bounded: a missing, truncated or partially written sidecar yields whatever parses,
+/// because a live view must never fail a snapshot the operator is waiting on.
+fn read_worker_activity(root: &Path) -> BTreeMap<String, Vec<String>> {
+    const MAX_PER_WORKER: usize = 20;
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let Ok(text) = std::fs::read_to_string(root.join(FLEET_ACTIVITY_SIDECAR)) else {
+        return out;
+    };
+    for line in text.lines() {
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(agent) = record["agent"].as_str() else {
+            continue;
+        };
+        let summary = format!(
+            "{} · {} · {}",
+            record["type"].as_str().unwrap_or("event"),
+            record["operation"].as_str().unwrap_or("—"),
+            record["outcome"].as_str().unwrap_or("ok"),
+        );
+        let entries = out.entry(agent.to_string()).or_default();
+        entries.push(bounded_text(&summary, 300));
+        if entries.len() > MAX_PER_WORKER {
+            entries.remove(0);
+        }
+    }
+    out
+}
+
+/// Feed newly arrived stdout bytes to [`append_worker_activity`], one complete line at a time.
+/// Returns the unconsumed tail (a partial line) to be carried into the next poll.
+fn drain_activity_lines(pending: &mut String, chunk: &str, fleet_root: &Path, agent_id: &str) {
+    pending.push_str(chunk);
+    while let Some(newline) = pending.find('\n') {
+        let line = pending[..newline].trim().to_string();
+        pending.drain(..=newline);
+        if !line.is_empty() {
+            append_worker_activity(fleet_root, agent_id, &line);
+        }
+    }
+    // A single absurdly long line must not grow this buffer without bound.
+    if pending.len() > FLEET_STREAM_JSON_LINE_LIMIT {
+        pending.clear();
+    }
+}
+
 async fn guarded_agent_run_async(
     worktree: &Path,
     read_roots: &[PathBuf],
@@ -105,6 +392,26 @@ async fn guarded_agent_run_async(
             .add_read_root(root)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     }
+    // C-607: pin the worker's confinement here rather than inheriting whatever the operator's shell
+    // resolved. `flux fleet run` is operator-invoked and must stay unconfined itself — it creates
+    // worktrees in each member repository's shared git dir, outside any single workspace — but the
+    // turn it launches has no approval boundary at all, which is exactly C-262's criterion. Left to
+    // `from_env`, an operator with no `FLUX_SANDBOX` set resolved `Off` and the worker was spawned
+    // unwrapped, making the workspace path guard its only confinement of any kind (and that guard does
+    // not cover `bash`/`proc.run`, nor does the OS sandbox restrict reads on either backend).
+    // C-607 is NOT fixed here yet, deliberately. Forcing `SandboxMode::On` at this spawn site does
+    // confine the worker, but it also made every worker turn fail with
+    // `emitted an invalid event stream` — reproducibly, where the same story committed successfully
+    // without it. The parse error is masked by the context message (which shows only stderr, carrying
+    // the child's `trusting FLUX_SANDBOXED=1` startup warning), so the mechanism is not yet
+    // established: it may be the child's own startup output reaching stdout and corrupting the NDJSON
+    // protocol, or the wrapped spawn changing how output is delivered.
+    //
+    // Leaving the fleet unable to do any work is worse than the exposure this closes, so the posture
+    // stays inherited until the stream failure is understood. The exposure is real and documented in
+    // C-607: with no `FLUX_SANDBOX` set, a worker resolves `Off` and is spawned unwrapped, so the
+    // workspace path guard is its only confinement — and that guard does not cover `bash`/`proc.run`,
+    // which C-606 has now removed from the default story capabilities.
     let system = flux_system::System::new(workspace).with_sandbox(
         flux_system::sandbox::Sandbox::resolve(flux_system::sandbox::SandboxSettings::from_env()),
     );
@@ -124,8 +431,12 @@ async fn guarded_agent_run_async(
     let mut stderr = Vec::new();
     let mut dropping_stdout_line = false;
     let mut dropping_stderr_line = false;
+    let mut activity_pending = String::new();
     loop {
         let (out, err) = child.read_output();
+        // Project each complete line to the activity sidecar as it arrives. This poll loop is the
+        // only place that sees worker events before the process exits.
+        drain_activity_lines(&mut activity_pending, &out, &fleet_root, &agent_id);
         append_capped_line_buffer(
             &mut stdout,
             &mut dropping_stdout_line,
@@ -316,6 +627,15 @@ pub(super) enum BoardAction {
         limit: usize,
         #[arg(long)]
         area: Option<String>,
+        /// Return the largest wave-safe set instead of the highest-priority prefix.
+        ///
+        /// Dependency satisfaction says only that nothing an item *waits on* is outstanding. It
+        /// says nothing about whether two ready items can be built at the same time, and
+        /// integration refuses a wave in which two stories wrote the same path. Priority clusters
+        /// by subject, and subject is what predicts collisions, so the highest-priority `--limit`
+        /// items are often the worst possible wave.
+        #[arg(long)]
+        independent: bool,
     },
     /// Create a story, epic or design without clobbering an existing file.
     Create {
@@ -339,6 +659,10 @@ pub(super) enum BoardAction {
         design: Option<String>,
         #[arg(long)]
         note: Option<String>,
+        /// Leave the new document uncommitted. It will not be visible to any board read that resolves
+        /// items at a git ref, which is the default for a workspace member.
+        #[arg(long)]
+        no_commit: bool,
     },
     /// Update common planning metadata.
     Update {
@@ -376,6 +700,12 @@ pub(super) enum BoardAction {
     Evidence { id: String, evidence: String },
     /// Validate frontmatter, ids, priorities and planning-document links.
     Check,
+    /// Report items whose work is already present while their status says it is outstanding.
+    ///
+    /// A story implemented in `main` while its row still read `ready` was dispatched again, and a
+    /// worker turn reproduced code committed hours earlier. Every input was already recorded and
+    /// nothing could ask. Detection is the whole value: this reports and never repairs.
+    Reconcile,
     /// Regenerate the Track marker region byte-for-byte compatibly.
     Render,
     /// Validate then render the selected board.
@@ -583,11 +913,46 @@ pub(super) enum FleetAction {
         #[arg(long, default_value_t = 2)]
         max_rework: usize,
     },
+    /// Diagnose configuration AND runtime health, read-only.
+    ///
+    /// Beyond `validate`'s configuration checks, reports agents recorded active whose supervisor is
+    /// gone, waves wedged mid-integration, worktrees a topology names that disk lacks, items claimed by
+    /// more than one live wave, and branches left at their pinned base holding nothing unique. Each
+    /// finding carries its own next action; runtime findings do not fail the run, so `data.runtime` is
+    /// the machine-readable verdict.
     Doctor,
     Refresh,
+    /// Reclaim a finished wave's build output, and its worktrees if they provably hold no work.
+    ///
+    /// Acceptance reclaims automatically; this is for the waves that ended some other way — parked,
+    /// failed, conflicted — which otherwise keep their target directories for as long as the checkout
+    /// exists. Disk is what caps fleet width, so those are not free.
+    Reclaim {
+        /// Wave to reclaim. Omit to reclaim every wave that is not in flight.
+        target: Option<String>,
+    },
+    /// Rebuild the structure a wave's topology names and disk lacks, discarding nothing.
+    ///
+    /// A worktree removed out from under an unfinished wave, or one left off the base it is pinned
+    /// to, currently takes a hand-written `git worktree add` or `git reset --hard` against values
+    /// read out of `state.json`. Every input is already recorded, so this is a verb.
+    Repair {
+        /// Wave whose recorded structure should be rebuilt.
+        wave: String,
+    },
     Validate,
     Start,
     Stop,
+    /// Stop dispatch and confirm no worker turn is in flight, so a new binary can be installed.
+    ///
+    /// The recorded quiesce refuses every dispatch until `flux fleet resume` lifts it, and the
+    /// command itself fails while a worker is still moving — so `flux fleet quiesce && install`
+    /// cannot proceed into a live wave.
+    Quiesce {
+        /// Why the fleet is being quiesced. Recorded on the state and in the journal.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Record and inspect goals the main coordinator must use for every planning decision.
     Goal {
         #[command(subcommand)]
@@ -645,6 +1010,9 @@ pub(super) enum FleetAction {
         worker: Option<String>,
         #[arg(long)]
         session: Option<String>,
+        /// Derive the write set from `base..HEAD` instead of restating what the range already proves.
+        #[arg(long, conflicts_with = "write_set")]
+        from_worktree: bool,
         #[arg(long = "write-set", value_name = "PATH")]
         write_set: Vec<String>,
         #[arg(long = "test-arg", value_name = "ARGV", allow_hyphen_values = true)]
@@ -696,15 +1064,58 @@ pub(super) enum FleetAction {
     Cancel {
         target: String,
     },
+    /// Park a wave with a recorded reason, so it stops being re-decided while a human deliberates.
+    ///
+    /// Parking used to be a line in a driver-owned text file: invisible to `fleet status`, so the
+    /// coordinator re-decided a parked wave every minute, and unparking meant editing text.
+    Park {
+        wave: String,
+        /// Why the wave is paused. Recorded on the wave and reported by `fleet status`.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Return a parked wave to the lifecycle state it held when it was parked.
+    Unpark {
+        wave: String,
+    },
     Resume {
         target: Option<String>,
     },
     /// Merge a recorded green local candidate. Never pushes, releases or deploys.
     Apply {
         wave: String,
+        /// Accept only this repository's candidate, from a wave whose other repositories failed.
+        ///
+        /// Integration is per repository and produces one candidate each, so a wave can hold a green
+        /// candidate beside a conflicted one. Without this, that green candidate was unreachable: apply
+        /// demanded the whole wave be green, and an independent repository's delivered work was stranded
+        /// by a collision it had no part in.
+        #[arg(long)]
+        only: Option<String>,
     },
     Status,
     Schedule,
+    /// Run the unattended driver: one deterministic tick, or an interval loop over it.
+    ///
+    /// C-631. The driver was a 582-line bash script that parsed `state.json` three separate ways with
+    /// no `--if-revision` guard, could not be edited while running, and needed a production failure to
+    /// find each of its defects. Its judgment always lived outside it — planner, retro and scribe are
+    /// authored `.flux` loops it invoked host-side — so this inherits those unchanged and owns only
+    /// tick mechanics: report, advance, accumulate, dispatch.
+    Drive {
+        /// Perform exactly one tick and exit. The default when neither flag is given.
+        #[arg(long)]
+        tick: bool,
+        /// Repeat the tick on an interval, under a durable single-instance guard.
+        #[arg(long = "loop", conflicts_with = "tick")]
+        run_loop: bool,
+        /// Seconds between ticks under `--loop`.
+        #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+        interval: u64,
+        /// Stop after this many ticks under `--loop`; `0` runs until the fleet is stopped or quiesced.
+        #[arg(long, default_value_t = 0)]
+        max_ticks: u64,
+    },
     /// Show unresolved human decisions without stopping unrelated work.
     Decisions {
         /// Queue unresolved decisions for an independent adversarial decision agent.
@@ -731,6 +1142,9 @@ pub(super) enum FleetAction {
         #[arg(value_enum)]
         view: InspectView,
         target: Option<String>,
+        /// `inspect gate` only: narrow a wave's gate output to one repository of its topology.
+        #[arg(long)]
+        repository: Option<String>,
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
@@ -821,6 +1235,8 @@ pub(super) enum InspectView {
     Activity,
     Worktree,
     Integration,
+    /// A wave's repository gates: argv, exit code and the gate's own captured output, tail first.
+    Gate,
     Source,
     Search,
     Story,
@@ -860,8 +1276,49 @@ struct FleetState {
     agents: BTreeMap<String, Value>,
     #[serde(default)]
     waves: BTreeMap<String, Value>,
+    /// C-642: the recorded maintenance window. `Some` means dispatch is stopped until
+    /// `flux fleet resume` lifts it. `default` keeps state files written before it existed loadable.
+    #[serde(default)]
+    quiesce: Option<QuiesceRecord>,
+    /// C-631: what the unattended driver has already done, so a tick is comparable to the last one.
+    ///
+    /// The bash driver kept this in files beside the state — a pidfile, a tick counter, a
+    /// last-status text blob — which is why three parsers disagreed about the same fleet. `default`
+    /// keeps state files written before it existed loadable.
+    #[serde(default)]
+    drive: Option<DriveRecord>,
     #[serde(default)]
     idempotency: BTreeMap<String, StoredResult>,
+}
+
+/// C-631: the durable record one `flux fleet drive` tick leaves behind.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct DriveRecord {
+    /// Ticks this fleet has run. Monotonic, and the tick number reported by each result.
+    ticks: u64,
+    /// Fingerprint of the state the previous tick decided on.
+    ///
+    /// A tick whose fingerprint is unchanged decided on exactly the same facts, which is what makes
+    /// an idle tick provable instead of inferred from the absence of output.
+    #[serde(default)]
+    fingerprint: Option<String>,
+    /// The fleet revision the previous tick observed.
+    #[serde(default)]
+    revision: u64,
+}
+
+/// C-642: the durable fact that dispatch is stopped, and why.
+///
+/// Recorded rather than derived, because process absence and a deliberate pause were previously
+/// indistinguishable: the operator's "is anything running?" test was a process-table scan, and a
+/// `pgrep` that matched its own shell reported idle while three workers ran.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct QuiesceRecord {
+    /// Operator-supplied cause, redacted like every other recorded string.
+    #[serde(default)]
+    reason: Option<String>,
+    /// The fleet revision this quiesce was recorded at, so the journal can be ordered against it.
+    since_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -876,6 +1333,14 @@ struct MainAgentState {
     last_turn: Option<Value>,
     #[serde(default)]
     last_error: Option<String>,
+    /// The coordinator's recorded scope: mode, operation count, and the repository roots it holds.
+    ///
+    /// C-610. The ceiling was always enforced at spawn, but the record did not exist as a field at all,
+    /// so `state.json` described every constrained worker and stayed silent about the privileged agent.
+    /// An absent record is indistinguishable from an absent ceiling — auditing the fleet led to exactly
+    /// the wrong conclusion about which agent was confined. `default` keeps older state files loadable.
+    #[serde(default)]
+    capability_set: Option<Value>,
 }
 
 impl Default for MainAgentState {
@@ -889,6 +1354,7 @@ impl Default for MainAgentState {
             goals_revision: 0,
             last_turn: None,
             last_error: None,
+            capability_set: None,
         }
     }
 }
@@ -919,6 +1385,12 @@ struct FleetConfig {
     allow_ad_hoc_agents: bool,
     #[serde(default)]
     agent_templates: Vec<AgentTemplate>,
+    /// Operator-authored behavior profiles available to Fleet task policy.
+    #[serde(default)]
+    loop_profiles: BTreeMap<String, FleetLoopProfile>,
+    /// Task kind -> loop profile id. Fleet tasks have no implicit adaptive fallback.
+    #[serde(default)]
+    loop_policy: BTreeMap<String, String>,
     #[serde(default = "default_worktree_root")]
     worktree_root: PathBuf,
     #[serde(default)]
@@ -992,6 +1464,12 @@ struct MainAgentConfig {
     instructions: Option<PathBuf>,
     #[serde(default)]
     model: Option<String>,
+    /// Explicit operator-authored outer loop for the main coordinator.
+    #[serde(default, rename = "loop")]
+    agent_loop: Option<PathBuf>,
+    /// Explicit operator-authored outer loop for bounded research children started with `task`.
+    #[serde(default)]
+    research_loop: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -999,6 +1477,8 @@ struct MainAgentConfig {
 struct AgentTemplate {
     id: String,
     role: String,
+    #[serde(default = "default_fleet_task_kind")]
+    task_kind: String,
     instructions: PathBuf,
     #[serde(default)]
     model: Option<String>,
@@ -1010,6 +1490,16 @@ struct AgentTemplate {
     fences: Vec<String>,
     #[serde(default = "default_template_instances")]
     max_instances: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FleetLoopProfile {
+    revision: String,
+    source: PathBuf,
+    entry: String,
+    #[serde(default)]
+    required_runtime_features: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -1031,6 +1521,19 @@ struct FleetRepository {
     board: String,
     #[serde(default)]
     gate: Vec<String>,
+    /// Regenerate this repository's derived artifacts on the assembled candidate, before the gate.
+    ///
+    /// Some checked-in artifacts are derived from many stories at once — a documentation mirror, a
+    /// generated index, a lockfile. They belong to the CANDIDATE, not to any one story: two stories
+    /// regenerating the same artifact collide, and regenerating it on either branch alone produces an
+    /// artifact missing the other story's contribution. Observed on `wave-346`, where the flux gate
+    /// refused a candidate with `embedded docs are stale` because two stories had edited
+    /// `website/docs/**` and neither could correctly rebuild the shared mirror by itself.
+    ///
+    /// Runs after every cherry-pick for the repository and before its gate, in the integration worktree.
+    /// Optional: an empty list means the candidate is exactly what the stories produced.
+    #[serde(default)]
+    prepare: Vec<String>,
     #[serde(default)]
     fences: Vec<String>,
     #[serde(default)]
@@ -1051,6 +1554,14 @@ const fn default_true() -> bool {
 }
 const fn default_template_instances() -> usize {
     1
+}
+/// The task kind that grants a template the dedicated wave-integrator catalogue. Declaring it in
+/// `fleet.toml` is the operator's explicit act; nothing else confers assemble authority.
+const FLEET_INTEGRATION_TASK_KIND: &str = "integration";
+const FLEET_IMPLEMENTATION_TASK_KIND: &str = "implementation";
+
+fn default_fleet_task_kind() -> String {
+    FLEET_IMPLEMENTATION_TASK_KIND.into()
 }
 fn default_canonical_ref() -> String {
     "origin/main".into()
@@ -1073,6 +1584,8 @@ impl Default for FleetState {
             intake: BTreeMap::new(),
             agents: BTreeMap::new(),
             waves: BTreeMap::new(),
+            quiesce: None,
+            drive: None,
             idempotency: BTreeMap::new(),
         }
     }
@@ -1083,12 +1596,744 @@ pub(super) struct FleetTuiLaunch {
     pub(super) root: PathBuf,
     pub(super) store: PathBuf,
     pub(super) session: Option<String>,
+    pub(super) agent_loop: String,
+    pub(super) initial_snapshot: flux_tui::operations::FleetBoardSnapshot,
     pub(super) source: flux_tui::operations::SharedFleetBoardSource,
 }
 
 #[derive(Clone, Debug)]
 struct FleetTuiSource {
     root: PathBuf,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetAgentsInput {
+    /// Maximum worker records to return. The total always reports the untruncated count.
+    #[serde(default = "default_native_fleet_agent_limit")]
+    limit: usize,
+}
+
+fn default_native_fleet_agent_limit() -> usize {
+    100
+}
+
+/// Read-only native Fleet operations installed only for an explicitly attached main coordinator.
+///
+/// These are deliberately separate from `flux-orchestrate`'s A2A/process `fleet.*` pack. That pack
+/// owns transient workers started inside one agent process; this projection reads durable native
+/// Fleet admission state, which is also what `flux fleet agents` and the Operations TUI display.
+pub(super) fn native_fleet_integrator_tools(
+    root: PathBuf,
+) -> Result<Vec<Arc<dyn flux_runtime::Tool>>> {
+    let root = confined_root(&root)?;
+    if !root.join(".flux/fleet.toml").is_file() {
+        bail!(
+            "not-found: no Fleet configuration at {}",
+            root.join(".flux/fleet.toml").display()
+        )
+    }
+    Ok(native_fleet_integrator_tools_at(root))
+}
+
+pub(super) fn native_fleet_main_tools(root: PathBuf) -> Result<Vec<Arc<dyn flux_runtime::Tool>>> {
+    let root = confined_root(&root)?;
+    if !root.join(".flux/fleet.toml").is_file() {
+        bail!(
+            "not-found: no Fleet configuration at {}",
+            root.join(".flux/fleet.toml").display()
+        )
+    }
+    Ok(native_fleet_main_tools_at(root))
+}
+
+const NATIVE_COORDINATOR_OPERATIONS: [NativeCoordinatorOperation; 15] = [
+    NativeCoordinatorOperation::BoardShow,
+    NativeCoordinatorOperation::BoardGet,
+    NativeCoordinatorOperation::BoardNext,
+    NativeCoordinatorOperation::BoardCheck,
+    NativeCoordinatorOperation::BoardStart,
+    NativeCoordinatorOperation::BoardBlock,
+    NativeCoordinatorOperation::BoardUnblock,
+    NativeCoordinatorOperation::BoardComment,
+    NativeCoordinatorOperation::BoardEvidence,
+    NativeCoordinatorOperation::FleetStatus,
+    NativeCoordinatorOperation::FleetSchedule,
+    NativeCoordinatorOperation::FleetRun,
+    NativeCoordinatorOperation::FleetMessage,
+    NativeCoordinatorOperation::FleetCancel,
+    NativeCoordinatorOperation::FleetResume,
+];
+
+/// The dedicated wave-integrator's exact ceiling. Deliberately disjoint from the coordinator's: the
+/// integrator may assemble a wave and read Fleet lifecycle state, and nothing else. It gets no Board
+/// mutation, no dispatch, no cancel/resume, and no apply — a green gate is where its authority ends.
+///
+/// `fleet.integrate` is intentionally **absent** from [`NATIVE_COORDINATOR_OPERATIONS`]. The
+/// coordinator schedules work and delegates assembly; keeping the two catalogues disjoint is what
+/// makes "the writer never integrates itself, and the scheduler never assembles" structural rather
+/// than a matter of prompt discipline.
+const NATIVE_INTEGRATOR_OPERATIONS: [NativeCoordinatorOperation; 2] = [
+    NativeCoordinatorOperation::FleetIntegrate,
+    NativeCoordinatorOperation::FleetStatus,
+];
+
+fn native_fleet_integrator_tools_at(root: PathBuf) -> Vec<Arc<dyn flux_runtime::Tool>> {
+    NATIVE_INTEGRATOR_OPERATIONS
+        .into_iter()
+        .map(|operation| {
+            Arc::new(NativeCoordinatorTool {
+                root: root.clone(),
+                operation,
+            }) as Arc<dyn flux_runtime::Tool>
+        })
+        .collect()
+}
+
+/// Exact model-facing operation ceiling for the dedicated wave integrator.
+pub(super) fn native_fleet_integrator_operation_ceiling() -> Vec<String> {
+    let mut names = vec!["ai_segment".to_string()];
+    names.extend(
+        NATIVE_INTEGRATOR_OPERATIONS
+            .into_iter()
+            .map(|operation| operation.name().to_string()),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn native_fleet_main_tools_at(root: PathBuf) -> Vec<Arc<dyn flux_runtime::Tool>> {
+    let mut tools: Vec<Arc<dyn flux_runtime::Tool>> =
+        vec![Arc::new(NativeFleetAgentsTool { root: root.clone() })];
+    tools.extend(NATIVE_COORDINATOR_OPERATIONS.into_iter().map(|operation| {
+        Arc::new(NativeCoordinatorTool {
+            root: root.clone(),
+            operation,
+        }) as Arc<dyn flux_runtime::Tool>
+    }));
+    tools
+}
+
+/// Exact model-facing coordinator operation ceiling. Authored-loop machinery is added by the
+/// engine assembly and remains hidden; this list contains only deliberate native services plus
+/// bounded research delegation.
+pub(super) fn native_fleet_main_operation_ceiling() -> Vec<String> {
+    let mut names = vec![
+        "fleet.agents".to_string(),
+        "task".to_string(),
+        "ai_segment".to_string(),
+    ];
+    names.extend(
+        NATIVE_COORDINATOR_OPERATIONS
+            .into_iter()
+            .map(|operation| operation.name().to_string()),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+pub(super) fn native_fleet_main_read_operations() -> Vec<&'static str> {
+    let mut names = vec!["fleet.agents"];
+    names.extend(
+        NATIVE_COORDINATOR_OPERATIONS
+            .into_iter()
+            .filter(|operation| operation.is_read())
+            .map(NativeCoordinatorOperation::name),
+    );
+    names
+}
+
+/// Hard ceiling for `task` children started by the attached main. The child can inspect the
+/// workspace and git evidence, but cannot mutate files, run processes, manage Board/Fleet, or
+/// recursively delegate another task.
+pub(super) fn native_fleet_research_operation_ceiling() -> Vec<String> {
+    // `register_agent_ops` adds the child's hidden loop machinery after this base is narrowed.
+    // Datasource retrieval is intentionally omitted: the specialized spawner owns only the native
+    // read/git-inspection tools registered in `try_register_builtins`.
+    let mut names = [
+        "read",
+        "glob",
+        "grep",
+        "cwd",
+        "home_dir",
+        "sys_info",
+        "now",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_hunks",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Build the same native Fleet-main pack for the test-only production catalog census.
+///
+/// The census reads operation specifications and never executes them, so it needs no synthetic
+/// Fleet configuration or mutable state fixture.
+#[cfg(test)]
+pub(super) fn native_fleet_main_tools_for_catalog() -> Vec<Arc<dyn flux_runtime::Tool>> {
+    native_fleet_main_tools_at(PathBuf::from("."))
+}
+
+struct NativeFleetAgentsTool {
+    root: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum NativeCoordinatorOperation {
+    BoardShow,
+    BoardGet,
+    BoardNext,
+    BoardCheck,
+    BoardStart,
+    BoardBlock,
+    BoardUnblock,
+    BoardComment,
+    BoardEvidence,
+    FleetStatus,
+    FleetSchedule,
+    FleetRun,
+    FleetMessage,
+    FleetCancel,
+    FleetResume,
+    FleetIntegrate,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeEmptyInput {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardIdInput {
+    id: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardNextInput {
+    #[serde(default = "default_native_board_next_limit")]
+    limit: usize,
+    /// Return the largest wave-safe set instead of the highest-priority prefix.
+    ///
+    /// The coordinator is the caller that actually needs this: it is choosing a wave, and a prefix
+    /// of the priority order is not one. Without it the only way to ask for a batch is to take the
+    /// top N and hope they do not collide, which on this Board returns eight stories writing one
+    /// crate.
+    #[serde(default)]
+    independent: bool,
+}
+
+fn default_native_board_next_limit() -> usize {
+    10
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardBlockInput {
+    id: String,
+    reason: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeBoardTextInput {
+    id: String,
+    text: String,
+    #[serde(default)]
+    if_revision: Option<String>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetRunInput {
+    items: Vec<String>,
+    #[serde(default)]
+    prepare_only: bool,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetIntegrateInput {
+    /// the exact wave to assemble, e.g. `wave-263`
+    wave: String,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum NativeWaitLevel {
+    Accepted,
+    Delivered,
+    Completed,
+}
+
+impl NativeWaitLevel {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Delivered => "delivered",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetMessageInput {
+    target: String,
+    message: String,
+    #[serde(default = "default_native_wait_level")]
+    wait: NativeWaitLevel,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+fn default_native_wait_level() -> NativeWaitLevel {
+    NativeWaitLevel::Completed
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NativeFleetTargetInput {
+    target: String,
+    #[serde(default)]
+    if_revision: Option<u64>,
+    #[serde(default)]
+    idempotency_key: Option<String>,
+}
+
+struct NativeCoordinatorTool {
+    root: PathBuf,
+    operation: NativeCoordinatorOperation,
+}
+
+impl NativeCoordinatorOperation {
+    fn name(self) -> &'static str {
+        match self {
+            Self::BoardShow => "board.show",
+            Self::BoardGet => "board.get",
+            Self::BoardNext => "board.next",
+            Self::BoardCheck => "board.check",
+            Self::BoardStart => "board.start",
+            Self::BoardBlock => "board.block",
+            Self::BoardUnblock => "board.unblock",
+            Self::BoardComment => "board.comment",
+            Self::BoardEvidence => "board.evidence",
+            Self::FleetStatus => "fleet.status",
+            Self::FleetSchedule => "fleet.schedule",
+            Self::FleetRun => "fleet.run",
+            Self::FleetMessage => "fleet.message",
+            Self::FleetCancel => "fleet.cancel",
+            Self::FleetResume => "fleet.resume",
+            Self::FleetIntegrate => "fleet.integrate",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::BoardShow => "Show the authoritative workspace Board and planning documents.",
+            Self::BoardGet => {
+                "Read one exact namespaced item from the authoritative workspace Board."
+            }
+            Self::BoardNext => {
+                "List dependency-satisfied ready Board items in deterministic priority order. Set \
+                 `independent` when choosing a wave: it returns the largest set that can be built \
+                 at the same time, with `held_back` naming what each excluded item collides with. \
+                 A priority prefix is not a wave — integration refuses one in which two stories \
+                 wrote the same path."
+            }
+            Self::BoardCheck => {
+                "Validate the authoritative workspace Board configuration and story contracts."
+            }
+            Self::BoardStart => "Move one authoritative Board item to in-progress.",
+            Self::BoardBlock => "Block one authoritative Board item and record the reason.",
+            Self::BoardUnblock => "Return one blocked authoritative Board item to ready.",
+            Self::BoardComment => "Append a durable comment to one authoritative Board item.",
+            Self::BoardEvidence => "Append structured evidence to one authoritative Board item.",
+            Self::FleetStatus => {
+                "Read bounded durable native Fleet lifecycle state and source status."
+            }
+            Self::FleetSchedule => {
+                "Read the dependency-aware native Fleet schedule derived from the Board."
+            }
+            Self::FleetRun => {
+                "Prepare and launch a native Fleet wave for exact dependency-satisfied Board items."
+            }
+            Self::FleetMessage => {
+                "Deliver an acknowledged message to an admitted native Fleet agent."
+            }
+            Self::FleetCancel => "Cancel one exact native Fleet worker or wave.",
+            Self::FleetResume => {
+                "Resume one exact native Fleet target using its durable admitted state."
+            }
+            Self::FleetIntegrate => {
+                "Assemble one wave's accepted story commits in declared dependency order onto its \
+                 integration branch and run each repository's configured final gate exactly once. \
+                 Refuses unless every story is handoff-accepted and write sets are disjoint. Records \
+                 a green candidate as eligible for explicit operator apply; it never merges into a \
+                 main branch, pushes, releases or deploys."
+            }
+        }
+    }
+
+    fn is_read(self) -> bool {
+        matches!(
+            self,
+            Self::BoardShow
+                | Self::BoardGet
+                | Self::BoardNext
+                | Self::BoardCheck
+                | Self::FleetStatus
+                | Self::FleetSchedule
+        )
+    }
+
+    fn input_schema(self) -> Value {
+        match self {
+            Self::BoardShow | Self::BoardCheck | Self::FleetStatus | Self::FleetSchedule => {
+                flux_spec::tool_input_schema::<NativeEmptyInput>()
+            }
+            Self::BoardGet | Self::BoardStart | Self::BoardUnblock => {
+                flux_spec::tool_input_schema::<NativeBoardIdInput>()
+            }
+            Self::BoardNext => flux_spec::tool_input_schema::<NativeBoardNextInput>(),
+            Self::BoardBlock => flux_spec::tool_input_schema::<NativeBoardBlockInput>(),
+            Self::BoardComment | Self::BoardEvidence => {
+                flux_spec::tool_input_schema::<NativeBoardTextInput>()
+            }
+            Self::FleetRun => flux_spec::tool_input_schema::<NativeFleetRunInput>(),
+            Self::FleetMessage => flux_spec::tool_input_schema::<NativeFleetMessageInput>(),
+            Self::FleetCancel | Self::FleetResume => {
+                flux_spec::tool_input_schema::<NativeFleetTargetInput>()
+            }
+            Self::FleetIntegrate => flux_spec::tool_input_schema::<NativeFleetIntegrateInput>(),
+        }
+    }
+
+    fn cli_args(self, root: &Path, params: Value) -> Result<Vec<String>> {
+        fn board_prefix(root: &Path) -> Vec<String> {
+            vec![
+                "board".into(),
+                "--root".into(),
+                display_path(root),
+                "--scope".into(),
+                "workspace".into(),
+                "--output".into(),
+                "json".into(),
+            ]
+        }
+        fn fleet_prefix(root: &Path) -> Vec<String> {
+            vec![
+                "fleet".into(),
+                "--root".into(),
+                display_path(root),
+                "--output".into(),
+                "json".into(),
+            ]
+        }
+        fn add_board_guards(args: &mut Vec<String>, revision: Option<String>, key: Option<String>) {
+            if let Some(revision) = revision {
+                args.extend(["--if-revision".into(), revision]);
+            }
+            if let Some(key) = key {
+                args.extend(["--idempotency-key".into(), key]);
+            }
+        }
+        fn add_fleet_guards(args: &mut Vec<String>, revision: Option<u64>, key: Option<String>) {
+            if let Some(revision) = revision {
+                args.extend(["--if-revision".into(), revision.to_string()]);
+            }
+            if let Some(key) = key {
+                args.extend(["--idempotency-key".into(), key]);
+            }
+        }
+
+        let args = match self {
+            Self::BoardShow => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = board_prefix(root);
+                args.push("show".into());
+                args
+            }
+            Self::BoardCheck => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = board_prefix(root);
+                args.push("check".into());
+                args
+            }
+            Self::BoardGet => {
+                let input: NativeBoardIdInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                args.extend(["get".into(), input.id]);
+                args
+            }
+            Self::BoardNext => {
+                let input: NativeBoardNextInput = serde_json::from_value(params)?;
+                if !(1..=100).contains(&input.limit) {
+                    bail!("board.next: limit must be 1..=100")
+                }
+                let mut args = board_prefix(root);
+                args.extend(["next".into(), "--limit".into(), input.limit.to_string()]);
+                if input.independent {
+                    args.push("--independent".into());
+                }
+                args
+            }
+            Self::BoardStart | Self::BoardUnblock => {
+                let input: NativeBoardIdInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                add_board_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    if matches!(self, Self::BoardStart) {
+                        "start"
+                    } else {
+                        "unblock"
+                    }
+                    .into(),
+                    input.id,
+                ]);
+                args
+            }
+            Self::BoardBlock => {
+                let input: NativeBoardBlockInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                add_board_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend(["block".into(), input.id, "--reason".into(), input.reason]);
+                args
+            }
+            Self::BoardComment | Self::BoardEvidence => {
+                let input: NativeBoardTextInput = serde_json::from_value(params)?;
+                let mut args = board_prefix(root);
+                add_board_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    if matches!(self, Self::BoardComment) {
+                        "comment"
+                    } else {
+                        "evidence"
+                    }
+                    .into(),
+                    input.id,
+                    input.text,
+                ]);
+                args
+            }
+            Self::FleetStatus => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = fleet_prefix(root);
+                args.extend([
+                    "inspect".into(),
+                    "snapshot".into(),
+                    "--limit".into(),
+                    "100".into(),
+                ]);
+                args
+            }
+            Self::FleetSchedule => {
+                serde_json::from_value::<NativeEmptyInput>(params)?;
+                let mut args = fleet_prefix(root);
+                args.push("schedule".into());
+                args
+            }
+            Self::FleetRun => {
+                let input: NativeFleetRunInput = serde_json::from_value(params)?;
+                if input.items.is_empty() || input.items.len() > 10 {
+                    bail!("fleet.run: items must contain 1..=10 exact Board refs")
+                }
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.push("run".into());
+                args.extend(input.items);
+                if input.prepare_only {
+                    args.push("--prepare-only".into());
+                }
+                args
+            }
+            Self::FleetMessage => {
+                let input: NativeFleetMessageInput = serde_json::from_value(params)?;
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    "message".into(),
+                    input.target,
+                    input.message,
+                    "--wait".into(),
+                    input.wait.as_str().into(),
+                ]);
+                args
+            }
+            Self::FleetIntegrate => {
+                let input: NativeFleetIntegrateInput = serde_json::from_value(params)?;
+                if input.wave.trim().is_empty() {
+                    bail!("fleet.integrate: wave must be an exact wave id")
+                }
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend(["integrate".into(), input.wave]);
+                args
+            }
+            Self::FleetCancel | Self::FleetResume => {
+                let input: NativeFleetTargetInput = serde_json::from_value(params)?;
+                let mut args = fleet_prefix(root);
+                add_fleet_guards(&mut args, input.if_revision, input.idempotency_key);
+                args.extend([
+                    if matches!(self, Self::FleetCancel) {
+                        "cancel"
+                    } else {
+                        "resume"
+                    }
+                    .into(),
+                    input.target,
+                ]);
+                args
+            }
+        };
+        Ok(args)
+    }
+}
+
+#[async_trait]
+impl flux_runtime::Tool for NativeCoordinatorTool {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        let read = self.operation.is_read();
+        flux_spec::ToolSpec {
+            name: self.operation.name().into(),
+            description: self.operation.description().into(),
+            input_schema: self.operation.input_schema(),
+            output_schema: None,
+            effects: if read {
+                vec![flux_spec::Effect::Read]
+            } else {
+                vec![flux_spec::Effect::Write, flux_spec::Effect::Process]
+            },
+            risk: if read {
+                flux_spec::Risk::Low
+            } else {
+                flux_spec::Risk::Medium
+            },
+            idempotency: flux_spec::Idempotency::NonIdempotent,
+            access: if read {
+                vec![flux_spec::AccessKind::Filesystem]
+            } else {
+                vec![
+                    flux_spec::AccessKind::Filesystem,
+                    flux_spec::AccessKind::Process,
+                ]
+            },
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, params: &Value) -> Vec<String> {
+        let mut subjects = vec![display_path(&self.root)];
+        for key in ["id", "target"] {
+            if let Some(value) = params.get(key).and_then(Value::as_str) {
+                subjects.push(bounded_text(value, 200));
+            }
+        }
+        subjects
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &flux_runtime::ToolContext,
+        params: Value,
+    ) -> flux_core::Result<flux_runtime::ToolResult> {
+        let args = self
+            .operation
+            .cli_args(&self.root, params)
+            .map_err(|error| {
+                flux_core::Error::Other(format!("{}: {error}", self.operation.name()))
+            })?;
+        let root = self.root.clone();
+        let operation = self.operation.name().to_string();
+        let result = tokio::task::spawn_blocking(move || invoke_flux_cli(&root, &args))
+            .await
+            .map_err(|error| flux_core::Error::Other(format!("{operation}: {error}")))?
+            .map_err(|error| flux_core::Error::Other(format!("{operation}: {error}")))?;
+        Ok(flux_runtime::ToolResult::ok(
+            json!({
+                "schema": "flux.native-coordinator-operation/v1",
+                "operation": operation,
+                "revision": result.revision,
+                "warnings": result.warnings,
+                "data": result.data,
+            })
+            .to_string(),
+        ))
+    }
+}
+
+#[async_trait]
+impl flux_runtime::Tool for NativeFleetAgentsTool {
+    fn spec(&self) -> flux_spec::ToolSpec {
+        flux_spec::ToolSpec {
+            name: "fleet.agents".into(),
+            description:
+                "List bounded durable native Fleet worker admissions and current statuses. \
+                          Unlike fleet.worker_status, this needs no known worker id and does not \
+                          inspect transient A2A/process workers."
+                    .into(),
+            input_schema: flux_spec::tool_input_schema::<NativeFleetAgentsInput>(),
+            output_schema: None,
+            effects: vec![flux_spec::Effect::Read],
+            risk: flux_spec::Risk::Low,
+            // This is a live state read. Idempotent would allow the operation cache to replay a
+            // stale worker census instead of observing a just-completed/cancelled worker.
+            idempotency: flux_spec::Idempotency::NonIdempotent,
+            access: vec![flux_spec::AccessKind::Filesystem],
+            group: None,
+        }
+    }
+
+    fn permission_subjects(&self, _params: &Value) -> Vec<String> {
+        vec![display_path(&self.root.join(".flux/fleet/state.json"))]
+    }
+
+    async fn execute(
+        &self,
+        _ctx: &flux_runtime::ToolContext,
+        params: Value,
+    ) -> flux_core::Result<flux_runtime::ToolResult> {
+        let input: NativeFleetAgentsInput = serde_json::from_value(params)
+            .map_err(|error| flux_core::Error::Other(format!("fleet.agents: {error}")))?;
+        if !(1..=100).contains(&input.limit) {
+            return Ok(flux_runtime::ToolResult::error(
+                "fleet.agents: limit must be 1..=100",
+            ));
+        }
+        let state = read_fleet_state(&self.root)
+            .map_err(|error| flux_core::Error::Other(format!("fleet.agents: {error}")))?;
+        Ok(flux_runtime::ToolResult::ok(
+            fleet_agents_projection(&state, input.limit).to_string(),
+        ))
+    }
 }
 
 /// Validate one Fleet root and resolve the reserved main agent's exact durable store/session.
@@ -1101,16 +2346,224 @@ pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
             root.join(".flux/fleet.toml").display()
         )
     }
-    read_fleet_config(&root)?;
+    let config = read_fleet_config(&root)?;
+    let agent_loop = configured_main_agent_loop(&root, &config)?;
+    configured_main_research_loop_with(&root, &config)?;
     let state = read_fleet_state(&root)?;
     let store = agent_store_path(&root, "main")?;
     let session = state.main_agent.session.clone();
+    let initial_snapshot = fleet_tui_initial_snapshot(&root, &state, &config);
     Ok(FleetTuiLaunch {
         root: root.clone(),
         store,
         session,
+        agent_loop,
+        initial_snapshot,
         source: Arc::new(FleetTuiSource { root }),
     })
+}
+
+fn configured_main_agent_loop(root: &Path, config: &FleetConfig) -> Result<String> {
+    let configured_loop = config.main.agent_loop.as_deref().with_context(|| {
+        "validation/gate: Fleet main requires `[main] loop = \"path/to/coordinator.flux\"`"
+    })?;
+    let loop_path = confined_config_file(root, configured_loop, "main coordinator loop")?;
+    loop_path
+        .strip_prefix(root)
+        .context("permission: main coordinator loop escaped the Fleet root")?
+        .to_str()
+        .context("input/schema: main coordinator loop path is not UTF-8")
+        .map(str::to_string)
+}
+
+pub(super) fn configured_main_research_loop(root: &Path) -> Result<String> {
+    let config = read_fleet_config(root)?;
+    configured_main_research_loop_with(root, &config)
+}
+
+fn configured_main_research_loop_with(root: &Path, config: &FleetConfig) -> Result<String> {
+    let configured_loop = config.main.research_loop.as_deref().with_context(|| {
+        "validation/gate: Fleet main requires `[main] research_loop = \"path/to/research.flux\"`"
+    })?;
+    let loop_path = confined_config_file(root, configured_loop, "main research loop")?;
+    loop_path
+        .strip_prefix(root)
+        .context("permission: main research loop escaped the Fleet root")?
+        .to_str()
+        .context("input/schema: main research loop path is not UTF-8")
+        .map(str::to_string)
+}
+
+fn fleet_tui_initial_snapshot(
+    root: &Path,
+    state: &FleetState,
+    config: &FleetConfig,
+) -> flux_tui::operations::FleetBoardSnapshot {
+    use flux_tui::operations::{FleetBoardSnapshot, FleetCapacityView, FleetGoalView};
+
+    let is_active = |status: &str| matches!(status, "active" | "running" | "working");
+    let active = state
+        .agents
+        .values()
+        .filter(|agent| agent["status"].as_str().is_some_and(is_active))
+        .count();
+    let active_wave = active_wave_view(state, config.max_wave);
+    let goals = state
+        .goals
+        .values()
+        .take(100)
+        .map(|goal| FleetGoalView {
+            scope: serde_json::to_value(goal.scope)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".into()),
+            name: goal.name.clone(),
+            statement: bounded_text(&goal.statement, 500),
+            revision: goal.revision,
+        })
+        .collect();
+
+    FleetBoardSnapshot {
+        schema: "flux.tui-board-fleet/v1".into(),
+        root: display_path(root),
+        running: state.running,
+        main_status: state.main_agent.status.clone(),
+        main_session: state.main_agent.session.clone(),
+        revision: state.revision,
+        goals_revision: state.main_agent.goals_revision,
+        goals,
+        active_wave,
+        capacity: FleetCapacityView {
+            configured: config.max_workers,
+            desired: None,
+            active,
+            draining: None,
+            registered: state.agents.len(),
+        },
+        workers: Vec::new(),
+        workers_total: state.agents.len(),
+        items: Vec::new(),
+        items_total: 0,
+        decisions: Vec::new(),
+        decisions_total: 0,
+        documents: Vec::new(),
+        documents_total: 0,
+        metrics_schema: "unavailable".into(),
+        metrics: Vec::new(),
+        stats_facts: Vec::new(),
+        status_counts: Vec::new(),
+        history: Vec::new(),
+        failures: Vec::new(),
+        failures_total: 0,
+        intake: Vec::new(),
+        intake_total: state.intake.len(),
+        blocked_items: 0,
+        attention_required: false,
+    }
+}
+
+fn hash_path_metadata(path: &Path, hasher: &mut impl Hasher) {
+    path.hash(hasher);
+    let Ok(metadata) = fs::metadata(path) else {
+        "missing".hash(hasher);
+        return;
+    };
+    metadata.len().hash(hasher);
+    if let Ok(modified) = metadata.modified() {
+        if let Ok(elapsed) = modified.duration_since(std::time::UNIX_EPOCH) {
+            elapsed.as_secs().hash(hasher);
+            elapsed.subsec_nanos().hash(hasher);
+        }
+    }
+}
+
+fn hash_guarded_file_revision(
+    system: &flux_system::System,
+    path: &str,
+    hasher: &mut impl Hasher,
+) -> Result<()> {
+    path.hash(hasher);
+    match system.file_revision(path)? {
+        Some(revision) => revision.hash(hasher),
+        None => "missing".hash(hasher),
+    }
+    Ok(())
+}
+
+fn repository_git_dir(root: &Path) -> Option<PathBuf> {
+    let dot_git = root.join(".git");
+    let mut git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let body = fs::read_to_string(dot_git).ok()?;
+        let path = body.trim().strip_prefix("gitdir:")?.trim();
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            root.join(path)
+        }
+    };
+    if let Ok(common) = fs::read_to_string(git_dir.join("commondir")) {
+        let common = PathBuf::from(common.trim());
+        git_dir = if common.is_absolute() {
+            common
+        } else {
+            git_dir.join(common)
+        };
+    }
+    Some(git_dir)
+}
+
+fn hash_canonical_ref_metadata(root: &Path, canonical_ref: &str, hasher: &mut impl Hasher) {
+    let Some(git_dir) = repository_git_dir(root) else {
+        return;
+    };
+    hash_path_metadata(&git_dir.join("packed-refs"), hasher);
+    hash_path_metadata(&git_dir.join("HEAD"), hasher);
+    if canonical_ref.starts_with("refs/") {
+        hash_path_metadata(&git_dir.join(canonical_ref), hasher);
+    } else {
+        hash_path_metadata(&git_dir.join("refs/remotes").join(canonical_ref), hasher);
+        hash_path_metadata(&git_dir.join("refs/heads").join(canonical_ref), hasher);
+    }
+}
+
+fn fleet_tui_refresh_token(root: &Path) -> Result<String> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let system = flux_system::System::new(flux_system::Workspace::new(root)?);
+    for path in [
+        ".flux/fleet/state.json",
+        ".flux/fleet.toml",
+        ".flux/board.toml",
+        ".flux/board-state.json",
+        // Without this the token cannot change for the entire duration of a wave: `state.json` is
+        // written once before the first worker starts and once after the last joins, and no other
+        // hashed path moves in between. The surface then takes zero snapshots while work happens,
+        // which is why a running wave looked frozen.
+        FLEET_ACTIVITY_SIDECAR,
+        "ROADMAP.md",
+        "VISION.md",
+    ] {
+        hash_guarded_file_revision(&system, path, &mut hasher)?;
+    }
+    for directory in ["decisions", "docs/decisions"] {
+        directory.hash(&mut hasher);
+        for (path, revision) in system.directory_revisions(directory)? {
+            path.hash(&mut hasher);
+            revision.hash(&mut hasher);
+        }
+    }
+    if system.file_revision(".flux/board.toml")?.is_some() {
+        let board = read_board_workspace_config(root)?;
+        for member in &board.members {
+            let member_root = board_member_root(root, member)?;
+            member.id.hash(&mut hasher);
+            member.canonical_ref.hash(&mut hasher);
+            hash_canonical_ref_metadata(&member_root, &member.canonical_ref, &mut hasher);
+        }
+    }
+    Ok(format!("{:016x}", hasher.finish()))
 }
 
 impl FleetTuiSource {
@@ -1190,6 +2643,26 @@ impl FleetTuiSource {
         }
     }
 
+    /// Run one fleet action through the same path the CLI uses.
+    ///
+    /// Reimplementing an action's body here would fork it: `FleetAction::Start` is where configuration is
+    /// re-read, every loop binding re-validated and the coordinator's recorded capability set rebuilt, and a
+    /// second copy of that would drift from the first the moment either changed.
+    fn fleet_action(&self, action: FleetAction) -> Result<String> {
+        let command = FleetCommand {
+            root: self.root.clone(),
+            output: AgentOutput::Human,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            action,
+        };
+        let state = read_fleet_state(&self.root)?;
+        let (_, _, _, revision) = run_fleet_action(&command, &self.root, state, None)?;
+        Ok(revision.to_string())
+    }
+
     fn board_command(&self, action: BoardAction) -> Result<BoardCommand> {
         let scope = default_board_scope(&self.root)?;
         Ok(BoardCommand {
@@ -1226,16 +2699,22 @@ impl FleetTuiSource {
 }
 
 impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
+    fn refresh_token(&self) -> Result<String> {
+        fleet_tui_refresh_token(&self.root)
+    }
+
     fn snapshot(&self) -> Result<flux_tui::operations::FleetBoardSnapshot> {
         use flux_tui::operations::{
             BoardDecisionView, BoardItemView, DecisionOptionView, FleetBoardSnapshot,
-            FleetCapacityView, FleetFailureView, FleetGoalView, FleetIntakeView, FleetWaveView,
-            FleetWorkerView, MAX_DECISIONS, MAX_DOCUMENTS, MAX_FAILURES, MAX_INTAKE, MAX_ITEMS,
-            MAX_WORKERS,
+            FleetCapacityView, FleetFailureView, FleetGoalView, FleetIntakeView, FleetWorkerView,
+            MAX_DECISIONS, MAX_DOCUMENTS, MAX_FAILURES, MAX_INTAKE, MAX_ITEMS, MAX_WORKERS,
         };
         const MAX_GOALS: usize = 100;
         const MAX_HISTORY_DAYS: usize = 120;
         const MAX_ITEM_LINKS: usize = 50;
+        /// Story prose the TUI may render inside one expanded box. A story body is a page, not a
+        /// document; this keeps a projection of 200 items bounded.
+        const MAX_ITEM_BODY: usize = 4_000;
         const MAX_DECISION_OPTIONS: usize = 20;
 
         let state = read_fleet_state(&self.root)?;
@@ -1248,12 +2727,12 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         })?;
         let stats = stats(&stats_command, &self.root, true, None)?;
 
-        let is_active = |status: &str| matches!(status, "active" | "running" | "working");
         let active = state
             .agents
             .values()
-            .filter(|agent| agent["status"].as_str().is_some_and(is_active))
+            .filter(|agent| worker_activity(agent) == WorkerActivity::Active)
             .count();
+        let live_activity = read_worker_activity(&self.root);
         let mut workers = state
             .agents
             .iter()
@@ -1288,16 +2767,28 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                         .as_str()
                         .or_else(|| agent["last_turn"]["ack"].as_str())
                         .map(|value| bounded_text(value, 500)),
-                    activity: event_log_summaries(&agent["last_turn"]["events"]),
+                    // Prefer live sidecar activity while the worker is mid-turn; fall back to the
+                    // last turn's receipt once it has one. Without this a running worker shows the
+                    // events of its *previous* turn, which reads as stale rather than as progress.
+                    activity: live_activity
+                        .get(id.as_str())
+                        .cloned()
+                        .filter(|lines| !lines.is_empty())
+                        .unwrap_or_else(|| event_log_summaries(&agent["last_turn"]["events"])),
                     error: agent["last_error"]
                         .as_str()
                         .map(|value| bounded_text(value, 500)),
                 }
             })
             .collect::<Vec<_>>();
+        // Status first, then NEWEST WAVE first. Without the wave tiebreak the rail's five slots fill
+        // with `failed` workers (order 1, ahead of `completed`) left over from long-finished waves,
+        // burying the one worker that is actually running. Ordering by the wave's numeric suffix —
+        // not the id string — keeps `wave-99` behind `wave-100`.
         workers.sort_by(|left, right| {
             worker_status_order(&left.status)
                 .cmp(&worker_status_order(&right.status))
+                .then_with(|| wave_recency(&right.wave).cmp(&wave_recency(&left.wave)))
                 .then_with(|| left.id.cmp(&right.id))
         });
         let workers_total = workers.len();
@@ -1321,6 +2812,11 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                     .as_deref()
                     .map(|value| bounded_text(value, 500)),
                 epic: story.epic.as_deref().map(|value| bounded_text(value, 500)),
+                // C-621: the expanded box renders this as markdown. The frontmatter is dropped —
+                // the box header already carries id, status and priority — and the prose is
+                // bounded like every other projected field.
+                body: Some(bounded_text(story_prose(&story.body), MAX_ITEM_BODY))
+                    .filter(|body| !body.trim().is_empty()),
             })
             .collect::<Vec<_>>();
         items.sort_by(|left, right| {
@@ -1484,7 +2980,9 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         for (id, agent) in &state.agents {
             let status = agent["status"].as_str().unwrap_or("unknown");
             let error = agent["last_error"].as_str();
-            if matches!(status, "failed" | "parked") || error.is_some() {
+            if matches!(status, "failed" | "parked")
+                || (error.is_some() && !matches!(status, "cancelled" | "completed" | "done"))
+            {
                 failures.push(FleetFailureView {
                     subject: bounded_text(id, 200),
                     kind: "worker".into(),
@@ -1499,6 +2997,9 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
         }
         for (id, wave) in &state.waves {
             let status = wave["status"].as_str().unwrap_or_default();
+            if matches!(status, "cancelled" | "completed" | "done") {
+                continue;
+            }
             let mut detailed = false;
             if let Some(conflict) = wave.get("conflict").filter(|value| !value.is_null()) {
                 detailed = true;
@@ -1607,23 +3108,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             intake.drain(..intake.len() - MAX_INTAKE);
         }
 
-        let active_wave = state
-            .waves
-            .iter()
-            .find(|(_, wave)| {
-                !matches!(
-                    wave["status"].as_str(),
-                    Some("completed" | "failed" | "cancelled" | "parked")
-                )
-            })
-            .map(|(id, wave)| FleetWaveView {
-                id: id.clone(),
-                status: wave["status"].as_str().unwrap_or("unknown").to_string(),
-                items: value_strings(&wave["items"])
-                    .into_iter()
-                    .take(config.max_wave)
-                    .collect(),
-            });
+        let active_wave = active_wave_view(&state, config.max_wave);
         let goals = state
             .goals
             .values()
@@ -1644,6 +3129,10 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             .count();
         let attention_required = failures_total > 0
             || blocked_items > 0
+            || state
+                .agents
+                .values()
+                .any(|agent| worker_activity(agent) == WorkerActivity::Attention)
             || decision_views
                 .iter()
                 .any(|decision| decision.status == "open");
@@ -1716,6 +3205,46 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                 "attached".into(),
                 json!({"agent":"main","session":session,"status":state.main_agent.status}),
             ))
+        })
+    }
+
+    fn restart(&self) -> Result<flux_tui::operations::FleetAck> {
+        // Refuse while work is genuinely in flight. A stop-and-start beneath a live turn orphans it: the
+        // worker keeps running against a coordinator that has been reset under it, and its handoff will
+        // arrive for a wave whose record no longer expects it. `worker_activity` is the same derivation
+        // `fleet status` reports, so the refusal and the display can never disagree — and it accounts for a
+        // supervisor that has died, so a corpse recorded as `working` does not block a restart forever.
+        let live = read_fleet_state(&self.root)?
+            .agents
+            .values()
+            .filter(|agent| worker_activity(agent) == WorkerActivity::Active)
+            .count();
+        if live > 0 {
+            bail!(
+                "conflict/precondition: {live} worker(s) are still running; a restart beneath a live turn \
+                 orphans it — wait, or cancel the wave first"
+            )
+        }
+        self.mutate("fleet.restarted", |state| {
+            state.running = false;
+            state.revision += 1;
+            Ok((
+                "fleet".into(),
+                "restarted".into(),
+                json!({"phase": "stopped", "revision": state.revision}),
+            ))
+        })?;
+        // `fleet start` is what re-reads configuration, re-validates every loop binding and re-establishes
+        // the coordinator's recorded capability set, so the restart is that call rather than a flag flip.
+        let started = self.fleet_action(FleetAction::Start)?;
+        Ok(flux_tui::operations::FleetAck {
+            id: "fleet".into(),
+            level: "restarted".into(),
+            revision: started,
+            message:
+                "fleet restarted: configuration, loop bindings and the coordinator capability set \
+                      were re-read"
+                    .into(),
         })
     }
 
@@ -1970,6 +3499,125 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
     } else {
         head
     }
+}
+
+fn loop_binding_summary(value: &Value) -> Value {
+    if !value.is_object() {
+        return Value::Null;
+    }
+    let bounded_list = |key: &str| {
+        value[key]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .take(100)
+            .filter_map(Value::as_str)
+            .map(|entry| bounded_text(entry, 200))
+            .collect::<Vec<_>>()
+    };
+    json!({
+        "schema": bounded_text(value["schema"].as_str().unwrap_or(""), 100),
+        "profile": bounded_text(value["profile"].as_str().unwrap_or(""), 200),
+        "revision": bounded_text(value["revision"].as_str().unwrap_or(""), 100),
+        "runner": bounded_text(value["runner"].as_str().unwrap_or(""), 100),
+        "source_ref": bounded_text(value["source_ref"].as_str().unwrap_or(""), 500),
+        "source_sha256": bounded_text(value["source_sha256"].as_str().unwrap_or(""), 64),
+        "entry_point": bounded_text(value["entry_point"].as_str().unwrap_or(""), 100),
+        "required_operations": bounded_list("required_operations"),
+        "required_runtime_features": bounded_list("required_runtime_features"),
+    })
+}
+
+fn fleet_worker_summary(id: &str, agent: &Value) -> Value {
+    let assignment = &agent["assignment"];
+    json!({
+        "id": bounded_text(id, 200),
+        "role": bounded_text(agent["role"].as_str().unwrap_or("worker"), 100),
+        "task_kind": agent["task_kind"].as_str().map(|value| bounded_text(value, 100)),
+        "status": bounded_text(agent["status"].as_str().unwrap_or("unknown"), 100),
+        "board_ref": assignment["board_ref"].as_str()
+            .or_else(|| agent["board_ref"].as_str())
+            .map(|value| bounded_text(value, 200)),
+        "wave": assignment["wave"].as_str()
+            .or_else(|| agent["wave"].as_str())
+            .map(|value| bounded_text(value, 200)),
+        "session": agent["runtime_session"].as_str()
+            .or_else(|| agent["session"].as_str())
+            .map(|value| bounded_text(value, 200)),
+        "recommendation_must_be_challenged": agent["recommendation_must_be_challenged"].as_bool(),
+        "loop_binding": loop_binding_summary(&agent["loop_binding"]),
+    })
+}
+
+fn fleet_agents_projection(state: &FleetState, limit: usize) -> Value {
+    let workers_total = state.agents.len();
+    let workers = state
+        .agents
+        .iter()
+        .take(limit)
+        .map(|(id, agent)| fleet_worker_summary(id, agent))
+        .collect::<Vec<_>>();
+    json!({
+        "schema": "flux.fleet-agents/v1",
+        "revision": state.revision,
+        "running": state.running,
+        "main_agent": {
+            "id": bounded_text(&state.main_agent.id, 200),
+            "status": bounded_text(&state.main_agent.status, 100),
+            "session": state.main_agent.session.as_deref().map(|value| bounded_text(value, 200)),
+        },
+        "workers": workers,
+        "workers_total": workers_total,
+        "truncated": workers_total > limit,
+    })
+}
+
+fn fleet_agents_cli_projection(state: &FleetState) -> Value {
+    let mut projection = fleet_agents_projection(state, usize::MAX);
+    projection["workers"] = Value::Object(
+        state
+            .agents
+            .iter()
+            .map(|(id, agent)| (id.clone(), fleet_worker_summary(id, agent)))
+            .collect::<Map<_, _>>(),
+    );
+    projection
+}
+
+/// Is the process that recorded an in-flight turn still there?
+///
+/// Signal 0 performs the existence check without delivering anything. Always the same user as the
+/// recorder, so a non-zero return means gone rather than forbidden. On a platform without signals the
+/// answer is unknown, and unknown must read as "still there": wrongly reporting a live worker as
+/// interrupted would let a wave be reaped underneath it, which is far worse than the status quo.
+#[cfg(unix)]
+fn supervisor_process_is_live(pid: i64) -> bool {
+    // Range-check BEFORE narrowing, and treat anything outside it as gone. This is not defensive
+    // padding: `pid_t` is `i32`, so a value that does not fit wraps, and `u32::MAX` wraps to `-1` — for
+    // which `kill` means *every process this user may signal* and duly reports success. A nonsense pid
+    // therefore read as alive, which a test caught; with any signal other than 0 the same cast would
+    // have been a far worse bug than a wrong status.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn supervisor_process_is_live(_pid: i64) -> bool {
+    true
+}
+
+/// Sortable recency for a worker's wave, from the `wave-<n>` numeric suffix. An unattached worker
+/// sorts oldest so it never displaces a live wave's rows.
+fn wave_recency(wave: &Option<String>) -> u64 {
+    wave.as_deref()
+        .and_then(|wave| wave.rsplit('-').next())
+        .and_then(|suffix| suffix.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 fn worker_status_order(status: &str) -> u8 {
@@ -2418,7 +4066,18 @@ fn run_session_board_action(
                 current,
             ))
         }
-        BoardAction::Next { limit, area } => {
+        BoardAction::Next {
+            limit,
+            area,
+            independent,
+        } => {
+            if *independent {
+                // Session items carry no areas, so there is nothing to derive a write set from.
+                // Refusing beats returning a prefix that claims to be wave-safe.
+                anyhow::bail!(
+                    "--independent needs declared areas to reason about; session-scope items have none"
+                );
+            }
             let mut items = snapshot
                 .items
                 .values()
@@ -2638,7 +4297,11 @@ fn run_session_board_action(
             let data = session_snapshot_value(&snapshot);
             Ok((serde_json::to_string_pretty(&data)?, data, vec![], current))
         }
+        // A session board keeps neither git history nor acceptance prose, so it has nothing
+        // reconcile could read. Refusing beats answering "nothing drifted" from a backend that
+        // could not have seen drift.
         BoardAction::Call { .. }
+        | BoardAction::Reconcile
         | BoardAction::Render
         | BoardAction::Sync
         | BoardAction::Import { .. }
@@ -2794,13 +4457,20 @@ fn run_board_action(
             area.as_deref(),
             text.as_deref(),
         ),
-        BoardAction::Next { limit, area } => {
+        BoardAction::Next {
+            limit,
+            area,
+            independent,
+        } => {
             if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
                 let mut stories = active_program_projection(root)?;
                 stories.retain(|story| {
                     area.as_deref()
                         .is_none_or(|area| story.areas.iter().any(|value| value == area))
                 });
+                if *independent {
+                    return independent_batch_result(stories, *limit);
+                }
                 stories.truncate(*limit);
                 return item_result_preserving_order(stories);
             }
@@ -2824,6 +4494,9 @@ fn run_board_action(
                 })
                 .collect();
             sort_ready(&mut stories);
+            if *independent {
+                return independent_batch_result(stories, *limit);
+            }
             stories.truncate(*limit);
             item_result(stories)
         }
@@ -2838,6 +4511,7 @@ fn run_board_action(
             areas,
             design,
             note,
+            no_commit,
         } => create_item(
             command,
             root,
@@ -2852,6 +4526,7 @@ fn run_board_action(
                 areas,
                 design: design.as_deref(),
                 note: note.as_deref(),
+                commit: !no_commit,
             },
         ),
         BoardAction::Update {
@@ -2906,6 +4581,7 @@ fn run_board_action(
                 check_board(root)
             }
         }
+        BoardAction::Reconcile => reconcile_board(command, root),
         BoardAction::Render => {
             let rendered = render_track(root, command.dry_run)?;
             Ok((
@@ -3044,12 +4720,100 @@ fn run_fleet_checked(command: FleetCommand) -> Result<()> {
     }
 }
 
+/// C-618: every intake item belongs to exactly one addressee.
+///
+/// Coordinator intake and tasks are recorded with `target: "main"`; a message carries the agent it
+/// was sent to. Items persisted before the field existed are the coordinator's, so an absent target
+/// reads as `main` rather than as "anybody's".
+fn intake_addressee(item: &Value) -> &str {
+    item["target"].as_str().unwrap_or("main")
+}
+
+/// The accepted items addressed to `target`, rendered one per line.
+///
+/// C-618: resume used to render *every* accepted item, so a story worker was handed the
+/// coordinator's queue — operator traffic it is contractually forbidden to act on, and unrelated
+/// context it should never see.
+fn pending_intake_for(state: &FleetState, target: &str) -> Vec<String> {
+    state
+        .intake
+        .values()
+        .filter(|item| item["ack"].as_str() == Some("accepted") && intake_addressee(item) == target)
+        .map(|item| {
+            format!(
+                "- {}: {}",
+                item["id"].as_str().unwrap_or("unknown"),
+                item["text"]
+                    .as_str()
+                    .or_else(|| item["instruction"].as_str())
+                    .or_else(|| item["message"].as_str())
+                    .unwrap_or("resume")
+            )
+        })
+        .collect()
+}
+
+/// The request a resumed agent is given: its own standing assignment plus its own pending items.
+fn resume_request_for(state: &FleetState, target: &str) -> String {
+    let pending = pending_intake_for(state, target);
+    let standing = if target == "main" {
+        "Resume from the durable manifest and board. Inspect in-flight waves, blocked decisions, failed/crashed turns and dependency-satisfied work; continue only previously authorized work."
+    } else {
+        // A worker's assignment already travels with its admitted record; resume tells it to carry
+        // that same assignment on, and never to inspect the fleet on the coordinator's behalf.
+        "Resume your existing assignment from your worktree and carry it to its stated completion. Work only on the board item you were admitted for; do not select other work or coordinate the fleet."
+    };
+    if pending.is_empty() {
+        standing.into()
+    } else {
+        format!(
+            "{standing}\n\nThen process these accepted inputs addressed to you, in order:\n{}",
+            pending.join("\n")
+        )
+    }
+}
+
+/// Acknowledge exactly the items the resumed agent was actually given, and report their ids.
+///
+/// C-618: the delivery bound. A resume that consumed every accepted item made each item deliverable
+/// at most once *to the wrong agent* — the coordinator's queue was acknowledged by a worker turn that
+/// never saw it, or replayed into the next worker when it was not acknowledged at all.
+fn complete_resumed_intake(state: &mut FleetState, target: &str, receipt: &Value) -> Vec<String> {
+    let mut consumed = Vec::new();
+    for (id, intake) in state.intake.iter_mut() {
+        if intake["ack"].as_str() == Some("accepted") && intake_addressee(intake) == target {
+            intake["ack"] = json!("completed");
+            intake["receipt"] = receipt.clone();
+            consumed.push(id.clone());
+        }
+    }
+    consumed
+}
+
 fn run_fleet_action(
     command: &FleetCommand,
     root: &Path,
     mut state: FleetState,
     request: Option<Value>,
 ) -> Result<(String, Value, Vec<String>, u64)> {
+    // C-642: one place decides that a quiesced fleet admits no new work.
+    //
+    // Keeping the refusal here rather than at each dispatch site is the whole safety property.
+    // "Quiesce before installing a binary" used to be a procedure — scan for processes, stop what
+    // you find, install — and a procedure can be raced by a dispatch that lands between the scan
+    // and the install. A recorded flag consulted on the way into every admitting verb cannot be.
+    if let Some(quiesce) = state.quiesce.as_ref() {
+        if fleet_action_dispatches(&command.action) {
+            bail!(
+                "conflict/precondition: fleet is quiesced{}; run `flux fleet resume` before dispatching new work",
+                quiesce
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(" ({reason})"))
+                    .unwrap_or_default()
+            )
+        }
+    }
     match &command.action {
         FleetAction::Skill => {
             let skill = fleet_skill();
@@ -3076,10 +4840,53 @@ fn run_fleet_action(
             if !command.dry_run {
                 let system = guarded_system(root)?;
                 if system.read_optional_text(".flux/fleet.toml")?.is_none() {
-                    system.write_file_atomic(".flux/fleet.toml", &format!("schema = \"flux.fleet/v1\"\nmax_workers = {max_workers}\nmax_wave = {max_wave}\nmax_rework = {max_rework}\ndecision_mode = \"human\" # or \"auto\" for an independent adversarial decision agent\nallow_ad_hoc_agents = true\nworktree_root = \".flux/fleet/worktrees\"\n\n# [main]\n# instructions = \".flux/fleet/main.md\"\n# model = \"codex/gpt-5.6-sol\"\n\n# [[agent_templates]]\n# id = \"story-worker\"\n# role = \"writer\"\n# instructions = \".flux/fleet/agents/story-worker.md\"\n# mode = \"write\"\n# capabilities = [\"read\", \"edit\", \"git\", \"shell\"]\n# fences = [\".git/**\", \".flux/fleet/**\"]\n# max_instances = {max_workers}\n\n# [[repositories]]\n# id = \"repo\"\n# root = \".\"\n# board = \"default\"\n# canonical_ref = \"origin/main\"\n# gate = [\"cargo\", \"test\", \"--workspace\"]\n"))?;
+                    system.write_file_atomic(
+                        ".flux/fleet.toml",
+                        &format!(
+                            r#"schema = "flux.fleet/v1"
+max_workers = {max_workers}
+max_wave = {max_wave}
+max_rework = {max_rework}
+decision_mode = "human" # or "auto" for an independent adversarial decision agent
+allow_ad_hoc_agents = true
+worktree_root = ".flux/fleet/worktrees"
+
+# [main]
+# instructions = ".flux/fleet/main.md"
+# model = "codex/gpt-5.6-sol"
+# loop = ".flux/fleet/loops/main-coordinator.flux" # required before a main turn or TUI attachment
+# research_loop = ".flux/fleet/loops/research.flux" # required read-only task-child loop
+
+# [loop_profiles.implementation]
+# revision = "1"
+# source = ".flux/fleet/loops/team-implementation.flux"
+# entry = "work"
+
+# [loop_policy]
+# implementation = "implementation"
+
+# [[agent_templates]]
+# id = "story-worker"
+# role = "writer"
+# task_kind = "implementation"
+# instructions = ".flux/fleet/agents/story-worker.md"
+# mode = "write"
+# capabilities = ["read", "edit", "git", "shell"]
+# fences = [".git/**", ".flux/fleet/**"]
+# max_instances = {max_workers}
+
+# [[repositories]]
+# id = "repo"
+# root = "."
+# board = "default"
+# canonical_ref = "origin/main"
+# gate = ["cargo", "test", "--workspace"]
+"#,
+                        ),
+                    )?;
                 }
                 let config = read_fleet_config(root)?;
-                write_fleet_state(root, &state)?;
+                write_fleet_state_waiting(root, &state)?;
                 append_fleet_event(
                     root,
                     "fleet.initialized",
@@ -3105,22 +4912,64 @@ fn run_fleet_action(
             let config = root.join(".flux/fleet.toml");
             let mut errors = Vec::new();
             if !config.exists() {
-                errors.push("missing .flux/fleet.toml".to_string());
+                errors.push("missing .flux/fleet.toml (run `flux fleet init`)".to_string());
             }
+            let mut loops = Vec::new();
             let limits = if config.exists() {
                 let config = read_fleet_config(root)?;
+                loops = validate_fleet_loop_bindings(root, &config, &mut errors);
                 json!({"max_workers":config.max_workers,"max_wave":config.max_wave,"max_rework":config.max_rework})
             } else {
                 Value::Null
             };
-            let data = json!({"valid": errors.is_empty(), "errors": errors, "config":limits, "state": state});
+            let mut data = json!({"valid": errors.is_empty(), "errors": errors, "config":limits, "loops": loops, "state": state});
             if !data["valid"].as_bool().unwrap_or(false) {
-                bail!("validation/gate: missing .flux/fleet.toml (run `flux fleet init`)");
+                let errors = data["errors"]
+                    .as_array()
+                    .map(|errors| {
+                        errors
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    })
+                    .unwrap_or_default();
+                bail!("validation/gate: {errors}");
+            }
+            // `doctor` also asks the RUNTIME questions; `validate` stays configuration-only.
+            //
+            // The two verbs share this arm because configuration validity is exactly the same question
+            // for both. What differs is what else is worth knowing: `validate` is the pre-flight a
+            // config change runs, while `doctor` is what an operator reaches for when something is
+            // already wrong — and until now it answered a question they had not asked and stayed silent
+            // about the one they had.
+            let mut warnings = Vec::new();
+            let mut runtime_summary = String::new();
+            if matches!(command.action, FleetAction::Doctor) {
+                let runtime = fleet_runtime_health(&state);
+                for finding in runtime["findings"].as_array().into_iter().flatten() {
+                    warnings.push(format!(
+                        "{}: {} — {} (fix: {})",
+                        finding["check"].as_str().unwrap_or_default(),
+                        finding["subject"].as_str().unwrap_or_default(),
+                        finding["detail"].as_str().unwrap_or_default(),
+                        finding["fix"].as_str().unwrap_or_default(),
+                    ));
+                }
+                runtime_summary = if warnings.is_empty() {
+                    "; runtime healthy".to_string()
+                } else {
+                    format!("; {} runtime finding(s) need attention", warnings.len())
+                };
+                data["runtime"] = runtime;
             }
             Ok((
-                "fleet configuration valid".into(),
+                format!(
+                    "fleet configuration valid; {} loop binding(s) analyzed{runtime_summary}",
+                    loops.len()
+                ),
                 data,
-                vec![],
+                warnings,
                 state.revision,
             ))
         }
@@ -3133,9 +4982,32 @@ fn run_fleet_action(
                 state.revision,
             ))
         }
+        FleetAction::Reclaim { target } => {
+            reclaim_finished_waves(command, root, state, target.as_deref())
+        }
+        FleetAction::Repair { wave } => repair_wave_structure(command, root, state, wave),
         FleetAction::Start => {
             state.running = true;
             state.main_agent.status = "running".into();
+            // C-610: establish the coordinator's RECORDED scope when the fleet starts, which is exactly
+            // when its umbrella is defined. The ceiling itself has always been enforced at spawn
+            // (`--operation-ceiling` plus explicit `--add-dir` roots); what was missing was any record of
+            // it, so `state.json` described every constrained worker and said nothing about the
+            // privileged agent — and an absent record reads exactly like an absent ceiling.
+            let started_config = read_fleet_config(root)?;
+            let coordinator_roots = started_config
+                .repositories
+                .iter()
+                .map(|repository| repository_root(root, repository))
+                .collect::<Result<Vec<_>>>()?;
+            state.main_agent.capability_set = Some(capability_set_manifest(
+                FleetTaskMode::Write,
+                &["fleet-coordinator".to_string()],
+                &native_fleet_main_operation_ceiling(),
+                root,
+                &coordinator_roots,
+                &normalize_fences(Vec::new()),
+            ));
             state.revision += 1;
             persist_fleet_mutation(
                 command,
@@ -3169,6 +5041,7 @@ fn run_fleet_action(
                 state.revision,
             ))
         }
+        FleetAction::Quiesce { reason } => fleet_quiesce(command, root, state, reason.as_deref()),
         FleetAction::Goal { action } => fleet_goal(command, root, state, action),
         FleetAction::Ingest {
             text,
@@ -3262,13 +5135,29 @@ fn run_fleet_action(
             },
         ),
         FleetAction::Status | FleetAction::Dashboard => {
-            let data = json!({"state": state, "sources": fleet_sources(root)?, "schedule": fleet_schedule(root)?, "human_decisions": open_decisions(root)?});
+            let data = fleet_status_projection(root, &state)?;
             Ok((fleet_status_human(&data), data, vec![], state.revision))
         }
         FleetAction::Schedule => {
             let data = fleet_schedule(root)?;
             Ok((schedule_human(&data), data, vec![], state.revision))
         }
+        FleetAction::Drive {
+            tick,
+            run_loop,
+            interval,
+            max_ticks,
+        } => fleet_drive(
+            command,
+            root,
+            state,
+            DriveOptions {
+                tick: *tick,
+                run_loop: *run_loop,
+                interval: *interval,
+                max_ticks: *max_ticks,
+            },
+        ),
         FleetAction::Decisions { auto } => {
             let decisions = open_decisions(root)?;
             let configured = if root.join(".flux/fleet.toml").is_file() {
@@ -3375,19 +5264,72 @@ fn run_fleet_action(
                     config.max_wave
                 );
             }
-            let selected = if items.is_empty() {
-                select_ready_items(root, config.max_wave)?
-            } else {
+            let explicit = !items.is_empty();
+            let selected = if explicit {
                 validate_board_refs(items)?;
                 items.clone()
+            } else {
+                select_ready_items(root, config.max_wave)?
             };
             if selected.is_empty() {
                 bail!("not-found: no dependency-satisfied ready items");
+            }
+            // C-619: never dispatch work this Fleet has already delivered.
+            //
+            // The Board cannot be relied on to say so. It stays `ready` after a wave is gated and
+            // accepted, and a workspace board additionally REFUSES every mutation while its member
+            // checkout is off the configured canonical ref — which any delivered-but-unpushed work
+            // guarantees. So an unattended driver reading `board next` re-selects finished stories
+            // forever: `flux/C-569` was dispatched three times in eleven seconds after passing its full
+            // gate, each attempt costing a worker turn and gigabytes of build output.
+            //
+            // Fleet's own state is the authority here, and it is always available: a wave that reached
+            // `green` or `applied` delivered its items, full stop.
+            let delivered = delivered_board_items(&state);
+            let repeats = selected
+                .iter()
+                .filter(|item| delivered.contains_key(item.as_str()))
+                .map(|item| format!("{item} (wave {})", delivered[item.as_str()]))
+                .collect::<Vec<_>>();
+            // Explicit intent gets an error; an auto-selected wave gets the delivered items FILTERED
+            // OUT. Bailing on a selection the operator did not choose would let one finished story
+            // block a whole multi-item wave — the Board still lists delivered work as `ready`, so with
+            // several workers that is the common case, not the edge case.
+            let selected = if explicit || repeats.is_empty() {
+                selected
+            } else {
+                let remaining = selected
+                    .iter()
+                    .filter(|item| !delivered.contains_key(item.as_str()))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if remaining.is_empty() {
+                    bail!(
+                        "not-found: every dependency-satisfied ready item was already delivered by a \
+                         gated wave: {}. Accumulate the accepted candidates instead (C-619)",
+                        repeats.join(", ")
+                    )
+                }
+                remaining
+            };
+            if explicit && !repeats.is_empty() {
+                bail!(
+                    "conflict/precondition: already delivered by a gated wave, so this dispatch would \
+                     re-implement finished work: {}. Accumulate the accepted candidate instead, or \
+                     transition the Board item once its checkout is back at its canonical ref (C-619)",
+                    repeats.join(", ")
+                )
             }
             let template = config
                 .agent_templates
                 .iter()
                 .find(|template| template.id == "story-worker");
+            let task_kind = template
+                .map(|template| template.task_kind.as_str())
+                .unwrap_or("implementation");
+            // Resolve and parse policy before worktree creation: a Fleet task never falls back to
+            // the general adaptive harness and an invalid profile cannot reach a model call.
+            let loop_binding = resolve_fleet_loop_binding(root, &config, task_kind)?;
             let instructions = match template {
                 Some(template) => read_configured_instructions(
                     root,
@@ -3410,15 +5352,28 @@ fn run_fleet_action(
                         .map(|capability| (*capability).to_string())
                         .collect()
                 });
-            let (capabilities, operations) =
+            // A pre-check against the maximal grant, before any worktree is cut: an operation no
+            // bundle could ever provide is a defect in the loop, not a property of a repository.
+            let (_, grantable_operations) =
                 normalize_worker_capabilities(mode, &requested_capabilities)?;
+            validate_loop_capability_compatibility(&loop_binding, &grantable_operations)?;
             let template_fences = template
                 .map(|template| template.fences.clone())
                 .unwrap_or_default();
             let model = template.and_then(|template| template.model.clone());
             let wave = format!("wave-{}", state.revision + 1);
-            let topology = prepare_wave_worktrees(command, root, &wave, &selected)?;
+            let mut topology = prepare_wave_worktrees(command, root, &wave, &selected)?;
+            for repository in topology["repositories"]
+                .as_array_mut()
+                .into_iter()
+                .flatten()
+            {
+                for story in repository["stories"].as_array_mut().into_iter().flatten() {
+                    story["wave"] = json!(wave);
+                }
+            }
             state.revision += 1;
+            let mut admitted_workers = Vec::new();
             for (index, item) in selected.iter().enumerate() {
                 let worker = format!("{}-worker-{}", wave, index + 1);
                 let assignment = topology["repositories"]
@@ -3449,6 +5404,31 @@ fn run_fleet_action(
                 let fences =
                     normalize_fences(template_fences.iter().cloned().chain(repository_fences));
                 let read_roots = Vec::<PathBuf>::new();
+                // C-605: resolve the toolchain half of the ceiling from the checkout this worker was
+                // actually assigned, so a repository with no Cargo manifest never receives `cargo_*`
+                // and a Node one receives `npm` from the very same declaration. `--dry-run` does not
+                // cut the worktree, so probe the source checkout it would be cut from instead —
+                // otherwise a dry run would report a ceiling no real dispatch would produce.
+                let probe_root = if worktree.is_dir() {
+                    worktree.clone()
+                } else {
+                    repository_id
+                        .and_then(|repository_id| {
+                            config
+                                .repositories
+                                .iter()
+                                .find(|repository| repository.id == repository_id)
+                        })
+                        .and_then(|repository| repository_root(root, repository).ok())
+                        .unwrap_or_else(|| root.to_path_buf())
+                };
+                let (capabilities, operations) = normalize_worker_capabilities_in(
+                    mode,
+                    &requested_capabilities,
+                    task_kind,
+                    Some(&probe_root),
+                )?;
+                validate_loop_capability_compatibility(&loop_binding, &operations)?;
                 let capability_set = capability_set_manifest(
                     mode,
                     &capabilities,
@@ -3457,11 +5437,27 @@ fn run_fleet_action(
                     &read_roots,
                     &fences,
                 );
+                // C-594: `--dry-run` promises to "validate and return the proposed result without
+                // writing", and `prepare_wave_worktrees` honours that by skipping `git worktree
+                // add`. Snapshotting the loop binding then tried to open a guarded workspace on a
+                // story worktree that deliberately does not exist, so EVERY dry run died with
+                // `workspace root …/stories/<ID>: No such file or directory` before returning a
+                // topology. The binding is already resolved and validated above; persisting its
+                // snapshot is a write, and writes are exactly what a dry run must not do.
+                if !command.dry_run {
+                    snapshot_fleet_loop_binding(
+                        &worktree,
+                        &loop_binding,
+                        FLEET_AGENT_LOOP_SOURCE,
+                        FLEET_AGENT_LOOP_BINDING,
+                    )?;
+                }
                 state.agents.insert(
                     worker.clone(),
                     json!({
-                        "id": worker,
+                        "id": worker.clone(),
                         "role": role,
+                        "task_kind": task_kind,
                         "parent": "main",
                         "created_by": "main",
                         "board_ref": item,
@@ -3478,8 +5474,44 @@ fn run_fleet_action(
                         "writable_root": display_path(&worktree),
                         "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
                         "capability_set": capability_set,
+                        "loop_binding": loop_binding.metadata(),
+                        "loop_source": FLEET_AGENT_LOOP_SOURCE,
+                        "loop_binding_receipt": FLEET_AGENT_LOOP_BINDING,
                     }),
                 );
+                admitted_workers.push(json!({
+                    "id": worker,
+                    "board_ref": item,
+                    "role": role,
+                    "task_kind": task_kind,
+                    "session": format!("{wave}-session-{}", index + 1),
+                    "loop_binding": loop_binding.metadata(),
+                }));
+            }
+            // Rebase this dispatch onto current state before writing it.
+            //
+            // Everything above already happened on disk: `prepare_wave_worktrees` created a worktree and
+            // a branch per story. If the coordinator or an operator wrote Fleet state during that window
+            // — a `fleet message`, an ack, a decision — the compare-and-set here loses and the whole
+            // dispatch is discarded with its worktrees already on disk and nothing recording them.
+            // Observed exactly once as `dispatch FAILED for: flux/C-605` immediately after the
+            // coordinator accepted an intake; the next tick re-dispatched, so the cost was a leaked
+            // wave root and a minute.
+            //
+            // Safe to rebase, unlike a blanket retry: this call only ever ADDS keys that nothing else
+            // could have written — a fresh wave id and its fresh worker ids. Re-running the action
+            // instead would be wrong, because `prepare_wave_worktrees` refuses an existing wave root and
+            // `integrate` would spend a second gate. The same idiom guards the wave-completion write
+            // below.
+            if let Ok(latest) = read_fleet_state(root) {
+                if latest.revision > state.revision {
+                    let mut rebased = latest;
+                    rebased.revision += 1;
+                    for (id, record) in &state.agents {
+                        rebased.agents.entry(id.clone()).or_insert(record.clone());
+                    }
+                    state = rebased;
+                }
             }
             state.waves.insert(wave.clone(), json!({"id": wave, "items": selected, "status": "accepted", "coordinator": "main", "goals_revision": state.main_agent.goals_revision, "topology": topology, "apply_eligible": false}));
             persist_fleet_mutation(
@@ -3517,6 +5549,10 @@ fn run_fleet_action(
                 for spec in &specs {
                     if let Some(agent) = state.agents.get_mut(&spec.id) {
                         agent["status"] = json!("working");
+                        // The wave path records `working` too, and this is the path that produced the
+                        // worker stuck at `working` with no process behind it. Recording the supervisor
+                        // only in the single-turn path would have left the motivating case unfixed.
+                        agent["supervisor_pid"] = json!(std::process::id());
                     }
                 }
                 persist_fleet_mutation(
@@ -3566,6 +5602,20 @@ fn run_fleet_action(
                     });
                     outcomes.extend(batch_outcomes);
                 }
+                // A wave runs for many minutes. During that window the coordinator or an operator may
+                // legitimately mutate Fleet state — a `fleet message`, a cancel, a decision. Applying
+                // these outcomes to the snapshot this call started with would then lose the
+                // compare-and-set in `write_fleet_state`, and the whole wave result is discarded:
+                // every receipt, every recorded session, and the record of workers that already
+                // committed. Refresh first and write the outcomes onto current state, exactly as the
+                // single-turn path does before recording. The wave and its agent records are already
+                // durable here (`wave.accepted` and `wave.agent-turns.delivered` both persisted
+                // above), so the refreshed state still contains everything this loop updates.
+                if let Ok(latest) = read_fleet_state(root) {
+                    if latest.revision > state.revision {
+                        state = latest;
+                    }
+                }
                 let mut receipts = Vec::new();
                 let mut errors = Vec::new();
                 for (id, outcome) in outcomes {
@@ -3573,6 +5623,7 @@ fn run_fleet_action(
                         Ok(receipt) => {
                             if let Some(agent) = state.agents.get_mut(&id) {
                                 agent["status"] = json!("completed");
+                                agent["supervisor_pid"] = Value::Null;
                                 agent["runtime_session"] = receipt["session"].clone();
                                 agent["session"] = receipt["session"].clone();
                                 agent["last_turn"] = receipt.clone();
@@ -3584,20 +5635,43 @@ fn run_fleet_action(
                             let message = redact(&error.to_string());
                             if let Some(agent) = state.agents.get_mut(&id) {
                                 agent["status"] = json!("failed");
+                                agent["supervisor_pid"] = Value::Null;
                                 agent["last_error"] = json!(message);
+                                record_failed_turn_evidence(agent, &error);
                             }
                             errors.push(json!({"agent":id,"error":message}));
                         }
                     }
                 }
+                // C-670: this is where the loop used to end. Every worker completed, the wave went to
+                // `awaiting-handoffs`, and nothing in the fleet could invoke the verb that leaves that
+                // state — so the wave waited for a human who, on the night this was found, was not
+                // there. Recording now, from the worktrees the turns just finished in, is what makes a
+                // wave able to advance on its own.
+                let handoffs = record_provisional_handoffs(&mut state, &wave);
+                let handed_off = handoffs
+                    .iter()
+                    .filter(|report| report["recorded"] == json!(true))
+                    .count();
                 if let Some(record) = state.waves.get_mut(&wave) {
-                    record["status"] = json!(if errors.is_empty() {
+                    let outstanding = record["topology"]["repositories"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .flat_map(|repository| {
+                            repository["stories"].as_array().into_iter().flatten()
+                        })
+                        .any(|story| story["status"].as_str() != Some("handoff-accepted"));
+                    record["status"] = json!(if !errors.is_empty() {
+                        "agent-turn-failed"
+                    } else if outstanding {
                         "awaiting-handoffs"
                     } else {
-                        "agent-turn-failed"
+                        "handoffs-ready"
                     });
                     record["agent_turns"] = json!(receipts);
                     record["agent_errors"] = json!(errors);
+                    record["provisional_handoffs"] = json!(handoffs);
                 }
                 state.revision += 1;
                 persist_fleet_mutation(
@@ -3619,15 +5693,18 @@ fn run_fleet_action(
                     )
                 }
                 return Ok((
-                    format!("{wave} agents completed; handoffs required"),
-                    json!({"wave": wave, "items": selected, "ack": "completed", "topology": topology, "receipts": receipts}),
+                    format!(
+                        "{wave} agents completed; {handed_off} of {} handed off provisionally",
+                        handoffs.len()
+                    ),
+                    json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "completed", "topology": topology, "receipts": receipts, "handoffs": handoffs}),
                     vec![],
                     state.revision,
                 ));
             }
             Ok((
                 format!("{wave} accepted: {} item(s)", selected.len()),
-                json!({"wave": wave, "items": selected, "ack": "accepted", "prepare_only": prepare_only, "topology": topology}),
+                json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "accepted", "prepare_only": prepare_only, "topology": topology}),
                 vec![],
                 state.revision,
             ))
@@ -3638,6 +5715,7 @@ fn run_fleet_action(
             commit,
             worker,
             session,
+            from_worktree,
             write_set,
             test_argv,
             failing_before,
@@ -3654,6 +5732,7 @@ fn run_fleet_action(
                 commit,
                 worker: worker.as_deref(),
                 session: session.as_deref(),
+                from_worktree: *from_worktree,
                 write_set,
                 test_argv,
                 failing_before: *failing_before,
@@ -3774,52 +5853,31 @@ fn run_fleet_action(
         FleetAction::Cancel { target } => {
             fleet_control_mutation(command, root, state, "cancelled", target)
         }
+        FleetAction::Park { wave, reason } => park_wave(command, root, state, wave, reason),
+        FleetAction::Unpark { wave } => unpark_wave(command, root, state, wave),
         FleetAction::Resume { target } => {
             let target = target.as_deref().unwrap_or("main");
             state.running = true;
-            let pending = state
-                .intake
-                .values()
-                .filter(|item| item["ack"].as_str() == Some("accepted"))
-                .map(|item| {
-                    format!(
-                        "- {}: {}",
-                        item["id"].as_str().unwrap_or("unknown"),
-                        item["text"]
-                            .as_str()
-                            .or_else(|| item["instruction"].as_str())
-                            .or_else(|| item["message"].as_str())
-                            .unwrap_or("resume")
-                    )
-                })
-                .collect::<Vec<_>>();
-            let request = if pending.is_empty() {
-                "Resume from the durable manifest and board. Inspect in-flight waves, blocked decisions, failed/crashed turns and dependency-satisfied work; continue only previously authorized work.".into()
-            } else {
-                format!(
-                    "Resume from the durable manifest and process these accepted inputs in order:\n{}",
-                    pending.join("\n")
-                )
-            };
+            // C-642: `resume` is the inverse of `quiesce`, so lifting the recorded maintenance
+            // window is part of resuming rather than a second thing to remember. A window that
+            // ended with the flag still set would be a fleet that silently refuses every later
+            // dispatch, which is the failure this verb pair exists to remove.
+            let quiesce_lifted = state.quiesce.take();
+            let request = resume_request_for(&state, target);
             let spec = addressed_turn_spec(root, &state, target, request)?;
             let receipt = execute_and_record_agent_turn(command, root, &mut state, spec, None)?;
-            for intake in state.intake.values_mut() {
-                if intake["ack"].as_str() == Some("accepted") {
-                    intake["ack"] = json!("completed");
-                    intake["receipt"] = receipt.clone();
-                }
-            }
+            let consumed = complete_resumed_intake(&mut state, target, &receipt);
             state.revision += 1;
             persist_fleet_mutation(
                 command,
                 root,
                 &state,
                 "fleet.resumed",
-                json!({"target": target, "receipt": receipt}),
+                json!({"target": target, "consumed": consumed, "receipt": receipt, "quiesce_lifted": quiesce_lifted}),
             )?;
             Ok((
                 format!("{target} resumed from durable state"),
-                json!({"target": target, "ack": "completed", "receipt": receipt}),
+                json!({"target": target, "ack": "completed", "consumed": consumed, "receipt": receipt, "quiesce_lifted": quiesce_lifted}),
                 vec![],
                 state.revision,
             ))
@@ -3878,7 +5936,7 @@ fn run_fleet_action(
                 .chain(state.agents.keys().cloned())
                 .collect::<Vec<_>>()
                 .join("\n"),
-            json!({"main_agent": state.main_agent, "workers": state.agents}),
+            fleet_agents_cli_projection(&state),
             vec![],
             state.revision,
         )),
@@ -3889,9 +5947,17 @@ fn run_fleet_action(
         FleetAction::Inspect {
             view,
             target,
+            repository,
             limit,
         } => {
-            let data = fleet_inspect(root, &state, *view, target.as_deref(), *limit)?;
+            let data = fleet_inspect(
+                root,
+                &state,
+                *view,
+                target.as_deref(),
+                *limit,
+                repository.as_deref(),
+            )?;
             Ok((
                 serde_json::to_string_pretty(&data)?,
                 data,
@@ -3899,7 +5965,9 @@ fn run_fleet_action(
                 state.revision,
             ))
         }
-        FleetAction::Apply { wave } => apply_wave(command, root, state, wave),
+        FleetAction::Apply { wave, only } => {
+            apply_wave(command, root, state, wave, only.as_deref())
+        }
         FleetAction::Call { operation } => fleet_call(command, root, state, operation, request),
     }
 }
@@ -3923,6 +5991,7 @@ fn board_operations() -> &'static [&'static str] {
         "comment",
         "evidence",
         "check",
+        "reconcile",
         "render",
         "sync",
         "graph",
@@ -3977,7 +6046,7 @@ fn board_action_mutates(action: &BoardAction) -> bool {
             }
             | BoardAction::Report { out: Some(_), .. }
             | BoardAction::Export { out: Some(_) }
-    ) || matches!(action, BoardAction::Call { target, operation } if !matches!(operation.as_deref().unwrap_or(target), "get" | "list" | "query" | "stats" | "check" | "graph" | "schema"))
+    ) || matches!(action, BoardAction::Call { target, operation } if !matches!(operation.as_deref().unwrap_or(target), "get" | "list" | "query" | "stats" | "check" | "reconcile" | "graph" | "schema"))
 }
 
 fn board_action_requires_member(action: &BoardAction) -> bool {
@@ -3998,12 +6067,31 @@ fn board_action_requires_member(action: &BoardAction) -> bool {
     )
 }
 
+/// The verbs that admit new work, and therefore the exact set a quiesce must refuse.
+///
+/// C-642. These three are what put a new process behind the fleet: a dispatched wave, an admitted
+/// agent, a coordinator task. Inspection, handoff, integration, acceptance and reclamation stay
+/// available while quiesced — a maintenance window that also blindfolded the operator would just be
+/// a worse `fleet stop`.
+fn fleet_action_dispatches(action: &FleetAction) -> bool {
+    matches!(
+        action,
+        FleetAction::Run { .. }
+            | FleetAction::Spawn { .. }
+            | FleetAction::Task { .. }
+            // C-631: a tick's last phase sends workers at the schedule, so a quiesced fleet must
+            // refuse the driver itself rather than let each tick walk into the dispatch it wraps.
+            | FleetAction::Drive { .. }
+    )
+}
+
 fn fleet_action_mutates(action: &FleetAction) -> bool {
     matches!(
         action,
         FleetAction::Init { .. }
             | FleetAction::Start
             | FleetAction::Stop
+            | FleetAction::Quiesce { .. }
             | FleetAction::Decisions { .. }
             | FleetAction::Goal {
                 action: FleetGoalAction::Set { .. } | FleetGoalAction::Remove { .. }
@@ -4017,9 +6105,14 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Task { .. }
             | FleetAction::Message { .. }
             | FleetAction::Cancel { .. }
+            | FleetAction::Park { .. }
+            | FleetAction::Unpark { .. }
             | FleetAction::Resume { .. }
             | FleetAction::Apply { .. }
             | FleetAction::Note { .. }
+            | FleetAction::Reclaim { .. }
+            | FleetAction::Repair { .. }
+            | FleetAction::Drive { .. }
     ) || matches!(action, FleetAction::Call { operation } if !matches!(operation.as_str(), "status" | "schedule" | "schema"))
 }
 
@@ -4162,9 +6255,16 @@ fn fleet_operations() -> &'static [&'static str] {
         "init",
         "doctor",
         "refresh",
+        // Reclaim MUTATES (it deletes build output and journals what it freed), so it is deliberately
+        // absent from the read-only list below. Repair writes checkouts, so it belongs on the same
+        // side.
+        "reclaim",
+        "repair",
         "validate",
         "start",
         "stop",
+        // Quiesce MUTATES: it records the durable maintenance window that refuses dispatch.
+        "quiesce",
         "goal",
         "ingest",
         "spawn",
@@ -4175,10 +6275,15 @@ fn fleet_operations() -> &'static [&'static str] {
         "task",
         "message",
         "cancel",
+        "park",
+        "unpark",
         "resume",
         "apply",
         "status",
         "schedule",
+        // Drive MUTATES and DISPATCHES: one tick advances waves, accumulates its own record, and
+        // sends workers at the schedule.
+        "drive",
         "decisions",
         "events",
         "logs",
@@ -4268,11 +6373,11 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
 }
 
 fn board_skill() -> String {
-    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board next --limit 8 --independent --output json  # a wave-safe set, not a priority prefix\nflux board reconcile --output json  # items whose work is already in the tree\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -4477,6 +6582,25 @@ fn story_from_body(file: String, body: String) -> Option<Story> {
     })
 }
 
+/// A story's prose, without the frontmatter block above it.
+///
+/// The expanded Board box renders this as markdown; frontmatter is metadata the box header already
+/// carries, and rendering it as a `---` thematic break would be noise.
+fn story_prose(body: &str) -> &str {
+    let mut lines = body.split_inclusive('\n');
+    let mut offset = match lines.next() {
+        Some(first) if first.trim() == "---" => first.len(),
+        _ => return body,
+    };
+    for line in lines {
+        offset += line.len();
+        if line.trim() == "---" {
+            return body[offset..].trim_start();
+        }
+    }
+    body
+}
+
 fn parse_frontmatter(text: &str) -> BTreeMap<String, String> {
     let mut data = BTreeMap::new();
     let mut lines = text.lines();
@@ -4594,6 +6718,225 @@ fn sort_ready(stories: &mut [Story]) {
 fn item_result(mut stories: Vec<Story>) -> Result<(String, Value, Vec<String>, Option<String>)> {
     stories.sort_by(|a, b| natural_cmp(&a.id, &b.id));
     item_result_preserving_order(stories)
+}
+
+/// The member a workspace item belongs to, or `None` for a repository-scoped id.
+fn story_member(id: &str) -> Option<&str> {
+    id.split_once('/').map(|(member, _)| member)
+}
+
+/// Why `a` and `b` cannot be built in the same wave, or `None` if they are independent.
+///
+/// Independence here means "will not write the same path", because a shared path is what
+/// integration refuses. It is decided from what the stories declare about themselves, and it fails
+/// closed: a story that declares no `areas` has an unknown write set, and a wave that dies at
+/// integration costs every worker in it, not just the two that collided.
+fn wave_conflict(a: &Story, b: &Story) -> Option<String> {
+    // Different members never conflict. Integration assembles one candidate per repository, so
+    // their commits cannot land in the same tree however much they overlap in subject.
+    if let (Some(left), Some(right)) = (story_member(&a.id), story_member(&b.id)) {
+        if left != right {
+            return None;
+        }
+    }
+    if a.dependencies.contains(&b.id) || b.dependencies.contains(&a.id) {
+        return Some("declared dependency".to_string());
+    }
+    if let Some(area) = a.areas.iter().find(|area| b.areas.contains(area)) {
+        return Some(format!("shared area {area}"));
+    }
+    if a.areas.is_empty() || b.areas.is_empty() {
+        return Some("undeclared write set".to_string());
+    }
+    match (a.design.as_deref(), b.design.as_deref()) {
+        // Both stories update the design as they land, so the document itself is the collision.
+        (Some(left), Some(right)) if left == right => Some(format!("shared design {left}")),
+        _ => None,
+    }
+}
+
+/// Search ceiling for [`select_independent_batch`]. A ready pool is tens of items and the width is
+/// single digits, so the exact search finishes far inside this; the budget exists so a pathological
+/// pool degrades to the best set found instead of running unbounded.
+const INDEPENDENT_BATCH_NODE_BUDGET: usize = 200_000;
+
+/// The largest set of mutually independent stories, preferring higher priority among equal sizes.
+///
+/// The objective is deliberately lexicographic — **more items always beats better priority** —
+/// because an idle worker delivers nothing, while a lower-priority story still delivers a story.
+///
+/// Takes `stories` already in priority order and returns indices into it, the stories held back
+/// with the batch member each one collides with, and whether the search was exhaustive.
+fn select_independent_batch(stories: &[Story], limit: usize) -> (Vec<usize>, Vec<Value>, bool) {
+    let count = stories.len();
+    if count == 0 || limit == 0 {
+        return (Vec::new(), Vec::new(), true);
+    }
+
+    let mut reasons: BTreeMap<(usize, usize), String> = BTreeMap::new();
+    let mut conflicts = vec![vec![false; count]; count];
+    for left in 0..count {
+        for right in (left + 1)..count {
+            if let Some(reason) = wave_conflict(&stories[left], &stories[right]) {
+                conflicts[left][right] = true;
+                conflicts[right][left] = true;
+                reasons.insert((left, right), reason);
+            }
+        }
+    }
+
+    // Rank is the index, because `stories` arrives in priority order. A smaller rank sum is a
+    // higher-priority batch, so the key maximises size first and negated rank sum second.
+    fn key(chosen: &[usize]) -> (usize, i64) {
+        (chosen.len(), -(chosen.iter().sum::<usize>() as i64))
+    }
+
+    let mut best: Vec<usize> = Vec::new();
+    let mut best_key = (0usize, 0i64);
+    let mut chosen: Vec<usize> = Vec::new();
+    let mut nodes = 0usize;
+    let mut exhaustive = true;
+
+    // Iterative depth-first search over "take or skip" at each candidate, so a deep pool cannot
+    // overflow the stack the way recursion would.
+    struct Frame {
+        position: usize,
+        taken: bool,
+    }
+    let mut stack: Vec<Frame> = vec![Frame {
+        position: 0,
+        taken: false,
+    }];
+
+    while let Some(frame) = stack.pop() {
+        if frame.taken {
+            chosen.pop();
+            continue;
+        }
+        nodes += 1;
+        if nodes > INDEPENDENT_BATCH_NODE_BUDGET {
+            exhaustive = false;
+            break;
+        }
+        if key(&chosen) > best_key {
+            best_key = key(&chosen);
+            best = chosen.clone();
+        }
+        if chosen.len() == limit || frame.position == count {
+            continue;
+        }
+        // Nothing left to reach can beat the incumbent on size, and size dominates the key.
+        let reachable = chosen.len() + (count - frame.position).min(limit - chosen.len());
+        if reachable < best_key.0 {
+            continue;
+        }
+        let index = frame.position;
+        // Skip branch is pushed first so the take branch is explored first: taking the
+        // highest-priority admissible item early raises the incumbent and prunes harder.
+        stack.push(Frame {
+            position: index + 1,
+            taken: false,
+        });
+        if !chosen.iter().any(|other| conflicts[*other][index]) {
+            chosen.push(index);
+            stack.push(Frame {
+                position: index,
+                taken: true,
+            });
+            stack.push(Frame {
+                position: index + 1,
+                taken: false,
+            });
+        }
+    }
+
+    best.sort_unstable();
+    let held_back = (0..count)
+        .filter(|index| !best.contains(index))
+        .map(|index| {
+            let blocker = best.iter().find(|other| conflicts[**other][index]).copied();
+            match blocker {
+                Some(other) => {
+                    let pair = (index.min(other), index.max(other));
+                    json!({
+                        "id": stories[index].id,
+                        "blocked_by": stories[other].id,
+                        "reason": reasons.get(&pair).cloned().unwrap_or_default(),
+                    })
+                }
+                // Independent of the batch but the width ran out before it was reached.
+                None => json!({"id": stories[index].id, "reason": "width reached"}),
+            }
+        })
+        .collect();
+
+    (best, held_back, exhaustive)
+}
+
+/// `board next --independent`: the batch, plus why every other ready item was held back.
+///
+/// The held-back list is the point as much as the batch is. A width that cannot be filled is a fact
+/// about the shape of the backlog, and naming the item each exclusion collided with is what turns
+/// "the fleet only ran three workers" into "one crate serialises eleven stories".
+fn independent_batch_result(
+    stories: Vec<Story>,
+    limit: usize,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let (indices, held_back, exhaustive) = select_independent_batch(&stories, limit);
+    let pool = stories.len();
+    let batch: Vec<Story> = indices
+        .iter()
+        .map(|index| stories[*index].clone())
+        .collect();
+
+    let mut human = batch
+        .iter()
+        .map(|story| format!("{}\t{}\t{}", story.id, story.status, story.title))
+        .collect::<Vec<_>>();
+    human.push(format!(
+        "\n{} of {} requested, from a ready pool of {pool}{}",
+        batch.len(),
+        limit,
+        if exhaustive {
+            ""
+        } else {
+            " (search truncated)"
+        }
+    ));
+    if batch.len() < limit {
+        human.push(format!(
+            "held back: {}",
+            held_back
+                .iter()
+                .filter_map(|entry| {
+                    let id = entry.get("id")?.as_str()?;
+                    let reason = entry.get("reason")?.as_str()?;
+                    Some(format!("{id} ({reason})"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let mut warnings = Vec::new();
+    if !exhaustive {
+        warnings.push(
+            "independent-batch search hit its node budget; the batch is the best found, not proven \
+             largest"
+                .to_string(),
+        );
+    }
+    Ok((
+        human.join("\n"),
+        json!({
+            "items": batch,
+            "held_back": held_back,
+            "pool": pool,
+            "proved_largest": exhaustive,
+        }),
+        warnings,
+        None,
+    ))
 }
 
 fn item_result_preserving_order(
@@ -5611,6 +7954,7 @@ struct CreateItemInput<'a> {
     areas: &'a [String],
     design: Option<&'a str>,
     note: Option<&'a str>,
+    commit: bool,
 }
 
 fn create_item(
@@ -5629,6 +7973,7 @@ fn create_item(
         areas,
         design,
         note,
+        commit,
     } = input;
     let status = normalize_status(status);
     if !matches!(status.as_str(), "backlog" | "ready") {
@@ -5690,15 +8035,90 @@ fn create_item(
             .with_context(|| format!("conflict/precondition: {} already exists", file.display()))?;
         output.write_all(body.as_bytes())?;
     }
+    let recorded = if command.dry_run || !commit {
+        None
+    } else {
+        commit_new_planning_document(root, &file, &id, title)?
+    };
     Ok((
         format!(
-            "created {id}{}",
-            if command.dry_run { " (dry run)" } else { "" }
+            "created {id}{}{}",
+            if command.dry_run { " (dry run)" } else { "" },
+            recorded
+                .as_deref()
+                .map(|sha| format!(" and committed as {}", &sha[..sha.len().min(8)]))
+                .unwrap_or_default()
         ),
-        json!({"id": id, "slug": slug, "kind": format!("{kind:?}").to_ascii_lowercase(), "file": display_path(&file), "status": status, "pillar": pillar, "areas": areas, "dry_run": command.dry_run, "content": if command.dry_run { Some(body) } else { None }}),
+        json!({"id": id, "slug": slug, "kind": format!("{kind:?}").to_ascii_lowercase(), "file": display_path(&file), "status": status, "pillar": pillar, "areas": areas, "commit": recorded, "dry_run": command.dry_run, "content": if command.dry_run { Some(body) } else { None }}),
         vec![],
         changed_revision(root, command.dry_run)?,
     ))
+}
+
+/// Commit exactly the document just created, and nothing else.
+///
+/// Creating a planning item without committing it is a silent no-op wherever items are resolved at a
+/// git ref, which is the normal case: a workspace member's items are read with `ls-tree`/`show` at its
+/// `canonical_ref`, so an uncommitted story does not exist as far as the Board is concerned. Twenty-seven
+/// stories were filed, reported as created, and could not be scheduled — the command had succeeded and
+/// nothing had happened. Committing is what makes creation take effect, so it is the default.
+///
+/// Deliberately narrow:
+/// - The commit is path-scoped. It never sweeps in whatever else happens to be dirty in the checkout,
+///   which is the whole reason `git commit -a` is not used anywhere near this.
+/// - It commits to the current branch rather than a side branch. A side branch would reproduce exactly
+///   the invisibility being fixed. Item creation is also the one planning mutation that cannot conflict:
+///   it only ever adds a path that did not exist.
+/// - Outside a git repository it does nothing and reports nothing, because there is no ref for a read
+///   to resolve against.
+/// - Mid-merge or mid-rebase it refuses rather than committing into someone else's in-progress
+///   operation. The document is already on disk, so the path is named in the error and no work is lost.
+fn commit_new_planning_document(
+    root: &Path,
+    file: &Path,
+    id: &str,
+    title: &str,
+) -> Result<Option<String>> {
+    let Some(git_dir) = git_output(root, &["rev-parse", "--absolute-git-dir"]) else {
+        return Ok(None);
+    };
+    let git_dir = PathBuf::from(git_dir);
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        if git_dir.join(marker).exists() {
+            bail!(
+                "conflict/precondition: {} is mid-{marker}; {} was written but not committed",
+                root.display(),
+                file.display()
+            )
+        }
+    }
+    let relative = file
+        .strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let staged = guarded_git(root, &["add", "--", &relative])?;
+    if staged.exit_code != 0 {
+        bail!(
+            "validation/gate: staging {relative} failed; the document was written but not committed: {}",
+            clipped_redacted(staged.stderr.as_bytes())
+        )
+    }
+    let message = format!("board: add {id} {title}");
+    // The pathspec makes this `--only`: exactly this document, whatever else is staged.
+    let committed = guarded_git(root, &["commit", "-m", &message, "--", &relative])?;
+    if committed.exit_code != 0 {
+        bail!(
+            "validation/gate: committing {relative} failed; the document was written but not committed: {}",
+            clipped_redacted(committed.stderr.as_bytes())
+        )
+    }
+    Ok(git_output(root, &["rev-parse", "HEAD"]))
 }
 
 fn allocate_id(root: &Path, prefix: &str) -> String {
@@ -5875,6 +8295,302 @@ fn check_workspace_board(root: &Path) -> Result<(String, Value, Vec<String>, Opt
             warnings.len()
         ),
         json!({"valid": true, "stories": stories.len(), "members": members}),
+        warnings,
+        None,
+    ))
+}
+
+/// How far back `board reconcile` reads history for landed implementation.
+///
+/// The failure this catches is hours old, not months — a story dispatched again while its work was
+/// already committed — so a fixed depth keeps one `git log` bounded on a long history. A scan that
+/// reaches the ceiling says so rather than reporting a partial answer as complete.
+const RECONCILE_HISTORY_DEPTH: usize = 500;
+
+/// How many landed commits one finding cites before it just counts the rest.
+const RECONCILE_COMMITS_PER_FINDING: usize = 5;
+
+/// The board's own documents. A commit confined to these is the status record, not the work.
+const RECONCILE_BOARD_PREFIX: &str = "docs/stories/";
+
+/// Record and field separators for the single `git log` pass. ASCII 0x1e/0x1f cannot appear in a
+/// path and are vanishingly unlikely in a commit message, so one bounded call yields hash, subject,
+/// body and file list without a delimiter a message could forge.
+const RECONCILE_RECORD_SEPARATOR: char = '\u{1e}';
+const RECONCILE_FIELD_SEPARATOR: char = '\u{1f}';
+
+/// One commit from the scanned history, with its message and how its files divide.
+struct HistoryCommit {
+    hash: String,
+    subject: String,
+    /// Subject and body together, so an item named only in a trailer still matches.
+    message: String,
+    /// Files outside the board's own directory: the implementation, if this commit carries any.
+    work_files: usize,
+}
+
+/// Split one `git log` pass into commits and divide each one's files from the board's own.
+fn parse_history_records(stdout: &str) -> Vec<HistoryCommit> {
+    let mut commits = Vec::new();
+    for record in stdout.split(RECONCILE_RECORD_SEPARATOR) {
+        let mut fields = record.splitn(4, RECONCILE_FIELD_SEPARATOR);
+        let (Some(hash), Some(subject), Some(body), Some(files)) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let hash = hash.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        let work_files = files
+            .lines()
+            .map(str::trim)
+            .filter(|path| !path.is_empty() && !path.starts_with(RECONCILE_BOARD_PREFIX))
+            .count();
+        commits.push(HistoryCommit {
+            hash: hash.to_string(),
+            subject: subject.trim().to_string(),
+            message: format!("{subject}\n{body}"),
+            work_files,
+        });
+    }
+    commits
+}
+
+/// Read a bounded slice of `root`'s history, newest first, and say whether it hit the ceiling.
+///
+/// `None` means there is no readable history here at all — an unborn branch or a directory that is
+/// not a repository. That is a fact worth reporting, not a reason to fail the whole verb, so the
+/// caller degrades to the evidence that needs no history.
+fn read_reconcile_history(root: &Path, depth: usize) -> Option<(Vec<HistoryCommit>, bool)> {
+    let limit = depth.to_string();
+    let format = format!(
+        "--format={RECONCILE_RECORD_SEPARATOR}%H{RECONCILE_FIELD_SEPARATOR}%s{RECONCILE_FIELD_SEPARATOR}%b{RECONCILE_FIELD_SEPARATOR}"
+    );
+    let output = guarded_git(
+        root,
+        &[
+            "log",
+            "--no-merges",
+            "-n",
+            limit.as_str(),
+            "--name-only",
+            format.as_str(),
+            "HEAD",
+        ],
+    )
+    .ok()
+    .filter(|output| output.exit_code == 0)?;
+    let commits = parse_history_records(&output.stdout);
+    let truncated = commits.len() >= depth;
+    Some((commits, truncated))
+}
+
+/// Is `id` named as a whole token in `text`?
+///
+/// Ids share prefixes by construction, so a substring search finds `C-63` inside `C-637` and
+/// reports the wrong item — and a wrong finding is worse than none, because the repair it suggests
+/// is a status lie. `/` is not part of a token, so the workspace spelling `member/C-637` still
+/// names the item its own repository calls `C-637`.
+fn names_item(text: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let in_token = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_';
+    text.match_indices(id).any(|(index, _)| {
+        let before = index.checked_sub(1).map(|previous| bytes[previous]);
+        let after = bytes.get(index + id.len()).copied();
+        !before.is_some_and(in_token) && !after.is_some_and(in_token)
+    })
+}
+
+/// Evidence that this item's work is already present while its status says it is outstanding.
+///
+/// Two independent signals, both derived from what the board already records:
+///
+/// - **`implementation-landed`** — a commit reachable from `HEAD` names the item *and* touches a
+///   path outside the board's own directory. Adding the item, flipping its status and re-rendering
+///   the marker region all name it and all land in `docs/stories/`; counting those as
+///   implementation would report every item on the board, which is the same as reporting none.
+/// - **`acceptance-complete`** — every checkbox under `## Acceptance` is ticked. It is the weaker
+///   signal and deliberately kept: it needs no history and no commit-message convention, so a
+///   repository with neither still gets an answer.
+///
+/// A `done` item is never a finding — its status and its tree already agree.
+fn already_present_evidence(
+    story: &Story,
+    local_id: &str,
+    history: &[HistoryCommit],
+) -> Vec<Value> {
+    if story.status == "done" {
+        return Vec::new();
+    }
+    let mut evidence = Vec::new();
+    let (ticked, _, total) = checkbox_counts(&story.body, "Acceptance");
+    if total > 0 && ticked == total {
+        evidence.push(json!({
+            "signal": "acceptance-complete",
+            "detail": format!("{ticked} of {total} Acceptance criteria ticked"),
+        }));
+    }
+    let landed = history
+        .iter()
+        .filter(|commit| commit.work_files > 0 && names_item(&commit.message, local_id))
+        .collect::<Vec<_>>();
+    for commit in landed.iter().take(RECONCILE_COMMITS_PER_FINDING) {
+        evidence.push(json!({
+            "signal": "implementation-landed",
+            "commit": commit.hash,
+            "subject": commit.subject,
+            "files": commit.work_files,
+        }));
+    }
+    if landed.len() > RECONCILE_COMMITS_PER_FINDING {
+        evidence.push(json!({
+            "signal": "implementation-landed",
+            "more_commits": landed.len() - RECONCILE_COMMITS_PER_FINDING,
+        }));
+    }
+    evidence
+}
+
+/// The shortest profile-valid transition path from `status` to `done`.
+///
+/// The repair is a transition, so the report has to name one the state machine will accept. Every
+/// step here is checked against [`valid_planning_transition`] by test rather than restated beside
+/// it, because two copies of a state machine are how they drift apart.
+fn path_to_done(status: &str) -> Vec<&'static str> {
+    match status {
+        "backlog" => vec!["ready", "in-progress", "done"],
+        "ready" => vec!["in-progress", "done"],
+        "in-progress" | "blocked" => vec!["done"],
+        _ => Vec::new(),
+    }
+}
+
+/// Split a board id into the member whose history holds its work and the id that member uses.
+///
+/// A workspace item is `member/ID` and the commit that implemented it lives in that member's
+/// repository, not in the workspace root. An empty member means "this root".
+fn reconcile_member_split(id: &str, workspace: bool) -> (&str, &str) {
+    match id.split_once('/') {
+        Some((member, local)) if workspace => (member, local),
+        _ => ("", id),
+    }
+}
+
+/// `board reconcile`: items whose work is already present while their status says otherwise.
+///
+/// Read-only by construction. The fix is a transition anyone can make once they know, so each
+/// finding names the evidence that fired and the profile-valid path that would close it, and the
+/// verb itself writes nothing — which is what makes it safe to run from a coordinator loop.
+fn reconcile_board(
+    command: &BoardCommand,
+    root: &Path,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let stories = read_board_items(command, root)?;
+    let workspace = command.scope() == BoardScopeArg::Workspace && command.board.is_none();
+    let outstanding = stories
+        .iter()
+        .filter(|story| story.status != "done")
+        .collect::<Vec<_>>();
+
+    let mut warnings = Vec::new();
+    let mut histories: BTreeMap<String, Vec<HistoryCommit>> = BTreeMap::new();
+    let members = outstanding
+        .iter()
+        .map(|story| reconcile_member_split(&story.id, workspace).0.to_string())
+        .collect::<BTreeSet<_>>();
+    for member in members {
+        let member_root = if member.is_empty() {
+            root.to_path_buf()
+        } else {
+            member_root(root, &member)?
+        };
+        let label = if member.is_empty() {
+            display_path(&member_root)
+        } else {
+            member.clone()
+        };
+        match read_reconcile_history(&member_root, RECONCILE_HISTORY_DEPTH) {
+            Some((history, truncated)) => {
+                if truncated {
+                    warnings.push(format!(
+                        "{label}: history scan stopped at {RECONCILE_HISTORY_DEPTH} commits; \
+                         implementation older than that is not visible to this report"
+                    ));
+                }
+                histories.insert(member, history);
+            }
+            None => {
+                warnings.push(format!(
+                    "{label}: no readable git history; only acceptance evidence is available"
+                ));
+                histories.insert(member, Vec::new());
+            }
+        }
+    }
+
+    let mut findings = Vec::new();
+    for story in &outstanding {
+        let (member, local_id) = reconcile_member_split(&story.id, workspace);
+        let history = histories.get(member).map(Vec::as_slice).unwrap_or_default();
+        let evidence = already_present_evidence(story, local_id, history);
+        if evidence.is_empty() {
+            continue;
+        }
+        let signals = evidence
+            .iter()
+            .filter_map(|entry| entry["signal"].as_str())
+            .collect::<BTreeSet<_>>();
+        findings.push(json!({
+            "id": story.id,
+            "title": story.title,
+            "status": story.status,
+            "file": story.file,
+            "signals": signals,
+            "evidence": evidence,
+            "transition_path": path_to_done(&story.status),
+        }));
+    }
+
+    let summary = format!(
+        "{} of {} outstanding item(s) already have work present",
+        findings.len(),
+        outstanding.len()
+    );
+    let rows = findings
+        .iter()
+        .map(|finding| {
+            format!(
+                "{}\t{}\t{}",
+                finding["id"].as_str().unwrap_or_default(),
+                finding["status"].as_str().unwrap_or_default(),
+                finding["signals"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .collect::<Vec<_>>();
+    let human = if rows.is_empty() {
+        summary
+    } else {
+        format!("{}\n\n{summary}", rows.join("\n"))
+    };
+    Ok((
+        human,
+        json!({
+            "findings": findings,
+            "outstanding": outstanding.len(),
+            "items": stories.len(),
+            "history_depth": RECONCILE_HISTORY_DEPTH,
+        }),
         warnings,
         None,
     ))
@@ -6877,6 +9593,7 @@ fn board_call(
             ))
         }
         "check" if request.is_none() => check_board(root),
+        "reconcile" if request.is_none() => reconcile_board(command, root),
         "schema" => Ok((
             String::new(),
             family_schema("board", board_operations()),
@@ -7207,12 +9924,14 @@ fn read_workspace_member_stories(workspace: &Path, member: &WorkspaceMember) -> 
     if git_output(&root, &["rev-parse", "--verify", &verified]).is_none() {
         return read_stories(&root);
     }
+    // `-l` adds each blob's size, which is what lets the reads below be batched to a budget
+    // instead of one process per file.
     let listing = guarded_git(
         &root,
         &[
             "ls-tree",
             "-r",
-            "--name-only",
+            "-l",
             &member.canonical_ref,
             "--",
             "docs/stories",
@@ -7225,35 +9944,64 @@ fn read_workspace_member_stories(workspace: &Path, member: &WorkspaceMember) -> 
             member.canonical_ref
         )
     }
-    let mut paths = listing
+    // `<mode> <type> <oid> <size>\t<path>`
+    let mut sized = listing
         .stdout
         .lines()
-        .filter(|path| {
-            path.ends_with(".md")
-                && !path.ends_with("/README.md")
-                && !path.ends_with("/_TEMPLATE.md")
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            if !path.ends_with(".md")
+                || path.ends_with("/README.md")
+                || path.ends_with("/_TEMPLATE.md")
+            {
+                return None;
+            }
+            let size = meta.split_whitespace().nth(3)?.parse::<usize>().ok()?;
+            Some((size, path))
         })
         .collect::<Vec<_>>();
-    paths.sort_unstable();
-    let mut stories = Vec::new();
-    for path in paths {
-        let object = format!("{}:{path}", member.canonical_ref);
-        let output = guarded_git(&root, &["show", &object])?;
-        if output.exit_code != 0 {
-            bail!(
-                "validation/gate: cannot read workspace member {} item {} at {}",
-                member.id,
-                path,
-                member.canonical_ref
-            )
-        }
-        let file = Path::new(path)
+    sized.sort_unstable_by_key(|(_, path)| *path);
+
+    let file_name = |path: &str| {
+        Path::new(path)
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
-            .into_owned();
-        if let Some(story) = story_from_body(file, output.stdout) {
-            stories.push(story);
+            .into_owned()
+    };
+    let unreadable = |path: &str| {
+        anyhow::anyhow!(
+            "validation/gate: cannot read workspace member {} item {} at {}",
+            member.id,
+            path,
+            member.canonical_ref
+        )
+    };
+
+    let mut stories = Vec::new();
+    for chunk in size_bounded_chunks(&sized) {
+        match git_cat_file_batch(&root, &member.canonical_ref, &chunk) {
+            Some(blobs) => {
+                for (path, blob) in chunk.iter().zip(blobs) {
+                    let body = blob.ok_or_else(|| unreadable(path))?;
+                    if let Some(story) = story_from_body(file_name(path), body) {
+                        stories.push(story);
+                    }
+                }
+            }
+            // Framing did not line up. Correctness over speed: read each object on its own.
+            None => {
+                for path in chunk {
+                    let object = format!("{}:{path}", member.canonical_ref);
+                    let output = guarded_git(&root, &["show", &object])?;
+                    if output.exit_code != 0 {
+                        return Err(unreadable(path));
+                    }
+                    if let Some(story) = story_from_body(file_name(path), output.stdout) {
+                        stories.push(story);
+                    }
+                }
+            }
         }
     }
     Ok(stories)
@@ -7326,6 +10074,51 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
     if let Some(instructions) = &config.main.instructions {
         confined_config_file(root, instructions, "main instructions")?;
     }
+    if let Some(agent_loop) = &config.main.agent_loop {
+        confined_config_file(root, agent_loop, "main coordinator loop")?;
+    }
+    if let Some(research_loop) = &config.main.research_loop {
+        confined_config_file(root, research_loop, "main research loop")?;
+    }
+    for (profile_id, profile) in &config.loop_profiles {
+        flux_datasource::board::BoardId::new(profile_id)
+            .map_err(|error| anyhow::anyhow!("input/schema: loop profile {error}"))?;
+        if profile.revision.trim().is_empty() || profile.entry.trim().is_empty() {
+            bail!(
+                "input/schema: Fleet loop profile {profile_id} requires non-empty revision and entry"
+            )
+        }
+        let source = read_configured_instructions(
+            root,
+            &profile.source,
+            &format!("Fleet loop profile {profile_id}"),
+        )?;
+        flux_agent::AgentLoopBinding::native_flux_with_features(
+            profile_id,
+            &profile.revision,
+            format!(
+                "fleet-profile:{profile_id}@{}:{}",
+                profile.revision,
+                display_path(&profile.source)
+            ),
+            &profile.entry,
+            source,
+            profile.required_runtime_features.clone(),
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("validation/gate: Fleet loop profile {profile_id}: {error}")
+        })?;
+    }
+    for (task_kind, profile_id) in &config.loop_policy {
+        if task_kind.trim().is_empty() || profile_id.trim().is_empty() {
+            bail!("input/schema: Fleet loop policy keys and profile ids cannot be empty")
+        }
+        if !config.loop_profiles.contains_key(profile_id) {
+            bail!(
+                "validation/gate: Fleet loop policy `{task_kind}` names missing profile `{profile_id}`"
+            )
+        }
+    }
     let mut template_ids = BTreeSet::new();
     for template in &config.agent_templates {
         flux_datasource::board::BoardId::new(&template.id)
@@ -7342,6 +10135,13 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
                 template.id
             )
         }
+        if !config.loop_policy.contains_key(template.task_kind.trim()) {
+            bail!(
+                "validation/gate: agent template {} task kind `{}` has no explicit loop policy binding",
+                template.id,
+                template.task_kind
+            )
+        }
         if !(1..=config.max_workers).contains(&template.max_instances) {
             bail!(
                 "input/schema: agent template {} max_instances must be 1..={} ",
@@ -7354,7 +10154,12 @@ fn read_fleet_config(root: &Path) -> Result<FleetConfig> {
             &template.instructions,
             &format!("agent template {} instructions", template.id),
         )?;
-        normalize_worker_capabilities(template.mode, &template.capabilities).map_err(|error| {
+        normalize_worker_capabilities_for(
+            template.mode,
+            &template.capabilities,
+            template.task_kind.trim(),
+        )
+        .map_err(|error| {
             let message = error.to_string();
             let detail = message
                 .strip_prefix("validation/gate: ")
@@ -7807,12 +10612,23 @@ fn write_fleet_state(root: &Path, state: &FleetState) -> Result<()> {
                     .map_err(|error| flux_core::Error::Other(error.to_string()))?;
                 let mut current_core = current_state.clone();
                 current_core.idempotency.clear();
-                if current_state.revision > desired_revision
-                    || (current_state.revision == desired_revision && current_core != desired_core)
-                {
+                // Two different failures, and they used to print the same sentence. The equal-revision
+                // case rendered as `stale fleet revision 392; current revision is 392`, which reads as
+                // a contradiction and tells the reader nothing about what to do — it cost real time to
+                // work out that a concurrent writer had already produced that revision with different
+                // content, and that retrying from a fresh read is the whole remedy.
+                if current_state.revision > desired_revision {
                     return Err(flux_core::Error::Other(format!(
-                        "stale fleet revision {desired_revision}; current revision is {}",
+                        "stale fleet revision {desired_revision}; current revision is {} — re-read the \
+                         state and recompute this mutation",
                         current_state.revision
+                    )));
+                }
+                if current_state.revision == desired_revision && current_core != desired_core {
+                    return Err(flux_core::Error::Other(format!(
+                        "lost update at fleet revision {desired_revision}: another writer already \
+                         produced this revision with different content, so this mutation was computed \
+                         against a state that no longer exists — re-read and retry"
                     )));
                 }
             }
@@ -7829,6 +10645,42 @@ fn write_fleet_state(root: &Path, state: &FleetState) -> Result<()> {
     }
     Ok(())
 }
+
+/// How long to keep trying for the state reservation before giving up.
+///
+/// A held reservation is not a conflict, it is a queue: the other writer is mid-write and will be done in
+/// microseconds. Distinguishing the two is the whole point — a *content* conflict means this mutation was
+/// computed against a state that no longer exists and must be recomputed, while a *reservation* conflict
+/// means nothing except "not yet". The old code told the caller to retry and then had no one do it, so a
+/// handoff simply failed; at width every worker reaches handoff at once, which turns a microsecond of
+/// contention into a lost delivery.
+const FLEET_STATE_RESERVATION_ATTEMPTS: usize = 200;
+const FLEET_STATE_RESERVATION_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// [`write_fleet_state`], waiting out a reservation another writer holds.
+fn write_fleet_state_waiting(root: &Path, state: &FleetState) -> Result<()> {
+    let mut last = None;
+    for attempt in 0..FLEET_STATE_RESERVATION_ATTEMPTS {
+        match write_fleet_state(root, state) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                // Only reservation contention is worth waiting out. A stale revision or a lost update means
+                // the mutation itself is out of date, and sleeping cannot make it current — that is the
+                // caller's problem to solve by recomputing, which is what the rebase helpers do.
+                if !error.to_string().contains("holds the state reservation") {
+                    return Err(error);
+                }
+                last = Some(error);
+                if attempt + 1 < FLEET_STATE_RESERVATION_ATTEMPTS {
+                    std::thread::sleep(FLEET_STATE_RESERVATION_BACKOFF);
+                }
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        anyhow::anyhow!("conflict/precondition: fleet state reservation stayed held")
+    }))
+}
 fn append_fleet_event(root: &Path, kind: &str, data: Value) -> Result<()> {
     let data = redact_value(data);
     let line = format!(
@@ -7844,6 +10696,54 @@ fn append_fleet_event(root: &Path, kind: &str, data: Value) -> Result<()> {
     }
     Ok(())
 }
+/// Persist a mutation expressed as a DELTA, re-applying it if another writer wins the race.
+///
+/// The delta form is the whole point, and getting it wrong is instructive. Rebasing at record level —
+/// recompute my copy of the wave, then insert that copy onto fresh state — looks equivalent and is not: a
+/// wave record contains every story, so replacing it wholesale discards the sibling stories other workers
+/// updated in the same instant. Four concurrent handoffs each reported success and the wave ended holding
+/// one, because last writer won the whole record.
+///
+/// So the caller supplies `apply`, which performs its change against whatever state it is handed. The loop
+/// reads current state, applies the delta to THAT, and writes; on a compare-and-set failure it reads again
+/// and re-applies. Both failure branches are recomputable for the same reason: they mean the state moved,
+/// and neither is fixed by waiting.
+///
+/// Reserved for mutations that are genuinely re-appliable. Re-running an action that has already created
+/// worktrees or spent a gate would be far worse than losing its record, which is why integration rebases
+/// its own record instead of routing through here.
+fn persist_delta_mutation(
+    command: &FleetCommand,
+    root: &Path,
+    state: &mut FleetState,
+    kind: &str,
+    data: Value,
+    mut apply: impl FnMut(&mut FleetState) -> Result<()>,
+) -> Result<()> {
+    const ATTEMPTS: usize = 12;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            if let Ok(latest) = read_fleet_state(root) {
+                *state = latest;
+            }
+        }
+        apply(state)?;
+        state.revision += 1;
+        match persist_fleet_mutation(command, root, state, kind, data.clone()) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                let recomputable =
+                    message.contains("lost update") || message.contains("stale fleet revision");
+                if !recomputable || attempt + 1 == ATTEMPTS {
+                    return Err(error);
+                }
+            }
+        }
+    }
+    unreachable!("the loop returns on its final attempt")
+}
+
 fn persist_fleet_mutation(
     command: &FleetCommand,
     root: &Path,
@@ -7852,7 +10752,7 @@ fn persist_fleet_mutation(
     data: Value,
 ) -> Result<()> {
     if !command.dry_run {
-        write_fleet_state(root, state)?;
+        write_fleet_state_waiting(root, state)?;
         append_fleet_event(root, kind, data)?;
     }
     Ok(())
@@ -7890,17 +10790,109 @@ struct AgentTurnSpec {
     read_roots: Vec<PathBuf>,
     store: PathBuf,
     model: Option<String>,
+    agent_loop: Option<String>,
+    /// Internal receipt path paired with `agent_loop`; lets the child reconstruct the admitted
+    /// profile/revision/digest instead of re-identifying the snapshot as a fresh inline loop.
+    agent_loop_binding: Option<String>,
     instructions: String,
     request: String,
-    resume: bool,
+    resume_session: Option<String>,
     enforce_operation_ceiling: bool,
     admitted_operations: Vec<String>,
     capability_set: Value,
     shell_capability: bool,
     context_origin: Value,
+    /// Attach this turn as the dedicated wave integrator, selecting the closed two-operation
+    /// assemble/read catalogue. Mutually exclusive with the `main` coordinator attachment, which is
+    /// keyed on `id` — the child refuses if both are requested.
+    fleet_integrator: bool,
 }
 
-const DEFAULT_STORY_CAPABILITIES: [&str; 4] = ["read", "edit", "git", "shell"];
+/// What a story writer gets when no template narrows it further.
+///
+/// **No `shell`.** `bash` and `proc.run` take argv verbatim and never resolve through
+/// `Workspace::resolve*`, so one call defeats the whole ceiling — fences, typed effects,
+/// `permission_subjects` and the operation allow-list are all bypassable through arbitrary argv. And
+/// because the OS sandbox never restricts reads (Linux binds `--ro-bind / /`; macOS uses
+/// `(allow default)` and denies only `file-write*`/`network*`), the workspace guard is the *only* read
+/// guard — so a writer holding shell has unbounded read authority over the whole host, not merely its
+/// worktree.
+///
+/// Targeted validation is served by the typed toolchain bundles (`rust`, `node`, …), which carry real
+/// schemas and structured results. A template may still declare `shell` explicitly; this narrows the
+/// default, it does not remove the capability from the vocabulary.
+/// Every capability bundle name [`capability_operations`] resolves. Kept beside it and pinned by a
+/// drift test, because loop validation needs to reason about the *maximal* grantable ceiling and a
+/// bundle added without being listed here would silently narrow that reasoning.
+const CAPABILITY_BUNDLES: [&str; 12] = [
+    "read",
+    "edit",
+    "git-read",
+    "git",
+    "shell",
+    TOOLCHAIN_CAPABILITY,
+    "rust",
+    "node",
+    "go",
+    "python",
+    "make",
+    "task",
+];
+
+/// The language-neutral validation capability (C-605).
+///
+/// A template that names `rust` is wrong the moment a member repository is not Rust, and Fleet
+/// instruction prose that enumerates `cargo_check`/`npm` is wrong in exactly the same way. Declaring
+/// `toolchain` says *what* the worker needs — the ability to validate the repository it was assigned —
+/// and [`toolchain_bundles_in`] answers *which* operations that is, from the assigned checkout.
+const TOOLCHAIN_CAPABILITY: &str = "toolchain";
+
+/// Toolchain bundles and the workspace-root marker whose presence surfaces each one.
+///
+/// `flux-tools` gates every toolchain group on a project signal that `flux_runtime::detect_signals`
+/// emits from exactly these markers, so an operation from an unmarked bundle is registered and never
+/// advertised. Granting it anyway is not harmless: `ai_segment` refuses a `tools:` entry the live
+/// ceiling does not contain, so a segment already holding an assignment dies mid-run on "tools outside
+/// the live capability ceiling".
+///
+/// `rust` belongs here with the rest. `cargo_*` is gated on `Cargo.toml` by the same mechanism as
+/// `npm` on `package.json`; treating it as unconditional was an assumption about which repositories a
+/// Fleet contains, not a property of the surfacing rule.
+const TOOLCHAIN_MARKERS: [(&str, &[&str]); 5] = [
+    ("rust", &["Cargo.toml"]),
+    ("node", &["package.json"]),
+    ("python", &["pyproject.toml", "requirements.txt"]),
+    ("go", &["go.mod"]),
+    ("make", &["Makefile", "makefile"]),
+];
+
+/// Whether `bundle` is a toolchain bundle whose marker is absent from `repository_root`.
+///
+/// Non-toolchain bundles (`read`, `git`, …) are never repository-conditional, so they answer `false`.
+fn toolchain_bundle_is_unsurfaced(repository_root: &Path, bundle: &str) -> bool {
+    TOOLCHAIN_MARKERS
+        .iter()
+        .find(|(name, _)| *name == bundle)
+        .is_some_and(|(_, markers)| {
+            !markers
+                .iter()
+                .any(|marker| repository_root.join(marker).exists())
+        })
+}
+
+/// The toolchain bundles `repository_root` actually surfaces, or all of them when no repository is
+/// known (config validation and template-less task kinds must not narrow a ceiling they cannot probe).
+fn toolchain_bundles_in(repository_root: Option<&Path>) -> Vec<&'static str> {
+    TOOLCHAIN_MARKERS
+        .iter()
+        .map(|(bundle, _)| *bundle)
+        .filter(|bundle| {
+            repository_root.is_none_or(|root| !toolchain_bundle_is_unsurfaced(root, bundle))
+        })
+        .collect()
+}
+
+const DEFAULT_STORY_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
 const REQUIRED_WRITER_CAPABILITIES: [&str; 3] = ["read", "edit", "git"];
 const AGENT_LOOP_MACHINERY_OPERATIONS: [&str; 9] = [
     "detect_intent",
@@ -7918,6 +10910,12 @@ fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
     Some(match name {
         "read" => &[
             "read",
+            // Batched reads belong in the same bundle as `read`, and their absence was a measured
+            // cost, not a theoretical one: wave-302's worker was instructed to "read them together
+            // rather than issuing sequential single reads", had no operation that could, and spent 30
+            // of its 60 model rounds on one-file-at-a-time reads — finishing with three rounds of
+            // headroom. A round is a provider call, so a missing batch operation is a budget leak.
+            "read_many",
             "glob",
             "grep",
             "search",
@@ -7947,6 +10945,24 @@ fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
             "git_branch",
         ],
         "shell" => &["bash", "proc.run"],
+        // The repository-neutral union. `normalize_worker_capabilities_in` narrows it to the bundles
+        // the ASSIGNED checkout surfaces; this resolution answers only "what could `toolchain` ever
+        // mean", which is what `maximal_task_kind_operations` and config validation need.
+        TOOLCHAIN_CAPABILITY => &[
+            "cargo_check",
+            "cargo_build",
+            "cargo_test",
+            "cargo_clippy",
+            "cargo_fmt",
+            "npm",
+            "node_run",
+            "go_build",
+            "go_test",
+            "go_vet",
+            "python_run",
+            "pytest",
+            "make",
+        ],
         "rust" => &[
             "cargo_check",
             "cargo_build",
@@ -7963,9 +10979,52 @@ fn capability_operations(name: &str) -> Option<&'static [&'static str]> {
     })
 }
 
+/// Derive the admitted operation set for a task kind, on top of the capability bundles.
+///
+/// Native Fleet services are deliberately outside `capability_operations` — they are host-installed
+/// catalogues, not workspace tool bundles, exactly as the coordinator's are. The integration kind is
+/// the operator's explicit declaration that this agent assembles waves, so its two operations join
+/// the admitted set; without this the authored integrator loop names operations the ceiling does not
+/// contain and admission refuses.
+fn task_kind_native_operations(task_kind: &str) -> Vec<String> {
+    if task_kind == FLEET_INTEGRATION_TASK_KIND {
+        NATIVE_INTEGRATOR_OPERATIONS
+            .into_iter()
+            .map(|operation| operation.name().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
 fn normalize_worker_capabilities(
     mode: FleetTaskMode,
     requested: &[String],
+) -> Result<(Vec<String>, Vec<String>)> {
+    normalize_worker_capabilities_for(mode, requested, default_fleet_task_kind().as_str())
+}
+
+fn normalize_worker_capabilities_for(
+    mode: FleetTaskMode,
+    requested: &[String],
+    task_kind: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    normalize_worker_capabilities_in(mode, requested, task_kind, None)
+}
+
+/// [`normalize_worker_capabilities_for`] against the repository the worker is actually assigned to.
+///
+/// `repository_root` is the checkout the worker will run in. Toolchain bundles resolve from it rather
+/// than being granted uniformly (C-605), so one shared template declaring `toolchain` is correct in a
+/// Rust repository, a Node one and a mixed one — and a repository with no Cargo manifest never
+/// receives `cargo_*`. `None` means "no assigned repository", which keeps the grant maximal: config
+/// validation and template-less task kinds must reason about what *could* be granted, not narrow a
+/// ceiling they cannot probe.
+fn normalize_worker_capabilities_in(
+    mode: FleetTaskMode,
+    requested: &[String],
+    task_kind: &str,
+    repository_root: Option<&Path>,
 ) -> Result<(Vec<String>, Vec<String>)> {
     let mut capabilities = requested
         .iter()
@@ -8002,6 +11061,1154 @@ fn normalize_worker_capabilities(
 
     let mut operations = capabilities
         .iter()
+        .flat_map(|capability| {
+            if capability == TOOLCHAIN_CAPABILITY {
+                // Expand the neutral capability to the bundles this repository surfaces, so the
+                // declaration carries no language name at all.
+                return toolchain_bundles_in(repository_root)
+                    .into_iter()
+                    .flat_map(|bundle| capability_operations(bundle).unwrap_or_default())
+                    .copied()
+                    .collect::<Vec<_>>();
+            }
+            // An explicitly named language bundle is narrowed by the same probe: naming `rust`
+            // cannot conjure a toolchain the assigned checkout does not surface.
+            if repository_root
+                .is_some_and(|root| toolchain_bundle_is_unsurfaced(root, capability.as_str()))
+            {
+                return Vec::new();
+            }
+            capability_operations(capability)
+                .unwrap_or_default()
+                .to_vec()
+        })
+        .map(|operation| operation.to_string())
+        .collect::<Vec<_>>();
+    operations.extend(
+        AGENT_LOOP_MACHINERY_OPERATIONS
+            .iter()
+            .map(|operation| (*operation).to_string()),
+    );
+    operations.extend(task_kind_native_operations(task_kind));
+    operations.sort();
+    operations.dedup();
+    Ok((capabilities, operations))
+}
+
+/// Analyze every loop binding Fleet policy can select, and reconcile each against the ceiling of the
+/// templates bound to it — at `fleet validate` time, on the operator's terminal.
+///
+/// Before this, `fleet validate` asserted only that `.flux/fleet.toml` existed, so an authored loop
+/// carrying a static defect was first refused inside a *spawned worker*. The coordinator surfaces a
+/// child's stderr as `emitted an invalid event stream`, which buried the real diagnostic under
+/// startup notes and cost several waves before anyone read to the end of the line.
+///
+/// Analysis runs against the full built-in registry deliberately. That is a superset of any worker's
+/// live surface, so an operation missing from it truly does not exist and there are no false
+/// positives from workspace-conditional groups. The converse is NOT covered here: the non-Rust
+/// toolchain groups surface only on a root signal (`node` on `package.json`, `python` on
+/// `pyproject.toml`, `go` on `go.mod`), so a loop may name an operation this check accepts and the
+/// assigned repository never installs. That failure still appears at runtime as "tools outside the
+/// live capability ceiling".
+fn validate_fleet_loop_bindings(
+    root: &Path,
+    config: &FleetConfig,
+    errors: &mut Vec<String>,
+) -> Vec<Value> {
+    let registry = match fleet_loop_analysis_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            errors.push(format!(
+                "loop analysis registry failed to assemble: {error:#}"
+            ));
+            return Vec::new();
+        }
+    };
+    let mut analyzed = Vec::new();
+    let mut toolchain_checked = BTreeSet::new();
+    for (task_kind, profile_id) in &config.loop_policy {
+        let binding = match resolve_fleet_loop_binding(root, config, task_kind) {
+            Ok(binding) => binding,
+            Err(error) => {
+                errors.push(format!(
+                    "loop policy `{task_kind}` -> `{profile_id}` did not resolve: {error:#}"
+                ));
+                continue;
+            }
+        };
+        // A loop is only admissible through the templates that can actually select it, so reconcile
+        // each one's ceiling rather than the union: a single template missing an operation is a
+        // dispatch that would die mid-turn. The union of those ceilings is also what may be assumed
+        // during analysis — a granted operation is real even when no static registry can hold it.
+        let mut ceilings = Vec::new();
+        let mut assumed = std::collections::HashSet::new();
+        for template in config
+            .agent_templates
+            .iter()
+            .filter(|template| template.task_kind.trim() == task_kind.as_str())
+        {
+            match normalize_worker_capabilities_for(
+                template.mode,
+                &template.capabilities,
+                task_kind,
+            ) {
+                Ok((_, operations)) => {
+                    if let Err(error) =
+                        validate_loop_capability_compatibility(&binding, &operations)
+                    {
+                        errors.push(format!(
+                            "template `{}` cannot run loop profile `{profile_id}`: {error:#}",
+                            template.id
+                        ));
+                    } else {
+                        ceilings.push(json!({
+                            "template": template.id,
+                            "operation_count": operations.len(),
+                        }));
+                    }
+                    assumed.extend(operations);
+                }
+                Err(error) => errors.push(format!(
+                    "template `{}` has an invalid capability set: {error:#}",
+                    template.id
+                )),
+            }
+        }
+        // A task kind can carry a loop policy with no template bound to it — such a task is admitted
+        // ad hoc, with capabilities supplied by the request. Validation cannot know that ceiling, so
+        // it assumes the maximal grantable one and reports only operations no bundle could ever
+        // grant. Narrowing this to the empty set instead would fail every template-less task kind on
+        // operations that are, in fact, always available to it.
+        if ceilings.is_empty() {
+            assumed.extend(maximal_task_kind_operations(task_kind));
+        }
+        if let Err(error) = binding.validate_analysis(
+            &registry,
+            Vec::new(),
+            &assumed,
+            FLEET_LOOP_ANALYSIS_ITERATIONS,
+        ) {
+            errors.push(format!(
+                "loop profile `{profile_id}` (task kind `{task_kind}`) is not runnable: {error}"
+            ));
+            continue;
+        }
+        // Reported once per profile, not once per task kind: several kinds share one profile, and the
+        // repository surface does not vary between them.
+        let unsurfaced = unsurfaced_toolchain_operations(root, config, &binding);
+        if toolchain_checked.insert(profile_id.clone()) {
+            for (repository, operations) in &unsurfaced {
+                errors.push(format!(
+                    "loop profile `{profile_id}` names toolchain operation(s) repository \
+                     `{repository}` does not surface: {}",
+                    operations.join(", ")
+                ));
+            }
+        }
+        if !unsurfaced.is_empty() {
+            continue;
+        }
+        analyzed.push(json!({
+            "task_kind": task_kind,
+            "profile": profile_id,
+            "revision": binding.metadata().revision,
+            "required_operations": binding.metadata().required_operations,
+            "templates": ceilings,
+        }));
+    }
+    analyzed
+}
+
+/// Loop analysis only needs the `repeat` lowering to expand, not a realistic turn budget; a small
+/// bound keeps validation instant while still exercising every lowered node.
+const FLEET_LOOP_ANALYSIS_ITERATIONS: usize = 8;
+
+/// Every Board item a gated wave has already delivered, mapped to the wave that delivered it.
+///
+/// `green` and `applied` both count: `green` means the final gate passed on the assembled candidate, and
+/// `applied` means that candidate was additionally accepted and pinned. Neither state is reflected on
+/// the Board, so this is the only reliable answer to "has this already been built?".
+fn delivered_board_items(state: &FleetState) -> BTreeMap<String, String> {
+    let mut delivered = BTreeMap::new();
+    for (wave_id, wave) in &state.waves {
+        if !matches!(wave["status"].as_str(), Some("green" | "applied")) {
+            continue;
+        }
+        for item in wave["items"].as_array().into_iter().flatten() {
+            if let Some(item) = item.as_str() {
+                delivered.insert(item.to_string(), wave_id.clone());
+            }
+        }
+    }
+    delivered
+}
+
+/// The porcelain entries that represent the WORKER's uncommitted work, excluding Fleet's own artifacts.
+///
+/// Fleet snapshots the resolved loop binding into the worktree it hands over
+/// (`.flux/fleet/agent-loop.flux` + its receipt), so `git status --porcelain` reports `?? .flux/` in any
+/// repository whose ignore rules do not already cover it. `flux/.gitignore` happens to carry `.flux/*`;
+/// flux-exchange does not — so the same worker behaviour was clean in one repository and "dirty" in
+/// another. That refused a handoff for three fully committed stories (C-624).
+///
+/// Excluding the prefix is sound rather than merely convenient: `.flux/fleet/**` is a standing fence for
+/// story workers, so a worker writing there is already a fence violation caught elsewhere, and anything
+/// it legitimately produces lives outside that prefix.
+fn worker_dirt(porcelain: &str) -> Vec<&str> {
+    porcelain
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| {
+            let path = line.get(3..).unwrap_or("").trim();
+            !(path == ".flux" || path == ".flux/" || path.starts_with(".flux/"))
+        })
+        .collect()
+}
+
+/// Regenerable build output that must never outlive the wave that produced it.
+const RECLAIMABLE_BUILD_DIRS: [&str; 2] = ["target", "node_modules"];
+
+/// Reclaim a terminal wave's disk footprint without ever destroying work.
+///
+/// Unattended operation makes this mandatory rather than tidy. One session's 24 waves accumulated
+/// **66 GB** under the worktree root and took an 848 GB volume to zero bytes free, which broke the next
+/// dispatch with no Fleet event and an empty log. 65 of those 66 GB were `target/` and `node_modules`:
+/// `max_workers` story worktrees plus an integration worktree each build the same Rust workspace
+/// independently, and the integration worktree alone reached 27 GB because the final gate is a full
+/// release gate.
+///
+/// The rule is asymmetric on purpose. Build output is deleted unconditionally — it is reproducible from
+/// the commit, and the wave is finished with it. A *worktree* is only removed when it holds nothing:
+/// no uncommitted change, and no commit that is not already reachable from the repository's canonical
+/// ref. Anything else is left exactly where it is, because a worktree is the only place a worker's
+/// unfinished work exists (wave-299 held a complete six-file implementation that its turn never
+/// committed). Failure to reclaim is reported, never fatal: a full disk must not also block the apply
+/// that frees it.
+/// Land a wave's record on CURRENT state, rebasing when another writer moved on.
+///
+/// Integration is the longest operation the fleet performs — cherry-picks, a candidate preparation step and
+/// a full repository gate, tens of minutes from cold — and it writes state several times along the way.
+/// Any coordinator write inside that window lost the compare-and-set and threw the entire run away: a real
+/// integration died on `stale fleet revision 428; current revision is 429` after both gates had run, with
+/// the wave left mid-flight and every minute of gate time wasted.
+///
+/// Rebasing is safe here for the same reason it is safe for dispatch: this function only ever replaces the
+/// record of ONE wave, and no other writer is touching that wave — the wave is owned by this integration
+/// for its duration, and ownership is recorded. Retrying the whole operation instead would be wrong,
+/// because it would re-run a gate that has already produced its verdict.
+fn commit_wave_record(state: &mut FleetState, root: &Path, wave_id: &str, wave: &Value) {
+    commit_records(state, root, &[(wave_id.to_string(), wave.clone())], &[]);
+}
+
+/// Land specific wave and agent records on CURRENT state, rebasing when another writer moved on.
+///
+/// The general form of [`commit_wave_record`], and the reason it generalises safely is the same: an
+/// operation owns the entities it is reporting on. A handoff owns one story's wave record and the worker
+/// that produced it; a turn owns one agent's record. No other writer touches those keys while the
+/// operation runs, so replacing them on a newer state loses nothing and preserves whatever else arrived.
+///
+/// This matters at width. A lost compare-and-set already discarded a dispatch and a completed integration
+/// with a single worker running; N workers reaching handoff together is precisely the contention this
+/// removes. What it deliberately does NOT do is retry the operation — re-running an action that has
+/// already created worktrees or spent a gate is worse than losing its record.
+///
+/// Deliberately not applied to `fleet.started`/`fleet.stopped`: those flip a global flag rather than an
+/// entity, so two racing callers are a genuine conflict an operator should hear about, not a write to
+/// reconcile.
+fn commit_records(
+    state: &mut FleetState,
+    root: &Path,
+    waves: &[(String, Value)],
+    agents: &[(String, Value)],
+) {
+    if let Ok(latest) = read_fleet_state(root) {
+        if latest.revision > state.revision {
+            *state = latest;
+        }
+    }
+    for (id, record) in waves {
+        state.waves.insert(id.clone(), record.clone());
+    }
+    for (id, record) in agents {
+        state.agents.insert(id.clone(), record.clone());
+    }
+    state.revision += 1;
+}
+
+/// Is this wave finished for good, so that its worktrees are no longer structure it needs?
+fn wave_worktrees_are_removable(status: &str) -> bool {
+    matches!(status, "applied" | "cancelled")
+}
+
+/// Does this wave still hold a claim on the items it was dispatched for?
+///
+/// A wave that finished for good — accepted and applied, or cancelled — has released them, and one of
+/// its items appearing in a newer wave is the system working. Anything else still holds its attempt,
+/// so the SAME item in two of them is one story being implemented twice. That happened: four separate
+/// waves each held an attempt at the same story, and noticing it took reading `state.json` by hand.
+fn wave_still_claims_items(status: &str) -> bool {
+    !wave_worktrees_are_removable(status)
+}
+
+/// One worktree a wave's topology names, with everything needed to judge it.
+struct WaveWorktree {
+    repository: String,
+    /// `integration`, `verify`, or the story's BoardRef.
+    role: String,
+    branch: Option<String>,
+    worktree: PathBuf,
+    source: PathBuf,
+    canonical_ref: String,
+    base_commit: Option<String>,
+}
+
+/// Every worktree a wave's topology names: one per story, plus each repository's integration and
+/// verify checkouts.
+///
+/// Shared by reclamation and `fleet doctor` deliberately. Both answer questions about a wave's
+/// structure, and a health check that walked a different set than the reclaimer would report healthy
+/// exactly the worktree the other had removed — or stay silent about the one it never looked at.
+fn wave_worktrees(wave: &Value) -> Vec<WaveWorktree> {
+    let mut named = Vec::new();
+    for repository in wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let id = repository["id"].as_str().unwrap_or_default();
+        let source = PathBuf::from(repository["source_root"].as_str().unwrap_or_default());
+        let canonical_ref = repository["canonical_ref"]
+            .as_str()
+            .unwrap_or("origin/main");
+        let base_commit = repository["base_commit"].as_str();
+        let entries = repository["stories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|story| {
+                (
+                    story["board_ref"].as_str().unwrap_or("story"),
+                    story["worktree"].as_str(),
+                    story["branch"].as_str(),
+                )
+            })
+            .chain(std::iter::once((
+                "integration",
+                repository["integration"]["worktree"].as_str(),
+                repository["integration"]["branch"].as_str(),
+            )))
+            .chain(std::iter::once((
+                "verify",
+                repository["verify"]["worktree"].as_str(),
+                repository["verify"]["branch"].as_str(),
+            )))
+            .collect::<Vec<_>>();
+        for (role, worktree, branch) in entries {
+            let Some(worktree) = worktree else {
+                continue;
+            };
+            named.push(WaveWorktree {
+                repository: id.to_string(),
+                role: role.to_string(),
+                branch: branch.map(str::to_string),
+                worktree: PathBuf::from(worktree),
+                source: source.clone(),
+                canonical_ref: canonical_ref.to_string(),
+                base_commit: base_commit.map(str::to_string),
+            });
+        }
+    }
+    named
+}
+
+/// The runtime questions `fleet doctor` answers, in report order.
+const FLEET_RUNTIME_CHECKS: [&str; 5] = [
+    "agent-supervisor-gone",
+    "wave-wedged",
+    "worktree-missing",
+    "item-double-claimed",
+    "branch-without-unique-work",
+];
+
+/// One runtime finding. `fix` is the single next action, in the spirit of `flux doctor`'s fix-it hints:
+/// every one of these is a question with one correct answer, so reporting it without the answer just
+/// moves the `jq` expression one step later.
+fn runtime_finding(check: &str, subject: &str, detail: String, fix: String) -> Value {
+    json!({"check": check, "subject": subject, "detail": detail, "fix": fix})
+}
+
+/// Agents recorded active by a supervisor that is gone.
+///
+/// A worker turn runs synchronously in the process that wrote `working`, so if that process dies no
+/// receipt is ever written: there is nothing stale to notice, only silence. `wave-308-worker-1` read
+/// `working` for hours that way, and the driver grew a `/proc` scanner because state could not answer
+/// a question state already had the data for.
+fn dead_supervisor_findings(state: &FleetState) -> Vec<Value> {
+    state
+        .agents
+        .iter()
+        .filter_map(|(id, agent)| {
+            let status = agent["status"].as_str()?;
+            if !matches!(status, "working" | "running" | "active") {
+                return None;
+            }
+            let pid = agent["supervisor_pid"].as_i64()?;
+            if supervisor_process_is_live(pid) {
+                return None;
+            }
+            Some(runtime_finding(
+                "agent-supervisor-gone",
+                id,
+                format!("recorded `{status}` by supervisor pid {pid}, which no longer exists"),
+                format!("flux fleet cancel {id}"),
+            ))
+        })
+        .collect()
+}
+
+/// Waves wedged in a transient state.
+///
+/// `integrating` is the one wave state with an owning process, and integration is the longest thing the
+/// fleet does. If that process dies mid-gate the wave keeps `integrating` forever — `fleet integrate`
+/// will in fact retry it, but nothing said so, and the operator's only visible option was hand-editing
+/// fleet state, which the operating rules forbid.
+fn wedged_wave_findings(state: &FleetState) -> Vec<Value> {
+    state
+        .waves
+        .iter()
+        .filter_map(|(id, wave)| {
+            if wave["status"].as_str() != Some("integrating") {
+                return None;
+            }
+            let pid = wave["integration_supervisor_pid"].as_i64()?;
+            if supervisor_process_is_live(pid) {
+                return None;
+            }
+            Some(runtime_finding(
+                "wave-wedged",
+                id,
+                format!("`integrating` under supervisor pid {pid}, which no longer exists"),
+                format!("flux fleet integrate {id} (a stalled attempt is retryable)"),
+            ))
+        })
+        .collect()
+}
+
+/// Worktrees a topology names that are absent from disk.
+///
+/// A wave that is still live and has lost a checkout cannot assemble anything, and the failure surfaces
+/// far from its cause — reclamation removed an integration worktree that was legitimately empty, and the
+/// wave was left with deliverable work and nowhere to put it. A wave that finished for good is exempt:
+/// its worktrees are supposed to be gone.
+fn missing_worktree_findings(state: &FleetState) -> Vec<Value> {
+    let mut findings = Vec::new();
+    for (id, wave) in &state.waves {
+        let status = wave["status"].as_str().unwrap_or("unknown");
+        if wave_worktrees_are_removable(status) {
+            continue;
+        }
+        for named in wave_worktrees(wave) {
+            if named.worktree.is_dir() {
+                continue;
+            }
+            findings.push(runtime_finding(
+                "worktree-missing",
+                &display_path(&named.worktree),
+                format!(
+                    "wave {id} is {status} and names this {} worktree for repository {}, which disk does not have",
+                    named.role, named.repository
+                ),
+                "re-create the checkout at the wave's pinned base, or cancel the wave".to_string(),
+            ));
+        }
+    }
+    findings
+}
+
+/// Items claimed by more than one live wave — the same story being implemented twice.
+fn double_claimed_findings(state: &FleetState) -> Vec<Value> {
+    let mut claims: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (id, wave) in &state.waves {
+        if !wave_still_claims_items(wave["status"].as_str().unwrap_or("unknown")) {
+            continue;
+        }
+        for item in value_strings(&wave["items"]) {
+            claims.entry(item).or_default().push(id.clone());
+        }
+    }
+    claims
+        .into_iter()
+        .filter(|(_, waves)| waves.len() > 1)
+        .map(|(item, waves)| {
+            runtime_finding(
+                "item-double-claimed",
+                &item,
+                format!(
+                    "claimed by {} live waves: {}",
+                    waves.len(),
+                    waves.join(", ")
+                ),
+                format!("flux fleet cancel {} (keep the live attempt)", waves[0]),
+            )
+        })
+        .collect()
+}
+
+/// The fleet-owned branch heads of one checkout, resolved in a single git call.
+///
+/// One call per repository, not one per branch: a fleet that has run for a day holds hundreds of
+/// branches, and a diagnostic that spawns a process for each of them is one an operator stops running.
+fn git_fleet_branch_heads(source: &Path) -> BTreeMap<String, String> {
+    git_output(
+        source,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short) %(objectname)",
+            "refs/heads/fleet/",
+        ],
+    )
+    .map(|listing| {
+        listing
+            .lines()
+            .filter_map(|line| {
+                let (name, object) = line.split_once(' ')?;
+                Some((name.to_string(), object.to_string()))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// Branches still sitting at the base they were cut from, holding nothing unique.
+///
+/// Empty scaffolding, one set per wave ever dispatched, until `git branch` stops being a view of real
+/// work: 686 local branches, of which 40 were empty, and telling them apart took a Python script. The
+/// head resolver is injected so the comparison is testable without a checkout.
+fn stale_branch_findings(
+    state: &FleetState,
+    resolve_heads: impl Fn(&Path) -> BTreeMap<String, String>,
+) -> Vec<Value> {
+    let mut heads: BTreeMap<PathBuf, BTreeMap<String, String>> = BTreeMap::new();
+    let mut findings = Vec::new();
+    for (id, wave) in &state.waves {
+        for named in wave_worktrees(wave) {
+            let (Some(branch), Some(base)) =
+                (named.branch.as_deref(), named.base_commit.as_deref())
+            else {
+                continue;
+            };
+            let known = heads
+                .entry(named.source.clone())
+                .or_insert_with(|| resolve_heads(&named.source));
+            // A branch git does not have is not this check's business: it was already pruned, or the
+            // repository is unreadable, and either way nothing can be concluded about its contents.
+            if known.get(branch).map(String::as_str) != Some(base) {
+                continue;
+            }
+            findings.push(runtime_finding(
+                "branch-without-unique-work",
+                branch,
+                format!(
+                    "wave {id} left it at its pinned base {base}, so it holds no commit of its own"
+                ),
+                format!("flux fleet reclaim {id}"),
+            ));
+        }
+    }
+    findings
+}
+
+/// The runtime half of `fleet doctor`: everything the fleet already records and offered no way to ask.
+///
+/// Read-only by construction — every check reads recorded state, the filesystem, or a `for-each-ref`
+/// listing, and none of them writes. It reports rather than fails: each finding is an operator decision
+/// (cancel this, retry that), and a diagnostic that exits non-zero on a wedged wave is one a driver
+/// stops being able to poll. `healthy` is the machine-readable verdict for a caller that wants a gate.
+fn fleet_runtime_health(state: &FleetState) -> Value {
+    let mut findings = dead_supervisor_findings(state);
+    findings.extend(wedged_wave_findings(state));
+    findings.extend(missing_worktree_findings(state));
+    findings.extend(double_claimed_findings(state));
+    findings.extend(stale_branch_findings(state, git_fleet_branch_heads));
+    json!({
+        "healthy": findings.is_empty(),
+        "checks": FLEET_RUNTIME_CHECKS,
+        "findings": findings,
+    })
+}
+
+/// Does this branch hold a commit the wave did not start from?
+///
+/// The same question `stale_branch_findings` asks, deliberately: a branch still sitting at its pinned
+/// base holds nothing of its own, and the two must never disagree about that. Doctor reports such a
+/// branch and prescribes reclamation, so reclamation has to recognise exactly the branch doctor named
+/// or the fix it prescribes cannot work.
+///
+/// `None` when the question cannot be answered — the branch is already gone, the repository is
+/// unreadable, or the wave recorded no base. An unanswered question is never a licence to delete.
+fn branch_is_at_pinned_base(source: &Path, branch: &str, base: Option<&str>) -> Option<bool> {
+    let base = base?;
+    let head = guarded_git(
+        source,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .ok()
+    .filter(|output| output.exit_code == 0)?;
+    Some(head.stdout.trim() == base)
+}
+
+/// Prune a wave's branch, and say what happened either way.
+///
+/// `git branch -d` alone is not enough here and never was. It deletes only what is merged into the
+/// deleting repository's HEAD, and a wave's `source_root` is a detached linked worktree pinned to
+/// whatever commit that wave started from — so `-d` refuses nearly every branch doctor flags, and the
+/// refusal used to be discarded by `let _ =`. Where the branch is provably still at its pinned base it
+/// holds no commit to lose, and the ref is deleted directly. Everything else is left alone WITH ITS
+/// REASON RECORDED, because a branch that has moved is delivered work.
+fn prune_wave_branch(source: &Path, branch: &str, base: Option<&str>, dry_run: bool) -> Value {
+    match branch_is_at_pinned_base(source, branch, base) {
+        Some(true) => {
+            if dry_run {
+                return json!({"branch": branch, "deleted": false, "would_delete": true});
+            }
+            let reference = format!("refs/heads/{branch}");
+            match guarded_git(source, &["update-ref", "-d", &reference]) {
+                Ok(output) if output.exit_code == 0 => json!({"branch": branch, "deleted": true}),
+                Ok(output) => json!({
+                    "branch": branch,
+                    "deleted": false,
+                    "reason": format!("git refused to delete the ref: {}", output.stderr.trim()),
+                }),
+                Err(error) => json!({
+                    "branch": branch,
+                    "deleted": false,
+                    "reason": format!("could not delete the ref: {error:#}"),
+                }),
+            }
+        }
+        Some(false) => json!({
+            "branch": branch,
+            "deleted": false,
+            "reason": "it has moved past its pinned base, so it holds commits of its own",
+        }),
+        None => json!({
+            "branch": branch,
+            "deleted": false,
+            "reason": "its head could not be resolved, so nothing can be concluded about its contents",
+        }),
+    }
+}
+
+fn reclaim_wave_storage(wave: &Value) -> Value {
+    reclaim_wave_storage_inner(wave, false)
+}
+
+fn reclaim_wave_storage_inner(wave: &Value, dry_run: bool) -> Value {
+    // Removing a worktree needs a stronger justification than removing build output.
+    //
+    // Build output is regenerable, so it always goes. A worktree is STRUCTURE the wave may still need, and
+    // `worktree_holds_work` answers a different question — "does this contain work?", not "is this still
+    // needed?". Those came apart immediately: reclaiming an `agent-turn-failed` wave removed its
+    // integration worktree, which was legitimately empty and at its pinned base, while a story worktree in
+    // the same wave held 940 uncommitted lines. The wave then had deliverable work and nowhere to assemble
+    // a candidate, and no operation could rebuild the missing structure.
+    //
+    // So worktrees are removed only for a wave that is finished for good. Everything else keeps its shape
+    // and loses only its build directories, which is where the space is anyway.
+    let terminal = wave_worktrees_are_removable(wave["status"].as_str().unwrap_or("unknown"));
+    let mut freed_dirs = Vec::new();
+    let mut removed = Vec::new();
+    let mut retained = Vec::new();
+    // A worktree the topology names and disk no longer has is neither removed nor retained. It used to
+    // be neither reported: the loop skipped it before it could count, so a run over waves whose
+    // checkouts were already gone reported them as reclaimed while doing nothing at all.
+    let mut absent = Vec::new();
+    let mut branches = Vec::new();
+    // Each worktree carries its branch: removing the checkout without removing the ref leaves the ref
+    // forever. Forty empty `fleet/wave-*` branches had accumulated in one repository, one set per wave
+    // ever dispatched, which makes `git branch` useless as a view of real work — the same absent-owner
+    // pattern as the build directories, one level up.
+    for WaveWorktree {
+        worktree,
+        branch,
+        source,
+        canonical_ref,
+        base_commit,
+        ..
+    } in wave_worktrees(wave)
+    {
+        let canonical = canonical_ref.as_str();
+        let present = worktree.is_dir();
+        if present {
+            for name in RECLAIMABLE_BUILD_DIRS {
+                for found in build_dirs_under(&worktree, name) {
+                    // Short-circuits, so a dry run never reaches the removal.
+                    if dry_run || std::fs::remove_dir_all(&found).is_ok() {
+                        freed_dirs.push(display_path(&found));
+                    }
+                }
+            }
+        }
+        if !terminal {
+            if present {
+                retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": "the wave is not finished, so its worktrees are still structure it needs",
+                }));
+            }
+            continue;
+        }
+        // Whether the checkout is gone by the end of this iteration, however it got that way. Only then
+        // is the branch scaffolding rather than the sole reference to a checkout somebody is using.
+        let mut checkout_gone = !present;
+        if present {
+            match worktree_holds_work(&worktree, &source, canonical) {
+                Ok(false) => {
+                    let path = worktree.display().to_string();
+                    let removal = dry_run
+                        || guarded_git(&source, &["worktree", "remove", "--force", &path])
+                            .is_ok_and(|output| output.exit_code == 0);
+                    if removal || !worktree.is_dir() {
+                        removed.push(display_path(&worktree));
+                        checkout_gone = true;
+                    } else {
+                        retained.push(json!({
+                            "worktree": display_path(&worktree),
+                            "reason": "git declined to remove the worktree",
+                        }));
+                    }
+                }
+                Ok(true) => retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": "holds uncommitted changes or commits absent from the canonical ref",
+                })),
+                Err(error) => retained.push(json!({
+                    "worktree": display_path(&worktree),
+                    "reason": format!("could not be inspected, so it was left alone: {error:#}"),
+                })),
+            }
+        } else {
+            absent.push(display_path(&worktree));
+        }
+        // The branch is pruned on its own evidence, not on whether this run happened to find a
+        // directory. A wave reclaimed once already has no checkouts left, and it was exactly those
+        // waves whose branches survived forever: the old loop reached this only through the removal
+        // arm it could no longer enter.
+        if checkout_gone {
+            if let Some(branch) = branch.as_deref() {
+                branches.push(prune_wave_branch(
+                    &source,
+                    branch,
+                    base_commit.as_deref(),
+                    dry_run,
+                ));
+            }
+        }
+    }
+    json!({
+        "build_dirs_removed": freed_dirs,
+        "worktrees_removed": removed,
+        "worktrees_retained": retained,
+        "worktrees_absent": absent,
+        "branches": branches,
+    })
+}
+
+/// How much a reclamation outcome actually changed.
+///
+/// The count reported to the operator is derived from this and nothing else. `outcomes_len` used to
+/// count candidates, so a sweep that removed nothing still announced every wave it had considered —
+/// which is precisely how a feature that had been inert for nineteen runs kept reporting success.
+fn reclaimed_effects(reclaimed: &Value) -> (usize, usize, usize) {
+    let len = |key: &str| reclaimed[key].as_array().map_or(0, Vec::len);
+    let deleted = reclaimed["branches"].as_array().map_or(0, |entries| {
+        entries
+            .iter()
+            .filter(|entry| entry["deleted"] == json!(true) || entry["would_delete"] == json!(true))
+            .count()
+    });
+    (len("build_dirs_removed"), len("worktrees_removed"), deleted)
+}
+
+/// Locate reclaimable build directories at or just below a worktree root.
+///
+/// Bounded to two levels deliberately: a Rust workspace keeps `target/` at its root, and the nested
+/// cases that actually occur are one level down (`plugins/target`, `website/node_modules`). An
+/// unbounded walk would descend into the very trees being deleted.
+fn build_dirs_under(worktree: &Path, name: &str) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let direct = worktree.join(name);
+    if direct.is_dir() {
+        found.push(direct);
+    }
+    if let Ok(entries) = std::fs::read_dir(worktree) {
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if !child.is_dir() || child.file_name().is_some_and(|n| n == ".git") {
+                continue;
+            }
+            let nested = child.join(name);
+            if nested.is_dir() {
+                found.push(nested);
+            }
+        }
+    }
+    found
+}
+
+/// Whether a worktree still holds anything that exists nowhere else.
+///
+/// "Somewhere else" means the **source checkout's own HEAD** first, and the canonical ref second.
+/// Checking only the canonical ref was a real defect: `apply` merges into the local branch and never
+/// pushes, so `origin/main` never advances under autonomous operation and every worktree would be
+/// retained forever — reclamation that never reclaims. The local merge target is what proves the work
+/// is safe; the canonical ref still counts for a worktree whose commits arrived by some other route.
+///
+/// Errs toward `true`: an inspection that cannot answer is treated as holding work, so an unreadable
+/// or half-initialized worktree is retained rather than deleted.
+fn worktree_holds_work(worktree: &Path, source: &Path, canonical_ref: &str) -> Result<bool> {
+    // Same exclusion as `worker_dirt`: Fleet's own loop-binding snapshot is not the worker's work, and
+    // counting it would retain every worktree forever in any repository that does not ignore `.flux/`.
+    if git_output(worktree, &["status", "--porcelain"])
+        .is_none_or(|status| !worker_dirt(&status).is_empty())
+    {
+        return Ok(true);
+    }
+    let head = git_output(worktree, &["rev-parse", "HEAD"])
+        .context("validation/gate: could not resolve the worktree HEAD")?;
+    let head = head.trim();
+    if !source.is_dir() {
+        return Ok(true);
+    }
+    // Reachability from ANY ref, not just the canonical branch.
+    //
+    // Tying this to the canonical ref made reclamation dead code: nothing pushes, so `origin/main`
+    // never advances, and since C-619 `apply` no longer merges either — so no story commit is ever an
+    // ancestor of it and every worktree was retained forever while the disk filled. What actually
+    // matters is whether the commit survives the worktree's removal, and `git worktree remove` leaves
+    // branches and tags untouched. A commit named by any branch or tag is therefore safe; one reachable
+    // from nothing exists only inside this worktree and must be kept.
+    if git_output(source, &["for-each-ref", "--contains", head, "--count=1"])
+        .is_some_and(|refs| !refs.trim().is_empty())
+    {
+        return Ok(false);
+    }
+    // Also safe when the canonical ref already contains it (a ref-less but merged commit).
+    if git_output(
+        source,
+        &["merge-base", "--is-ancestor", head, canonical_ref],
+    )
+    .is_some()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// What a worktree a topology names is FOR, which is what decides how it may be repaired.
+///
+/// The two roles are asymmetric and must stay that way. A story worktree's commits ARE the
+/// deliverable, so "ahead of the pinned base" is its correct state and never something to fix. The
+/// integration and verification checkouts are structure the fleet derives for itself — an assembly
+/// that integration rebuilds from the story branches, and a checkout whose entire purpose is to sit
+/// at the base — so putting one back on its base costs nothing that cannot be regenerated.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorktreeRole {
+    Story,
+    Derived,
+}
+
+/// Everything repair needs to know about one worktree, gathered before any decision is taken.
+struct WorktreeFacts<'a> {
+    role: WorktreeRole,
+    present: bool,
+    dirty: bool,
+    /// `None` when the checkout exists but git could not be asked — an uninspectable tree.
+    head: Option<&'a str>,
+    base: &'a str,
+    /// The commit this repository's gate recorded, when it has one.
+    candidate: Option<&'a str>,
+}
+
+/// The one repair a single worktree needs, or the reason it must not be repaired.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum WorktreeRepair {
+    Intact,
+    /// The topology names it and disk lacks it.
+    Recreate,
+    /// A derived checkout that drifted off the base it is pinned to.
+    ResetToBase,
+    /// Repairing it would destroy something that exists nowhere else.
+    Refused(&'static str),
+}
+
+/// Decide one worktree's repair from recorded facts alone.
+///
+/// Kept pure and separate from the git that carries it out, because the whole risk of this verb lives
+/// in the decision. `fleet repair` writes checkouts an operator reaches for precisely when a wave is
+/// already damaged, and the failure mode is silent: a reset that discards the only copy of a change
+/// looks exactly like a successful repair.
+///
+/// So the refusals are the contract. An uncommitted change is refused because a worktree is the only
+/// place a worker's unfinished work exists — wave-299 held a complete six-file implementation its turn
+/// never committed. A checkout that cannot be inspected is refused for the same reason reclamation
+/// retains one: an unanswerable question is not a licence to act. And a derived worktree sitting on
+/// the commit its gate recorded is refused because that commit is the candidate `apply` pins, not a
+/// stray assembly to be rewound.
+fn plan_worktree_repair(facts: &WorktreeFacts<'_>) -> WorktreeRepair {
+    if !facts.present {
+        return WorktreeRepair::Recreate;
+    }
+    if facts.role == WorktreeRole::Story {
+        // Present is the entire test for a story checkout. Its commits are the deliverable and its
+        // uncommitted changes are a worker's live work, so there is nothing here repair may touch.
+        return WorktreeRepair::Intact;
+    }
+    if facts.dirty {
+        return WorktreeRepair::Refused(
+            "holds uncommitted changes, which resetting it to the pinned base would discard",
+        );
+    }
+    let Some(head) = facts.head else {
+        return WorktreeRepair::Refused("could not be inspected, so it was left alone");
+    };
+    if head == facts.base {
+        return WorktreeRepair::Intact;
+    }
+    if facts.candidate == Some(head) {
+        return WorktreeRepair::Refused(
+            "holds the candidate commit its gate recorded; only integration may move it",
+        );
+    }
+    WorktreeRepair::ResetToBase
+}
+
+/// Carry out one planned repair, reporting a git failure rather than abandoning the rest of the wave.
+///
+/// Partial repair beats no repair: a wave with five worktrees and one unfixable checkout should come
+/// back with four rebuilt and one explained, which is exactly how reclamation reports its own
+/// per-worktree outcomes.
+fn apply_worktree_repair(
+    plan: &WorktreeRepair,
+    source: &Path,
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+) -> Value {
+    match plan {
+        WorktreeRepair::Intact => json!({"action": "intact"}),
+        WorktreeRepair::Refused(reason) => json!({"action": "refused", "reason": reason}),
+        WorktreeRepair::Recreate => {
+            // Administrative records of a checkout that was DELETED rather than removed keep the
+            // branch "already checked out", so `git worktree add` refuses until they are pruned.
+            // Pruning only ever forgets worktrees whose directory is already gone.
+            let _ = guarded_git(source, &["worktree", "prune"]);
+            let reference = format!("refs/heads/{branch}");
+            // Reuse the recorded branch when it survived. This is what makes recreation
+            // non-destructive: the checkout comes back holding whatever the worker committed, and only
+            // a branch that is gone too is created afresh at the pinned base.
+            let restored = git_output(source, &["show-ref", "--verify", &reference]).is_some();
+            let path = worktree.display().to_string();
+            let argv = if restored {
+                vec!["worktree", "add", path.as_str(), branch]
+            } else {
+                vec!["worktree", "add", "-b", branch, path.as_str(), base]
+            };
+            match guarded_git(source, &argv) {
+                Ok(output) if output.exit_code == 0 => json!({
+                    "action": "recreated",
+                    "branch": if restored {"restored"} else {"recreated at the pinned base"},
+                    "head": git_output(worktree, &["rev-parse", "HEAD"]),
+                }),
+                Ok(output) => json!({
+                    "action": "failed",
+                    "reason": clipped_redacted(output.stderr.as_bytes()),
+                }),
+                Err(error) => json!({"action": "failed", "reason": format!("{error:#}")}),
+            }
+        }
+        WorktreeRepair::ResetToBase => {
+            // Record where it was. The discarded assembly stays in the reflog, and the report names
+            // the commit, so an unexpected reset is answerable rather than merely regrettable.
+            let from = git_output(worktree, &["rev-parse", "HEAD"]);
+            match guarded_git(worktree, &["reset", "--hard", base]) {
+                Ok(output) if output.exit_code == 0 => {
+                    json!({"action": "reset", "from": from, "head": base})
+                }
+                Ok(output) => json!({
+                    "action": "failed",
+                    "reason": clipped_redacted(output.stderr.as_bytes()),
+                }),
+                Err(error) => json!({"action": "failed", "reason": format!("{error:#}")}),
+            }
+        }
+    }
+}
+
+/// Rebuild the structure one wave's topology names and disk lacks.
+///
+/// Recovery is the half of the fleet that has no verbs: harvesting six delivered stories in one
+/// evening took a hand-written `git worktree add` to replace an integration worktree reclamation had
+/// removed, and repeated `git reset --hard <base>` before handoffs would verify. Every input to both
+/// is recorded — the source checkout, the branch, the pinned base — so the repair is mechanical and
+/// the only thing missing was somewhere to ask for it.
+fn repair_wave_structure(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let record = state
+        .waves
+        .get(wave_id)
+        .cloned()
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let status = record["status"].as_str().unwrap_or("unknown");
+    // A finished wave's worktrees are absent on purpose. Rebuilding them would resurrect structure
+    // nothing needs and re-fill the disk reclamation just freed.
+    if wave_worktrees_are_removable(status) {
+        bail!(
+            "conflict/precondition: wave {wave_id} is {status}; its worktrees are gone on purpose and \
+             rebuilding them would restore structure the wave no longer needs"
+        )
+    }
+    if !record["topology"].is_object() {
+        bail!("not-found: wave {wave_id} has no recorded topology to rebuild")
+    }
+    let mut outcomes = Vec::new();
+    for repository in record["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let source = PathBuf::from(repository["source_root"].as_str().unwrap_or_default());
+        let base = repository["base_commit"].as_str().unwrap_or_default();
+        let candidate = repository["candidate"].as_str();
+        let mut targets = vec![
+            (
+                "integration",
+                WorktreeRole::Derived,
+                &repository["integration"],
+            ),
+            ("verify", WorktreeRole::Derived, &repository["verify"]),
+        ];
+        targets.extend(
+            repository["stories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|story| ("story", WorktreeRole::Story, story)),
+        );
+        for (label, role, entry) in targets {
+            let (Some(path), Some(branch)) = (entry["worktree"].as_str(), entry["branch"].as_str())
+            else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            let present = path.is_dir();
+            let porcelain = present
+                .then(|| git_output(&path, &["status", "--porcelain"]))
+                .flatten();
+            let head = present
+                .then(|| git_output(&path, &["rev-parse", "HEAD"]))
+                .flatten();
+            let plan = plan_worktree_repair(&WorktreeFacts {
+                role,
+                present,
+                dirty: porcelain
+                    .as_deref()
+                    .is_some_and(|status| !worker_dirt(status).is_empty()),
+                head: head.as_deref(),
+                base,
+                candidate,
+            });
+            let repair = if command.dry_run {
+                json!({"action": "preview", "planned": format!("{plan:?}")})
+            } else {
+                apply_worktree_repair(&plan, &source, &path, branch, base)
+            };
+            outcomes.push(json!({
+                "repository": repository["id"],
+                "role": label,
+                "worktree": display_path(&path),
+                "branch": branch,
+                "repair": repair,
+            }));
+        }
+    }
+    let counted = |action: &str| {
+        outcomes
+            .iter()
+            .filter(|outcome| outcome["repair"]["action"] == action)
+            .count()
+    };
+    let summary = format!(
+        "wave {wave_id}: {} recreated, {} reset to base, {} refused, {} intact",
+        counted("recreated"),
+        counted("reset"),
+        counted("refused"),
+        counted("intact")
+    );
+    // Journal it for the same reason reclamation is journalled: the effect lands on disk rather than
+    // in the state being written, so an unrecorded run is indistinguishable from a no-op.
+    state.revision += 1;
+    let data = json!({"wave": wave_id, "dry_run": command.dry_run, "worktrees": outcomes});
+    persist_fleet_mutation(command, root, &state, "wave.repaired", data.clone())?;
+    Ok((summary, data, vec![], state.revision))
+}
+
+/// Per repository, the operations `binding` requires that the repository will not surface.
+///
+/// Reported per repository rather than collapsed: a Fleet spans several checkouts, and an operation
+/// that is fine in one is a mid-turn failure in another, so the operator needs to know which.
+fn unsurfaced_toolchain_operations(
+    root: &Path,
+    config: &FleetConfig,
+    binding: &flux_agent::AgentLoopBinding,
+) -> Vec<(String, Vec<String>)> {
+    let required = binding
+        .metadata()
+        .required_operations
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let mut findings = Vec::new();
+    for repository in &config.repositories {
+        let repository_root = root.join(&repository.root);
+        // A checkout that is not present yet cannot be judged; `fleet refresh` materializes it, and
+        // failing here would make validation depend on checkout order.
+        if !repository_root.is_dir() {
+            continue;
+        }
+        let mut missing = Vec::new();
+        for (bundle, _) in TOOLCHAIN_MARKERS {
+            if !toolchain_bundle_is_unsurfaced(&repository_root, bundle) {
+                continue;
+            }
+            missing.extend(
+                capability_operations(bundle)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|operation| required.contains(**operation))
+                    .map(|operation| (*operation).to_string()),
+            );
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            missing.dedup();
+            findings.push((repository.id.clone(), missing));
+        }
+    }
+    findings
+}
+
+/// The widest operation set any agent of `task_kind` could be granted: every capability bundle, the
+/// agent-loop machinery, and the task kind's native Fleet operations. Used only to reason about a
+/// task kind with no bound template — never to grant anything.
+fn maximal_task_kind_operations(task_kind: &str) -> Vec<String> {
+    let mut operations = CAPABILITY_BUNDLES
+        .iter()
         .flat_map(|capability| capability_operations(capability).unwrap_or_default())
         .map(|operation| (*operation).to_string())
         .collect::<Vec<_>>();
@@ -8010,9 +12217,54 @@ fn normalize_worker_capabilities(
             .iter()
             .map(|operation| (*operation).to_string()),
     );
+    operations.extend(task_kind_native_operations(task_kind));
     operations.sort();
     operations.dedup();
-    Ok((capabilities, operations))
+    operations
+}
+
+/// Assemble the statically knowable operations any Fleet agent could be given, for analysis only.
+///
+/// A worker's real registry is built during agent assembly and needs a provider, a surface and a
+/// session, so it cannot be reproduced here. This unions the three packs that *are* static —
+/// workspace built-ins, the dev/knowledge pack, and the authored-loop control plane that owns
+/// `ai_segment`.
+///
+/// The native Fleet operations are deliberately absent: `task_kind_native_operations` already folds
+/// them into every template ceiling, so they reach analysis as assumed operations. Registering tool
+/// instances here as well would add a second registration seam for a registry that is discarded
+/// after validation and never dispatches anything.
+fn fleet_loop_analysis_registry() -> Result<flux_runtime::ToolRegistry> {
+    let mut registry = flux_runtime::ToolRegistry::new();
+    flux_tools::try_register_builtins(&mut registry)?;
+    flux_tools::try_register_dev_builtins(&mut registry)?;
+    flux_tools::install_reflect(&mut registry)?;
+    Ok(registry)
+}
+
+fn validate_loop_capability_compatibility(
+    binding: &flux_agent::AgentLoopBinding,
+    admitted_operations: &[String],
+) -> Result<()> {
+    let admitted = admitted_operations
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let missing = binding
+        .metadata()
+        .required_operations
+        .iter()
+        .filter(|operation| !admitted.contains(operation.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        bail!(
+            "validation/gate: Fleet loop profile `{}` is incompatible with its capability ceiling; missing operations: {}",
+            binding.metadata().profile,
+            missing.join(", ")
+        )
+    }
+    Ok(())
 }
 
 fn normalize_fences(fences: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -8127,6 +12379,106 @@ fn read_configured_instructions(root: &Path, path: &Path, label: &str) -> Result
         .with_context(|| format!("not-found: {label} {}", absolute.display()))
 }
 
+fn resolve_fleet_loop_binding(
+    root: &Path,
+    config: &FleetConfig,
+    task_kind: &str,
+) -> Result<flux_agent::AgentLoopBinding> {
+    let task_kind = task_kind.trim();
+    if task_kind.is_empty() {
+        bail!("input/schema: Fleet task kind cannot be empty")
+    }
+    let profile_id = config.loop_policy.get(task_kind).with_context(|| {
+        format!(
+            "validation/gate: Fleet task kind `{task_kind}` has no explicit loop policy binding"
+        )
+    })?;
+    let profile = config.loop_profiles.get(profile_id).with_context(|| {
+        format!(
+            "validation/gate: Fleet loop policy `{task_kind}` names missing profile `{profile_id}`"
+        )
+    })?;
+    let source = read_configured_instructions(
+        root,
+        &profile.source,
+        &format!("Fleet loop profile {profile_id}"),
+    )?;
+    flux_agent::AgentLoopBinding::native_flux_with_features(
+        profile_id,
+        &profile.revision,
+        format!(
+            "fleet-profile:{profile_id}@{}:{}",
+            profile.revision,
+            display_path(&profile.source)
+        ),
+        &profile.entry,
+        source,
+        profile.required_runtime_features.clone(),
+    )
+    .map_err(|error| anyhow::anyhow!(error.to_string()))
+}
+
+const FLEET_AGENT_LOOP_SOURCE: &str = ".flux/fleet/agent-loop.flux";
+const FLEET_AGENT_LOOP_BINDING: &str = ".flux/fleet/agent-loop-binding.json";
+
+fn snapshot_fleet_loop_binding(
+    worktree: &Path,
+    binding: &flux_agent::AgentLoopBinding,
+    source_path: &str,
+    metadata_path: &str,
+) -> Result<()> {
+    let system = guarded_system(worktree)?;
+    system
+        .write_file_atomic(source_path, binding.source())
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let metadata = serde_json::to_string_pretty(binding.metadata())?;
+    system
+        .write_file_atomic(metadata_path, &metadata)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(())
+}
+
+fn reconstruct_fleet_loop_binding(
+    worktree: &Path,
+    agent: &Value,
+    id: &str,
+) -> Result<flux_agent::AgentLoopBinding> {
+    let admitted: flux_core::AgentLoopBindingMetadata =
+        serde_json::from_value(agent["loop_binding"].clone()).with_context(|| {
+            format!("validation/gate: admitted agent {id} has no valid loop binding snapshot")
+        })?;
+    let source_path = agent["loop_source"].as_str().with_context(|| {
+        format!("validation/gate: admitted agent {id} has no loop source snapshot")
+    })?;
+    let metadata_path = agent["loop_binding_receipt"].as_str().with_context(|| {
+        format!("validation/gate: admitted agent {id} has no loop binding receipt snapshot")
+    })?;
+    let system = guarded_system(worktree)?;
+    let source = system
+        .read_optional_text(source_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .with_context(|| {
+            format!("validation/gate: admitted agent {id} loop source snapshot is missing")
+        })?;
+    let metadata_text = system
+        .read_optional_text(metadata_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?
+        .with_context(|| {
+            format!("validation/gate: admitted agent {id} loop binding receipt is missing")
+        })?;
+    let snapshotted: flux_core::AgentLoopBindingMetadata = serde_json::from_str(&metadata_text)
+        .with_context(|| {
+            format!("validation/gate: admitted agent {id} loop binding receipt is invalid")
+        })?;
+    if snapshotted != admitted {
+        bail!(
+            "validation/gate: admitted agent {id} loop binding receipt drifted; explicit re-admission is required"
+        )
+    }
+    flux_agent::AgentLoopBinding::from_metadata_and_source(admitted, source)
+        .map_err(|error| anyhow::anyhow!("validation/gate: admitted agent {id}: {error}"))
+}
+
 fn story_worker_request(item: &str, assignment: &Value, worktree: &Path) -> String {
     format!(
         "Work only on board item {item}. Your isolated worktree is {}. Your branch is {} at pinned base {}. Use `flux board skill`, then inspect the owning repository's AGENTS.md, the exact story contract and linked design. Implement that contract as a writer; do not select, observe or explore unrelated work. Finish with one exact commit and report its full SHA, observed write set, targeted test argv, failing-before/passing-after evidence, and summary for `flux fleet handoff`.",
@@ -8138,35 +12490,61 @@ fn story_worker_request(item: &str, assignment: &Value, worktree: &Path) -> Stri
 
 fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<AgentTurnSpec> {
     let config = read_fleet_config(root)?;
+    let agent_loop = configured_main_agent_loop(root, &config)?;
+    configured_main_research_loop_with(root, &config)?;
     let read_roots = config
         .repositories
         .iter()
         .map(|repository| repository_root(root, repository))
         .collect::<Result<Vec<_>>>()?;
+    // The manifest is built from the same list the child is actually given, so the record cannot drift
+    // from the grant.
+    let read_roots_recorded = read_roots.clone();
     let instructions = match config.main.instructions.as_deref() {
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
     };
-    let resume = state.main_agent.session.is_some();
+    let resume_session = state.main_agent.session.clone();
     let context_origin = agent_context_origin(
         "main",
         &instructions,
         None,
-        resume,
+        resume_session.is_some(),
         state.main_agent.goals_revision,
     );
     Ok(AgentTurnSpec {
+        // The coordinator is never the integrator; the two catalogues are disjoint by construction.
+        fleet_integrator: false,
         id: "main".into(),
         worktree: root.to_path_buf(),
         read_roots,
         store: agent_store_path(root, "main")?,
         model: config.main.model,
+        agent_loop: Some(agent_loop),
+        agent_loop_binding: None,
         instructions,
         request,
-        resume,
-        enforce_operation_ceiling: false,
-        admitted_operations: Vec::new(),
-        capability_set: Value::Null,
+        resume_session,
+        enforce_operation_ceiling: true,
+        admitted_operations: native_fleet_main_operation_ceiling(),
+        // C-610: RECORD the coordinator's scope, do not merely enforce it.
+        //
+        // The ceiling above is real — `--operation-ceiling` plus explicit `--add-dir` roots reach the
+        // child — but leaving the manifest `Null` meant `state.json` carried no mode, no operation count
+        // and no root count for `main`, while every worker carried all three. An operator inspecting the
+        // fleet could therefore audit the constrained agents and not the privileged one, and an absent
+        // record is indistinguishable from an absent ceiling: reading that state, I concluded the
+        // coordinator was unconfined when in fact it was confined and merely unaudited. The umbrella
+        // model — the coordinator holds every repository root, each worker exactly one — is only
+        // verifiable if both halves are written down.
+        capability_set: capability_set_manifest(
+            FleetTaskMode::Write,
+            &["fleet-coordinator".to_string()],
+            &native_fleet_main_operation_ceiling(),
+            root,
+            &read_roots_recorded,
+            &normalize_fences(Vec::new()),
+        ),
         shell_capability: false,
         context_origin,
     })
@@ -8217,8 +12595,16 @@ fn addressed_turn_spec(
         format!("validation/gate: admitted agent {target} has no valid mode snapshot")
     })?;
     let configured_capabilities = value_string_list(agent, "capabilities", target)?;
-    let (capabilities, admitted_operations) =
-        normalize_worker_capabilities(mode, &configured_capabilities)?;
+    // C-605: the same repository-derived resolution the admission used, so the digest below still
+    // reconciles and the live turn is granted exactly the toolchain its checkout surfaces.
+    let (capabilities, admitted_operations) = normalize_worker_capabilities_in(
+        mode,
+        &configured_capabilities,
+        agent["task_kind"]
+            .as_str()
+            .unwrap_or(FLEET_IMPLEMENTATION_TASK_KIND),
+        Some(&worktree),
+    )?;
     let fences = normalize_fences(value_string_list(agent, "fences", target)?);
     let capability_set = capability_set_manifest(
         mode,
@@ -8238,29 +12624,93 @@ fn addressed_turn_spec(
             "validation/gate: admitted agent {target} capability-set digest drifted; explicit re-admission is required"
         )
     }
-    let resume = agent["runtime_session"].is_string();
+    let resume_session = agent["runtime_session"].as_str().map(str::to_string);
+    let _loop_binding = reconstruct_fleet_loop_binding(&worktree, agent, target)?;
+    let loop_source = agent["loop_source"]
+        .as_str()
+        .context("validation/gate: admitted agent has no loop source snapshot")?
+        .to_string();
+    let loop_binding_receipt = agent["loop_binding_receipt"]
+        .as_str()
+        .context("validation/gate: admitted agent has no loop binding receipt snapshot")?
+        .to_string();
     let context_origin = agent_context_origin(
         target,
         &instructions,
         agent.get("assignment"),
-        resume,
+        resume_session.is_some(),
         state.main_agent.goals_revision,
     );
     Ok(AgentTurnSpec {
+        // An admitted agent attaches as the wave integrator when its template declared that task
+        // kind. This is the only route to the assemble catalogue: it follows the admitted record, so
+        // a worker cannot request integration authority by prose or by resuming another agent.
+        fleet_integrator: agent["task_kind"].as_str() == Some(FLEET_INTEGRATION_TASK_KIND),
         id: target.to_string(),
         store: agent_store_path(&worktree, target)?,
         worktree,
         read_roots,
         model: agent["model"].as_str().map(str::to_string),
+        agent_loop: Some(loop_source),
+        agent_loop_binding: Some(loop_binding_receipt),
         instructions,
         request,
-        resume,
+        resume_session,
         enforce_operation_ceiling: true,
         shell_capability: capabilities.iter().any(|capability| capability == "shell"),
         admitted_operations,
         capability_set,
         context_origin,
     })
+}
+
+/// Wave statuses that mean work is genuinely in flight.
+///
+/// Deliberately a closed *allow* list rather than a list of terminal states. The previous inverse
+/// form (`!matches!(status, "completed" | "failed" | "cancelled" | "parked")`) silently treated every
+/// status it had not heard of as active — so `agent-turn-failed`, `green`, `red` and `conflict` all
+/// counted, and a long-dead failed wave kept claiming the header.
+const ACTIVE_WAVE_STATUSES: [&str; 4] = [
+    "accepted",
+    "awaiting-handoffs",
+    "handoffs-ready",
+    "integrating",
+];
+
+/// The wave the operator is currently watching: the newest one still in flight.
+///
+/// `state.waves` is a `BTreeMap`, so iterating it yields *lexicographic* key order and `.find()`
+/// returned the OLDEST match. Combined with the open-ended status test above, `wave-257` (status
+/// `agent-turn-failed`) pinned the header while `wave-286` was actually running — the same panel
+/// disagreeing with its own worker list. Order by the numeric suffix so `wave-99` and `wave-100`
+/// compare correctly too.
+fn active_wave_view(
+    state: &FleetState,
+    max_wave: usize,
+) -> Option<flux_tui::operations::FleetWaveView> {
+    use flux_tui::operations::FleetWaveView;
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| {
+            wave["status"]
+                .as_str()
+                .is_some_and(|status| ACTIVE_WAVE_STATUSES.contains(&status))
+        })
+        .max_by_key(|(id, _)| {
+            id.rsplit('-')
+                .next()
+                .and_then(|suffix| suffix.parse::<u64>().ok())
+                .unwrap_or(0)
+        })
+        .map(|(id, wave)| FleetWaveView {
+            id: id.clone(),
+            status: wave["status"].as_str().unwrap_or("unknown").to_string(),
+            items: value_strings(&wave["items"])
+                .into_iter()
+                .take(max_wave)
+                .collect(),
+        })
 }
 
 fn agent_store_path(worktree: &Path, id: &str) -> Result<PathBuf> {
@@ -8303,6 +12753,7 @@ struct OversizedFleetEventHeader {
     outcome: Option<String>,
     usage: Option<Value>,
     cost_usd: Option<Value>,
+    loop_binding: Option<Value>,
 }
 
 fn summarize_oversized_fleet_event(line: &str, actual_bytes: usize, limit_bytes: usize) -> Value {
@@ -8320,6 +12771,7 @@ fn summarize_oversized_fleet_event(line: &str, actual_bytes: usize, limit_bytes:
             "outcome": header.outcome,
             "usage": header.usage,
             "cost_usd": header.cost_usd,
+            "loop_binding": header.loop_binding,
             "answer": "",
             "error": "omitted: event_too_large",
             "payload_omitted": {
@@ -8394,6 +12846,50 @@ fn execute_agent_turn(fleet_root: &Path, spec: &AgentTurnSpec, goals: &str) -> R
     execute_agent_turn_with_runtime(fleet_root, spec, goals, None)
 }
 
+/// A worker turn that ran, produced a parseable event stream, and then reported a non-ok terminal.
+///
+/// The distinction matters because the side effects of a failed turn are real: a story worker can
+/// commit its complete deliverable and only afterwards exhaust a budget. Returning a bare message
+/// discarded the durable session id and the event stream that names that commit, so Fleet recorded a
+/// worker as `failed` with no way to find what it had already delivered, and `fleet rework` could not
+/// re-dispatch it (that path requires `runtime_session` to be a string, which only the success arm
+/// ever wrote). Carrying the parsed receipt alongside the message keeps the evidence addressable
+/// without pretending the turn succeeded.
+#[derive(Debug)]
+struct AgentTurnFailure {
+    message: String,
+    receipt: Value,
+}
+
+impl std::fmt::Display for AgentTurnFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentTurnFailure {}
+
+/// The partial receipt carried by a failed-but-observed turn, when there is one. A turn that never
+/// started, or whose stream could not be parsed, has no receipt and yields `None`.
+fn failed_turn_receipt(error: &anyhow::Error) -> Option<&Value> {
+    error
+        .downcast_ref::<AgentTurnFailure>()
+        .map(|failure| &failure.receipt)
+}
+
+/// Record what a failed turn still proved: its durable session and the parsed receipt. Mirrors the
+/// success arm's writes so a failed worker stays addressable by `fleet rework` and its committed SHA
+/// stays discoverable from state rather than only from the worktree.
+fn record_failed_turn_evidence(agent: &mut Value, error: &anyhow::Error) {
+    let Some(receipt) = failed_turn_receipt(error) else {
+        return;
+    };
+    if let Some(session) = receipt["session"].as_str() {
+        agent["runtime_session"] = json!(session);
+    }
+    agent["last_turn"] = receipt.clone();
+}
+
 fn render_agent_turn_prompt(spec: &AgentTurnSpec, goals: &str) -> String {
     if spec.id == "main" {
         format!(
@@ -8422,11 +12918,23 @@ fn agent_turn_argv(executable: &Path, spec: &AgentTurnSpec, prompt: String) -> V
         "--stream-json".into(),
         "--yes".into(),
     ];
-    if spec.resume {
-        argv.push("--continue".into());
+    if let Some(session) = spec.resume_session.as_deref() {
+        argv.extend(["--resume-session".into(), session.into()]);
     }
     if let Some(model) = spec.model.as_deref() {
         argv.extend(["--model".into(), model.into()]);
+    }
+    if let Some(agent_loop) = spec.agent_loop.as_deref() {
+        argv.extend(["--loop".into(), agent_loop.into()]);
+    }
+    if let Some(binding) = spec.agent_loop_binding.as_deref() {
+        argv.extend(["--resolved-loop-binding".into(), binding.into()]);
+    }
+    if spec.id == "main" {
+        argv.push("--native-fleet-main".into());
+    }
+    if spec.fleet_integrator {
+        argv.push("--native-fleet-integrator".into());
     }
     if spec.enforce_operation_ceiling {
         argv.push("--operation-ceiling".into());
@@ -8441,6 +12949,111 @@ fn agent_turn_argv(executable: &Path, spec: &AgentTurnSpec, prompt: String) -> V
     argv
 }
 
+/// Where the fleet keeps the compilation cache every worker shares.
+fn sccache_dir(fleet_root: &Path) -> PathBuf {
+    fleet_root.join(".flux/fleet/sccache")
+}
+
+/// Populate the shared cache once, at the base every worker in this wave branches from.
+///
+/// Without this the first worker to start pays the whole cold-compile cost while its siblings
+/// duplicate it in parallel, contending for the same cores — the wave's slowest possible shape. One
+/// warm pass ahead of dispatch turns that into a single sequential cost every worker then reads.
+///
+/// The `verify` worktree is the right site because it is already pinned to the exact base commit
+/// and it has to build anyway for the failing-before check, so this mostly moves work earlier
+/// rather than adding it.
+///
+/// Entirely best-effort. It is an optimisation, and an optimisation that can fail a wave is a
+/// liability — a warm that errors, times out or finds no cache is recorded and ignored.
+fn warm_wave_build_cache(fleet_root: &Path, wave: &str, repository: &str, verify_worktree: &Path) {
+    if sccache_executable().is_none() {
+        return;
+    }
+    let argv = ["cargo", "build", "--workspace", "--tests"]
+        .iter()
+        .map(|argument| (*argument).to_string())
+        .collect::<Vec<_>>();
+    let mut environment = vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())];
+    environment.extend(worker_build_environment(fleet_root));
+
+    let started = std::time::Instant::now();
+    let outcome = guarded_run_with_env(verify_worktree, &argv, &environment);
+    let elapsed = started.elapsed().as_secs();
+    let (status, detail) = match &outcome {
+        Ok(output) if output.exit_code == 0 => ("warmed", String::new()),
+        // A base that does not build is a real signal, but it is the gate's to report, not this
+        // step's: refusing to prepare the wave here would turn a slow start into no start.
+        Ok(output) => (
+            "failed",
+            clipped_redacted(output.stderr.as_bytes())
+                .chars()
+                .take(400)
+                .collect(),
+        ),
+        Err(error) => ("failed", error.to_string()),
+    };
+    let _ = append_fleet_event(
+        fleet_root,
+        "wave.build-cache.warmed",
+        json!({
+            "wave": wave,
+            "repository": repository,
+            "status": status,
+            "seconds": elapsed,
+            "worktree": display_path(verify_worktree),
+            "detail": detail,
+        }),
+    );
+}
+
+/// Build knobs for a story worker, on top of `CARGO_INCREMENTAL=0`.
+///
+/// Every worker in a wave branches from the *same* pinned base, so at width eight they compile a
+/// near-identical dependency graph eight times over. The fix cannot be a shared `CARGO_TARGET_DIR`
+/// — cargo locks one exclusively, which would turn the wave back into a queue (see the note in
+/// `flux-system`'s `SAFE_ENV`) — and it cannot be a copied warm target directory either, because
+/// the filesystem here has no reflink support and eight copies of a multi-gigabyte baseline is real
+/// disk. A **content-keyed compilation cache** gives the sharing without the lock: separate target
+/// directories, identical `rustc` invocations served from cache instead of recompiled.
+///
+/// `CARGO_PROFILE_DEV_DEBUG` attacks what the cache cannot. sccache caches compilation but not
+/// linking, and full debug info dominates both link time and the on-disk size that actually caps
+/// how many workers fit. `line-tables-only` keeps file and line in a panic — which is the entire
+/// reason a worker's build output exists — while dropping the rest.
+///
+/// These go through the caller-override slot of `apply_safe_env`, which is applied after the
+/// allow-list and wins, so no `SAFE_ENV` entry is needed and an operator's own rebuilds keep
+/// incremental compilation, full debug info and no wrapper.
+///
+/// **A missing `sccache` degrades rather than fails.** It is an optimisation; a fleet that refuses
+/// to dispatch because a cache is absent is worse than a slow one. The caller records which of the
+/// two happened, because a silently-disabled fast path is indistinguishable from a working one.
+fn worker_build_environment(fleet_root: &Path) -> Vec<(String, String)> {
+    let mut environment = vec![(
+        "CARGO_PROFILE_DEV_DEBUG".to_string(),
+        "line-tables-only".to_string(),
+    )];
+    if let Some(sccache) = sccache_executable() {
+        environment.push(("RUSTC_WRAPPER".to_string(), sccache));
+        environment.push((
+            "SCCACHE_DIR".to_string(),
+            sccache_dir(fleet_root).display().to_string(),
+        ));
+        environment.push(("SCCACHE_CACHE_SIZE".to_string(), "40G".to_string()));
+    }
+    environment
+}
+
+/// `sccache` on `PATH`, or `None` when it is not installed.
+fn sccache_executable() -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("sccache"))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.display().to_string())
+}
+
 fn execute_agent_turn_with_runtime(
     fleet_root: &Path,
     spec: &AgentTurnSpec,
@@ -8450,11 +13063,37 @@ fn execute_agent_turn_with_runtime(
     let store = spec.store.clone();
     let prompt = render_agent_turn_prompt(spec, goals);
     let argv = agent_turn_argv(&std::env::current_exe()?, spec, prompt);
-    let environment = if spec.shell_capability {
-        vec![("FLUX_ENABLE_BASH".to_string(), "1".to_string())]
-    } else {
-        Vec::new()
-    };
+    // An agent's build output is throwaway, so it must not pay for incremental compilation.
+    //
+    // Each story gets a fresh worktree and a fresh target directory that is discarded when the wave is
+    // reclaimed, so incremental artifacts are written and then deleted without ever being reused. They
+    // are roughly half of a checkout's build output, and disk — not model concurrency — is what actually
+    // caps how many workers can run: a measured ~7 GB per story worktree against a filesystem with tens
+    // of gigabytes free is the difference between one worker and several.
+    //
+    // Set here rather than in a shared cargo config because it is only true for one-shot builders. An
+    // operator's own rebuilds legitimately want incremental compilation, and this must not take it away
+    // from them.
+    // It is now load-bearing twice over: incremental artifacts are also not cacheable, so leaving
+    // incremental compilation on would defeat the shared cache configured just below.
+    let mut environment = vec![("CARGO_INCREMENTAL".to_string(), "0".to_string())];
+    environment.extend(worker_build_environment(fleet_root));
+    if sccache_executable().is_none() {
+        // Not an error — the turn proceeds uncached. Recorded because "slower than it should be"
+        // is otherwise invisible, and a fast path nobody can see is a fast path nobody notices is
+        // off.
+        let _ = append_fleet_event(
+            fleet_root,
+            "worker.build-cache.unavailable",
+            json!({
+                "agent": spec.id,
+                "reason": "sccache is not on PATH; this worker compiles without the shared cache",
+            }),
+        );
+    }
+    if spec.shell_capability {
+        environment.push(("FLUX_ENABLE_BASH".to_string(), "1".to_string()));
+    }
     let output = match runtime {
         Some(runtime) => guarded_agent_run_on(
             runtime,
@@ -8475,18 +13114,31 @@ fn execute_agent_turn_with_runtime(
         ),
     }
     .with_context(|| format!("transient-worker: agent {} could not start", spec.id))?;
+    // Report WHY the stream was invalid, not just what the child said on stderr. The previous message
+    // interpolated only stderr, so a parse failure surfaced as
+    // `emitted an invalid event stream: note: sandbox: …` — the sandbox note is unrelated boilerplate
+    // present on every run, and the actual cause (malformed JSON on a named line, or a stream with no
+    // terminal `turn_end`) was invisible. That masking cost two waves and blocked C-607's diagnosis,
+    // because it made an unrelated correlation look causal.
     let (events, session, terminal, stream_budget) =
-        parse_fleet_agent_events(&output.stdout, &spec.id, FLEET_AGENT_EVENT_LIMIT).with_context(
-            || {
-                format!(
-                    "transient-worker: agent {} emitted an invalid event stream: {}",
+        parse_fleet_agent_events(&output.stdout, &spec.id, FLEET_AGENT_EVENT_LIMIT).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "transient-worker: agent {} emitted an invalid event stream: {error:#}{}",
                     spec.id,
-                    clipped_redacted(output.stderr.as_bytes())
+                    if output.stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "; child stderr: {}",
+                            clipped_redacted(output.stderr.as_bytes())
+                        )
+                    }
                 )
             },
         )?;
     if output.exit_code != 0 || terminal["outcome"].as_str() != Some("ok") {
-        bail!(
+        let message = format!(
             "transient-worker: agent {} turn failed: {}{}",
             spec.id,
             terminal["error"].as_str().unwrap_or("non-zero exit"),
@@ -8495,7 +13147,28 @@ fn execute_agent_turn_with_runtime(
             } else {
                 format!("; {}", clipped_redacted(output.stderr.as_bytes()))
             }
-        )
+        );
+        // The stream parsed, so the session and events are known — including any commit the loop
+        // made before it failed. Carry them instead of dropping them on the floor.
+        return Err(anyhow::Error::new(AgentTurnFailure {
+            receipt: redact_value(json!({
+                "schema": "flux.fleet-agent-turn/v1",
+                "agent": spec.id,
+                "session": session,
+                "ack": "failed",
+                "error": message,
+                "answer": terminal["answer"],
+                "usage": terminal["usage"],
+                "loop_binding": terminal["loop_binding"],
+                "events": events,
+                "stream_budget": stream_budget,
+                "context_origin": spec.context_origin.clone(),
+                "capability_set": spec.capability_set.clone(),
+                "store": display_path(&store),
+                "exit_code": output.exit_code,
+            })),
+            message,
+        }));
     }
     Ok(redact_value(json!({
         "schema": "flux.fleet-agent-turn/v1",
@@ -8504,6 +13177,7 @@ fn execute_agent_turn_with_runtime(
         "ack": "completed",
         "answer": terminal["answer"],
         "usage": terminal["usage"],
+        "loop_binding": terminal["loop_binding"],
         "events": events,
         "stream_budget": stream_budget,
         "context_origin": spec.context_origin.clone(),
@@ -8535,6 +13209,9 @@ fn execute_and_record_agent_turn(
         state.main_agent.status = "working".into();
     } else if let Some(agent) = state.agents.get_mut(&spec.id) {
         agent["status"] = json!("working");
+        // Whose process owns this `working`? Executing the turn is synchronous, so if this process dies
+        // nothing writes a terminal status and the record claims work forever.
+        agent["supervisor_pid"] = json!(std::process::id());
     }
     if let Some(intake_id) = intake_id {
         if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -8584,10 +13261,15 @@ fn execute_and_record_agent_turn(
                 state.main_agent.last_error = None;
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
                 agent["status"] = json!("completed");
+                agent["supervisor_pid"] = Value::Null;
                 agent["runtime_session"] = json!(session.clone());
                 agent["session"] = json!(session);
                 agent["last_turn"] = receipt.clone();
                 agent["last_error"] = Value::Null;
+                // Land this agent's record on current state: several workers finish within milliseconds
+                // of each other, and the loser of the compare-and-set used to lose its whole receipt.
+                let landed = agent.clone();
+                commit_records(state, root, &[], &[(spec.id.clone(), landed)]);
             }
             if let Some(intake_id) = intake_id {
                 if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -8616,7 +13298,12 @@ fn execute_and_record_agent_turn(
                 state.main_agent.last_error = Some(message.clone());
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
                 agent["status"] = json!(if cancelled { "cancelled" } else { "failed" });
+                agent["supervisor_pid"] = Value::Null;
                 agent["last_error"] = json!(message);
+                record_failed_turn_evidence(agent, &error);
+                // A failed turn's evidence is the most expensive thing to lose, so land it the same way.
+                let landed = agent.clone();
+                commit_records(state, root, &[], &[(spec.id.clone(), landed)]);
             }
             if let Some(intake_id) = intake_id {
                 if let Some(intake) = state.intake.get_mut(intake_id) {
@@ -8674,6 +13361,13 @@ fn fleet_spawn(
         .mode
         .or_else(|| template.map(|template| template.mode))
         .unwrap_or_default();
+    let task_kind = template
+        .map(|template| template.task_kind.as_str())
+        .unwrap_or(match mode {
+            FleetTaskMode::ReadOnly => "research",
+            FleetTaskMode::Write => "implementation",
+        });
+    let loop_binding = resolve_fleet_loop_binding(root, &config, task_kind)?;
     if mode == FleetTaskMode::Write && options.item.is_none() {
         bail!("input/schema: a write-capable worker requires --item BOARD/ITEM")
     }
@@ -8735,6 +13429,10 @@ fn fleet_spawn(
     if id == "main" || state.agents.contains_key(&id) {
         bail!("conflict/precondition: agent id {id:?} is reserved or already registered")
     }
+    let loop_dir = format!(".flux/fleet/agents/{}", safe_ref_segment(&id));
+    let loop_source = format!("{loop_dir}/agent-loop.flux");
+    let loop_binding_receipt = format!("{loop_dir}/agent-loop-binding.json");
+    snapshot_fleet_loop_binding(root, &loop_binding, &loop_source, &loop_binding_receipt)?;
     let mut capabilities = match template {
         Some(template) => template.capabilities.clone(),
         None if options.capabilities.is_empty() => match mode {
@@ -8747,7 +13445,9 @@ fn fleet_spawn(
         None => Vec::new(),
     };
     capabilities.extend(options.capabilities.iter().cloned());
-    let (capabilities, operations) = normalize_worker_capabilities(mode, &capabilities)?;
+    let (capabilities, operations) =
+        normalize_worker_capabilities_in(mode, &capabilities, task_kind, Some(root))?;
+    validate_loop_capability_compatibility(&loop_binding, &operations)?;
     let mut fences = template
         .map(|template| template.fences.clone())
         .unwrap_or_default();
@@ -8766,6 +13466,7 @@ fn fleet_spawn(
         "id": id,
         "parent": "main",
         "role": role,
+        "task_kind": task_kind,
         "template": template.map(|template| template.id.as_str()),
         "ephemeral": template.is_none(),
         "transport": "flux-local",
@@ -8779,6 +13480,9 @@ fn fleet_spawn(
         "writable_root": display_path(root),
         "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
         "capability_set": capability_set,
+        "loop_binding": loop_binding.metadata(),
+        "loop_source": loop_source,
+        "loop_binding_receipt": loop_binding_receipt,
         "status": "admitted",
         "lease": {"generation": state.revision, "holder": id, "status": "active"},
         "created_by": "main",
@@ -8888,6 +13592,471 @@ fn goal_key(scope: GoalScope, name: &str) -> Result<String> {
     Ok(format!("{}/{}", scope.as_str(), name))
 }
 
+/// Which wave statuses are safe to reclaim without asking?
+///
+/// Everything that cannot still be advanced. A wave awaiting handoffs or mid-integration owns live
+/// worktrees and a build in progress; anything else has finished, one way or another, and its build
+/// output is dead weight. `parked` is deliberately included — a parked wave is precisely the one that
+/// sits for hours holding gigabytes while a human decides, and reclaiming build output costs it nothing
+/// because its commits live on branches.
+fn wave_is_reclaimable(status: &str) -> bool {
+    matches!(
+        status,
+        "applied" | "cancelled" | "conflict" | "red" | "parked" | "agent-turn-failed" | "green"
+    )
+}
+
+/// Wave directories on disk that no recorded wave claims.
+///
+/// Every reclamation path iterates `state.waves`, so a wave that never reached state is invisible to
+/// all of them. That is not hypothetical: wave-665 created four worktrees and ran a 112-second build
+/// warm, then lost the compare-and-set that would have recorded it — and its 15GB sat unreferenced
+/// while the disk it was on ran to 93%. Disk is what caps fleet width, and the largest consumer on it
+/// was the one thing the fleet could not name.
+fn orphaned_wave_dirs(root: &Path, state: &FleetState) -> Vec<PathBuf> {
+    let Ok(config) = read_fleet_config(root) else {
+        return Vec::new();
+    };
+    let worktree_root = if config.worktree_root.is_absolute() {
+        config.worktree_root.clone()
+    } else {
+        root.join(&config.worktree_root)
+    };
+    let Ok(entries) = std::fs::read_dir(&worktree_root) else {
+        return Vec::new();
+    };
+    let mut orphans: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !state.waves.contains_key(name))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    orphans.sort();
+    orphans
+}
+
+/// Is every checkout beneath this directory free of uncommitted work?
+///
+/// Commits are not at risk here — they are reachable from the branches this never touches — so the
+/// only question is whether a turn left something it never committed. Unreadable counts as holding
+/// work, the same asymmetry `worktree_holds_work` keeps: the cost of retaining a dead directory is
+/// disk, and the cost of the other mistake is somebody's uncommitted afternoon.
+fn orphan_holds_no_work(dir: &Path) -> bool {
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        // A linked worktree carries a `.git` file. Stop here rather than descending: below this point
+        // is the checkout's own content, including the build output that makes these directories big.
+        if path.join(".git").exists() {
+            match git_output(&path, &["status", "--porcelain", "-uall"]) {
+                Some(status) if status.trim().is_empty() => continue,
+                _ => return false,
+            }
+        }
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                stack.push(entry.path());
+            }
+        }
+    }
+    true
+}
+
+fn reclaim_finished_waves(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    target: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let waves = match target {
+        Some(wave) => {
+            let record = state
+                .waves
+                .get(wave)
+                .with_context(|| format!("not-found: wave {wave}"))?;
+            let status = record["status"].as_str().unwrap_or("unknown");
+            if !wave_is_reclaimable(status) {
+                bail!(
+                    "conflict/precondition: wave {wave} is {status}; reclaiming a wave that can still \
+                     advance would delete a build it is about to use"
+                )
+            }
+            vec![wave.to_string()]
+        }
+        None => state
+            .waves
+            .iter()
+            .filter(|(_, record)| {
+                wave_is_reclaimable(record["status"].as_str().unwrap_or("unknown"))
+            })
+            .map(|(id, _)| id.clone())
+            .collect(),
+    };
+    let mut outcomes = Vec::new();
+    let mut freed_dirs = 0usize;
+    let mut freed_trees = 0usize;
+    let mut freed_refs = 0usize;
+    let mut changed = 0usize;
+    for wave in &waves {
+        let Some(record) = state.waves.get(wave) else {
+            continue;
+        };
+        if !record["topology"].is_object() {
+            continue;
+        }
+        // A dry run performs the same inspection and withholds only the writes. It used to short-circuit
+        // to `{"preview": true}`, which is why the documented `--dry-run --output json # what would be
+        // freed` could never report what would be freed.
+        let reclaimed = reclaim_wave_storage_inner(record, command.dry_run);
+        let (dirs, trees, refs) = reclaimed_effects(&reclaimed);
+        freed_dirs += dirs;
+        freed_trees += trees;
+        freed_refs += refs;
+        if dirs + trees + refs > 0 {
+            changed += 1;
+        }
+        outcomes.push(json!({"wave": wave, "reclaimed": reclaimed}));
+    }
+    let considered = outcomes.len();
+    // Only a full sweep looks for orphans. A named target is a question about one wave, and answering
+    // it by deleting directories the operator did not name would be its own kind of dishonesty.
+    let mut orphans_removed = Vec::new();
+    let mut orphans_retained = Vec::new();
+    if target.is_none() {
+        for dir in orphaned_wave_dirs(root, &state) {
+            if !orphan_holds_no_work(&dir) {
+                orphans_retained.push(json!({
+                    "path": display_path(&dir),
+                    "reason": "a checkout beneath it holds uncommitted work, or could not be read",
+                }));
+                continue;
+            }
+            if command.dry_run {
+                orphans_removed.push(display_path(&dir));
+                changed += 1;
+                continue;
+            }
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => {
+                    orphans_removed.push(display_path(&dir));
+                    changed += 1;
+                }
+                Err(error) => orphans_retained.push(json!({
+                    "path": display_path(&dir),
+                    "reason": format!("could not be removed: {error}"),
+                })),
+            }
+        }
+    }
+    let orphan_count = orphans_removed.len();
+    let data = json!({
+        "waves": outcomes,
+        "dry_run": command.dry_run,
+        "orphans_removed": orphans_removed,
+        "orphans_retained": orphans_retained,
+    });
+    // Record what was freed. Reclamation is the one maintenance action whose effect is invisible in the
+    // state it mutates, so an unjournalled run leaves no way to tell it from a no-op.
+    //
+    // A sweep that freed nothing is not a mutation, and treating it as one was not free: it bumped the
+    // revision and rewrote a 21MB state file on every inert run, so nineteen consecutive no-ops each
+    // left a journal entry indistinguishable from progress.
+    if changed > 0 && !command.dry_run {
+        state.revision += 1;
+        persist_fleet_mutation(command, root, &state, "wave.reclaimed", data.clone())?;
+    }
+    let verb = if command.dry_run {
+        "would reclaim"
+    } else {
+        "reclaimed"
+    };
+    Ok((
+        format!(
+            "{verb} {changed} of {considered} wave(s): {freed_dirs} build dir(s), \
+             {freed_trees} worktree(s), {freed_refs} branch(es), \
+             {orphan_count} unrecorded wave director(ies)"
+        ),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
+/// The status a wave parked without a park record returns to.
+///
+/// Rework escalation parks a wave by writing `parked` straight onto it, so the only wave that carries
+/// no recorded previous status is one that ran out of rework rounds while awaiting handoffs. That is
+/// exactly the wave a human unparks after answering the review, which is why `unpark` has to work on it
+/// rather than refusing for want of a record it never had.
+const PARK_DEFAULT_RETURN_STATUS: &str = "awaiting-handoffs";
+
+/// Park a wave with a recorded reason.
+///
+/// Parking was a line in a driver-owned text file — invisible to `fleet status`, so a parked wave was
+/// re-decided every minute, and unparking meant editing text. Recording it on the wave makes the pause,
+/// its reason and the status it returns to durable state, and makes leaving it a verb.
+fn park_wave(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+    reason: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        bail!("input/schema: park --reason must not be empty");
+    }
+    let reason = redact(reason);
+    let wave = state
+        .waves
+        .get(wave_id)
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let previous_status = wave["status"].as_str().unwrap_or("unknown").to_string();
+    if previous_status == "parked" {
+        // Never overwrite the first reason. The recorded reason is why the wave is paused, and a second
+        // park replacing it would lose the fact the pause was made for.
+        let recorded = wave["park"]["reason"]
+            .as_str()
+            .unwrap_or("no reason recorded");
+        bail!("conflict/precondition: wave {wave_id} is already parked ({recorded})")
+    }
+    let park = json!({
+        "reason": reason,
+        "previous_status": previous_status,
+        // Revision rather than a wall clock: fleet state records no timestamps, and the revision is the
+        // ordering every other fleet record is already read against.
+        "revision": state.revision + 1,
+    });
+    let event = json!({"wave": wave_id, "status": "parked", "park": park.clone()});
+    let mut harvested = Vec::new();
+    persist_delta_mutation(command, root, &mut state, "wave.parked", event, |state| {
+        // R-10: harvest before the pause. A worker that committed its deliverable and then ran out of
+        // turn holds that work in a worktree nothing has recorded, and parking on top of it buries a
+        // finished story under a decision — three separate waves once held the same completed story,
+        // were parked as failures, and a human dug the commits out days later. The delta is recomputed
+        // on every attempt, so a retry rebuilds this report rather than double-counting it.
+        harvested.clear();
+        harvested.extend(record_provisional_handoffs(state, wave_id));
+        let wave = state
+            .waves
+            .get_mut(wave_id)
+            .with_context(|| format!("not-found: wave {wave_id}"))?;
+        wave["status"] = json!("parked");
+        wave["park"] = park.clone();
+        Ok(())
+    })?;
+    let recorded = harvested
+        .iter()
+        .filter(|report| report["recorded"] == json!(true))
+        .count();
+    let data = json!({
+        "wave": wave_id, "status": "parked", "park": park, "harvested": harvested,
+    });
+    if recorded > 0 {
+        append_fleet_event(
+            root,
+            "wave.park.harvested",
+            json!({"wave": wave_id, "harvested": data["harvested"].clone()}),
+        )?;
+    }
+    let harvest_note = if recorded > 0 {
+        format!(" (harvested {recorded} handoff(s) first)")
+    } else {
+        String::new()
+    };
+    Ok((
+        format!("{wave_id} parked: {reason}{harvest_note}"),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
+/// Clear the rework budget a park exhausted, and return the stories the park froze to work.
+///
+/// R-13, counter hygiene. Rework escalation parks by writing `parked` onto the story *and* the wave
+/// once `rework_attempts` reaches the configured ceiling. Restoring only the wave left both facts
+/// behind: the story stayed `parked`, so the wave could never earn `handoffs-ready` again, and the
+/// counter stayed at the ceiling, so the very next review parked it again on its first round — the
+/// human's answer bought zero rework rounds. Unparking is the moment the pause was answered, so it is
+/// the moment the budget resets.
+fn reset_parked_story_budgets(wave: &mut Value) -> Vec<Value> {
+    let mut reset = Vec::new();
+    for repository in wave["topology"]["repositories"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+    {
+        for story in repository["stories"].as_array_mut().into_iter().flatten() {
+            let attempts = story["rework_attempts"].as_u64().unwrap_or(0);
+            let was_parked = story["status"].as_str() == Some("parked");
+            if attempts == 0 && !was_parked {
+                continue;
+            }
+            // A story parked by rework always holds the accepted handoff its findings reviewed. One
+            // parked any other way has nothing to return to, so its status is left exactly as it is
+            // and the report says so rather than inventing a state it never held.
+            let restored = (was_parked && story["handoff"]["status"].as_str() == Some("accepted"))
+                .then_some("handoff-accepted");
+            if let Some(status) = restored {
+                story["status"] = json!(status);
+            }
+            if attempts > 0 {
+                story["rework_attempts"] = json!(0);
+            }
+            reset.push(json!({
+                "item": story["board_ref"].as_str().unwrap_or_default(),
+                "status": story["status"].as_str().unwrap_or("unknown"),
+                "restored": restored.is_some(),
+                "rework_attempts_cleared": attempts,
+            }));
+        }
+    }
+    reset
+}
+
+/// Return a parked wave to the lifecycle state it held, and clear the park record.
+fn unpark_wave(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let wave = state
+        .waves
+        .get(wave_id)
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    let status = wave["status"].as_str().unwrap_or("unknown");
+    if status != "parked" {
+        bail!("conflict/precondition: wave {wave_id} is {status}, not parked")
+    }
+    let restored = wave["park"]["previous_status"]
+        .as_str()
+        .unwrap_or(PARK_DEFAULT_RETURN_STATUS)
+        .to_string();
+    let event = json!({
+        "wave": wave_id,
+        "status": restored,
+        "previous_status": "parked",
+        "reason": wave["park"]["reason"].clone(),
+    });
+    let reason = wave["park"]["reason"].clone();
+    let target = restored.clone();
+    let mut budget_reset = Vec::new();
+    persist_delta_mutation(command, root, &mut state, "wave.unparked", event, |state| {
+        let wave = state
+            .waves
+            .get_mut(wave_id)
+            .with_context(|| format!("not-found: wave {wave_id}"))?;
+        wave["status"] = json!(target);
+        budget_reset.clear();
+        budget_reset.extend(reset_parked_story_budgets(wave));
+        if let Some(record) = wave.as_object_mut() {
+            record.remove("park");
+        }
+        Ok(())
+    })?;
+    let data = json!({
+        "wave": wave_id,
+        "status": restored,
+        "previous_status": "parked",
+        "reason": reason,
+        "budget_reset": budget_reset,
+    });
+    Ok((
+        format!("{wave_id} unparked: {restored}"),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
+/// Stop dispatch, then confirm nothing is in flight — the two halves of a safe install window.
+///
+/// C-642. The order is the point. The quiesce is recorded FIRST and unconditionally, because
+/// admission has to stop before liveness is inspected: a wave dispatched between the inspection and
+/// the install is precisely the race this closes. Only then is in-flight work reported, and a fleet
+/// with a live worker turn returns a `conflict/precondition` error, so `flux fleet quiesce &&
+/// install` cannot walk past a running worker. Doing this by hand went wrong twice in one evening —
+/// once corrupting a full workspace test run — because a process-table scan answered "idle" while
+/// three workers ran.
+///
+/// Re-running the verb once those workers settle confirms the same, now-quiet, state; only
+/// `flux fleet resume` lifts the window.
+fn fleet_quiesce(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    reason: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let reason = reason
+        .map(|reason| redact(reason.trim()))
+        .filter(|reason| !reason.is_empty());
+    state.revision += 1;
+    let record = QuiesceRecord {
+        reason: reason.clone(),
+        since_revision: state.revision,
+    };
+    state.quiesce = Some(record.clone());
+    // The same derivation `fleet status` uses: a recorded terminal receipt, transition or dead
+    // supervisor settles a stale `working` row, so this never reports a ghost as in flight.
+    let in_flight = state
+        .agents
+        .iter()
+        .filter(|(_, agent)| worker_activity(agent) == WorkerActivity::Active)
+        .map(|(id, agent)| {
+            let assignment = &agent["assignment"];
+            json!({
+                "agent": bounded_status_text(id, 200),
+                "status": bounded_status_text(agent["status"].as_str().unwrap_or("unknown"), 40),
+                "board_ref": bounded_status_ref(assignment["board_ref"].as_str().or_else(|| agent["board_ref"].as_str())),
+                "wave": bounded_status_ref(assignment["wave"].as_str().or_else(|| agent["wave"].as_str())),
+            })
+        })
+        .collect::<Vec<_>>();
+    let settled = in_flight.is_empty();
+    let data = json!({
+        "schema": "flux.fleet-quiesce/v1",
+        "quiesced": true,
+        "reason": record.reason,
+        "since_revision": record.since_revision,
+        "in_flight": in_flight,
+        "safe_to_install": settled,
+    });
+    persist_fleet_mutation(command, root, &state, "fleet.quiesced", data.clone())?;
+    if !settled {
+        let names = data["in_flight"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|worker| worker["agent"].as_str().unwrap_or("worker").to_string())
+            .collect::<Vec<_>>();
+        bail!(
+            "conflict/precondition: dispatch is quiesced, but {} worker turn(s) are still in \
+             flight: {}. Wait for them to settle and re-run `flux fleet quiesce` before installing \
+             a new binary",
+            names.len(),
+            names.join(", ")
+        )
+    }
+    Ok((
+        format!(
+            "fleet quiesced at revision {}; no worker turn is in flight, so installing a new binary cannot race one",
+            record.since_revision
+        ),
+        data,
+        vec![],
+        state.revision,
+    ))
+}
+
 fn fleet_control_mutation(
     command: &FleetCommand,
     root: &Path,
@@ -8913,8 +14082,26 @@ fn fleet_control_mutation(
         "cancelled" => bail!("not-found: fleet agent or wave {target}"),
         _ => {}
     }
+    // Reclaim a cancelled wave's build output here, not only on acceptance.
+    //
+    // Reclamation ran on accept alone, so every wave that ended any other way kept its target
+    // directories for as long as the checkout existed — 27 GB of it on one machine, cleared by hand.
+    // Disk is what caps how many workers can run, so unreclaimed dead waves directly cost width.
+    //
+    // Safe because `reclaim_wave_storage` already separates the two things: build output is regenerable
+    // and always goes, while the worktree itself is removed only when it provably holds no commit and no
+    // uncommitted change. Cancelling a wave therefore cannot cost work, only rebuild time.
+    let reclaimed = if verb == "cancelled" && !command.dry_run {
+        state
+            .waves
+            .get(target)
+            .filter(|wave| wave["topology"].is_object())
+            .map(reclaim_wave_storage)
+    } else {
+        None
+    };
     state.revision += 1;
-    let data = json!({"target":target,"state":verb,"ack":"completed"});
+    let data = json!({"target":target,"state":verb,"ack":"completed","reclaimed":reclaimed});
     persist_fleet_mutation(
         command,
         root,
@@ -8938,12 +14125,42 @@ fn read_event_lines(root: &Path, limit: usize) -> Result<Vec<Value>> {
     Ok(lines)
 }
 
+/// The per-line character bound of one projected gate output line, applied before the structural
+/// byte budget so a single pathological line cannot consume the whole projection.
+const GATE_OUTPUT_LINE_CHARS: usize = 2_000;
+
+/// One captured gate stream, most recent line first.
+///
+/// A gate's verdict is the LAST thing it wrote, and a repository gate writes tens of thousands of
+/// lines of compilation banner before it. A head-first projection therefore spends its entire bound
+/// on progress noise and drops the one line the operator opened the view for — which is exactly why
+/// reading `topology.repositories[].gate.evidence.stdout` by hand meant a `jq`/Python expression that
+/// sliced the tail. The tail is emitted first and the bound applies to the tail, so the reason
+/// survives both `--limit` and the structural byte budget. `line_count` reports what the gate
+/// actually wrote, so a truncated tail is never mistaken for a short log.
+fn gate_output_tail(value: &Value, limit: usize) -> Value {
+    let text = value.as_str().unwrap_or_default();
+    let line_count = text.lines().count();
+    let lines = text
+        .lines()
+        .rev()
+        .take(limit)
+        .map(|line| bounded_text(line, GATE_OUTPUT_LINE_CHARS))
+        .collect::<Vec<_>>();
+    json!({
+        "lines": lines,
+        "line_count": line_count,
+        "truncated": line_count > lines.len(),
+    })
+}
+
 fn fleet_inspect(
     root: &Path,
     state: &FleetState,
     view: InspectView,
     target: Option<&str>,
     limit: usize,
+    repository: Option<&str>,
 ) -> Result<Value> {
     let limit = limit.min(10_000);
     let target_required = || target.context("input/schema: this inspect view requires a target");
@@ -8951,7 +14168,14 @@ fn fleet_inspect(
         InspectView::Snapshot => json!({
             "revision":state.revision,
             "running":state.running,
-            "main_agent":state.main_agent,
+            "main_agent": {
+                "id": state.main_agent.id,
+                "role": state.main_agent.role,
+                "status": state.main_agent.status,
+                "session": state.main_agent.session,
+                "intake_sequence": state.main_agent.intake_sequence,
+                "goals_revision": state.main_agent.goals_revision,
+            },
             "goals_revision":state.main_agent.goals_revision,
             "goals":state.goals.len(),
             "intake":state.intake.len(),
@@ -9020,6 +14244,45 @@ fn fleet_inspect(
                 .with_context(|| format!("not-found: wave {target}"))?;
             json!({"wave":target,"status":wave["status"],"apply_eligible":wave["apply_eligible"],"integration_order":wave["integration_order"],"repositories":wave["topology"]["repositories"].as_array().into_iter().flatten().map(|repository|json!({"id":repository["id"],"base_commit":repository["base_commit"],"integration":repository["integration"],"candidate":repository["candidate"],"gate":repository["gate"]})).take(limit).collect::<Vec<_>>()})
         }
+        InspectView::Gate => {
+            let target = target_required()?;
+            let wave = state
+                .waves
+                .get(target)
+                .with_context(|| format!("not-found: wave {target}"))?;
+            let mut repositories = Vec::new();
+            for entry in wave["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+            {
+                let id = entry["id"].as_str().unwrap_or_default();
+                if repository.is_some_and(|wanted| wanted != id) {
+                    continue;
+                }
+                let gate = &entry["gate"];
+                let evidence = &gate["evidence"];
+                repositories.push(json!({
+                    "id": id,
+                    "status": gate["status"],
+                    "candidate": gate["candidate"].as_str().or_else(|| entry["candidate"].as_str()),
+                    "runs": gate["runs"],
+                    // Why a gate never ran at all — `missing final gate argv`, or a candidate
+                    // unchanged since its red gate — is recorded instead of evidence, not beside it.
+                    "reason": gate["reason"],
+                    "argv": evidence["argv"],
+                    "exit_code": evidence["exit_code"],
+                    "stdout": gate_output_tail(&evidence["stdout"], limit),
+                    "stderr": gate_output_tail(&evidence["stderr"], limit),
+                }));
+            }
+            if repositories.is_empty() {
+                if let Some(repository) = repository {
+                    bail!("not-found: repository {repository} in wave {target}")
+                }
+            }
+            json!({"wave":target,"order":"tail-first","repositories":repositories})
+        }
         InspectView::Source => {
             let mut sources = fleet_sources(root)?;
             if let Some(target) = target {
@@ -9062,7 +14325,8 @@ fn fleet_inspect(
                 .into_iter()
                 .find(|story| story.id == target)
                 .with_context(|| format!("not-found: story {target}"))?;
-            let execution = fleet_inspect(root, state, InspectView::Result, Some(target), limit)?;
+            let execution =
+                fleet_inspect(root, state, InspectView::Result, Some(target), limit, None)?;
             json!({"planning":story,"execution":execution})
         }
         InspectView::PullRequest => {
@@ -9074,14 +14338,23 @@ fn fleet_inspect(
             json!({"wave":target,"supported":false,"reason":"fleet never opens pull requests; inspect the local candidate and apply explicitly","status":wave["status"],"apply_eligible":wave["apply_eligible"]})
         }
     };
-    Ok(redact_value(json!({
+    let mut payload = redact_value(payload);
+    let omitted = enforce_projection_budget(
+        &mut payload,
+        FLEET_INSPECT_BUDGET_BYTES.saturating_sub(FLEET_STATUS_BUDGET_MARGIN_BYTES),
+        FLEET_INSPECT_OMITTED_SCHEMA,
+    );
+    Ok(json!({
         "schema":"flux.fleet-inspect/v1",
         "view":format!("{view:?}").to_ascii_lowercase(),
-        "target":target,
+        "target":target.map(redact),
+        "repository":repository.map(redact),
         "bounded":true,
         "limit":limit,
+        "budget_bytes":FLEET_INSPECT_BUDGET_BYTES,
+        "omitted":omitted,
         "data":payload,
-    })))
+    }))
 }
 
 fn fleet_sources(root: &Path) -> Result<Value> {
@@ -9111,11 +14384,16 @@ fn fleet_sources(root: &Path) -> Result<Value> {
         "root": display_path(root),
         "config": true,
         "limits": {"max_workers": config.max_workers, "max_wave": config.max_wave, "max_rework": config.max_rework},
-        "main": {"instructions": config.main.instructions, "model": config.main.model},
+        "main": {"instructions": config.main.instructions, "model": config.main.model, "loop": config.main.agent_loop, "research_loop": config.main.research_loop},
+        "loop_profiles": config.loop_profiles.iter().map(|(id, profile)| (id.clone(), json!({
+            "revision": profile.revision, "source": profile.source, "entry": profile.entry,
+            "required_runtime_features": profile.required_runtime_features
+        }))).collect::<Map<String, Value>>(),
+        "loop_policy": config.loop_policy,
         "allow_ad_hoc_agents": config.allow_ad_hoc_agents,
         "worktree_root": config.worktree_root,
         "agent_templates": config.agent_templates.iter().map(|template| json!({
-            "id": template.id, "role": template.role, "mode": template.mode,
+            "id": template.id, "role": template.role, "task_kind": template.task_kind, "mode": template.mode,
             "model": template.model, "max_instances": template.max_instances,
             "capabilities": template.capabilities, "fences": template.fences
         })).collect::<Vec<_>>(),
@@ -9311,6 +14589,529 @@ fn fleet_schedule(root: &Path) -> Result<Value> {
         "attention_required": !human_decisions.as_array().is_none_or(Vec::is_empty)
     }))
 }
+
+/// C-631: the schema of one deterministic driver tick.
+const DRIVE_TICK_SCHEMA: &str = "flux.fleet-drive-tick/v1";
+
+/// C-631: the durable single-instance guard for `flux fleet drive --loop`.
+const DRIVE_LOCK_PATH: &str = ".flux/fleet/drive.lock";
+
+/// How `flux fleet drive` was invoked.
+struct DriveOptions {
+    tick: bool,
+    run_loop: bool,
+    interval: u64,
+    max_ticks: u64,
+}
+
+/// The decisions one tick makes, computed from durable state alone.
+#[derive(Debug, Default, PartialEq)]
+struct DrivePlan {
+    /// The state this tick decided on, as one comparable value.
+    fingerprint: String,
+    /// Waves whose stories are all handed off and may leave `awaiting-handoffs`.
+    advance: Vec<String>,
+    /// Waves with outstanding stories whose finished turns can still be reconstructed into handoffs.
+    reconstruct: Vec<String>,
+    /// Items this tick will send workers at.
+    dispatch: Vec<String>,
+    /// Items this tick deliberately did not send, each with the reason it was held back.
+    withheld: Vec<Value>,
+    /// Why the dispatch phase sent nothing at all, when that is a property of the fleet.
+    blocked: Option<String>,
+    /// Free worker slots at the configured width.
+    width: usize,
+}
+
+/// The stories a wave's topology names, across every repository in it.
+fn drive_wave_stories(wave: &Value) -> Vec<&Value> {
+    wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+        .collect()
+}
+
+/// The status a wave has *earned*, or `None` if it is already where it belongs.
+///
+/// The only advancement a tick performs. `awaiting-handoffs` is the state a wave sits in while its
+/// stories are recorded one by one; once every story holds an accepted handoff the wave is ready for
+/// its integrator, and nothing else in the fleet was moving it there.
+fn drive_wave_next_status(wave: &Value) -> Option<&'static str> {
+    if wave["status"].as_str() != Some("awaiting-handoffs") {
+        return None;
+    }
+    let stories = drive_wave_stories(wave);
+    if stories.is_empty() {
+        return None;
+    }
+    stories
+        .iter()
+        .all(|story| story["status"].as_str() == Some("handoff-accepted"))
+        .then_some("handoffs-ready")
+}
+
+/// What a tick would decide on, rendered as one stable value.
+///
+/// The bash driver answered "did anything change?" by diffing rendered status text, which changed
+/// whenever a clock did. This is derived only from the facts a tick acts on: the revision, the
+/// admission window, and every wave and worker status.
+fn drive_fingerprint(state: &FleetState) -> String {
+    let mut signature = format!(
+        "r{}|running={}|quiesced={}",
+        state.revision,
+        state.running,
+        state.quiesce.is_some()
+    );
+    for (id, wave) in &state.waves {
+        signature.push_str(&format!(
+            "|w:{id}={}",
+            wave["status"].as_str().unwrap_or("unknown")
+        ));
+    }
+    for (id, agent) in &state.agents {
+        signature.push_str(&format!(
+            "|a:{id}={}",
+            agent["status"].as_str().unwrap_or("unknown")
+        ));
+    }
+    format!("{:016x}", drive_hash(&signature))
+}
+
+/// FNV-1a over a tick signature.
+///
+/// A fingerprint is compared against one written by an earlier *process*, which rules out
+/// `DefaultHasher` — its output is explicitly not stable across builds.
+fn drive_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The wave holding one item's attempt, and whether that hold is a pause a human owns.
+struct ItemClaim {
+    wave: String,
+    /// The recorded park reason, when the holding wave is parked rather than working.
+    parked: Option<String>,
+}
+
+/// Items a live wave still holds an attempt at, and the wave holding each.
+///
+/// A claim is released only when the wave provably ends — accepted and applied, or cancelled. A park
+/// is not an ending: the wave keeps its claim, because the work it holds is still on disk and the
+/// pause is a decision a human has yet to answer. The distinction is carried here so the driver can
+/// say *which* of the two withheld the item instead of reporting one as the other.
+fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, ItemClaim> {
+    let mut claims: BTreeMap<String, ItemClaim> = BTreeMap::new();
+    for (id, wave) in &state.waves {
+        let status = wave["status"].as_str().unwrap_or("unknown");
+        if !wave_still_claims_items(status) {
+            continue;
+        }
+        let parked = (status == "parked").then(|| {
+            wave["park"]["reason"]
+                .as_str()
+                .unwrap_or("no reason recorded")
+                .to_string()
+        });
+        for item in value_strings(&wave["items"]) {
+            claims.entry(item).or_insert_with(|| ItemClaim {
+                wave: id.clone(),
+                parked: parked.clone(),
+            });
+        }
+    }
+    claims
+}
+
+/// Compute one tick's decisions. Pure: every input is already-read durable state.
+///
+/// `reconcile` is `None` when `board reconcile` could not be read, and that case **fails closed**:
+/// an empty already-built set is indistinguishable from "nothing is already built", and answering
+/// the second when the first is true is exactly how `wave-472` dispatched ten stories whose work was
+/// already in `main`.
+fn drive_tick_plan(
+    state: &FleetState,
+    schedule: &Value,
+    reconcile: Option<&Value>,
+    max_workers: usize,
+) -> DrivePlan {
+    let mut plan = DrivePlan {
+        fingerprint: drive_fingerprint(state),
+        ..DrivePlan::default()
+    };
+    for (id, wave) in &state.waves {
+        // A parked wave is one a human is deliberating over. Advancing it would be re-deciding it,
+        // which is the behaviour parking exists to stop.
+        if wave["status"].as_str() == Some("parked") {
+            continue;
+        }
+        if drive_wave_next_status(wave).is_some() {
+            plan.advance.push(id.clone());
+        } else if wave["status"].as_str() == Some("awaiting-handoffs") {
+            plan.reconstruct.push(id.clone());
+        }
+    }
+
+    let active = state
+        .agents
+        .values()
+        .filter(|agent| matches!(worker_activity(agent), WorkerActivity::Active))
+        .count();
+    plan.width = max_workers.saturating_sub(active);
+
+    if !state.running {
+        plan.blocked = Some("fleet is stopped; `flux fleet start` before dispatching".into());
+        return plan;
+    }
+    let Some(reconcile) = reconcile else {
+        plan.blocked = Some(
+            "board reconcile could not be read; an empty already-built set is indistinguishable \
+             from nothing being built, so this tick dispatched nothing"
+                .into(),
+        );
+        return plan;
+    };
+    let already_built = reconcile["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|finding| {
+            finding["id"]
+                .as_str()
+                .map(|id| (id.to_string(), finding.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let claimed = drive_claimed_items(state);
+
+    let mut seen = BTreeSet::new();
+    for wave in schedule["waves"].as_array().into_iter().flatten() {
+        for item in value_strings(&wave["eligible"]) {
+            if !seen.insert(item.clone()) {
+                continue;
+            }
+            if let Some(claim) = claimed.get(&item) {
+                let holder = &claim.wave;
+                plan.withheld.push(match &claim.parked {
+                    Some(reason) => json!({
+                        "item": item,
+                        "reason": "parked",
+                        "detail": format!(
+                            "wave {holder} is parked pending a decision: {reason}"
+                        ),
+                    }),
+                    None => json!({
+                        "item": item,
+                        "reason": "claimed",
+                        "detail": format!("wave {holder} still holds an attempt at this item"),
+                    }),
+                });
+                continue;
+            }
+            if let Some(finding) = already_built.get(&item) {
+                plan.withheld.push(json!({
+                    "item": item,
+                    "reason": "already-built",
+                    "detail": "board reconcile reports the implementation is already present",
+                    "signals": finding["signals"].clone(),
+                    "transition_path": finding["transition_path"].clone(),
+                }));
+                continue;
+            }
+            if plan.dispatch.len() >= plan.width {
+                plan.withheld.push(json!({
+                    "item": item,
+                    "reason": "width",
+                    "detail": format!("{active} of {max_workers} worker slots are in use"),
+                }));
+                continue;
+            }
+            plan.dispatch.push(item);
+        }
+    }
+    plan
+}
+
+/// Read `board reconcile` the way the board CLI reads it, so the driver and an operator see the
+/// same already-present set.
+fn drive_reconcile(root: &Path) -> Result<Value> {
+    let command = BoardCommand {
+        root: root.to_path_buf(),
+        board: None,
+        scope: Some(default_board_scope(root)?),
+        profile: BoardProfileArg::default(),
+        output: AgentOutput::Json,
+        request: None,
+        idempotency_key: None,
+        if_revision: None,
+        dry_run: false,
+        session: None,
+        action: BoardAction::Reconcile,
+    };
+    let (_, data, _, _) = reconcile_board(&command, root)?;
+    Ok(data)
+}
+
+/// Take the drive lock, or name the live process that already holds it.
+///
+/// The bash driver's guard was a pidfile written after the work started, so two drivers regularly
+/// raced the same wave. The reservation makes taking it atomic, and a recorded pid that is gone is
+/// not a lock — a crashed driver must not need a human to clear a file before the next one starts.
+fn acquire_drive_lock(root: &Path) -> Result<()> {
+    let mine = format!("{}\n", std::process::id());
+    let updated = guarded_system(root)?
+        .update_file_reserved(DRIVE_LOCK_PATH, |current| {
+            match current.and_then(|held| held.trim().parse::<u32>().ok()) {
+                Some(pid)
+                    if pid != std::process::id() && supervisor_process_is_live(i64::from(pid)) =>
+                {
+                    Err(flux_core::Error::Other(format!(
+                        "`flux fleet drive --loop` is already running as pid {pid}"
+                    )))
+                }
+                _ => Ok(mine.clone()),
+            }
+        })
+        .map_err(|error| anyhow::anyhow!("conflict/precondition: {error}"))?;
+    if !updated {
+        bail!("conflict/precondition: another writer holds the drive lock reservation; retry")
+    }
+    Ok(())
+}
+
+/// Release the drive lock. Failure is never fatal: a stale lock naming a dead pid is not a lock.
+fn release_drive_lock(root: &Path) {
+    if let Ok(system) = guarded_system(root) {
+        let _ = system.write_file_atomic(DRIVE_LOCK_PATH, "");
+    }
+}
+
+/// `flux fleet drive`: the native unattended driver.
+fn fleet_drive(
+    command: &FleetCommand,
+    root: &Path,
+    state: FleetState,
+    options: DriveOptions,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    if options.tick && options.run_loop {
+        bail!("input/schema: drive takes either --tick or --loop, not both")
+    }
+    if !options.run_loop {
+        return drive_one_tick(command, root, state);
+    }
+    if options.interval == 0 {
+        bail!("input/schema: drive --interval must be at least one second")
+    }
+    acquire_drive_lock(root)?;
+    let outcome = drive_interval_loop(command, root, &options);
+    release_drive_lock(root);
+    outcome
+}
+
+/// Run ticks on an interval until the fleet says to stop.
+///
+/// `flux fleet stop` and `flux fleet quiesce` are the off switch, and they are durable facts rather
+/// than a signal to a shell, so the loop reads them at the top of every tick instead of holding a
+/// decision it made when it started.
+fn drive_interval_loop(
+    command: &FleetCommand,
+    root: &Path,
+    options: &DriveOptions,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let mut ticks = Vec::new();
+    let mut warnings = Vec::new();
+    let mut revision = read_fleet_state(root)?.revision;
+    let mut stopped = "tick ceiling reached";
+    let mut ran: u64 = 0;
+    loop {
+        let state = read_fleet_state(root)?;
+        if !state.running {
+            stopped = "fleet is stopped";
+            break;
+        }
+        if state.quiesce.is_some() {
+            stopped = "fleet is quiesced";
+            break;
+        }
+        let (_, data, tick_warnings, next) = drive_one_tick(command, root, state)?;
+        revision = next;
+        warnings.extend(tick_warnings);
+        ticks.push(data);
+        ran += 1;
+        if options.max_ticks != 0 && ran >= options.max_ticks {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(options.interval));
+    }
+    Ok((
+        format!("drive ran {ran} tick(s); stopped because {stopped}"),
+        json!({
+            "schema": "flux.fleet-drive/v1",
+            "ticks": ticks,
+            "count": ran,
+            "interval_seconds": options.interval,
+            "stopped_because": stopped,
+        }),
+        warnings,
+        revision,
+    ))
+}
+
+/// One deterministic tick: report, advance, accumulate, dispatch — in that order.
+///
+/// The order is the contract. Reporting first is what makes the tick comparable to the last one;
+/// advancing and accumulating before dispatch is what stops a tick from sending workers at a wave
+/// whose stories it has not yet recorded.
+fn drive_one_tick(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let config = read_fleet_config(root)?;
+    let schedule = fleet_schedule(root)?;
+    let mut warnings = Vec::new();
+    let reconcile = match drive_reconcile(root) {
+        Ok(data) => Some(data),
+        Err(error) => {
+            warnings.push(format!(
+                "board reconcile could not be read ({}); this tick dispatched nothing",
+                redact(&error.to_string())
+            ));
+            None
+        }
+    };
+    let plan = drive_tick_plan(&state, &schedule, reconcile.as_ref(), config.max_workers);
+    let previous = state.drive.clone().unwrap_or_default();
+    let idle = previous.fingerprint.as_deref() == Some(plan.fingerprint.as_str())
+        && plan.dispatch.is_empty()
+        && plan.advance.is_empty()
+        && plan.reconstruct.is_empty();
+
+    let reconstruct = plan.reconstruct.clone();
+    let fingerprint = plan.fingerprint.clone();
+    let mut advanced = Vec::new();
+    let mut reconstructed = Vec::new();
+    let event = json!({
+        "fingerprint": fingerprint,
+        "advance": plan.advance,
+        "reconstruct": plan.reconstruct,
+        "dispatch": plan.dispatch,
+        "withheld": plan.withheld,
+        "blocked": plan.blocked,
+    });
+    persist_delta_mutation(
+        command,
+        root,
+        &mut state,
+        "fleet.drive.tick",
+        event,
+        |state| {
+            // The delta is recomputed on every attempt, so a retry must not double-count what the
+            // previous attempt observed.
+            advanced.clear();
+            reconstructed.clear();
+            for wave in &reconstruct {
+                let reports = record_provisional_handoffs(state, wave);
+                let recorded = reports
+                    .iter()
+                    .filter(|report| report["recorded"] == json!(true))
+                    .count();
+                if recorded > 0 {
+                    reconstructed.push(json!({"wave": wave, "recorded": recorded}));
+                }
+            }
+            for (id, wave) in state.waves.iter_mut() {
+                if wave["status"].as_str() == Some("parked") {
+                    continue;
+                }
+                if let Some(next) = drive_wave_next_status(wave) {
+                    advanced.push(json!({"wave": id, "from": "awaiting-handoffs", "to": next}));
+                    wave["status"] = json!(next);
+                }
+            }
+            let record = state.drive.get_or_insert_with(DriveRecord::default);
+            record.ticks += 1;
+            record.fingerprint = Some(fingerprint.clone());
+            record.revision = state.revision;
+            Ok(())
+        },
+    )?;
+    let tick = state.drive.clone().unwrap_or_default().ticks;
+
+    // Dispatch last, and never from the plan's stale view: the phases above moved the very waves
+    // whose claims decide what is dispatchable.
+    let mut dispatch = json!({
+        "width": plan.width,
+        "items": plan.dispatch,
+        "withheld": plan.withheld,
+        "blocked": plan.blocked,
+    });
+    if !plan.dispatch.is_empty() && !command.dry_run {
+        let run = FleetCommand {
+            root: command.root.clone(),
+            output: command.output,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            action: FleetAction::Run {
+                items: plan.dispatch.clone(),
+                prepare_only: false,
+            },
+        };
+        let current = read_fleet_state(root)?;
+        match run_fleet_action(&run, root, current, None) {
+            Ok((_, data, run_warnings, _)) => {
+                warnings.extend(run_warnings);
+                dispatch["result"] = data;
+            }
+            Err(error) => {
+                // A dispatch that failed is a fact to report, not a reason to lose the tick that
+                // already advanced and recorded a wave. The next tick re-decides from state.
+                let message = redact(&error.to_string());
+                warnings.push(format!("dispatch failed: {message}"));
+                dispatch["error"] = json!(message);
+                append_fleet_event(
+                    root,
+                    "fleet.drive.dispatch-failed",
+                    json!({"items": plan.dispatch, "error": message}),
+                )?;
+            }
+        }
+    }
+    let revision = read_fleet_state(root)?.revision;
+    let data = json!({
+        "schema": DRIVE_TICK_SCHEMA,
+        "tick": tick,
+        "fingerprint": plan.fingerprint,
+        "idle": idle,
+        "report": {
+            "revision": revision,
+            "previous_fingerprint": previous.fingerprint,
+            "workers_configured": config.max_workers,
+            "worker_slots_free": plan.width,
+        },
+        "advanced": advanced,
+        "reconstructed": reconstructed,
+        "dispatch": dispatch,
+    });
+    Ok((
+        format!(
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), dispatched {} item(s), withheld {}",
+            advanced.len(),
+            reconstructed.len(),
+            dispatch["items"].as_array().map_or(0, Vec::len),
+            dispatch["withheld"].as_array().map_or(0, Vec::len),
+        ),
+        data,
+        warnings,
+        revision,
+    ))
+}
 fn schedule_human(data: &Value) -> String {
     data["waves"]
         .as_array()
@@ -9326,18 +15127,626 @@ fn schedule_human(data: &Value) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-fn fleet_status_human(data: &Value) -> String {
-    format!(
-        "fleet: {} · revision {} · {} agent(s) · {} wave(s)",
-        if data["state"]["running"].as_bool().unwrap_or(false) {
-            "running"
+/// C-562: the reviewed fixed byte budget for the default `fleet status`/`dashboard` projection. The
+/// 2026-08-05 roadmap dogfood run reached 2,694,752 bytes by copying `last_turn` receipts, intake
+/// receipts and historical event arrays into it; detailed evidence stays behind `fleet inspect`.
+const FLEET_STATUS_BUDGET_BYTES: usize = 64 * 1024;
+/// Head room reserved for the budget and next-command metadata attached after trimming.
+const FLEET_STATUS_BUDGET_MARGIN_BYTES: usize = 8 * 1024;
+/// The matching fixed budget for the human projection of the same data.
+const FLEET_STATUS_HUMAN_BUDGET_BYTES: usize = 4 * 1024;
+/// The fixed byte budget of one bounded `fleet inspect` view, applied after redaction.
+const FLEET_INSPECT_BUDGET_BYTES: usize = 256 * 1024;
+const FLEET_STATUS_MAX_WORKER_ROWS: usize = 25;
+const FLEET_STATUS_MAX_WAVE_ROWS: usize = 10;
+const FLEET_STATUS_MAX_REF_ROWS: usize = 25;
+const FLEET_PROJECTION_OMISSION_RECORDS: usize = 12;
+const FLEET_STATUS_OMITTED_SCHEMA: &str = "flux.fleet-status-omitted/v1";
+const FLEET_INSPECT_OMITTED_SCHEMA: &str = "flux.fleet-inspect-omitted/v1";
+
+/// C-562: one shared derivation of worker liveness for `fleet status` and the TUI dashboard. A
+/// recorded terminal receipt, error or transition outranks a stale `working` status, so a completed,
+/// failed, cancelled or interrupted process is never counted as active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerActivity {
+    Active,
+    Attention,
+    Settled,
+}
+
+impl WorkerActivity {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Attention => "attention",
+            Self::Settled => "settled",
+        }
+    }
+
+    fn order(self) -> u8 {
+        match self {
+            Self::Active => 0,
+            Self::Attention => 1,
+            Self::Settled => 2,
+        }
+    }
+}
+
+fn worker_turn_ended(agent: &Value) -> bool {
+    match agent["last_activity"].as_str() {
+        // The recorded transition outranks the retained receipt in both directions: a terminal
+        // transition settles a stale `working` status, and a fresh delivery proves the host handed
+        // the process another turn after the receipt of an earlier continued turn.
+        Some("agent.turn.completed" | "agent.turn.failed" | "agent.turn.cancelled") => return true,
+        Some("agent.turn.delivered") => return false,
+        _ => {}
+    }
+    let turn = &agent["last_turn"];
+    turn["exit_code"].is_number()
+        || turn["ack"]
+            .as_str()
+            .is_some_and(|ack| matches!(ack, "completed" | "failed" | "cancelled"))
+}
+
+fn worker_activity(agent: &Value) -> WorkerActivity {
+    let status = agent["status"].as_str().unwrap_or("unknown");
+    let errored = agent["last_error"]
+        .as_str()
+        .is_some_and(|error| !error.trim().is_empty());
+    if matches!(status, "failed" | "parked" | "interrupted") || errored {
+        return WorkerActivity::Attention;
+    }
+    if matches!(status, "working" | "running" | "active") {
+        // Two independent ways an active status can be a lie, and both are needed.
+        //
+        // A terminal receipt or transition proves the turn ENDED — the status field is merely stale, and
+        // that is what `worker_turn_ended` reads. But the turn is executed synchronously by the process
+        // that recorded `working`, so if that process is killed no receipt is ever written at all: there
+        // is nothing stale to notice, only silence. `wave-308-worker-1` read `working` for hours that way,
+        // inflating the active count, keeping its wave out of reaping, and pushing the driver into
+        // scanning `/proc` because state could not answer.
+        //
+        // So a recorded supervisor that is gone settles the record too. Pid reuse can fool this — a
+        // recycled pid reads as alive — which is exactly the previous behaviour, making it a strict
+        // improvement rather than a guarantee. An agent with no recorded pid is judged on its receipts
+        // alone, so records written before the pid existed are unaffected.
+        let supervisor_gone = agent["supervisor_pid"]
+            .as_i64()
+            .is_some_and(|pid| !supervisor_process_is_live(pid));
+        return if worker_turn_ended(agent) || supervisor_gone {
+            WorkerActivity::Attention
         } else {
-            "stopped"
+            WorkerActivity::Active
+        };
+    }
+    WorkerActivity::Settled
+}
+
+fn projection_bytes(value: &Value) -> usize {
+    serde_json::to_vec(value).map_or(0, |encoded| encoded.len())
+}
+
+/// C-562: shrink one already-redacted projection to a fixed byte budget without ever byte-slicing a
+/// structured value. An oversized scalar is replaced atomically with post-redaction omission
+/// metadata; an oversized array loses its tail and records how many entries were omitted.
+fn enforce_projection_budget(value: &mut Value, budget: usize, schema: &str) -> Vec<Value> {
+    let scalar_limit = (budget / 8).max(1_024);
+    let mut omitted = Vec::new();
+    replace_oversized_scalars(value, scalar_limit, schema, &mut omitted);
+    let mut trimmed: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for _ in 0..1_024 {
+        if projection_bytes(value) <= budget {
+            break;
+        }
+        let Some((path, len)) = largest_projection_array(value) else {
+            break;
+        };
+        let retained = len / 2;
+        let Some(items) = value_at_mut(value, &path).and_then(Value::as_array_mut) else {
+            break;
+        };
+        items.truncate(retained);
+        let entry = trimmed.entry(path.join(".")).or_insert((0, retained));
+        entry.0 += len - retained;
+        entry.1 = retained;
+    }
+    omitted.extend(trimmed.into_iter().map(|(path, (dropped, retained))| {
+        json!({
+            "schema": schema,
+            "reason": "records_omitted",
+            "path": path,
+            "omitted": dropped,
+            "retained": retained,
+        })
+    }));
+    omitted.truncate(FLEET_PROJECTION_OMISSION_RECORDS);
+    if projection_bytes(value) > budget {
+        let record = json!({
+            "schema": schema,
+            "reason": "projection_too_large",
+            "limit_bytes": budget,
+        });
+        omitted.push(record.clone());
+        *value = record;
+    }
+    omitted
+}
+
+fn replace_oversized_scalars(
+    value: &mut Value,
+    limit: usize,
+    schema: &str,
+    omitted: &mut Vec<Value>,
+) {
+    match value {
+        Value::String(text) if text.len() > limit => {
+            let record = json!({
+                "schema": schema,
+                "reason": "value_too_large",
+                "bytes": text.len(),
+                "limit_bytes": limit,
+                "sha256": flux_lang::runtime::sha256_hex(text),
+            });
+            omitted.push(record.clone());
+            *value = record;
+        }
+        Value::Array(items) => {
+            for item in items {
+                replace_oversized_scalars(item, limit, schema, omitted);
+            }
+        }
+        Value::Object(fields) => {
+            for (_, item) in fields.iter_mut() {
+                replace_oversized_scalars(item, limit, schema, omitted);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn largest_projection_array(value: &Value) -> Option<(Vec<String>, usize)> {
+    fn walk(value: &Value, path: &mut Vec<String>, best: &mut Option<(Vec<String>, usize, usize)>) {
+        match value {
+            Value::Array(items) => {
+                if !items.is_empty() {
+                    let bytes = projection_bytes(value);
+                    if best.as_ref().is_none_or(|(_, _, largest)| bytes > *largest) {
+                        *best = Some((path.clone(), items.len(), bytes));
+                    }
+                }
+                for (index, item) in items.iter().enumerate() {
+                    path.push(index.to_string());
+                    walk(item, path, best);
+                    path.pop();
+                }
+            }
+            Value::Object(fields) => {
+                for (key, item) in fields {
+                    path.push(key.clone());
+                    walk(item, path, best);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = None;
+    walk(value, &mut Vec::new(), &mut best);
+    best.map(|(path, len, _)| (path, len))
+}
+
+fn value_at_mut<'a>(value: &'a mut Value, path: &[String]) -> Option<&'a mut Value> {
+    let mut cursor = value;
+    for segment in path {
+        cursor = match cursor {
+            Value::Object(fields) => fields.get_mut(segment)?,
+            Value::Array(items) => items.get_mut(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(cursor)
+}
+
+fn bounded_status_text(value: &str, max_chars: usize) -> String {
+    bounded_text(&redact(value), max_chars)
+}
+
+fn bounded_status_ref(value: Option<&str>) -> Option<String> {
+    value.map(|value| bounded_status_text(value, 200))
+}
+
+/// A payload-free summary of one retained turn receipt: acknowledgement, session and event count.
+fn turn_summary(turn: Option<&Value>) -> Option<String> {
+    let turn = turn.filter(|turn| !turn.is_null())?;
+    let ack = turn["ack"].as_str().unwrap_or("recorded");
+    let session = turn["session"].as_str().unwrap_or("none");
+    let events = turn["events"].as_array().map_or(0, Vec::len);
+    let exit = turn["exit_code"]
+        .as_i64()
+        .map(|code| format!(" · exit {code}"))
+        .unwrap_or_default();
+    Some(bounded_status_text(
+        &format!("ack={ack} · session={session} · {events} event(s){exit}"),
+        300,
+    ))
+}
+
+fn wave_gate_summary(wave: &Value) -> Option<String> {
+    let red = wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|repository| repository["gate"]["status"].as_str() == Some("red"))
+        .map(|repository| {
+            bounded_status_text(repository["id"].as_str().unwrap_or("repository"), 100)
+        })
+        .collect::<Vec<_>>();
+    (!red.is_empty()).then(|| bounded_text(&format!("red gate: {}", red.join(", ")), 200))
+}
+
+/// The recorded park on a wave, bounded for the status projection.
+///
+/// A parked wave is deliberately NOT counted as attention: the pause is a decision already taken, and
+/// the whole point of recording it is that nothing re-decides it every minute. What status owes the
+/// operator is the reason, so the pause is legible without reading `state.json`.
+fn wave_park_summary(wave: &Value) -> Option<Value> {
+    let park = wave.get("park")?.as_object()?;
+    Some(json!({
+        "reason": bounded_status_text(
+            park.get("reason").and_then(Value::as_str).unwrap_or("no reason recorded"),
+            300,
+        ),
+        "previous_status": bounded_status_ref(
+            park.get("previous_status").and_then(Value::as_str),
+        ),
+        "revision": park.get("revision").and_then(Value::as_u64),
+    }))
+}
+
+/// C-562: the bounded default projection behind `fleet status` and `fleet dashboard`. It reports
+/// operational truth — main state, active/attention worker counts, wave/item state, exact BoardRefs,
+/// repositories, current sessions, last transition/error summaries and the current revision — and
+/// never copies answers, tool events, diffs or repository contents out of durable state.
+fn fleet_status_projection(root: &Path, state: &FleetState) -> Result<Value> {
+    let sources = fleet_sources(root)?;
+    let schedule = fleet_schedule(root)?;
+
+    let mut active = 0usize;
+    let mut attention = 0usize;
+    let mut by_status: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rows = Vec::new();
+    for (id, agent) in &state.agents {
+        let activity = worker_activity(agent);
+        match activity {
+            WorkerActivity::Active => active += 1,
+            WorkerActivity::Attention => attention += 1,
+            WorkerActivity::Settled => {}
+        }
+        *by_status
+            .entry(bounded_status_text(
+                agent["status"].as_str().unwrap_or("unknown"),
+                40,
+            ))
+            .or_default() += 1;
+        let assignment = &agent["assignment"];
+        let id = bounded_status_text(id, 200);
+        rows.push((
+            activity.order(),
+            id.clone(),
+            json!({
+                "id": id,
+                "role": bounded_status_text(agent["role"].as_str().unwrap_or("worker"), 100),
+                "status": bounded_status_text(agent["status"].as_str().unwrap_or("unknown"), 40),
+                "activity": activity.as_str(),
+                "board_ref": bounded_status_ref(assignment["board_ref"].as_str().or_else(|| agent["board_ref"].as_str())),
+                "wave": bounded_status_ref(assignment["wave"].as_str().or_else(|| agent["wave"].as_str())),
+                "session": bounded_status_ref(agent["runtime_session"].as_str().or_else(|| agent["session"].as_str())),
+                "last_transition": bounded_status_ref(agent["last_activity"].as_str()),
+                "last_turn": turn_summary(agent.get("last_turn")),
+                "last_error": agent["last_error"].as_str().map(|error| bounded_status_text(error, 300)),
+                "rework_round": agent["rework_round"].as_u64().or_else(|| assignment["rework_round"].as_u64()),
+            }),
+        ));
+    }
+    rows.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let workers_total = rows.len();
+    let worker_rows = rows
+        .into_iter()
+        .take(FLEET_STATUS_MAX_WORKER_ROWS)
+        .map(|(_, _, row)| row)
+        .collect::<Vec<_>>();
+
+    let waves_total = state.waves.len();
+    let mut wave_rows = state
+        .waves
+        .iter()
+        .rev()
+        .take(FLEET_STATUS_MAX_WAVE_ROWS)
+        .map(|(id, wave)| {
+            json!({
+                "id": bounded_status_text(id, 200),
+                "status": bounded_status_text(wave["status"].as_str().unwrap_or("unknown"), 40),
+                "apply_eligible": wave["apply_eligible"].as_bool(),
+                "item_count": wave["items"].as_array().map_or(0, Vec::len),
+                "items": value_strings(&wave["items"]).iter().take(FLEET_STATUS_MAX_REF_ROWS)
+                    .map(|item| bounded_status_text(item, 200)).collect::<Vec<_>>(),
+                "gate": wave_gate_summary(wave),
+                "park": wave_park_summary(wave),
+            })
+        })
+        .collect::<Vec<_>>();
+    wave_rows.reverse();
+
+    let ready_refs = value_strings(&schedule["program_items"]);
+    let configured_waves = schedule["waves"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(FLEET_STATUS_MAX_WAVE_ROWS)
+        .map(|wave| {
+            json!({
+                "id": bounded_status_ref(wave["id"].as_str()),
+                "state": bounded_status_ref(wave["state"].as_str()),
+                "item_count": wave["items"].as_array().map_or(0, Vec::len),
+                "eligible_count": wave["eligible"].as_array().map_or(0, Vec::len),
+                "dependencies_done": wave["dependencies_done"].as_bool(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let schedule_view = json!({
+        "active_milestone": bounded_status_ref(schedule["active_milestone"].as_str()),
+        "max_wave": schedule["max_wave"],
+        "attention_required": schedule["attention_required"].as_bool().unwrap_or(false),
+        "ready_total": ready_refs.len(),
+        "ready_items": ready_refs.iter().take(FLEET_STATUS_MAX_REF_ROWS)
+            .map(|item| bounded_status_text(item, 200)).collect::<Vec<_>>(),
+        "configured_waves_total": schedule["waves"].as_array().map_or(0, Vec::len),
+        "configured_waves": configured_waves,
+    });
+
+    let repositories_total = sources["repositories"].as_array().map_or(0, Vec::len);
+    let repositories = sources["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(FLEET_STATUS_MAX_REF_ROWS)
+        .map(|repository| {
+            json!({
+                "id": bounded_status_ref(repository["id"].as_str()),
+                "board": bounded_status_ref(repository["board"].as_str()),
+                "root": bounded_status_ref(repository["root"].as_str()),
+                "canonical_ref": bounded_status_ref(repository["canonical_ref"].as_str()),
+                "head": bounded_status_ref(repository["head"].as_str()),
+                "canonical_commit": bounded_status_ref(repository["canonical_commit"].as_str()),
+                "dirty": repository["dirty"].as_bool(),
+                "stale_or_diverged": repository["stale_or_diverged"].as_bool(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let decisions_total = schedule["human_decisions"].as_array().map_or(0, Vec::len);
+    let decision_rows = schedule["human_decisions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(FLEET_STATUS_MAX_REF_ROWS)
+        .map(|decision| {
+            json!({
+                "ref": bounded_status_ref(decision["ref"].as_str()),
+                "title": bounded_status_ref(decision["title"].as_str()),
+                "blocks": decision["blocks"].as_array().map_or(0, Vec::len),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let mut intake_by_ack: BTreeMap<String, usize> = BTreeMap::new();
+    for intake in state.intake.values() {
+        *intake_by_ack
+            .entry(bounded_status_text(
+                intake["ack"].as_str().unwrap_or("unknown"),
+                40,
+            ))
+            .or_default() += 1;
+    }
+    let intake = json!({
+        "total": state.intake.len(),
+        "by_ack": intake_by_ack,
+        "latest": state.intake
+            .get(&format!("intake-{}", state.main_agent.intake_sequence))
+            .map(|intake| json!({
+                "id": bounded_status_ref(intake["id"].as_str()),
+                "ack": bounded_status_ref(intake["ack"].as_str()),
+                "source": bounded_status_ref(intake["source"].as_str()),
+            })),
+    });
+
+    let main = json!({
+        "id": bounded_status_text(&state.main_agent.id, 100),
+        "role": bounded_status_text(&state.main_agent.role, 100),
+        "status": bounded_status_text(&state.main_agent.status, 40),
+        "session": state.main_agent.session.as_deref().map(|session| bounded_status_text(session, 200)),
+        "goals_revision": state.main_agent.goals_revision,
+        "goals": state.goals.len(),
+        "intake_sequence": state.main_agent.intake_sequence,
+        "last_turn": turn_summary(state.main_agent.last_turn.as_ref()),
+        "last_error": state.main_agent.last_error.as_deref().map(|error| bounded_status_text(error, 300)),
+    });
+
+    let attention_required = attention > 0
+        || decisions_total > 0
+        || state.main_agent.last_error.is_some()
+        || wave_rows.iter().any(|wave| wave["gate"].is_string());
+    let listed_workers = worker_rows.len();
+    let listed_waves = wave_rows.len();
+    let listed_repositories = repositories.len();
+    let listed_decisions = decision_rows.len();
+    let mut data = json!({
+        "schema": "flux.fleet-status/v1",
+        "bounded": true,
+        "root": bounded_status_text(&display_path(root), 500),
+        "revision": state.revision,
+        "running": state.running,
+        // C-642: a quiesced fleet must not read as a merely idle one — that ambiguity is what sent
+        // the operator to the process table in the first place.
+        "quiesce": state.quiesce.as_ref().map(|quiesce| json!({
+            "reason": quiesce.reason.as_deref().map(|reason| bounded_status_text(reason, 300)),
+            "since_revision": quiesce.since_revision,
+        })),
+        "config": sources["config"],
+        "limits": sources["limits"],
+        "main": main,
+        "intake": intake,
+        "workers": {
+            "total": workers_total,
+            "active": active,
+            "attention": attention,
+            "settled": workers_total.saturating_sub(active + attention),
+            "by_status": by_status,
+            "listed": worker_rows,
+            "omitted": workers_total.saturating_sub(listed_workers),
         },
-        data["state"]["revision"],
-        data["state"]["agents"].as_object().map_or(0, Map::len),
-        data["state"]["waves"].as_object().map_or(0, Map::len)
-    )
+        "waves": {
+            "total": waves_total,
+            "listed": wave_rows,
+            "omitted": waves_total.saturating_sub(listed_waves),
+        },
+        "schedule": schedule_view,
+        "repositories": {
+            "total": repositories_total,
+            "listed": repositories,
+            "omitted": repositories_total.saturating_sub(listed_repositories),
+        },
+        "open_decisions": {
+            "total": decisions_total,
+            "listed": decision_rows,
+            "omitted": decisions_total.saturating_sub(listed_decisions),
+        },
+        "attention_required": attention_required,
+    });
+    let omitted = enforce_projection_budget(
+        &mut data,
+        FLEET_STATUS_BUDGET_BYTES.saturating_sub(FLEET_STATUS_BUDGET_MARGIN_BYTES),
+        FLEET_STATUS_OMITTED_SCHEMA,
+    );
+    let payload_bytes = projection_bytes(&data);
+    data["next_command"] = json!(fleet_status_next_command(&data));
+    data["budget"] = json!({
+        "schema": "flux.fleet-status-budget/v1",
+        "limit_bytes": FLEET_STATUS_BUDGET_BYTES,
+        "payload_bytes": payload_bytes,
+        "omitted": omitted,
+    });
+    Ok(data)
+}
+
+/// The next useful bounded inspection or recovery command for the observed state.
+fn fleet_status_next_command(data: &Value) -> String {
+    let workers = data["workers"]["listed"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Some(worker) = workers
+        .iter()
+        .find(|worker| worker["activity"] == "attention")
+    {
+        let id = worker["id"].as_str().unwrap_or("WORKER");
+        if matches!(
+            worker["status"].as_str(),
+            Some("working" | "running" | "active")
+        ) {
+            return format!("flux fleet resume {id} --output json");
+        }
+        return format!("flux fleet inspect worker {id} --limit 50 --output json");
+    }
+    if data["main"]["last_error"].is_string() {
+        return "flux fleet inspect worker main --limit 50 --output json".into();
+    }
+    if let Some(wave) = data["waves"]["listed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|wave| wave["gate"].is_string())
+    {
+        return format!(
+            "flux fleet inspect gate {} --limit 50 --output json",
+            wave["id"].as_str().unwrap_or("WAVE")
+        );
+    }
+    if workers.iter().any(|worker| worker["activity"] == "active") {
+        return "flux fleet inspect activity --limit 50 --output json".into();
+    }
+    if data["open_decisions"]["total"].as_u64().unwrap_or(0) > 0 {
+        return "flux fleet decisions --output json".into();
+    }
+    if data["schedule"]["ready_total"].as_u64().unwrap_or(0) > 0 {
+        return "flux fleet schedule --output json".into();
+    }
+    "flux fleet inspect snapshot --limit 50 --output json".into()
+}
+
+fn fleet_status_human(data: &Value) -> String {
+    let workers = &data["workers"];
+    let waves = data["waves"]["listed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|wave| {
+            format!(
+                "{}={} ({} item(s)){}",
+                wave["id"].as_str().unwrap_or("?"),
+                wave["status"].as_str().unwrap_or("unknown"),
+                wave["item_count"],
+                wave["park"]["reason"]
+                    .as_str()
+                    .map(|reason| format!(" parked: {reason}"))
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ");
+    let lines = [
+        format!(
+            "fleet: {} · revision {} · main {}{}",
+            if data["quiesce"].is_object() {
+                "quiesced"
+            } else if data["running"].as_bool().unwrap_or(false) {
+                "running"
+            } else {
+                "stopped"
+            },
+            data["revision"],
+            data["main"]["status"].as_str().unwrap_or("unknown"),
+            data["main"]["session"]
+                .as_str()
+                .map(|session| format!(" · session {session}"))
+                .unwrap_or_default(),
+        ),
+        format!(
+            "workers: {} active · {} attention · {} registered",
+            workers["active"], workers["attention"], workers["total"]
+        ),
+        format!("waves: {} · {waves}", data["waves"]["total"]),
+        format!(
+            "items: {} ready · milestone {}",
+            data["schedule"]["ready_total"],
+            data["schedule"]["active_milestone"]
+                .as_str()
+                .unwrap_or("none")
+        ),
+        format!(
+            "repositories: {} · open decisions: {}",
+            data["repositories"]["total"], data["open_decisions"]["total"]
+        ),
+        format!(
+            "next: {}",
+            data["next_command"]
+                .as_str()
+                .unwrap_or("flux fleet inspect snapshot --limit 50 --output json")
+        ),
+    ];
+    // One char encodes to at most four UTF-8 bytes, so this char bound provably keeps the human
+    // projection inside the reviewed human byte budget.
+    bounded_text(&lines.join("\n"), FLEET_STATUS_HUMAN_BUDGET_BYTES / 4)
 }
 fn validate_board_refs(items: &[String]) -> Result<()> {
     for item in items {
@@ -9467,11 +15876,16 @@ fn prepare_wave_worktrees(
     }
     let mut repositories = Vec::new();
     for (repository_id, story_refs) in grouped {
-        let (repository_root, canonical_ref, gate) = if config.repositories.is_empty() {
+        let (repository_root, canonical_ref, gate, prepare) = if config.repositories.is_empty() {
             if repository_id != "default" {
                 bail!("not-found: fleet repository {repository_id}")
             }
-            (root.to_path_buf(), "HEAD".to_string(), Vec::new())
+            (
+                root.to_path_buf(),
+                "HEAD".to_string(),
+                Vec::new(),
+                Vec::new(),
+            )
         } else {
             let repository = config
                 .repositories
@@ -9482,6 +15896,7 @@ fn prepare_wave_worktrees(
                 repository_root(root, repository)?,
                 repository.canonical_ref.clone(),
                 repository.gate.clone(),
+                repository.prepare.clone(),
             )
         };
         let dirty = git_output(&repository_root, &["status", "--porcelain"])
@@ -9500,6 +15915,18 @@ fn prepare_wave_worktrees(
         let integration_path = repository_dir.join("integration");
         let integration_branch = format!("fleet/{wave}/{repository_id}/integration");
         validate_new_worktree_target(&repository_root, &integration_path, &integration_branch)?;
+        // A checkout pinned at the base, which integration NEVER touches.
+        //
+        // "The cited test fails at the pinned base" was verified in the INTEGRATION worktree, whose
+        // content is whatever the last integration attempt left in it — cherry-picks of this and other
+        // stories. So the pre-state a handoff was judged against depended on unrelated history: a
+        // re-handoff was refused with "unexpectedly passed on the pinned base" because a previous attempt
+        // had already applied that very story there, and in the opposite arrangement the same flaw would
+        // ACCEPT a handoff whose test never failed at the base at all. Evidence measured against a
+        // mutable shared tree is not evidence.
+        let verify_path = repository_dir.join("verify");
+        let verify_branch = format!("fleet/{wave}/{repository_id}/verify");
+        validate_new_worktree_target(&repository_root, &verify_path, &verify_branch)?;
         let mut stories = Vec::new();
         for board_ref in story_refs {
             let (_, item_id) = board_ref.split_once('/').expect("validated BoardRef");
@@ -9523,6 +15950,7 @@ fn prepare_wave_worktrees(
                 &integration_branch,
                 &base,
             )?;
+            add_git_worktree(&repository_root, &verify_path, &verify_branch, &base)?;
             for story in &stories {
                 add_git_worktree(
                     &repository_root,
@@ -9531,6 +15959,9 @@ fn prepare_wave_worktrees(
                     &base,
                 )?;
             }
+            // Every worktree above sits on the same base commit, so one compile populates the cache
+            // for all of them. Done after they exist and before anything is dispatched.
+            warm_wave_build_cache(root, wave, &repository_id, &verify_path);
         }
         repositories.push(json!({
             "id": repository_id,
@@ -9538,8 +15969,10 @@ fn prepare_wave_worktrees(
             "canonical_ref": canonical_ref,
             "base_commit": base,
             "integration": {"branch": integration_branch, "worktree": display_path(&integration_path)},
+            "verify": {"branch": verify_branch, "worktree": display_path(&verify_path)},
             "stories": stories,
             "final_gate": gate,
+            "candidate_prepare": prepare,
         }));
     }
     Ok(json!({
@@ -9620,6 +16053,7 @@ struct HandoffInput<'a> {
     commit: &'a str,
     worker: Option<&'a str>,
     session: Option<&'a str>,
+    from_worktree: bool,
     write_set: &'a [String],
     test_argv: &'a [String],
     failing_before: bool,
@@ -9703,19 +16137,46 @@ fn path_hits_fence(path: &str, fence: &str) -> bool {
     path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
+/// Clip long captured output while KEEPING BOTH ENDS.
+///
+/// This used to keep the head alone, which threw away the only part that matters. A repository gate emits
+/// thousands of `Compiling …` and `test … ok` lines and then fails at the very end, so a failed gate's
+/// record filled its 16 KiB with progress and cut the error off: on one real wave both streams were
+/// exactly 16385 bytes and the reason for the failure was not recoverable from Fleet state at all.
+///
+/// The head is still worth keeping — it carries the command, the toolchain, and the first error in a
+/// compile — so the budget is split, with an explicit marker naming how much was dropped. Never claim
+/// completeness silently. The same reasoning already governs the agent event buffer, which retains the
+/// NEWEST lines for exactly this reason.
 fn clipped_redacted(bytes: &[u8]) -> String {
     const MAX: usize = 16 * 1024;
     let text = String::from_utf8_lossy(bytes);
     if text.len() <= MAX {
         return redact(&text);
     }
-    let end = text
+    // Two thirds to the tail: a failure is far more likely to be explained by the end than the start.
+    let tail_budget = MAX / 3 * 2;
+    let head_budget = MAX - tail_budget;
+    let head_end = text
         .char_indices()
-        .take_while(|(index, _)| *index <= MAX)
+        .take_while(|(index, _)| *index <= head_budget)
         .map(|(index, character)| index + character.len_utf8())
         .last()
-        .unwrap_or(0);
-    redact(&text[..end.min(text.len())])
+        .unwrap_or(0)
+        .min(text.len());
+    let mut tail_start = text.len().saturating_sub(tail_budget);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let dropped = tail_start.saturating_sub(head_end);
+    if dropped == 0 {
+        return redact(&text[..head_end]);
+    }
+    redact(&format!(
+        "{}\n… [{dropped} bytes elided from the middle; the tail is kept because a failure explains itself there] …\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    ))
 }
 
 fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
@@ -9737,6 +16198,166 @@ fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
     }))
 }
 
+/// Verify that a commit really is what a story worktree delivered, and return its observed write set.
+///
+/// Extracted so the operator-driven handoff and the provisional one recorded when a turn ends
+/// (`C-670`) prove the *same* git facts. Two copies would drift, and the copy that drifted would be
+/// the automatic one — the one nobody reads until a wave has already been assembled from it.
+///
+/// This is deliberately only the git half. Targeted validation evidence is the operator's claim and
+/// stays in `fleet_handoff`, which is exactly what makes a provisional record weaker and why it is
+/// marked as such rather than quietly presented as the same thing.
+fn verify_story_commit(
+    worktree: &Path,
+    branch: &str,
+    base: &str,
+    commit: &str,
+) -> Result<Vec<String>> {
+    let resolved = git_output(
+        worktree,
+        &["rev-parse", "--verify", &format!("{commit}^{{commit}}")],
+    )
+    .context("validation/gate: handoff commit does not exist")?;
+    if resolved != commit {
+        bail!("input/schema: handoff commit must be the full exact object id {resolved}")
+    }
+    if git_output(worktree, &["rev-parse", "HEAD"]).as_deref() != Some(commit) {
+        bail!("conflict/precondition: handoff commit is not the story worktree HEAD")
+    }
+    if git_output(worktree, &["rev-parse", branch]).as_deref() != Some(commit) {
+        bail!("conflict/precondition: handoff branch does not point at the exact commit")
+    }
+    let ancestor = guarded_git(worktree, &["merge-base", "--is-ancestor", base, commit])?;
+    if ancestor.exit_code != 0 {
+        bail!("conflict/precondition: handoff commit does not descend from its pinned wave base")
+    }
+    if git_output(worktree, &["status", "--porcelain"])
+        .is_some_and(|status| !worker_dirt(&status).is_empty())
+    {
+        bail!(
+            "conflict/precondition: story worktree is dirty at handoff: {}",
+            worker_dirt(&git_output(worktree, &["status", "--porcelain"]).unwrap_or_default())
+                .join(", ")
+        )
+    }
+    diff_write_set(worktree, base, commit)
+}
+
+/// Turn every finished worker turn in a wave into a handoff, so the wave advances with nobody
+/// watching.
+///
+/// C-670. `handoff-accepted` used to be reachable only from the CLI verb, and no agent in the fleet
+/// could invoke it: the worker holds no fleet operations, the coordinator's native operation set has
+/// no `fleet.handoff`, and the integrator's `fleet.integrate` refuses until every story is already
+/// accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human could move it.
+/// Ten workers once ended their turns and left nine commits the fleet never recorded.
+///
+/// What is recorded here is **provisional**: the git facts are proved by the same
+/// [`verify_story_commit`] the operator path uses, but there is no targeted validation evidence,
+/// because a turn that has already ended cannot be asked to cite the argv it ran. That is why the
+/// entry says so. Integration still runs the repository's full gate, which is what actually decides
+/// whether the wave is green — a provisional handoff moves work forward, it does not bless it.
+///
+/// This can never fail the wave. Every refusal becomes a recorded reason on the story, because a
+/// wave that dies during bookkeeping is strictly worse than one that reports what it could not do.
+fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Value> {
+    let Some(record) = state.waves.get(wave_id).cloned() else {
+        return Vec::new();
+    };
+    let mut reports = Vec::new();
+    let repositories = record["topology"]["repositories"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for (repository_index, repository) in repositories.iter().enumerate() {
+        let stories = repository["stories"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for (story_index, story) in stories.iter().enumerate() {
+            let item = story["board_ref"].as_str().unwrap_or_default().to_string();
+            if story["status"].as_str() == Some("handoff-accepted") {
+                continue;
+            }
+            let (Some(worktree), Some(branch), Some(base)) = (
+                story["worktree"].as_str(),
+                story["branch"].as_str(),
+                story["base_commit"].as_str(),
+            ) else {
+                reports.push(json!({"item": item, "recorded": false, "reason": "story assignment is incomplete"}));
+                continue;
+            };
+            let worktree_path = PathBuf::from(worktree);
+            // Same resolution as the operator path: the worktree disambiguates an item that more than
+            // one wave has attempted.
+            let Some((worker, agent)) = state.agents.iter().find(|(_, agent)| {
+                agent["board_ref"].as_str() == Some(item.as_str())
+                    && agent["assignment"]["worktree"].as_str() == Some(worktree)
+            }) else {
+                reports.push(json!({"item": item, "recorded": false, "reason": "no worker records this worktree"}));
+                continue;
+            };
+            let worker = worker.clone();
+            let session = agent["session"].as_str().unwrap_or_default().to_string();
+            let Some(commit) = git_output(&worktree_path, &["rev-parse", "HEAD"]) else {
+                reports.push(json!({"item": item, "worker": worker, "recorded": false, "reason": "worktree HEAD could not be read"}));
+                continue;
+            };
+            // A turn that produced nothing is a fact worth recording. Silence here is what made an
+            // empty worker indistinguishable from an unrecorded one.
+            if commit == base {
+                reports.push(json!({"item": item, "worker": worker, "recorded": false, "reason": "turn ended at the pinned base with no commit"}));
+                continue;
+            }
+            let observed = match verify_story_commit(&worktree_path, branch, base, &commit) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    reports.push(json!({"item": item, "worker": worker, "recorded": false, "reason": redact(&error.to_string())}));
+                    continue;
+                }
+            };
+            let entry = json!({
+                "schema": "flux.fleet-handoff/v1",
+                "board_ref": item,
+                "worker": worker,
+                "session": session,
+                "worktree": display_path(&worktree_path),
+                "branch": branch,
+                "commit": commit,
+                "write_set": observed,
+                "test_argv": [],
+                "failing_before": Value::Null,
+                "passing_after": Value::Null,
+                "summary": "recorded from the worker's worktree when its turn ended",
+                "status": "accepted",
+                "provisional": true,
+            });
+            if let Some(story) = state.waves.get_mut(wave_id).and_then(|record| {
+                record["topology"]["repositories"]
+                    .get_mut(repository_index)
+                    .and_then(|repository| repository["stories"].get_mut(story_index))
+            }) {
+                if !story["handoffs"].is_array() {
+                    story["handoffs"] = json!([]);
+                }
+                if let Some(handoffs) = story["handoffs"].as_array_mut() {
+                    handoffs.push(entry.clone());
+                }
+                story["handoff"] = entry.clone();
+                story["status"] = json!("handoff-accepted");
+            }
+            if let Some(agent) = state.agents.get_mut(&worker) {
+                agent["status"] = json!("handoff-accepted");
+                agent["commit"] = json!(commit);
+            }
+            reports.push(
+                json!({"item": item, "worker": worker, "recorded": true, "commit": commit, "write_set": entry["write_set"]}),
+            );
+        }
+    }
+    reports
+}
+
 fn fleet_handoff(
     command: &FleetCommand,
     root: &Path,
@@ -9747,7 +16368,7 @@ fn fleet_handoff(
     if input.summary.trim().is_empty() {
         bail!("input/schema: handoff summary cannot be empty")
     }
-    if input.write_set.is_empty() {
+    if input.write_set.is_empty() && !input.from_worktree {
         bail!("input/schema: handoff requires an explicit write set")
     }
     if input.test_argv.is_empty() {
@@ -9761,47 +16382,25 @@ fn fleet_handoff(
     let (repository_index, story_index) = wave_story_indices(&wave, input.item)?;
     let repository = &wave["topology"]["repositories"][repository_index];
     let story = &repository["stories"][story_index];
-    let worktree = PathBuf::from(
-        story["worktree"]
-            .as_str()
-            .context("validation/gate: story assignment has no worktree")?,
-    );
+    let story_worktree = story["worktree"]
+        .as_str()
+        .context("validation/gate: story assignment has no worktree")?;
+    let worktree = PathBuf::from(story_worktree);
     let branch = story["branch"]
         .as_str()
         .context("validation/gate: story assignment has no branch")?;
     let base = story["base_commit"]
         .as_str()
         .context("validation/gate: story assignment has no base commit")?;
-    let resolved = git_output(
-        &worktree,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("{}^{{commit}}", input.commit),
-        ],
-    )
-    .context("validation/gate: handoff commit does not exist")?;
-    if resolved != input.commit {
-        bail!("input/schema: handoff commit must be the full exact object id {resolved}")
-    }
-    if git_output(&worktree, &["rev-parse", "HEAD"]).as_deref() != Some(input.commit) {
-        bail!("conflict/precondition: handoff commit is not the story worktree HEAD")
-    }
-    if git_output(&worktree, &["rev-parse", branch]).as_deref() != Some(input.commit) {
-        bail!("conflict/precondition: handoff branch does not point at the exact commit")
-    }
-    let ancestor = guarded_git(
-        &worktree,
-        &["merge-base", "--is-ancestor", base, input.commit],
-    )?;
-    if ancestor.exit_code != 0 {
-        bail!("conflict/precondition: handoff commit does not descend from its pinned wave base")
-    }
-    if git_output(&worktree, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
-        bail!("conflict/precondition: story worktree is dirty at handoff")
-    }
-    let claimed = normalize_write_set(input.write_set)?;
-    let observed = diff_write_set(&worktree, base, input.commit)?;
+    let observed = verify_story_commit(&worktree, branch, base, input.commit)?;
+    // `--from-worktree` declines to restate what the range already proves. The observed set is what
+    // gets recorded either way, so a hand-typed claim only adds a way to be wrong — and a wrong write
+    // set is not a typo, it is false evidence. An empty range is still refused below.
+    let claimed = if input.from_worktree {
+        observed.clone()
+    } else {
+        normalize_write_set(input.write_set)?
+    };
     if observed.is_empty() || claimed != observed {
         bail!(
             "validation/gate: observed write set does not equal the approved write set (approved={claimed:?}, observed={observed:?})"
@@ -9853,11 +16452,19 @@ fn fleet_handoff(
             .as_str()
             .context("validation/gate: repository has no integration worktree")?,
     );
+    // Measure the pre-state where the pre-state actually is. Waves dispatched before the verification
+    // worktree existed fall back to the integration worktree, which is how this was always done — wrong,
+    // but no worse for them than it already was.
+    let base_worktree = repository["verify"]["worktree"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| integration_worktree.clone());
     let before = if documentation_only {
         Value::Null
     } else {
-        let evidence = run_typed_argv(&integration_worktree, input.test_argv)?;
-        if evidence["success"].as_bool() != Some(false) {
+        let evidence = run_typed_argv(&base_worktree, input.test_argv)?;
+        if evidence["success"].as_bool() != Some(false) && !ran_no_tests(&evidence) {
             bail!(
                 "validation/gate: failing-before validation unexpectedly passed on the pinned base"
             )
@@ -9868,16 +16475,59 @@ fn fleet_handoff(
     if after["success"].as_bool() != Some(true) {
         bail!("validation/gate: passing-after validation failed at the returned commit")
     }
-    if git_output(&worktree, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
-        bail!("validation/gate: targeted validation left the story worktree dirty")
+    // A test-first commit adds its test, so the SAME argv matches nothing at the pinned base — and a
+    // runner that filters to zero tests reports success (`cargo test <new name>` prints
+    // "0 passed; 0 failed; N filtered out" and exits 0). Demanding a non-zero exit there rejects the
+    // normal TDD shape outright, which is why no commit in this pipeline could ever be handed off.
+    //
+    // "Nothing ran at base, and the same argv runs and passes at the commit" IS failing-first
+    // evidence: the absence of the test is the pre-state. It is only accepted together with the
+    // passing-after check above and the requirement that the commit actually ran tests — so a typo'd
+    // or non-existent test name still fails, because it would match nothing at the commit either.
+    if !documentation_only && ran_no_tests(&before) && ran_no_tests(&after) {
+        bail!(
+            "validation/gate: targeted validation matched no test at the base or the commit — cite \
+             an argv that actually runs the failing-first test"
+        )
+    }
+    // Same exclusion as the pre-handoff check: Fleet's own loop-binding snapshot is not something the
+    // validation run produced. Fixing only the earlier check moved this refusal later rather than
+    // removing it — wave-346's `exchange/X-138` passed the first gate and failed here on the identical
+    // `?? .flux/` entry (C-624).
+    if git_output(&worktree, &["status", "--porcelain"])
+        .is_some_and(|status| !worker_dirt(&status).is_empty())
+    {
+        bail!(
+            "validation/gate: targeted validation left the story worktree dirty: {}",
+            worker_dirt(&git_output(&worktree, &["status", "--porcelain"]).unwrap_or_default())
+                .join(", ")
+        )
     }
 
-    let matching_workers = state
+    // The owning worker is already recorded: a worker's assignment IS this wave's story record, and
+    // that record names the worktree this handoff was just verified in. Matching on `board_ref` alone
+    // spans every wave that ever attempted the item — four waves once each held an attempt at the same
+    // story — so a second attempt made the identity "ambiguous" and the operator had to read
+    // `state.json` to name a worker Fleet already knew. Fall back to the item-wide set only when no
+    // agent records this worktree, which is how a wave dispatched before assignments carried one still
+    // hands off.
+    let mut matching_workers = state
         .agents
         .iter()
-        .filter(|(_, agent)| agent["board_ref"].as_str() == Some(input.item))
+        .filter(|(_, agent)| {
+            agent["board_ref"].as_str() == Some(input.item)
+                && agent["assignment"]["worktree"].as_str() == Some(story_worktree)
+        })
         .map(|(id, _)| id.clone())
         .collect::<Vec<_>>();
+    if matching_workers.is_empty() {
+        matching_workers = state
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent["board_ref"].as_str() == Some(input.item))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+    }
     let worker = match input.worker {
         Some(worker) if matching_workers.iter().any(|candidate| candidate == worker) => {
             worker.to_string()
@@ -9910,39 +16560,51 @@ fn fleet_handoff(
         "summary": input.summary,
         "status": "accepted",
     });
-    let mut updated_wave = wave;
-    let story =
-        &mut updated_wave["topology"]["repositories"][repository_index]["stories"][story_index];
-    if !story["handoffs"].is_array() {
-        story["handoffs"] = json!([]);
-    }
-    story["handoffs"]
-        .as_array_mut()
-        .unwrap()
-        .push(handoff.clone());
-    story["handoff"] = handoff.clone();
-    story["status"] = json!("handoff-accepted");
-    let all_handoffs = updated_wave["topology"]["repositories"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
-        .all(|story| story["status"].as_str() == Some("handoff-accepted"));
-    if all_handoffs {
-        updated_wave["status"] = json!("handoffs-ready");
-    }
-    state.waves.insert(input.wave.to_string(), updated_wave);
-    if let Some(agent) = state.agents.get_mut(&worker) {
-        agent["status"] = json!("handoff-accepted");
-        agent["commit"] = json!(input.commit);
-    }
-    state.revision += 1;
-    persist_fleet_mutation(
+    // Applied as a delta, because N workers reach this point at once and a wave record holds every story:
+    // recomputing a private copy and inserting it would discard whatever siblings landed meanwhile.
+    let wave_id = input.wave.to_string();
+    let handoff_entry = handoff.clone();
+    let worker_id = worker.clone();
+    let commit = input.commit.to_string();
+    persist_delta_mutation(
         command,
         root,
-        &state,
+        &mut state,
         "story.handoff.accepted",
         handoff.clone(),
+        move |state| {
+            let record = state
+                .waves
+                .get_mut(&wave_id)
+                .with_context(|| format!("not-found: wave {wave_id}"))?;
+            let story =
+                &mut record["topology"]["repositories"][repository_index]["stories"][story_index];
+            if !story["handoffs"].is_array() {
+                story["handoffs"] = json!([]);
+            }
+            story["handoffs"]
+                .as_array_mut()
+                .unwrap()
+                .push(handoff_entry.clone());
+            story["handoff"] = handoff_entry.clone();
+            story["status"] = json!("handoff-accepted");
+            // Recomputed against the CURRENT record, so the wave only advances once the last sibling has
+            // actually landed — whichever worker that turns out to be.
+            let all_handoffs = record["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+                .all(|story| story["status"].as_str() == Some("handoff-accepted"));
+            if all_handoffs {
+                record["status"] = json!("handoffs-ready");
+            }
+            if let Some(agent) = state.agents.get_mut(&worker_id) {
+                agent["status"] = json!("handoff-accepted");
+                agent["commit"] = json!(commit);
+            }
+            Ok(())
+        },
     )?;
     Ok((
         format!("{} handoff accepted at {}", input.item, input.commit),
@@ -10182,11 +16844,96 @@ fn integrate_wave(
         .get(wave_id)
         .cloned()
         .with_context(|| format!("not-found: wave {wave_id}"))?;
-    if !matches!(
-        wave["status"].as_str(),
-        Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
-    ) {
+    // `integrating` is a TRANSIENT state, and a transient state with no recorded owner is a trap.
+    //
+    // Integration cherry-picks and then runs a full repository gate, which is the longest-running thing
+    // the fleet does — minutes to tens of minutes from a cold build. If the process doing it dies in that
+    // window (killed, timed out, terminal closed), the wave keeps `integrating` forever: every retry is
+    // refused as "not ready for integration", and the only way out is hand-editing Fleet state, which the
+    // operating rules forbid. Exactly the shape of the worker that read `working` with no process behind
+    // it — same defect, different field.
+    //
+    // So integration records its own supervisor, and a wave still marked `integrating` by a process that
+    // is gone may be retried. Nothing is lost by retrying: the integration worktree is reset to its
+    // pinned base below, and the gate is re-run from scratch.
+    let stalled_integration = wave["status"].as_str() == Some("integrating")
+        && wave["integration_supervisor_pid"]
+            .as_i64()
+            .is_some_and(|pid| !supervisor_process_is_live(pid));
+    // A failed integration is RETRYABLE, because the reason it failed is usually outside the wave.
+    //
+    // `conflict` and `red` were terminal: once a wave reached either, no `fleet integrate` would ever
+    // touch it again. That made fixing the cause pointless — wave-346 conflicted because integration
+    // applied one commit per story instead of the worker's whole range, and after that defect was fixed
+    // and installed the retry was still refused with "not ready for integration". Three delivered
+    // stories were unreachable not because anything was wrong with them but because the wave had a
+    // memory of having failed.
+    //
+    // Nothing is lost by retrying: the handoffs are still accepted, and each repository's integration
+    // worktree is reset to its pinned base below. What must NOT be lost is the guard against spending a
+    // second gate run on an unchanged candidate — that guard belongs to the CANDIDATE, not the wave, and
+    // is enforced per repository further down by comparing the recomputed candidate with the one already
+    // gated.
+    let retryable_failure = matches!(wave["status"].as_str(), Some("conflict" | "red"));
+    if !stalled_integration
+        && !retryable_failure
+        && !matches!(
+            wave["status"].as_str(),
+            Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+        )
+    {
         bail!("conflict/precondition: wave {wave_id} is not ready for integration")
+    }
+    // Carry the previous attempt's verdicts aside, then clear them: this attempt records its own.
+    let previously_gated = wave["topology"]["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|repository| {
+            let id = repository["id"].as_str()?.to_string();
+            // The tree, resolved through the repository's own checkout, because that is the identity a
+            // retry can actually reproduce.
+            let source = PathBuf::from(repository["source_root"].as_str()?);
+            let candidate = repository["gate"]["candidate"].as_str()?;
+            let tree = git_output(&source, &["rev-parse", &format!("{candidate}^{{tree}}")])?;
+            let status = repository["gate"]["status"].as_str()?.to_string();
+            Some((id, (tree, status)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    // A repository whose candidate is already ACCEPTED keeps its verdict and is skipped below.
+    //
+    // Acceptance is the end of that repository's road: its candidate is pinned by a tag and nothing later
+    // in the wave can improve it. Re-gating it on a retry spends the longest operation in the pipeline to
+    // re-derive a known answer, and — worse — a re-gate that came out red would make already-accepted work
+    // read as failed. Observed: retrying wave-346 for its flux half cleared and re-ran the exchange gate
+    // that had already produced the accepted candidate.
+    let accepted_repositories = wave["applied"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry["accepted_tag"].is_string())
+        .filter_map(|entry| entry["repository"].as_str())
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    if retryable_failure || stalled_integration {
+        wave["conflict"] = Value::Null;
+        for repository in wave["topology"]["repositories"]
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+        {
+            if repository["id"]
+                .as_str()
+                .is_some_and(|id| accepted_repositories.contains(id))
+            {
+                continue;
+            }
+            repository["gate"] = Value::Null;
+            repository["candidate"] = Value::Null;
+            // Stale preparation evidence from the previous attempt would otherwise be reported as this
+            // attempt's, which is how a retry comes to look like it did work it never did.
+            repository["prepare"] = Value::Null;
+        }
     }
     let items = wave["items"]
         .as_array()
@@ -10200,7 +16947,24 @@ fn integrate_wave(
     }
     let order = integration_order(root, &items)?;
     let mut seen_workers = BTreeSet::new();
-    let mut seen_paths = BTreeMap::<String, String>::new();
+    // A shared path is NOT refused here, because a shared path is not a conflict.
+    //
+    // This used to reject any wave in which two stories' write sets intersected, which is a proxy for
+    // "these commits will not combine" — and a bad one in both directions. It was first keyed by path
+    // alone, so `CHANGELOG.md` in one repository "collided" with `CHANGELOG.md` in another: two
+    // different files in two different checkouts, each correctly updated by its own story, and every
+    // multi-repository wave hit it. Keying by (repository, path) fixed that, and left the deeper
+    // problem: within one repository the proxy refuses work that combines perfectly well. `wave-346`
+    // was parked because two stories each appended an entry to one changelog. Nearly every harness
+    // story edits the same hub module, so the proxy is precisely what makes more than one story per
+    // repository per wave impossible.
+    //
+    // The real test already runs a few lines below: each accepted commit is cherry-picked into the
+    // integration worktree, and a genuine conflict fails there — recording the conflicting files, the
+    // git stderr and the preserved candidate, which is strictly better evidence than a path
+    // intersection. Disjoint edits to one file now integrate; overlapping edits are refused by git
+    // rather than guessed at. Semantic incompatibility was never in the proxy's reach either way, and
+    // remains the final gate's job.
     for item in &items {
         let (repository_index, story_index) = wave_story_indices(&wave, item)?;
         let story = &wave["topology"]["repositories"][repository_index]["stories"][story_index];
@@ -10213,24 +16977,16 @@ fn integrate_wave(
         let worker = handoff["worker"]
             .as_str()
             .context("validation/gate: handoff missing worker")?;
+        // One writer per story stays a real invariant: two stories from one worker share a session and
+        // a worktree, so their commits are not independently attributable.
         if !seen_workers.insert(worker.to_string()) {
             bail!("conflict/precondition: worker {worker} owns more than one story in the wave")
         }
-        for path in handoff["write_set"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
-            if let Some(other) = seen_paths.insert(path.to_string(), item.clone()) {
-                bail!("conflict/precondition: unsafe write-set overlap on {path:?} between {other} and {item}")
-            }
-        }
     }
     wave["status"] = json!("integrating");
+    wave["integration_supervisor_pid"] = json!(std::process::id());
     wave["integration_order"] = json!(order);
-    state.waves.insert(wave_id.to_string(), wave.clone());
-    state.revision += 1;
+    commit_wave_record(&mut state, root, wave_id, &wave);
     persist_fleet_mutation(
         command,
         root,
@@ -10242,11 +16998,17 @@ fn integrate_wave(
     let repository_count = wave["topology"]["repositories"]
         .as_array()
         .map_or(0, Vec::len);
+    // Per-repository outcomes, so one repository's failure does not decide the others.
+    let mut failures: Vec<Value> = Vec::new();
+    let mut conflicted = false;
     for repository_index in 0..repository_count {
         let repository_id = wave["topology"]["repositories"][repository_index]["id"]
             .as_str()
             .unwrap_or("default")
             .to_string();
+        if accepted_repositories.contains(&repository_id) {
+            continue;
+        }
         let integration_worktree = PathBuf::from(
             wave["topology"]["repositories"][repository_index]["integration"]["worktree"]
                 .as_str()
@@ -10256,12 +17018,28 @@ fn integrate_wave(
             .as_str()
             .context("validation/gate: integration base missing")?
             .to_string();
+        // A retry must start from the pinned base, so put the worktree back there first.
+        //
+        // Without this the retry path is unusable: a previous attempt leaves the integration worktree
+        // holding its cherry-picks (that is what a candidate IS), so the clean-at-base check below refuses
+        // the retry — and refuses it with a *different* reason than the original failure, which is how a
+        // wave ends up looking broken in two ways at once. Resetting is safe because a candidate is
+        // reconstructed from the accepted handoffs on every attempt and is not the record of anything;
+        // the record lives in state.
+        if retryable_failure || stalled_integration {
+            let _ = guarded_git(&integration_worktree, &["cherry-pick", "--abort"]);
+            let _ = guarded_git(&integration_worktree, &["reset", "--hard", &base]);
+            let _ = guarded_git(&integration_worktree, &["clean", "-fd"]);
+        }
         if git_output(&integration_worktree, &["rev-parse", "HEAD"]).as_deref()
             != Some(base.as_str())
             || git_output(&integration_worktree, &["status", "--porcelain"])
                 .is_some_and(|s| !s.is_empty())
         {
-            bail!("conflict/precondition: integration worktree for {repository_id} is not clean at its pinned base")
+            // Also per repository: one repository's dirty integration worktree says nothing about
+            // another's, and aborting here discarded candidates that were fine.
+            failures.push(json!({"repository": repository_id, "reason": "integration worktree is not clean at its pinned base"}));
+            continue;
         }
         let repo_items = order
             .iter()
@@ -10272,13 +17050,39 @@ fn integrate_wave(
             .collect::<Vec<_>>();
         for item in repo_items {
             let (item_repository, story_index) = wave_story_indices(&wave, &item)?;
-            let commit = wave["topology"]["repositories"][item_repository]["stories"][story_index]
-                ["handoff"]["commit"]
+            let story = &wave["topology"]["repositories"][item_repository]["stories"][story_index];
+            let commit = story["handoff"]["commit"]
                 .as_str()
                 .context("validation/gate: handoff commit missing")?
                 .to_string();
+            // Integrate the worker's whole RANGE, not the single commit it cited.
+            //
+            // A handoff names one commit, and a story worker legitimately makes several — implementation
+            // then documentation is the shape the contract actually asks for. `cherry-pick <commit>`
+            // therefore applied only the LAST one and silently dropped everything before it. Measured on
+            // one real wave: `flux/C-562` is two commits and only its docs commit was applied;
+            // `flux/C-542` is five and only its docs commit was applied. This surfaced as a conflict,
+            // which was the lucky outcome — a clean apply would have produced a candidate documenting
+            // code that was not in it, and a gate that never compiles the missing part could even pass.
+            //
+            // The evidence already assumed the range: handoff verification computes the write set with
+            // `diff <base> <commit>`, so the record described a range the integration never applied.
+            // That contradiction is the proof of which unit is intended.
+            let story_base = story["base_commit"]
+                .as_str()
+                .unwrap_or(base.as_str())
+                .to_string();
+            let range = format!("{story_base}..{commit}");
             if !command.dry_run {
-                let output = guarded_git(&integration_worktree, &["cherry-pick", &commit])?;
+                // An empty range is an error to `cherry-pick`, and it means the worker committed nothing
+                // — which the handoff gate refuses long before here, so treat it as a contract violation
+                // rather than silently producing an unchanged candidate.
+                if story_base == commit {
+                    bail!(
+                        "validation/gate: {item} handoff cites its own base {commit}, so it carries no commit to integrate"
+                    )
+                }
+                let output = guarded_git(&integration_worktree, &["cherry-pick", &range])?;
                 if output.exit_code != 0 {
                     let conflicts = git_output(
                         &integration_worktree,
@@ -10292,8 +17096,8 @@ fn integrate_wave(
                     wave["status"] = json!("conflict");
                     wave["apply_eligible"] = json!(false);
                     wave["conflict"] = json!({"story":item,"commit":commit,"files":conflicts,"stderr":clipped_redacted(output.stderr.as_bytes()),"candidate":candidate});
-                    state.waves.insert(wave_id.to_string(), wave.clone());
-                    state.revision += 1;
+                    wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"conflict","runs":0,"reason":format!("integration conflict in {item}"),"candidate":candidate});
+                    commit_wave_record(&mut state, root, wave_id, &wave);
                     persist_fleet_mutation(
                         command,
                         root,
@@ -10301,29 +17105,119 @@ fn integrate_wave(
                         "wave.integration.conflict",
                         wave["conflict"].clone(),
                     )?;
-                    bail!("validation/gate: integration conflict in {item}; candidate history and conflict evidence were preserved")
+                    // Leave the worktree usable. The conflict evidence is already recorded in state
+                    // above, so keeping the half-applied cherry-pick on disk buys nothing and costs the
+                    // retry: a wedged worktree fails the next attempt's "clean at its pinned base"
+                    // precondition, so the wave reports a DIFFERENT reason the second time and never
+                    // recovers on its own.
+                    let _ = guarded_git(&integration_worktree, &["cherry-pick", "--abort"]);
+                    let _ = guarded_git(&integration_worktree, &["reset", "--hard", &base]);
+                    // Record and move on, rather than aborting integration for every repository.
+                    //
+                    // A conflict is a property of ONE repository's commits. Bailing here meant a
+                    // flux-internal collision also discarded an exchange candidate whose stories were
+                    // independent and perfectly integrable — the wave was assembled per repository from
+                    // the start, so nothing about that abort was necessary. The wave still ends as a
+                    // failure and stays ineligible for a blanket apply; what changes is that the healthy
+                    // repositories now have gated candidates, which `apply --only` can accept.
+                    failures.push(json!({"repository": repository_id, "reason": format!("integration conflict in {item}")}));
+                    conflicted = true;
+                    break;
                 }
             }
+        }
+        if conflicted {
+            conflicted = false;
+            continue;
+        }
+        // The gate and the preparation step are OPERATOR POLICY, so read them from current config and
+        // fall back to what the wave snapshotted.
+        //
+        // Everything else in a topology is pinned on purpose — the base, the branches, the write sets —
+        // because it is the story's contract. These two are not: they say how this repository is checked,
+        // which is the operator's to correct. Pinned, a wave dispatched against a broken or incomplete
+        // gate could never be fixed, only abandoned: `wave-346` was snapshotted before a preparation step
+        // existed, so the fix for its failure was unreachable by any retry and the delivered work would
+        // have needed re-dispatching to be judged by rules that already existed on disk.
+        let current_repository = read_fleet_config(root).ok().and_then(|config| {
+            config
+                .repositories
+                .into_iter()
+                .find(|candidate| candidate.id == repository_id)
+        });
+        let prepare_argv = current_repository
+            .as_ref()
+            .map(|repository| repository.prepare.clone())
+            .filter(|prepare| !prepare.is_empty())
+            .unwrap_or_else(|| {
+                wave["topology"]["repositories"][repository_index]["candidate_prepare"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+        if !prepare_argv.is_empty() && !command.dry_run {
+            let prepared = run_typed_argv(&integration_worktree, &prepare_argv)?;
+            if prepared["success"].as_bool() != Some(true) {
+                wave["topology"]["repositories"][repository_index]["prepare"] = prepared.clone();
+                failures.push(json!({
+                    "repository": repository_id,
+                    "reason": "candidate preparation failed",
+                    "evidence": prepared,
+                }));
+                continue;
+            }
+            // Whatever preparation regenerated is part of the candidate, so it must be committed — an
+            // uncommitted change would fail the gate's own cleanliness checks and would not survive
+            // into the accepted tag.
+            let status = git_output(&integration_worktree, &["status", "--porcelain"]);
+            if status.is_some_and(|status| !status.is_empty()) {
+                let _ = guarded_git(&integration_worktree, &["add", "-A"]);
+                let committed = guarded_git(
+                    &integration_worktree,
+                    &[
+                        "commit",
+                        "-m",
+                        "chore(integration): regenerate derived artifacts for this candidate",
+                    ],
+                )?;
+                if committed.exit_code != 0 {
+                    failures.push(json!({
+                        "repository": repository_id,
+                        "reason": "could not commit prepared artifacts",
+                        "stderr": clipped_redacted(committed.stderr.as_bytes()),
+                    }));
+                    continue;
+                }
+            }
+            wave["topology"]["repositories"][repository_index]["prepare"] = prepared;
         }
         let candidate = if command.dry_run {
             base.clone()
         } else {
             git_output(&integration_worktree, &["rev-parse", "HEAD"])
-                .context("validation/gate: integration candidate missing")?
+                .context("validation/gate: candidate commit missing after preparation")?
         };
-        let gate_argv = wave["topology"]["repositories"][repository_index]["final_gate"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+        let gate_argv = current_repository
+            .as_ref()
+            .map(|repository| repository.gate.clone())
+            .filter(|gate| !gate.is_empty())
+            .unwrap_or_else(|| {
+                wave["topology"]["repositories"][repository_index]["final_gate"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
         if gate_argv.is_empty() {
             wave["status"] = json!("red");
             wave["apply_eligible"] = json!(false);
             wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"red","runs":0,"reason":"missing final gate argv","candidate":candidate});
-            state.waves.insert(wave_id.to_string(), wave.clone());
-            state.revision += 1;
+            commit_wave_record(&mut state, root, wave_id, &wave);
             persist_fleet_mutation(
                 command,
                 root,
@@ -10331,7 +17225,27 @@ fn integrate_wave(
                 "wave.gate.red",
                 json!({"wave":wave_id,"repository":repository_id,"reason":"missing final gate argv"}),
             )?;
-            bail!("validation/gate: repository {repository_id} has no runnable final gate")
+            failures.push(json!({"repository": repository_id, "reason": "no runnable final gate"}));
+            continue;
+        }
+        // One gate run per candidate TREE, not per candidate commit.
+        //
+        // A retry that reproduces identical content has identical inputs, so re-running the gate would
+        // spend minutes to reach the same verdict. But it cannot be detected by comparing commit ids: a
+        // cherry-pick mints a new commit every time it runs — same content, different committer
+        // timestamp, different sha — so a sha comparison never matches and the guard never fires. The tree
+        // is what "the same inputs" actually means.
+        let candidate_tree = git_output(
+            &integration_worktree,
+            &["rev-parse", &format!("{candidate}^{{tree}}")],
+        );
+        if let Some((gated_tree, gated_status)) = previously_gated.get(&repository_id) {
+            if candidate_tree.as_deref() == Some(gated_tree.as_str()) && gated_status == "red" {
+                wave["topology"]["repositories"][repository_index]["candidate"] = json!(candidate);
+                wave["topology"]["repositories"][repository_index]["gate"] = json!({"status":"red","runs":1,"reason":"candidate unchanged since its red gate; nothing to re-run","candidate":candidate});
+                failures.push(json!({"repository": repository_id, "candidate": candidate, "reason": "candidate unchanged since its red gate"}));
+                continue;
+            }
         }
         let gate = if command.dry_run {
             json!({"argv":gate_argv,"success":true,"exit_code":Value::Null,"stdout":"","stderr":"","preview":true})
@@ -10344,8 +17258,7 @@ fn integrate_wave(
         if !green {
             wave["status"] = json!("red");
             wave["apply_eligible"] = json!(false);
-            state.waves.insert(wave_id.to_string(), wave.clone());
-            state.revision += 1;
+            commit_wave_record(&mut state, root, wave_id, &wave);
             persist_fleet_mutation(
                 command,
                 root,
@@ -10353,13 +17266,66 @@ fn integrate_wave(
                 "wave.gate.red",
                 json!({"wave":wave_id,"repository":repository_id,"candidate":candidate,"gate":wave["topology"]["repositories"][repository_index]["gate"]}),
             )?;
-            bail!("validation/gate: final gate failed for {repository_id}; exact candidate {candidate} was preserved")
+            failures.push(json!({"repository": repository_id, "candidate": candidate, "reason": "final gate failed"}));
+            continue;
         }
     }
+    if !failures.is_empty() {
+        // Set the wave's verdict HERE, from the collected failures, rather than in each branch on its way
+        // out. Deciding it per branch is what let a path slip through without setting one at all: the
+        // unchanged-candidate refusal left the wave `integrating` with its owner released, which is
+        // neither retryable nor ready — permanently wedged by a refusal that was supposed to be cheap.
+        wave["status"] = json!(if failures.iter().any(|failure| failure["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("conflict")))
+        {
+            "conflict"
+        } else {
+            "red"
+        });
+        wave["apply_eligible"] = json!(false);
+        // Release ownership before reporting: the run is over either way, and a wave left owned by a dead
+        // process is the trap this field exists to close.
+        wave["integration_supervisor_pid"] = Value::Null;
+        commit_wave_record(&mut state, root, wave_id, &wave);
+        persist_fleet_mutation(
+            command,
+            root,
+            &state,
+            "wave.integration.finished",
+            json!({"wave": wave_id, "failures": failures}),
+        )?;
+        // The wave failed, and every repository that did not is now sitting on a gated candidate that
+        // `apply --only <repository>` can accept. Naming them in the error is the difference between
+        // "this wave is stuck" and "this half of it is ready".
+        let green = wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|repository| repository["gate"]["status"].as_str() == Some("green"))
+            .filter_map(|repository| repository["id"].as_str())
+            .collect::<Vec<_>>();
+        let stuck = failures
+            .iter()
+            .filter_map(|failure| failure["repository"].as_str())
+            .collect::<Vec<_>>();
+        bail!(
+            "validation/gate: integration failed for {}{}",
+            stuck.join(", "),
+            if green.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; {} produced a green candidate and can be accepted with `fleet apply {wave_id} --only <repository>`",
+                    green.join(", ")
+                )
+            }
+        )
+    }
     wave["status"] = json!("green");
+    wave["integration_supervisor_pid"] = Value::Null;
     wave["apply_eligible"] = json!(true);
-    state.waves.insert(wave_id.to_string(), wave.clone());
-    state.revision += 1;
+    commit_wave_record(&mut state, root, wave_id, &wave);
     let data = json!({"wave":wave_id,"status":"green","apply_eligible":true,"topology":wave["topology"],"pushed":false});
     persist_fleet_mutation(command, root, &state, "wave.gate.green", data.clone())?;
     Ok((
@@ -10375,23 +17341,48 @@ fn apply_wave(
     root: &Path,
     mut state: FleetState,
     wave: &str,
+    only: Option<&str>,
 ) -> Result<(String, Value, Vec<String>, u64)> {
     let record = state
         .waves
         .get(wave)
         .cloned()
         .with_context(|| format!("not-found: wave {wave}"))?;
-    if !record["apply_eligible"].as_bool().unwrap_or(false)
-        || record["status"].as_str() != Some("green")
+    // Whole-wave eligibility is required only for a whole-wave apply.
+    //
+    // `--only` names one repository, and each repository's candidate is assembled and gated on its own,
+    // so the wave rollup says nothing about whether THAT candidate is good. The per-repository green
+    // gate is still demanded below, unchanged — this relaxes which waves may be asked, not what counts
+    // as accepted.
+    if only.is_none()
+        && (!record["apply_eligible"].as_bool().unwrap_or(false)
+            || record["status"].as_str() != Some("green"))
     {
         bail!("conflict/precondition: wave {wave} has no recorded green final gate");
     }
     let repositories = record["topology"]["repositories"]
         .as_array()
         .context("validation/gate: green wave has no repository topology")?;
+    if let Some(only) = only {
+        if !repositories
+            .iter()
+            .any(|repository| repository["id"].as_str() == Some(only))
+        {
+            bail!("not-found: wave {wave} has no repository {only}")
+        }
+    }
     let mut targets = Vec::new();
+    let mut skipped = Vec::new();
     for repository in repositories {
         let repository_id = repository["id"].as_str().unwrap_or("default");
+        if only.is_some_and(|only| only != repository_id) {
+            // Named apply: report what was left behind rather than silently accepting a subset.
+            skipped.push(json!({
+                "repository": repository_id,
+                "gate": repository["gate"]["status"].as_str().unwrap_or("none"),
+            }));
+            continue;
+        }
         if repository["gate"]["status"].as_str() != Some("green")
             || repository["gate"]["runs"].as_u64() != Some(1)
         {
@@ -10414,15 +17405,25 @@ fn apply_wave(
         let branch = repository["integration"]["branch"]
             .as_str()
             .context("validation/gate: candidate branch missing")?;
-        if git_output(&source, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty())
-        {
-            bail!("conflict/precondition: repository {repository_id} is dirty; apply refuses to modify it")
-        }
-        if git_output(&source, &["rev-parse", canonical_ref]).as_deref() != Some(base)
-            || git_output(&source, &["rev-parse", "HEAD"]).as_deref() != Some(base)
-        {
-            bail!("conflict/precondition: repository {repository_id} moved from its pinned base; rebase a new wave")
-        }
+        // Acceptance does not require the repository to have stood still.
+        //
+        // These two refusals are left over from when applying MERGED the candidate: a merge has to land on
+        // the base it was tested against, and it touches the working tree, so a moved ref or a dirty
+        // checkout were both real hazards. Acceptance now writes an annotated tag on the candidate and
+        // nothing else — it does not read the working tree, does not move any branch, and cannot be
+        // invalidated by unrelated commits arriving on the canonical ref.
+        //
+        // Keeping them cost a green wave. `wave-346` passed both repository gates and was then refused
+        // with "moved from its pinned base" because ordinary work had continued on `main` during the hours
+        // the wave took — so the longer a wave is worth accepting, the more certain it becomes that it
+        // cannot be. That is exactly backwards.
+        //
+        // The invariant that DOES matter is checked below: the candidate branch must still point at the
+        // commit that was gated. And the base it was gated against is recorded in the acceptance record,
+        // because the later step that writes `main` has to re-gate against whatever `main` has become —
+        // acceptance is not landing, and must not be read as landing.
+        let base_moved =
+            git_output(&source, &["rev-parse", canonical_ref]).as_deref() != Some(base);
         if git_output(&source, &["rev-parse", branch]).as_deref() != Some(candidate) {
             bail!("conflict/precondition: repository {repository_id} candidate branch moved after its green gate")
         }
@@ -10434,31 +17435,88 @@ fn apply_wave(
             repository_id.to_string(),
             source,
             branch.to_string(),
+            base.to_string(),
+            base_moved,
             candidate.to_string(),
         ));
     }
+    // C-619: ACCEPT the candidate; do not merge it here.
+    //
+    // This used to `git merge --no-ff` in the repository's *source checkout* — which Fleet keeps
+    // DETACHED at the pinned base, so the merge commit landed on no branch at all. `main` never moved,
+    // the merge was reachable only from that worktree's HEAD, and the next `fleet refresh` would strand
+    // it. "Applied locally" claimed something that had not happened.
+    //
+    // Main is written exactly once, by the gated accumulation snapshot, so acceptance is the whole job
+    // here. What acceptance must guarantee is that the candidate CANNOT BE LOST: it is pinned with an
+    // annotated tag that outlives the wave, the integration branch, and any worktree reclamation, and
+    // the tag name is reported so a human can always find accepted-but-unmerged work.
     let mut merged = Vec::new();
-    if !command.dry_run {
-        for (repository_id, source, branch, candidate) in &targets {
-            let output = guarded_git(source, &["merge", "--no-ff", "--no-edit", branch])?;
-            if output.exit_code != 0 {
-                bail!("validation/gate: local merge for {repository_id} failed; candidate {candidate} was preserved: {}", clipped_redacted(output.stderr.as_bytes()));
-            }
-            merged.push(json!({"repository":repository_id,"candidate":candidate,"head":git_output(source,&["rev-parse","HEAD"])}));
+    for (repository_id, source, branch, base, base_moved, candidate) in &targets {
+        let tag = format!("fleet/accepted/{wave}/{repository_id}");
+        if command.dry_run {
+            merged.push(json!({
+                "repository": repository_id,
+                "candidate": candidate,
+                "accepted_tag": tag,
+                "gated_against_base": base,
+                "canonical_ref_moved_since": base_moved,
+                "preview": true,
+            }));
+            continue;
         }
-    } else {
-        merged.extend(targets.iter().map(|(repository, _, _, candidate)| json!({"repository":repository,"candidate":candidate,"preview":true})));
+        // `-f`: acceptance is idempotent, so re-applying the same wave must not fail on an existing tag.
+        let output = guarded_git(
+            source,
+            &[
+                "tag",
+                "-f",
+                "-a",
+                &tag,
+                candidate,
+                "-m",
+                &format!(
+                    "Fleet accepted {wave} candidate {candidate} for {repository_id} after a green final gate; awaiting gated accumulation into the canonical branch."
+                ),
+            ],
+        )?;
+        if output.exit_code != 0 {
+            bail!(
+                "validation/gate: could not pin {repository_id} candidate {candidate} with tag {tag}; refusing to accept work that could be lost: {}",
+                clipped_redacted(output.stderr.as_bytes())
+            )
+        }
+        merged.push(json!({
+            "repository": repository_id,
+            "candidate": candidate,
+            "accepted_tag": tag,
+            "branch": branch,
+            "gated_against_base": base,
+            "canonical_ref_moved_since": base_moved,
+        }));
     }
     state.revision += 1;
     let mut updated = record;
-    updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
-    updated["apply_eligible"] = json!(command.dry_run);
+    // A named apply does not finish the wave, so it must not change the wave's own verdict or reclaim
+    // its storage: the repositories left behind still need their worktrees and their builds to be
+    // retried. `fleet reclaim` handles them once the wave really is done.
+    if only.is_none() {
+        updated["status"] = json!(if command.dry_run { "green" } else { "applied" });
+        updated["apply_eligible"] = json!(command.dry_run);
+    }
     updated["applied"] = json!(merged);
+    let reclaimed = if command.dry_run || only.is_some() {
+        Value::Null
+    } else {
+        reclaim_wave_storage(&updated)
+    };
     state.waves.insert(wave.to_string(), updated);
-    let data = json!({"wave":wave,"repositories":merged,"merged_locally":!command.dry_run,"pushed":false,"released":false,"deployed":false});
+    let data = json!({"wave":wave,"repositories":merged,"only":only,"skipped":skipped,"merged_locally":false,"accepted":!command.dry_run,"pushed":false,"released":false,"deployed":false,"reclaimed":reclaimed});
     persist_fleet_mutation(command, root, &state, "wave.applied", data.clone())?;
     Ok((
-        format!("{wave} applied locally; nothing was pushed"),
+        format!(
+            "{wave} accepted and pinned by tag; awaiting gated accumulation — nothing was merged or pushed"
+        ),
         data,
         vec![],
         state.revision,
@@ -10473,7 +17531,7 @@ fn fleet_call(
 ) -> Result<(String, Value, Vec<String>, u64)> {
     match operation {
         "status" if request.is_none() => {
-            let data = json!({"state":state,"sources":fleet_sources(root)?});
+            let data = fleet_status_projection(root, &state)?;
             Ok((fleet_status_human(&data), data, vec![], state.revision))
         }
         "schedule" if request.is_none() => {
@@ -10577,6 +17635,2018 @@ mod tests {
     use super::*;
     use flux_tui::operations::FleetBoardSource as _;
 
+    fn ready_story(id: &str, priority: i64, areas: &[&str]) -> Story {
+        Story {
+            id: id.to_string(),
+            title: format!("story {id}"),
+            status: "ready".to_string(),
+            file: format!("docs/stories/{id}.md"),
+            pillar: None,
+            epic: None,
+            design: None,
+            areas: areas.iter().map(|area| area.to_string()).collect(),
+            note: None,
+            priority: Some(priority),
+            dependencies: Vec::new(),
+            body: String::new(),
+        }
+    }
+
+    /// The shape that motivated `--independent`, taken from the flux board on 2026-08-07: the eight
+    /// highest-priority ready stories every one declared `flux-cli`, because every fleet verb lands
+    /// in the same file. `board next --limit 8` returns exactly those eight, so dispatching its
+    /// answer as a wave buys eight workers and one guaranteed integration refusal.
+    #[test]
+    fn the_highest_priority_prefix_can_be_the_worst_possible_wave() {
+        let stories: Vec<Story> = [
+            "C-618", "C-637", "C-635", "C-636", "C-641", "C-639", "C-638", "C-642",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(rank, id)| ready_story(&format!("flux/{id}"), rank as i64, &["flux-cli"]))
+        .collect();
+
+        let (batch, held_back, exhaustive) = select_independent_batch(&stories, 8);
+
+        assert!(
+            exhaustive,
+            "a pool this small must be searched exhaustively"
+        );
+        assert_eq!(
+            batch,
+            vec![0],
+            "eight stories writing one crate cannot share a wave"
+        );
+        assert_eq!(held_back.len(), 7);
+        assert_eq!(held_back[0]["blocked_by"], "flux/C-618");
+        assert_eq!(held_back[0]["reason"], "shared area flux-cli");
+    }
+
+    /// Integration assembles one candidate per repository, so two members cannot write the same
+    /// tree however much their declared areas overlap.
+    #[test]
+    fn stories_in_different_members_are_always_independent() {
+        let stories = vec![
+            ready_story("flux/C-1", 0, &["shared-name"]),
+            ready_story("exchange/X-1", 1, &["shared-name"]),
+        ];
+
+        let (batch, held_back, _) = select_independent_batch(&stories, 8);
+
+        assert_eq!(batch, vec![0, 1]);
+        assert!(held_back.is_empty());
+    }
+
+    /// A story that declares no areas has an unknown write set. Guessing costs every worker in the
+    /// wave when the guess is wrong, so the selector fails closed and says why.
+    #[test]
+    fn an_undeclared_write_set_conflicts_with_everything_in_its_member() {
+        let stories = vec![
+            ready_story("flux/C-1", 0, &["flux-cli"]),
+            ready_story("flux/C-2", 1, &[]),
+        ];
+
+        let (batch, held_back, _) = select_independent_batch(&stories, 8);
+
+        assert_eq!(batch, vec![0]);
+        assert_eq!(held_back[0]["reason"], "undeclared write set");
+    }
+
+    /// More items beats better priority: an idle worker delivers nothing, while a lower-priority
+    /// story still delivers a story. Here the top-priority item conflicts with all three others, so
+    /// dropping it triples the wave.
+    #[test]
+    fn a_larger_batch_wins_over_a_higher_priority_one() {
+        let stories = vec![
+            ready_story("flux/C-0", 0, &["one", "two", "three"]),
+            ready_story("flux/C-1", 1, &["one"]),
+            ready_story("flux/C-2", 2, &["two"]),
+            ready_story("flux/C-3", 3, &["three"]),
+        ];
+
+        let (batch, _, exhaustive) = select_independent_batch(&stories, 8);
+
+        assert!(exhaustive);
+        assert_eq!(batch, vec![1, 2, 3]);
+    }
+
+    /// Among equally large batches the higher-priority one wins, so the tie-break is priority and
+    /// only the tie-break is.
+    #[test]
+    fn equal_sized_batches_are_broken_by_priority() {
+        let stories = vec![
+            ready_story("flux/C-0", 0, &["one"]),
+            ready_story("flux/C-1", 1, &["one"]),
+            ready_story("flux/C-2", 2, &["two"]),
+        ];
+
+        let (batch, _, _) = select_independent_batch(&stories, 2);
+
+        assert_eq!(batch, vec![0, 2], "C-0 outranks C-1 and both exclude it");
+    }
+
+    /// A declared dependency between two ready items is an ordering, not a parallelism. It should
+    /// not survive `board next`'s own filter, but a pool is a snapshot and this is cheap to hold.
+    #[test]
+    fn a_declared_dependency_between_candidates_conflicts() {
+        let mut blocked = ready_story("flux/C-2", 1, &["other"]);
+        blocked.dependencies = vec!["flux/C-1".to_string()];
+        let stories = vec![ready_story("flux/C-1", 0, &["one"]), blocked];
+
+        let (batch, held_back, _) = select_independent_batch(&stories, 8);
+
+        assert_eq!(batch, vec![0]);
+        assert_eq!(held_back[0]["reason"], "declared dependency");
+    }
+
+    /// The coordinator is the caller that actually chooses waves, so a batch selector it cannot ask
+    /// for is a batch selector nobody uses. The flag has to reach the native operation, not just
+    /// the CLI a human types.
+    #[test]
+    fn the_coordinator_can_ask_board_next_for_an_independent_batch() {
+        let root = Path::new("/tmp/board-next-independent");
+
+        let plain = NativeCoordinatorOperation::BoardNext
+            .cli_args(root, json!({"limit": 8}))
+            .expect("board.next accepts a bare limit");
+        assert!(
+            !plain.iter().any(|arg| arg == "--independent"),
+            "a priority prefix stays the default: {plain:?}"
+        );
+
+        let batch = NativeCoordinatorOperation::BoardNext
+            .cli_args(root, json!({"limit": 8, "independent": true}))
+            .expect("board.next accepts the independent flag");
+        assert!(
+            batch.iter().any(|arg| arg == "--independent"),
+            "the coordinator's request must reach the CLI: {batch:?}"
+        );
+
+        // `deny_unknown_fields` is what would silently drop a misspelled flag, so prove the schema
+        // admits this one by name rather than trusting the round trip above.
+        let schema = NativeCoordinatorOperation::BoardNext.input_schema();
+        assert!(
+            schema.to_string().contains("independent"),
+            "the published schema must advertise it: {schema}"
+        );
+    }
+
+    /// The guarded port truncates a child's output at 1 MiB, so an unbounded batch is silently
+    /// useless: the first version of this asked for all 5.5 MB of the flux member in one go, got a
+    /// truncated stream, failed to frame it and fell back to one process per file — measuring as no
+    /// improvement whatsoever while looking like it worked.
+    #[test]
+    fn batches_stay_inside_the_guarded_output_cap() {
+        let half = GIT_BATCH_BUDGET_BYTES / 2;
+        let sized = vec![
+            (half, "a.md"),
+            (half, "b.md"),
+            (half, "c.md"),
+            (half, "d.md"),
+            (half, "e.md"),
+        ];
+
+        let chunks = size_bounded_chunks(&sized);
+
+        assert!(
+            chunks.len() > 1,
+            "five half-budget files cannot be one batch"
+        );
+        for chunk in &chunks {
+            let bytes: usize = chunk
+                .iter()
+                .map(|path| sized.iter().find(|(_, p)| p == path).unwrap().0)
+                .sum();
+            assert!(
+                bytes <= GIT_BATCH_BUDGET_BYTES,
+                "a batch asked for {bytes} bytes, over the budget"
+            );
+        }
+        let flat: Vec<&str> = chunks.iter().flatten().copied().collect();
+        assert_eq!(
+            flat,
+            vec!["a.md", "b.md", "c.md", "d.md", "e.md"],
+            "chunking must not drop or reorder files"
+        );
+    }
+
+    /// One file bigger than the whole budget still has to be requested. It gets a batch to itself,
+    /// so it fails framing alone and the per-file fallback handles it without dragging every other
+    /// story in the member onto the slow path.
+    #[test]
+    fn an_oversized_file_is_isolated_rather_than_dropped() {
+        let sized = vec![
+            (16, "small-before.md"),
+            (GIT_BATCH_BUDGET_BYTES * 3, "huge.md"),
+            (16, "small-after.md"),
+        ];
+
+        let chunks = size_bounded_chunks(&sized);
+
+        assert!(
+            chunks.iter().any(|chunk| chunk == &vec!["huge.md"]),
+            "the oversized file must sit alone: {chunks:?}"
+        );
+        let flat: Vec<&str> = chunks.iter().flatten().copied().collect();
+        assert_eq!(flat.len(), 3, "nothing may be dropped: {chunks:?}");
+    }
+
+    /// Eight workers in a wave branch from one pinned base and compile a near-identical dependency
+    /// graph eight times. A shared `CARGO_TARGET_DIR` would serialise them on cargo's exclusive
+    /// lock and a copied warm target directory costs real bytes on a filesystem without reflink, so
+    /// the sharing has to be a content-keyed cache with separate target directories.
+    #[test]
+    fn a_worker_compiles_against_the_shared_cache_when_one_is_available() {
+        let fleet_root = Path::new("/tmp/fleet-build-env");
+
+        let environment = worker_build_environment(fleet_root);
+        let value = |key: &str| {
+            environment
+                .iter()
+                .find(|(name, _)| name == key)
+                .map(|(_, value)| value.clone())
+        };
+
+        // Debug info is most of a target directory and most of link time, and sccache caches
+        // compilation but never linking — so this knob is not redundant with the cache.
+        assert_eq!(
+            value("CARGO_PROFILE_DEV_DEBUG").as_deref(),
+            Some("line-tables-only"),
+            "a worker's build output exists to explain a failing test, not to be debugged live"
+        );
+
+        match sccache_executable() {
+            Some(_) => {
+                assert!(
+                    value("RUSTC_WRAPPER").is_some(),
+                    "an available cache must actually be wired up: {environment:?}"
+                );
+                assert_eq!(
+                    value("SCCACHE_DIR").as_deref(),
+                    Some(sccache_dir(fleet_root).display().to_string().as_str()),
+                    "the cache is fleet-owned, so every worker in every wave shares one"
+                );
+                assert!(
+                    value("SCCACHE_CACHE_SIZE").is_some(),
+                    "an uncapped cache is a disk leak"
+                );
+            }
+            None => {
+                // Degrade, never fail: a missing cache must slow the fleet, not stop it.
+                assert!(
+                    value("RUSTC_WRAPPER").is_none(),
+                    "a wrapper that is not installed would fail every build: {environment:?}"
+                );
+            }
+        }
+    }
+
+    /// These are fleet policy, not ambient forwarding. They reach the worker's `cargo` through the
+    /// caller-override slot of `apply_safe_env`, which is applied after the allow-list and wins —
+    /// so an operator's own rebuilds keep incremental compilation and full debug info.
+    #[test]
+    fn worker_build_knobs_never_include_a_shared_target_directory() {
+        let environment = worker_build_environment(Path::new("/tmp/fleet-build-env"));
+
+        assert!(
+            !environment
+                .iter()
+                .any(|(name, _)| name == "CARGO_TARGET_DIR"),
+            "one shared target dir is locked exclusively by cargo, which serialises the wave"
+        );
+    }
+
+    /// Warming shares one cold compile across the wave instead of making the first worker pay it
+    /// while its siblings duplicate it in parallel. Its contract is that it can never fail a wave:
+    /// it returns no error to ignore, and whether it skips (no cache installed), succeeds, or the
+    /// build itself fails, preparation continues. An optimisation that can stop a wave is a
+    /// liability.
+    ///
+    /// This asserts the invariant that holds on any machine, rather than a branch that depends on
+    /// whether `sccache` happens to be installed on the one running the test.
+    #[test]
+    fn warming_can_never_fail_a_wave_or_fabricate_state() {
+        let scratch = std::env::temp_dir().join("flux-warm-cache-probe");
+        let absent = scratch.join("verify-worktree-that-does-not-exist");
+
+        // Deliberately handed a worktree that is not there: the build cannot succeed, and the point
+        // is that preparation survives it anyway.
+        warm_wave_build_cache(&scratch, "wave-1", "flux", &absent);
+
+        assert!(
+            !absent.exists(),
+            "warming must not conjure the worktree it was handed"
+        );
+        assert!(
+            !scratch.join(".flux").exists(),
+            "a warm against a root with no fleet must not scaffold one: {}",
+            scratch.display()
+        );
+    }
+
+    /// The width is a ceiling, not a target.
+    #[test]
+    fn the_batch_never_exceeds_the_requested_width() {
+        let stories: Vec<Story> = (0..10)
+            .map(|index| {
+                ready_story(
+                    &format!("flux/C-{index}"),
+                    index,
+                    &[&format!("area{index}")],
+                )
+            })
+            .collect();
+
+        let (batch, _, _) = select_independent_batch(&stories, 3);
+
+        assert_eq!(batch, vec![0, 1, 2]);
+    }
+
+    fn outstanding_story(id: &str, status: &str, body: &str) -> Story {
+        let mut story = ready_story(id, 0, &["flux-cli"]);
+        story.status = status.to_string();
+        story.body = body.to_string();
+        story
+    }
+
+    fn history_commit(hash: &str, subject: &str, work_files: usize) -> HistoryCommit {
+        HistoryCommit {
+            hash: hash.to_string(),
+            subject: subject.to_string(),
+            message: subject.to_string(),
+            work_files,
+        }
+    }
+
+    /// C-637's own failure: the work was committed, the row still read `ready`, and the coordinator
+    /// dispatched a second worker at it. The commit that named the item and touched code is the
+    /// evidence nobody could ask for.
+    #[test]
+    fn an_item_whose_work_landed_while_its_status_reads_ready_is_reported() {
+        let story = outstanding_story("C-637", "ready", "## Acceptance\n\n- [ ] not yet\n");
+        let history = vec![history_commit(
+            "abc1234",
+            "feat(board): report items whose work is already present (C-637)",
+            3,
+        )];
+
+        let evidence = already_present_evidence(&story, "C-637", &history);
+
+        assert_eq!(evidence.len(), 1, "one signal fired: {evidence:?}");
+        assert_eq!(evidence[0]["signal"], "implementation-landed");
+        assert_eq!(evidence[0]["commit"], "abc1234");
+        assert_eq!(evidence[0]["files"], 3);
+        assert_eq!(path_to_done(&story.status), vec!["in-progress", "done"]);
+    }
+
+    /// Creating the item, flipping its status and re-rendering the marker region all name the item
+    /// and all land in the board's own directory. Counting them as implementation would report every
+    /// item on the board, which is the same as reporting none.
+    #[test]
+    fn a_board_only_commit_is_not_implementation() {
+        let story = outstanding_story("C-637", "ready", "## Acceptance\n\n- [ ] not yet\n");
+        let history = parse_history_records(
+            "\u{1e}abc1234\u{1f}board: add C-637 board reconcile\u{1f}\u{1f}\n\
+             docs/stories/C-637-board-reconcile.md\ndocs/stories/README.md\n",
+        );
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].work_files, 0);
+        assert!(already_present_evidence(&story, "C-637", &history).is_empty());
+    }
+
+    /// A `done` item's status and tree already agree; reporting it is noise that hides the real one.
+    #[test]
+    fn a_done_item_is_never_a_finding() {
+        let story = outstanding_story("C-637", "done", "## Acceptance\n\n- [x] shipped\n");
+        let history = vec![history_commit("abc1234", "feat: C-637 landed", 9)];
+
+        assert!(already_present_evidence(&story, "C-637", &history).is_empty());
+    }
+
+    /// The weaker signal has to stand alone: a repository with no message convention, or no readable
+    /// history at all, still gets an answer from what the item says about itself.
+    #[test]
+    fn a_fully_ticked_acceptance_stands_on_its_own() {
+        let story = outstanding_story(
+            "C-637",
+            "in-progress",
+            "## Acceptance\n\n- [x] first\n- [X] second\n",
+        );
+
+        let evidence = already_present_evidence(&story, "C-637", &[]);
+
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert_eq!(evidence[0]["signal"], "acceptance-complete");
+        assert_eq!(evidence[0]["detail"], "2 of 2 Acceptance criteria ticked");
+        assert_eq!(path_to_done(&story.status), vec!["done"]);
+    }
+
+    /// Ids share a prefix by construction, so a substring search reports the wrong item — and a
+    /// wrong finding is worse than none, because the repair it suggests is a status lie.
+    #[test]
+    fn an_item_id_matches_only_as_a_whole_token() {
+        assert!(names_item("closes C-637 at last", "C-637"));
+        assert!(names_item("flux/C-637: the workspace spelling", "C-637"));
+        assert!(names_item("trailing punctuation C-637.", "C-637"));
+        assert!(!names_item("C-6370 is a different item", "C-637"));
+        assert!(!names_item("C-637 is a longer id", "C-63"));
+    }
+
+    /// The repair is a transition, so the suggested path has to be one the state machine accepts.
+    /// Restating the arrows beside `valid_planning_transition` is how they drift apart.
+    #[test]
+    fn the_repair_path_is_accepted_by_the_planning_state_machine() {
+        for status in ["backlog", "ready", "in-progress", "blocked"] {
+            let path = path_to_done(status);
+            assert_eq!(
+                path.last().copied(),
+                Some("done"),
+                "{status} must reach done"
+            );
+            let mut from = status;
+            for step in &path {
+                assert!(
+                    valid_planning_transition(from, step),
+                    "{from} -> {step} is not a planning transition"
+                );
+                from = step;
+            }
+        }
+        assert!(path_to_done("done").is_empty(), "done needs no repair");
+    }
+
+    /// One `git log` pass has to survive multi-line bodies and separate the board's own documents
+    /// from the work, because both appear in the same commit list.
+    #[test]
+    fn one_git_log_pass_splits_records_and_divides_files() {
+        let commits = parse_history_records(
+            "\u{1e}aaa1111\u{1f}feat: one (C-1)\u{1f}body line\nsecond body line\n\u{1f}\n\
+             crates/flux-cli/src/board_fleet_cmd.rs\ndocs/stories/C-1-x.md\n\
+             \u{1e}bbb2222\u{1f}board: add C-2\u{1f}\u{1f}\ndocs/stories/C-2-y.md\n",
+        );
+
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].hash, "aaa1111");
+        assert_eq!(commits[0].subject, "feat: one (C-1)");
+        assert!(commits[0].message.contains("second body line"));
+        assert_eq!(commits[0].work_files, 1, "the story file is not the work");
+        assert_eq!(commits[1].work_files, 0);
+    }
+
+    /// A workspace item is `member/ID`, and the commit that implemented it is in that member's
+    /// repository. Looking for it in the workspace root would report every member as untouched.
+    #[test]
+    fn a_workspace_id_names_the_member_whose_history_holds_its_work() {
+        assert_eq!(
+            reconcile_member_split("flux/C-637", true),
+            ("flux", "C-637")
+        );
+        assert_eq!(reconcile_member_split("C-637", true), ("", "C-637"));
+        assert_eq!(
+            reconcile_member_split("flux/C-637", false),
+            ("", "flux/C-637"),
+            "a repository board owns ids with slashes in them"
+        );
+    }
+
+    /// Detection is the whole value, so reconcile must be reachable from the published API and must
+    /// never be classed as a mutation — an operator asking what drifted cannot risk writing.
+    #[test]
+    fn board_reconcile_is_a_published_read_only_operation() {
+        assert!(board_operations().contains(&"reconcile"));
+        assert!(!board_action_mutates(&BoardAction::Reconcile));
+        assert!(!board_action_requires_member(&BoardAction::Reconcile));
+        assert!(!board_action_mutates(&BoardAction::Call {
+            target: "reconcile".into(),
+            operation: None,
+        }));
+    }
+
+    /// C-596: the integrator's authority ends at a green gate. Apply, push, Board mutation and
+    /// dispatch must be absent from its catalogue structurally, not merely discouraged in prose —
+    /// a loop naming an operation outside its admitted ceiling is refused at admission.
+    #[test]
+    fn the_wave_integrator_ceiling_stops_at_assembling_and_reading() {
+        let ceiling = native_fleet_integrator_operation_ceiling();
+
+        assert!(ceiling.contains(&"fleet.integrate".to_string()));
+        assert!(ceiling.contains(&"fleet.status".to_string()));
+        for forbidden in [
+            "fleet.apply",
+            "fleet.run",
+            "fleet.cancel",
+            "fleet.resume",
+            "fleet.message",
+            "board.start",
+            "board.comment",
+            "git_push",
+            "bash",
+        ] {
+            assert!(
+                !ceiling.contains(&forbidden.to_string()),
+                "`{forbidden}` must not be reachable by the integrator; ceiling was {ceiling:?}"
+            );
+        }
+    }
+
+    /// C-610: the umbrella invariant, both halves. The coordinator holds every configured repository root
+    /// and its own native operation ceiling; a story worker holds exactly one root — its assignment.
+    ///
+    /// Recording matters as much as enforcing. The coordinator's ceiling was always applied at spawn
+    /// (`--operation-ceiling` + explicit `--add-dir`), but its manifest was `Null`, so `state.json` showed
+    /// mode/ops/roots for every worker and nothing for the privileged agent. An absent record reads
+    /// exactly like an absent ceiling — it led me to report the coordinator as unconfined when it was
+    /// confined and merely unaudited.
+    #[test]
+    fn the_coordinator_records_every_root_and_a_worker_records_exactly_one() {
+        let roots = vec![
+            PathBuf::from("/fleet/sources/flux"),
+            PathBuf::from("/fleet/sources/exchange"),
+            PathBuf::from("/fleet/sources/connectors"),
+        ];
+        let coordinator = capability_set_manifest(
+            FleetTaskMode::Write,
+            &["fleet-coordinator".to_string()],
+            &native_fleet_main_operation_ceiling(),
+            Path::new("/fleet"),
+            &roots,
+            &normalize_fences(Vec::new()),
+        );
+        assert_eq!(coordinator["read_root_count"], json!(roots.len()));
+        assert!(
+            coordinator["operation_count"].as_u64().unwrap_or_default() > 0,
+            "the coordinator's ceiling must be recorded, not left absent: {coordinator}"
+        );
+
+        // A worker's own manifest names one root at most — its worktree is its world.
+        let (_, worker_ops) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &DEFAULT_STORY_CAPABILITIES.map(str::to_string),
+            &default_fleet_task_kind(),
+        )
+        .expect("the default story ceiling is valid");
+        let worker = capability_set_manifest(
+            FleetTaskMode::Write,
+            &DEFAULT_STORY_CAPABILITIES.map(str::to_string),
+            &worker_ops,
+            Path::new("/fleet/worktrees/w/flux/stories/C-1"),
+            &[],
+            &normalize_fences(Vec::new()),
+        );
+        assert_eq!(
+            worker["read_root_count"],
+            json!(0),
+            "a worker must not carry sibling roots"
+        );
+        assert!(
+            coordinator["read_root_count"].as_u64() > worker["read_root_count"].as_u64(),
+            "the umbrella is asymmetric by design: coordinator spans roots, worker does not"
+        );
+    }
+
+    /// The observed shape from the story: eight coordinator intakes pending while a story worker is
+    /// resumed, plus one message actually addressed to that worker and one legacy item persisted
+    /// before intake carried a target at all.
+    fn inbox_with_pending_coordinator_intake() -> FleetState {
+        let mut state = FleetState {
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 1..=8 {
+            state.intake.insert(
+                format!("intake-{index}"),
+                json!({
+                    "id": format!("intake-{index}"),
+                    "target": "main",
+                    "source": "automation",
+                    "text": "Autopilot tick. Report only: current revision, active workers",
+                    "ack": "accepted",
+                }),
+            );
+        }
+        // No `target` field: written before intake was addressed, and the coordinator's by default.
+        state.intake.insert(
+            "intake-9".into(),
+            json!({
+                "id": "intake-9",
+                "source": "user",
+                "text": "Legacy coordinator requirement",
+                "ack": "accepted",
+            }),
+        );
+        state.intake.insert(
+            "message-49".into(),
+            json!({
+                "id": "message-49",
+                "target": "wave-308-worker-1",
+                "message": "Finish only these C-560 items in your existing session",
+                "ack": "accepted",
+            }),
+        );
+        state
+    }
+
+    /// C-618 (failing first): `fleet resume wave-308-worker-1` built the *worker's* request out of the
+    /// coordinator's pending inbox — eight autopilot ticks and a task addressed to `main`, handed to an
+    /// agent whose contract forbids coordinating the fleet at all.
+    #[test]
+    fn a_resumed_worker_is_asked_only_about_its_own_pending_items() {
+        let state = inbox_with_pending_coordinator_intake();
+
+        let request = resume_request_for(&state, "wave-308-worker-1");
+
+        assert!(
+            request.contains("message-49"),
+            "the worker's own pending message must reach it: {request}"
+        );
+        for foreign in ["intake-1", "intake-8", "intake-9", "Autopilot tick"] {
+            assert!(
+                !request.contains(foreign),
+                "coordinator traffic {foreign:?} leaked into a worker resume: {request}"
+            );
+        }
+        assert!(
+            !request.contains("blocked decisions"),
+            "a worker must not be told to inspect the fleet: {request}"
+        );
+    }
+
+    /// C-618 (failing first): the delivery bound. Resuming a worker acknowledged every accepted item,
+    /// so coordinator intake was marked completed by a turn that never saw it; the coordinator's own
+    /// resume then found nothing pending.
+    #[test]
+    fn resuming_a_worker_never_consumes_coordinator_intake() {
+        let mut state = inbox_with_pending_coordinator_intake();
+        let receipt = json!({"status": "completed"});
+
+        let consumed = complete_resumed_intake(&mut state, "wave-308-worker-1", &receipt);
+
+        assert_eq!(consumed, vec!["message-49".to_string()]);
+        for id in ["intake-1", "intake-8", "intake-9"] {
+            assert_eq!(
+                state.intake[id]["ack"], "accepted",
+                "{id} must still be awaiting its own addressee"
+            );
+            assert!(
+                state.intake[id].get("receipt").is_none(),
+                "{id} must not carry a receipt from another agent's turn"
+            );
+        }
+
+        // The coordinator still gets its queue, in full, exactly once.
+        let coordinator_request = resume_request_for(&state, "main");
+        assert!(coordinator_request.contains("intake-1"));
+        assert!(coordinator_request.contains("intake-9"));
+        assert_eq!(
+            complete_resumed_intake(&mut state, "main", &receipt).len(),
+            9
+        );
+        assert!(pending_intake_for(&state, "main").is_empty());
+        assert!(complete_resumed_intake(&mut state, "main", &receipt).is_empty());
+    }
+
+    /// C-624 (failing first): Fleet writes its own loop-binding snapshot into the worktree it hands to a
+    /// worker, so `.flux/` shows as untracked wherever a repository does not already ignore it. Counting
+    /// that as the worker's dirt refused the handoff of three fully committed stories in wave-346, in
+    /// flux-exchange but not in flux — a difference caused entirely by an unrelated `.gitignore` line.
+    #[test]
+    fn fleet_own_loop_binding_snapshot_is_not_worker_dirt() {
+        assert!(
+            worker_dirt("?? .flux/\n").is_empty(),
+            "the harness's own snapshot must never read as the worker's uncommitted work"
+        );
+        assert!(worker_dirt("?? .flux\n").is_empty());
+        assert!(worker_dirt("?? .flux/fleet/agent-loop.flux\n").is_empty());
+        assert!(worker_dirt("").is_empty());
+
+        // Real work still counts, including a path that merely starts with the same letters.
+        assert_eq!(worker_dirt(" M crates/flux-core/src/budget.rs\n").len(), 1);
+        assert_eq!(worker_dirt("?? .fluxfoo/thing.rs\n").len(), 1);
+        assert_eq!(
+            worker_dirt("?? .flux/\n M crates/flux-core/src/budget.rs\n").len(),
+            1,
+            "a mixed status must report only the worker's own entry"
+        );
+    }
+
+    /// C-619 (failing first): a gated wave's items must be recognized as delivered from Fleet state
+    /// alone. The Board keeps them `ready` and a workspace board refuses every mutation while its member
+    /// checkout is off the canonical ref, so `board next` re-selects finished work indefinitely —
+    /// `flux/C-569` was dispatched three times in eleven seconds after passing its full gate.
+    #[test]
+    fn a_gated_waves_items_count_as_delivered_from_fleet_state_alone() {
+        let mut state = FleetState::default();
+        for (wave, status, item) in [
+            ("wave-100", "accepted", "flux/C-1"),
+            ("wave-200", "agent-turn-failed", "flux/C-2"),
+            ("wave-300", "green", "flux/C-3"),
+            ("wave-400", "applied", "flux/C-4"),
+            ("wave-500", "cancelled", "flux/C-5"),
+        ] {
+            state
+                .waves
+                .insert(wave.to_string(), json!({"status": status, "items": [item]}));
+        }
+
+        let delivered = delivered_board_items(&state);
+
+        assert_eq!(
+            delivered.get("flux/C-3").map(String::as_str),
+            Some("wave-300")
+        );
+        assert_eq!(
+            delivered.get("flux/C-4").map(String::as_str),
+            Some("wave-400")
+        );
+        for undelivered in ["flux/C-1", "flux/C-2", "flux/C-5"] {
+            assert!(
+                !delivered.contains_key(undelivered),
+                "`{undelivered}` has not been gated and must remain dispatchable: {delivered:?}"
+            );
+        }
+    }
+
+    /// Reclamation must be bounded and must never reach into a `.git` directory. An unbounded walk
+    /// would descend into the very trees it is deleting, and `.git` is not build output.
+    #[test]
+    fn build_dir_discovery_is_bounded_and_skips_git() {
+        let temp = reclaim_test_dir("build-dirs");
+        let root = temp.as_path();
+        for path in [
+            "target/debug",
+            "plugins/target/debug",
+            "website/node_modules/pkg",
+            "crates/deep/nested/target",
+            ".git/target",
+        ] {
+            std::fs::create_dir_all(root.join(path)).expect("fixture dirs");
+        }
+
+        let targets = build_dirs_under(root, "target");
+        assert!(targets.contains(&root.join("target")), "{targets:?}");
+        assert!(
+            targets.contains(&root.join("plugins/target")),
+            "{targets:?}"
+        );
+        assert!(
+            !targets.contains(&root.join(".git/target")),
+            "`.git` must never be treated as build output: {targets:?}"
+        );
+        assert!(
+            !targets.contains(&root.join("crates/deep/nested/target")),
+            "discovery must stay within two levels: {targets:?}"
+        );
+        assert_eq!(
+            build_dirs_under(root, "node_modules"),
+            vec![root.join("website/node_modules")]
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A story worktree holding one commit on its branch, above a pinned base.
+    ///
+    /// Returns `(worktree, branch, base, commit)`. Built with real git because the whole point of a
+    /// provisional handoff is that it reads the worktree rather than trusting a record.
+    fn story_worktree_with_a_commit(label: &str) -> (std::path::PathBuf, String, String, String) {
+        let root = reclaim_test_dir(label);
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        std::fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add base");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+        guarded_git(&root, &["checkout", "-b", "story"]).expect("branch");
+        std::fs::write(root.join("delivered.rs"), "// delivered\n").expect("write delivered");
+        guarded_git(&root, &["add", "."]).expect("add delivered");
+        guarded_git(&root, &["commit", "-m", "deliver"]).expect("commit delivered");
+        let commit = git_output(&root, &["rev-parse", "HEAD"]).expect("commit sha");
+        (root, "story".to_string(), base, commit)
+    }
+
+    fn wave_with_one_story(worktree: &Path, branch: &str, base: &str) -> FleetState {
+        let mut state = FleetState::default();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "id": "wave-1",
+                "status": "awaiting-handoffs",
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "stories": [{
+                        "board_ref": "flux/C-1",
+                        "branch": branch,
+                        "base_commit": base,
+                        "worktree": worktree.display().to_string(),
+                        "handoff": Value::Null,
+                    }],
+                }]},
+            }),
+        );
+        state.agents.insert(
+            "wave-1-worker-1".into(),
+            json!({
+                "role": "writer",
+                "status": "completed",
+                "session": "s-1",
+                "board_ref": "flux/C-1",
+                "assignment": {"wave": "wave-1", "board_ref": "flux/C-1", "worktree": worktree.display().to_string()},
+            }),
+        );
+        state
+    }
+
+    /// C-670: the whole defect in one assertion. A worker finished, committed, and its turn ended —
+    /// and the wave must now be able to advance without an operator typing anything.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_turn_hands_off_from_its_own_worktree_with_no_operator() {
+        let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-auto");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+
+        let reports = record_provisional_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
+        assert_eq!(reports[0]["commit"], json!(commit));
+        let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
+        assert_eq!(story["status"], json!("handoff-accepted"));
+        // Distinguishable from an operator-verified handoff: it proved the commit, not the tests.
+        assert_eq!(story["handoff"]["provisional"], json!(true));
+        assert_eq!(story["handoff"]["write_set"], json!(["delivered.rs"]));
+        assert_eq!(story["handoff"]["test_argv"], json!([]));
+        assert_eq!(
+            state.agents["wave-1-worker-1"]["status"],
+            json!("handoff-accepted")
+        );
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// A turn that produced nothing must say so. Recording nothing at all is what made an empty
+    /// worker indistinguishable from one whose record was simply never written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_ended_at_its_base_records_that_it_delivered_nothing() {
+        let (worktree, branch, base, _) = story_worktree_with_a_commit("handoff-empty");
+        guarded_git(&worktree, &["reset", "--hard", &base]).expect("rewind to base");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+
+        let reports = record_provisional_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports[0]["recorded"], json!(false), "{reports:?}");
+        assert!(
+            reports[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no commit")),
+            "{reports:?}"
+        );
+        let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
+        assert_ne!(story["status"], json!("handoff-accepted"));
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// The refusals the operator path has always made, now proved on the shared verification rather
+    /// than assumed.
+    ///
+    /// `verify_story_commit` was extracted so an automatic handoff proves the same git facts as a
+    /// typed one. That is only worth anything if the facts are still actually checked — and the
+    /// existing suite pins the happy paths, so an extraction that quietly dropped a check would have
+    /// passed it. A provisional handoff over a dirty worktree would record a write set that does not
+    /// match what is committed, which is false evidence rather than a missing record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_shared_verification_still_refuses_a_dirty_tree_and_a_foreign_commit() {
+        let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-refusals");
+
+        std::fs::write(worktree.join("uncommitted.txt"), "work in progress\n").expect("dirty it");
+        let dirty = verify_story_commit(&worktree, &branch, &base, &commit);
+        assert!(
+            dirty
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("dirty")),
+            "a dirty story worktree must still be refused: {dirty:?}"
+        );
+        std::fs::remove_file(worktree.join("uncommitted.txt")).expect("clean it");
+
+        // A commit that exists but does not descend from the pinned base is not this wave's work.
+        guarded_git(&worktree, &["checkout", "-b", "elsewhere", &base]).expect("orphan branch");
+        std::fs::write(worktree.join("other.txt"), "other\n").expect("write other");
+        guarded_git(&worktree, &["add", "."]).expect("add other");
+        guarded_git(&worktree, &["commit", "-m", "other"]).expect("commit other");
+        let foreign = git_output(&worktree, &["rev-parse", "HEAD"]).expect("foreign sha");
+        let wrong_base = verify_story_commit(&worktree, "elsewhere", &commit, &foreign);
+        assert!(
+            wrong_base
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("does not descend")),
+            "a commit off the pinned base must still be refused: {wrong_base:?}"
+        );
+
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not
+    /// reason enough to add one to a binary crate.
+    fn reclaim_test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "flux-reclaim-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&path).expect("scratch dir");
+        path
+    }
+
+    /// The asymmetry that keeps reclamation safe: a directory that cannot be inspected as a git
+    /// worktree counts as holding work, so it is retained rather than deleted. wave-299 held a
+    /// complete six-file implementation its turn never committed; losing that to a cleanup would be
+    /// worse than any disk cost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_uninspectable_worktree_counts_as_holding_work() {
+        let temp = reclaim_test_dir("uninspectable");
+        assert!(
+            worktree_holds_work(&temp, &temp, "origin/main").unwrap_or(true),
+            "a non-repository must never be reported as safe to delete"
+        );
+        std::fs::remove_dir_all(&temp).ok();
+    }
+
+    /// `CAPABILITY_BUNDLES` must stay the exact domain of `capability_operations`. A bundle added to
+    /// one and not the other would silently shrink the maximal ceiling loop validation reasons about,
+    /// turning a valid template-less task kind into a spurious "not runnable" refusal.
+    #[test]
+    fn capability_bundle_list_matches_the_resolver() {
+        for bundle in CAPABILITY_BUNDLES {
+            assert!(
+                capability_operations(bundle).is_some(),
+                "`{bundle}` is listed but does not resolve"
+            );
+        }
+        // The maximal set must be a genuine superset of what any single template can be granted.
+        let maximal = maximal_task_kind_operations(&default_fleet_task_kind());
+        let (_, story) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &DEFAULT_STORY_CAPABILITIES.map(str::to_string),
+            &default_fleet_task_kind(),
+        )
+        .expect("the default story ceiling is valid");
+        for operation in story {
+            assert!(
+                maximal.contains(&operation),
+                "`{operation}` is grantable but missing from the maximal set"
+            );
+        }
+    }
+
+    /// C-605 (failing first): toolchain operations are surfaced by the ASSIGNED REPOSITORY, not
+    /// granted uniformly. `flux-tools` gates every toolchain group on a workspace marker
+    /// (`flux_runtime::detect_signals`), so a bundle that grants `cargo_test` where no `Cargo.toml`
+    /// exists names an operation the worker can never call — a mismatch that only shows up mid-turn
+    /// as "tools outside the live capability ceiling". The `toolchain` capability is the
+    /// language-neutral way to say "validate this repository however it is validated", so one shared
+    /// template is correct in a Rust repo, a Node repo and a mixed one.
+    #[test]
+    fn toolchain_operations_follow_the_assigned_repository() {
+        let node_only = reclaim_test_dir("c605-node");
+        std::fs::write(node_only.join("package.json"), "{}").expect("node marker");
+        let rust_only = reclaim_test_dir("c605-rust");
+        std::fs::write(rust_only.join("Cargo.toml"), "[workspace]\n").expect("rust marker");
+        let bare = reclaim_test_dir("c605-bare");
+        let kind = default_fleet_task_kind();
+        let neutral = ["read", "edit", "git", "toolchain"].map(str::to_string);
+
+        let (_, in_node) = normalize_worker_capabilities_in(
+            FleetTaskMode::Write,
+            &neutral,
+            &kind,
+            Some(&node_only),
+        )
+        .expect("a node repository admits the neutral toolchain capability");
+        assert!(
+            !in_node
+                .iter()
+                .any(|operation| operation.starts_with("cargo_")),
+            "a repository with no Cargo manifest must not receive cargo_*: {in_node:?}"
+        );
+        assert!(
+            in_node.contains(&"npm".to_string()),
+            "the same declaration must yield the node toolchain there: {in_node:?}"
+        );
+
+        let (_, in_rust) = normalize_worker_capabilities_in(
+            FleetTaskMode::Write,
+            &neutral,
+            &kind,
+            Some(&rust_only),
+        )
+        .expect("a rust repository admits the neutral toolchain capability");
+        assert!(
+            in_rust.contains(&"cargo_test".to_string()),
+            "the same declaration must yield the rust toolchain here: {in_rust:?}"
+        );
+        assert!(
+            !in_rust.iter().any(|operation| operation == "npm"),
+            "a repository with no package.json must not receive npm: {in_rust:?}"
+        );
+
+        // An explicitly named language bundle is narrowed by the same repository probe: naming
+        // `rust` cannot conjure a toolchain the assigned checkout does not surface.
+        let explicit = ["read", "edit", "git", "rust"].map(str::to_string);
+        let (_, explicit) =
+            normalize_worker_capabilities_in(FleetTaskMode::Write, &explicit, &kind, Some(&bare))
+                .expect("an explicit bundle is still a valid declaration");
+        assert!(
+            !explicit
+                .iter()
+                .any(|operation| operation.starts_with("cargo_")),
+            "an unsurfaced bundle must contribute nothing: {explicit:?}"
+        );
+
+        // With no assigned repository (config validation, an ad-hoc task kind) the grant stays
+        // maximal — validation must not narrow a ceiling it cannot probe.
+        let (_, unknown) =
+            normalize_worker_capabilities_in(FleetTaskMode::Write, &neutral, &kind, None)
+                .expect("an unprobed declaration is still valid");
+        assert!(unknown.contains(&"cargo_test".to_string()));
+        assert!(unknown.contains(&"npm".to_string()));
+
+        for scratch in [node_only, rust_only, bare] {
+            std::fs::remove_dir_all(&scratch).ok();
+        }
+    }
+
+    /// C-606 (failing first): a story writer must not get arbitrary shell by default. `bash` and
+    /// `proc.run` resolve no paths, and the OS sandbox never restricts reads on either backend, so the
+    /// workspace guard is the only read guard — a writer holding shell can read the whole host. Every
+    /// worker up to `wave-286-worker-1` ran with `['edit','git','read','shell']`.
+    #[test]
+    fn a_story_writer_gets_no_shell_by_default() {
+        assert!(
+            !DEFAULT_STORY_CAPABILITIES.contains(&"shell"),
+            "shell bypasses the only read guard that exists: {DEFAULT_STORY_CAPABILITIES:?}"
+        );
+        // The writer-mode floor is still satisfied, so a default wave still admits a usable writer.
+        for required in REQUIRED_WRITER_CAPABILITIES {
+            assert!(
+                DEFAULT_STORY_CAPABILITIES.contains(&required),
+                "`{required}` is required for write mode"
+            );
+        }
+        // Narrowing the default must not remove the capability from the vocabulary — an operator can
+        // still grant it deliberately.
+        assert!(
+            capability_operations("shell").is_some_and(|ops| ops.contains(&"bash")),
+            "an explicit template may still declare shell"
+        );
+        // And the typed alternative a writer should use instead is available.
+        assert!(capability_operations("rust").is_some_and(|ops| ops.contains(&"cargo_test")));
+    }
+
+    /// The handoff gate could never accept a test-first commit. It re-runs the cited argv at the
+    /// pinned base and demands a non-zero exit — but the new test does not exist there, and
+    /// `cargo test <new name>` reports `0 passed; 0 failed; N filtered out` and exits 0. Verified
+    /// against the real runner before changing the gate.
+    #[test]
+    fn a_filtered_to_nothing_run_is_neither_a_pass_nor_a_failure() {
+        let cargo_no_match = json!({
+            "success": true,
+            "stdout": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 340 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(ran_no_tests(&cargo_no_match));
+
+        let real_failure = json!({
+            "success": false,
+            "stdout": "test result: FAILED. 3 passed; 1 failed; 0 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(
+            !ran_no_tests(&real_failure),
+            "a genuine failure is not 'no tests'"
+        );
+
+        let real_pass = json!({
+            "success": true,
+            "stdout": "test result: ok. 4 passed; 0 failed; 0 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(
+            !ran_no_tests(&real_pass),
+            "a genuine pass is not 'no tests'"
+        );
+
+        // An unrecognised runner keeps the strict exit-code contract rather than being waved through.
+        let opaque = json!({"success": true, "stdout": "done", "stderr": ""});
+        assert!(!ran_no_tests(&opaque));
+
+        // Failing first: `cargo test -p <pkg> <filter>` runs the lib unittests AND every integration
+        // test binary, so the filter matches in one target and matches nothing in the others. A
+        // substring search over the combined output saw `0 passed; 0 failed` from the non-matching
+        // target and concluded no test ran — refusing a handoff whose test genuinely ran and passed,
+        // and parking a wave that held delivered work. Real captured output from `cargo test -p
+        // flux-tui board_pane_groups_by_status_and_orders_by_priority`.
+        let multi_target = json!({
+            "success": true,
+            "stdout": "     Running unittests src/lib.rs (target/debug/deps/flux_tui-669f2bfa)\n\nrunning 1 test\ntest operations::tests::board_pane_groups_by_status_and_orders_by_priority ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 293 filtered out; finished in 0.01s\n\n     Running tests/loop_mocks.rs (target/debug/deps/loop_mocks-62225ac6)\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 22 filtered out; finished in 0.00s\n",
+            "stderr": ""
+        });
+        assert!(
+            !ran_no_tests(&multi_target),
+            "one target running the test is enough; sibling targets filter to nothing by construction"
+        );
+
+        // The genuinely-absent case still holds when several targets all match nothing.
+        let absent_everywhere = json!({
+            "success": true,
+            "stdout": "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 293 filtered out;\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 22 filtered out;\n",
+            "stderr": ""
+        });
+        assert!(ran_no_tests(&absent_everywhere));
+
+        // nextest's own vocabulary, both directions.
+        assert!(ran_no_tests(
+            &json!({"success": true, "stdout": "Starting 0 tests across 12 binaries\n", "stderr": ""})
+        ));
+        assert!(!ran_no_tests(
+            &json!({"success": true, "stdout": "Starting 3 tests across 12 binaries\n    Summary [0.2s] 3 tests run: 3 passed, 0 skipped\n", "stderr": ""})
+        ));
+    }
+
+    /// Failing first: clipped output must keep the END, because that is where a failure explains itself.
+    ///
+    /// Clipping kept the head alone. A repository gate emits thousands of `Compiling …` and `test … ok`
+    /// lines and then fails at the very end, so a failed gate's record filled its whole budget with
+    /// progress and cut the error off: on one real wave both captured streams were exactly 16385 bytes
+    /// and the reason for the failure was not recoverable from Fleet state at all.
+    #[test]
+    fn clipping_keeps_the_tail_where_a_failure_explains_itself() {
+        let mut long = String::new();
+        for index in 0..4000 {
+            long.push_str(&format!("   Compiling crate-number-{index} v0.1.0\n"));
+        }
+        long.push_str("error[E0425]: cannot find value `missing_thing` in this scope\n");
+        long.push_str("error: could not compile `exchange-host` (lib) due to 1 previous error\n");
+        let clipped = clipped_redacted(long.as_bytes());
+
+        assert!(
+            clipped.contains("could not compile"),
+            "the failure is at the end and must survive the clip"
+        );
+        assert!(
+            clipped.contains("cannot find value"),
+            "so must the diagnostic above it"
+        );
+        assert!(
+            clipped.contains("Compiling crate-number-0 "),
+            "the head is still worth keeping: it carries the command and the first error"
+        );
+        assert!(
+            clipped.contains("elided from the middle"),
+            "never claim completeness silently"
+        );
+        assert!(
+            clipped.len() <= 17 * 1024,
+            "still bounded: {}",
+            clipped.len()
+        );
+
+        // Output that fits is returned whole, with no marker.
+        let short = clipped_redacted(b"all good\n");
+        assert_eq!(short, "all good\n");
+    }
+
+    /// Failing first: reclamation may delete build output from an unfinished wave, never its worktrees.
+    ///
+    /// `worktree_holds_work` answers "does this contain work?" and was used as though it answered "is this
+    /// still needed?". Reclaiming an `agent-turn-failed` wave therefore removed its integration worktree —
+    /// legitimately empty, sitting at its pinned base — while a story worktree in the same wave held 940
+    /// uncommitted lines. The wave was left with deliverable work and nowhere to assemble a candidate, and
+    /// no operation could rebuild the missing structure.
+    #[test]
+    fn only_a_finished_wave_loses_its_worktrees() {
+        for status in ["applied", "cancelled"] {
+            assert!(
+                wave_worktrees_are_removable(status),
+                "{status} is finished for good"
+            );
+        }
+        for status in [
+            "parked",
+            "agent-turn-failed",
+            "conflict",
+            "red",
+            "green",
+            "handoffs-ready",
+            "accepted",
+        ] {
+            assert!(
+                !wave_worktrees_are_removable(status),
+                "{status} may still need to assemble or hand off"
+            );
+            assert!(
+                wave_is_reclaimable(status) || !wave_is_reclaimable(status),
+                "reclaimability of build output is a separate question"
+            );
+        }
+    }
+
+    /// Reclamation must never be able to delete a build a wave is about to use.
+    ///
+    /// The dangerous direction is one-sided: refusing to reclaim a finished wave wastes disk, while
+    /// reclaiming a wave that can still advance destroys work in progress. So the in-flight statuses are
+    /// enumerated here and asserted unreclaimable, rather than trusting the allow-list to stay right by
+    /// inspection. `parked` is on the reclaimable side on purpose — it is exactly the state that sits for
+    /// hours holding gigabytes while a human decides, and its commits live on branches.
+    #[test]
+    fn a_wave_that_can_still_advance_is_never_reclaimable() {
+        for status in [
+            "accepted",
+            "awaiting-handoffs",
+            "handoffs-ready",
+            "integrating",
+            "working",
+            "running",
+            "unknown",
+        ] {
+            assert!(
+                !wave_is_reclaimable(status),
+                "{status} can still advance and owns a live build"
+            );
+        }
+        for status in [
+            "applied",
+            "cancelled",
+            "conflict",
+            "red",
+            "parked",
+            "agent-turn-failed",
+            "green",
+        ] {
+            assert!(wave_is_reclaimable(status), "{status} has finished");
+        }
+    }
+
+    /// C-720: the defect that made reclamation inert for nineteen consecutive runs.
+    ///
+    /// A wave reclaimed once has no checkouts left — and the loop skipped every absent directory
+    /// before it could do anything, which is also where branch pruning lived. So the branches doctor
+    /// flagged survived forever while the command it prescribed reported success. The count came from
+    /// the candidate list, so "reclaimed 39 wave(s)" was printed over zero effects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wave_whose_checkouts_are_gone_still_loses_the_branches_it_left_behind() {
+        let root = reclaim_test_dir("reclaim-absent-checkout");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("scratch dir");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        std::fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add base");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+        guarded_git(&root, &["branch", "fleet/wave-9/story"]).expect("branch at base");
+        guarded_git(&root, &["branch", "fleet/wave-9/delivered"]).expect("branch to move");
+        guarded_git(&root, &["checkout", "fleet/wave-9/delivered"]).expect("checkout");
+        std::fs::write(root.join("delivered.rs"), "// delivered\n").expect("write delivered");
+        guarded_git(&root, &["add", "."]).expect("add delivered");
+        guarded_git(&root, &["commit", "-m", "deliver"]).expect("commit delivered");
+        guarded_git(&root, &["checkout", "main"]).expect("back to main");
+
+        // The whole point of the fixture: neither checkout exists any more.
+        let absent = root.join("worktrees").join("story");
+        let delivered_tree = root.join("worktrees").join("delivered");
+        assert!(!absent.is_dir() && !delivered_tree.is_dir());
+
+        let wave = json!({
+            "id": "wave-9",
+            "status": "cancelled",
+            "topology": {"repositories": [{
+                "id": "flux",
+                "source_root": root.display().to_string(),
+                "canonical_ref": "main",
+                "base_commit": base,
+                "stories": [
+                    {
+                        "board_ref": "flux/C-1",
+                        "branch": "fleet/wave-9/story",
+                        "worktree": absent.display().to_string(),
+                    },
+                    {
+                        "board_ref": "flux/C-2",
+                        "branch": "fleet/wave-9/delivered",
+                        "worktree": delivered_tree.display().to_string(),
+                    },
+                ],
+            }]},
+        });
+
+        let reclaimed = reclaim_wave_storage(&wave);
+        assert_eq!(
+            reclaimed["worktrees_absent"].as_array().map(Vec::len),
+            Some(2),
+            "an absent checkout is a reported outcome, not a silent skip"
+        );
+
+        let branches = reclaimed["branches"].as_array().expect("branches recorded");
+        let deleted: Vec<&str> = branches
+            .iter()
+            .filter(|entry| entry["deleted"] == json!(true))
+            .filter_map(|entry| entry["branch"].as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["fleet/wave-9/story"],
+            "the branch still at its pinned base is pruned; the one holding a commit is not"
+        );
+        assert!(
+            git_output(
+                &root,
+                &["rev-parse", "--verify", "refs/heads/fleet/wave-9/story"]
+            )
+            .is_none(),
+            "the ref must actually be gone, not merely reported gone"
+        );
+        assert!(
+            git_output(
+                &root,
+                &["rev-parse", "--verify", "refs/heads/fleet/wave-9/delivered"]
+            )
+            .is_some(),
+            "a branch that moved past its base holds delivered work and must survive"
+        );
+        assert_eq!(
+            reclaimed_effects(&reclaimed),
+            (0, 0, 1),
+            "the reported count is derived from verified effects, never from candidates"
+        );
+    }
+
+    fn repair_facts<'a>(
+        role: WorktreeRole,
+        present: bool,
+        dirty: bool,
+        head: Option<&'a str>,
+        candidate: Option<&'a str>,
+    ) -> WorktreeFacts<'a> {
+        WorktreeFacts {
+            role,
+            present,
+            dirty,
+            head,
+            base: "base",
+            candidate,
+        }
+    }
+
+    /// Failing first: the structure a topology names and disk lacks is exactly what repair rebuilds.
+    ///
+    /// Reclaiming an `agent-turn-failed` wave removed its integration worktree and no operation could
+    /// rebuild it, so the wave held deliverable work with nowhere to assemble a candidate. Absence is
+    /// unambiguous — nothing on disk can be lost by putting a recorded checkout back — so it is the one
+    /// case repair acts on regardless of role.
+    #[test]
+    fn a_worktree_the_topology_names_and_disk_lacks_is_rebuilt() {
+        for role in [WorktreeRole::Story, WorktreeRole::Derived] {
+            assert_eq!(
+                plan_worktree_repair(&repair_facts(role, false, false, None, None)),
+                WorktreeRepair::Recreate,
+                "{role:?} structure that disk lacks is rebuilt"
+            );
+        }
+    }
+
+    /// A story worktree is a worker's own checkout, so repair never rewinds it.
+    ///
+    /// Being ahead of the pinned base is the CORRECT state for a story worktree — those commits are
+    /// the deliverable — and its uncommitted changes may be the only copy of a live turn's work. A
+    /// verb that "repaired" either would destroy exactly what the wave exists to produce.
+    #[test]
+    fn a_present_story_worktree_is_never_rewound() {
+        for dirty in [false, true] {
+            assert_eq!(
+                plan_worktree_repair(&repair_facts(
+                    WorktreeRole::Story,
+                    true,
+                    dirty,
+                    Some("delivered"),
+                    None
+                )),
+                WorktreeRepair::Intact,
+                "a story worktree ahead of its base is finished work, not damage"
+            );
+        }
+    }
+
+    /// A derived worktree returns to its pinned base only when that discards nothing.
+    ///
+    /// `git reset --hard <base>` on an integration worktree was a hand step before handoffs would
+    /// verify, which is why it earns a verb — but the same command applied to a dirty tree, an
+    /// uninspectable one, or the commit a gate already recorded as its candidate spends work instead
+    /// of restoring shape. Each refusal is asserted rather than left to the caller's judgement.
+    #[test]
+    fn a_derived_worktree_is_reset_only_when_nothing_would_be_lost() {
+        assert_eq!(
+            plan_worktree_repair(&repair_facts(
+                WorktreeRole::Derived,
+                true,
+                false,
+                Some("assembly"),
+                None
+            )),
+            WorktreeRepair::ResetToBase
+        );
+        assert_eq!(
+            plan_worktree_repair(&repair_facts(
+                WorktreeRole::Derived,
+                true,
+                false,
+                Some("base"),
+                None
+            )),
+            WorktreeRepair::Intact
+        );
+        for facts in [
+            repair_facts(WorktreeRole::Derived, true, true, Some("assembly"), None),
+            repair_facts(WorktreeRole::Derived, true, false, None, None),
+            repair_facts(
+                WorktreeRole::Derived,
+                true,
+                false,
+                Some("assembly"),
+                Some("assembly"),
+            ),
+        ] {
+            assert!(
+                matches!(plan_worktree_repair(&facts), WorktreeRepair::Refused(_)),
+                "repair must refuse anything that would discard work"
+            );
+        }
+    }
+
+    /// Failing first: an agent recorded `working` by a process that no longer exists must not read as
+    /// active.
+    ///
+    /// Two independent lies are possible about an active status, and `worker_activity` must catch both. A
+    /// terminal receipt proves the turn ENDED and the status is merely stale. But the turn runs
+    /// synchronously in the process that wrote `working`, so if that process is killed no receipt is ever
+    /// written: there is nothing stale to notice, only silence. `wave-308-worker-1` read `working` for
+    /// hours that way — inflating the active count, keeping its wave out of reaping, and pushing the
+    /// driver into scanning `/proc` because state could not answer.
+    #[test]
+    fn an_agent_whose_supervisor_died_is_not_active() {
+        // A pid that is certainly dead: run a child to completion and reap it. Reusing that pid within
+        // the microseconds before the check is possible in principle and has no practical bearing here.
+        // Do NOT reach for a nonsense value instead — `u32::MAX` narrows to `-1`, which `kill` reads as
+        // "every process this user may signal", so it reports success and the assertion inverts.
+        let reaped = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let reaped_pid = reaped.id();
+        let mut reaped = reaped;
+        reaped.wait().expect("reap it");
+
+        // Silence: `working`, no receipt of any kind, and a supervisor that is gone.
+        let dead = json!({"status": "working", "supervisor_pid": reaped_pid});
+        assert_eq!(
+            worker_activity(&dead),
+            WorkerActivity::Attention,
+            "a `working` record with a dead supervisor is not work in flight"
+        );
+        assert_ne!(
+            worker_activity(&dead),
+            WorkerActivity::Settled,
+            "an interrupted worker needs attention, not silence"
+        );
+
+        // This process supervises a turn it is running, and must stay active.
+        let live = json!({"status": "working", "supervisor_pid": std::process::id()});
+        assert_eq!(worker_activity(&live), WorkerActivity::Active);
+
+        // A record written before the pid existed is judged on its receipts alone, not downgraded.
+        let legacy = json!({"status": "working"});
+        assert_eq!(worker_activity(&legacy), WorkerActivity::Active);
+
+        // The other half of the derivation still holds: a receipt settles a stale `working` even while
+        // the supervisor is alive, which is the case a pid check alone cannot see.
+        let receipted = json!({
+            "status": "working",
+            "supervisor_pid": std::process::id(),
+            "last_activity": "agent.turn.completed",
+        });
+        assert_eq!(worker_activity(&receipted), WorkerActivity::Attention);
+
+        // A settled status is never reinterpreted, whatever the pid says.
+        let done = json!({"status": "completed", "supervisor_pid": reaped_pid});
+        assert_eq!(worker_activity(&done), WorkerActivity::Settled);
+    }
+
+    /// Failing first: `fleet doctor` answered only "is the configuration valid?".
+    ///
+    /// Every runtime question the fleet already has the data for had to be asked some other way — with
+    /// `jq` over `state.json` by an operator, or with a `/proc` scanner a driver grew for itself. Four of
+    /// them are asserted here on one deliberately unhealthy state: an agent recorded `working` by a
+    /// process that is gone, a wave still `integrating` under a supervisor that is gone, a worktree the
+    /// topology names that disk lacks, and one item two live waves both claim.
+    ///
+    /// `validate` is asserted UNCHANGED in the same test. The two verbs shared one arm, so extending
+    /// doctor is only safe if configuration validation keeps its exact shape for the caller that wants
+    /// nothing else.
+    ///
+    /// On a runtime because the branch check resolves refs through the guarded process boundary, which
+    /// is where every fleet verb already runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fleet_doctor_reports_runtime_health_not_only_configuration() {
+        let root = fleet_tui_fixture("doctor-runtime");
+        // A pid that is certainly dead: run a child to completion and reap it. Never a nonsense value —
+        // `u32::MAX` narrows to `-1`, which `kill` reads as "every process this user may signal".
+        let reaped = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let dead_pid = reaped.id();
+        let mut reaped = reaped;
+        reaped.wait().expect("reap it");
+
+        let absent = root.join(".flux/fleet/worktrees/wave-1/flux/stories/C-1");
+        let mut state = FleetState {
+            revision: 4,
+            running: true,
+            ..FleetState::default()
+        };
+        state.agents.insert(
+            "wave-1-worker-1".into(),
+            json!({"status": "working", "supervisor_pid": dead_pid}),
+        );
+        state.agents.insert(
+            "wave-1-worker-2".into(),
+            json!({"status": "working", "supervisor_pid": std::process::id()}),
+        );
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "integrating",
+                "integration_supervisor_pid": dead_pid,
+                "items": ["flux/C-1"],
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "source_root": display_path(&root),
+                    "base_commit": "a".repeat(40),
+                    "stories": [{
+                        "board_ref": "flux/C-1",
+                        "branch": "fleet/wave-1/flux/story/C-1",
+                        "worktree": display_path(&absent),
+                    }],
+                }]},
+            }),
+        );
+        state.waves.insert(
+            "wave-2".into(),
+            json!({"status": "accepted", "items": ["flux/C-1"]}),
+        );
+        // A wave that finished for good has released both its worktrees and its claim, so neither of its
+        // absent checkouts nor its item may be reported.
+        state.waves.insert(
+            "wave-0".into(),
+            json!({
+                "status": "applied",
+                "items": ["flux/C-1"],
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "source_root": display_path(&root),
+                    "integration": {"branch": "fleet/wave-0/flux/integration", "worktree": display_path(&absent)},
+                }]},
+            }),
+        );
+
+        let (human, data, warnings, revision) = run_fleet_action(
+            &fleet_command(&root, FleetAction::Doctor),
+            &root,
+            state.clone(),
+            None,
+        )
+        .expect("a valid configuration still passes, runtime findings and all");
+
+        assert_eq!(revision, 4, "doctor is read-only and revises nothing");
+        assert_eq!(data["valid"], json!(true));
+        assert_eq!(
+            data["runtime"]["healthy"],
+            json!(false),
+            "this state is unhealthy in four separate ways: {data}"
+        );
+        let reported = data["runtime"]["findings"]
+            .as_array()
+            .expect("doctor reports runtime findings as an array")
+            .iter()
+            .map(|finding| {
+                (
+                    finding["check"].as_str().unwrap_or_default().to_string(),
+                    finding["subject"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            reported,
+            BTreeSet::from([
+                (
+                    "agent-supervisor-gone".to_string(),
+                    "wave-1-worker-1".to_string()
+                ),
+                ("wave-wedged".to_string(), "wave-1".to_string()),
+                ("worktree-missing".to_string(), display_path(&absent)),
+                ("item-double-claimed".to_string(), "flux/C-1".to_string()),
+            ]),
+            "a live worker, and a finished wave's absent worktree and released claim, are not findings"
+        );
+        assert!(
+            data["runtime"]["findings"]
+                .as_array()
+                .is_some_and(|findings| findings
+                    .iter()
+                    .all(|finding| finding["fix"].as_str().is_some_and(|fix| !fix.is_empty()))),
+            "every finding carries its own one-line fix-it hint: {data}"
+        );
+        assert!(
+            human.contains("4 runtime finding"),
+            "the human line counts them: {human}"
+        );
+        assert_eq!(
+            warnings.len(),
+            4,
+            "each finding reaches human output as a warning: {warnings:?}"
+        );
+
+        // The other half of the contract: `validate` still answers the configuration question alone.
+        let (validated_human, validated, validated_warnings, _) = run_fleet_action(
+            &fleet_command(&root, FleetAction::Validate),
+            &root,
+            state,
+            None,
+        )
+        .expect("validate is unchanged");
+        assert_eq!(validated["valid"], json!(true));
+        assert!(
+            validated["runtime"].is_null(),
+            "validate stays configuration-only: {validated}"
+        );
+        assert!(validated_warnings.is_empty());
+        assert!(!validated_human.contains("runtime"));
+    }
+
+    /// The fifth runtime check, whose answer needs a checkout: which `fleet/*` branches are empty
+    /// scaffolding?
+    ///
+    /// One repository held 686 local branches, of which 40 held nothing but the base they were cut
+    /// from, and separating them took a Python script over `git branch`. A branch still sitting at its
+    /// wave's pinned base is exactly that, and a branch git no longer has is nobody's business here —
+    /// asserted together, because reporting the second as a finding would make the check noise.
+    #[test]
+    fn a_branch_left_at_its_pinned_base_holds_nothing_unique() {
+        let base = "b".repeat(40);
+        let mut state = FleetState::default();
+        state.waves.insert(
+            "wave-3".into(),
+            json!({
+                "status": "applied",
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "source_root": "/src/flux",
+                    "base_commit": base,
+                    "stories": [
+                        {"board_ref": "flux/C-1", "branch": "fleet/wave-3/flux/story/C-1", "worktree": "/w/1"},
+                        {"board_ref": "flux/C-2", "branch": "fleet/wave-3/flux/story/C-2", "worktree": "/w/2"},
+                    ],
+                    "integration": {"branch": "fleet/wave-3/flux/integration", "worktree": "/w/i"},
+                }]},
+            }),
+        );
+        let findings = stale_branch_findings(&state, |source: &Path| {
+            assert_eq!(source, Path::new("/src/flux"), "resolved per repository");
+            BTreeMap::from([
+                // Untouched since dispatch.
+                ("fleet/wave-3/flux/story/C-1".to_string(), base.clone()),
+                // Carries a delivered commit.
+                ("fleet/wave-3/flux/story/C-2".to_string(), "c".repeat(40)),
+                // `fleet/wave-3/flux/integration` is absent: already pruned, nothing to conclude.
+            ])
+        });
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "only the branch still at its base is scaffolding: {findings:?}"
+        );
+        assert_eq!(findings[0]["check"], "branch-without-unique-work");
+        assert_eq!(findings[0]["subject"], "fleet/wave-3/flux/story/C-1");
+        assert_eq!(findings[0]["fix"], "flux fleet reclaim wave-3");
+    }
+
+    /// Live activity must reach a surface DURING a wave. Failing first: a wave writes `state.json`
+    /// twice, so nothing the refresh token hashed could change while workers ran and the panel was
+    /// frozen for the whole wave.
+    #[test]
+    fn worker_activity_projects_live_and_carries_no_payload() {
+        let root = fleet_tui_fixture("activity");
+        let events = [
+            // `turn_start` carries the whole prompt and must be skipped outright.
+            json!({"type":"turn_start","v":1,"input":"SECRET PROMPT"}).to_string(),
+            json!({"type":"tool_call","name":"read","input":{"path":"/etc/shadow"}}).to_string(),
+            json!({"type":"tool_result","name":"read","content":"hunter2","is_error":false})
+                .to_string(),
+            json!({"type":"tool_result","name":"bash","content":"boom","is_error":true})
+                .to_string(),
+        ];
+        for line in &events {
+            append_worker_activity(&root, "wave-9-worker-1", line);
+        }
+
+        let sidecar = fs::read_to_string(root.join(FLEET_ACTIVITY_SIDECAR)).unwrap();
+        assert!(
+            !sidecar.contains("SECRET PROMPT"),
+            "turn_start is skipped: {sidecar}"
+        );
+        assert!(
+            !sidecar.contains("hunter2"),
+            "result bodies never reach the sidecar: {sidecar}"
+        );
+        assert!(
+            !sidecar.contains("/etc/shadow"),
+            "tool inputs never reach the sidecar: {sidecar}"
+        );
+
+        let activity = read_worker_activity(&root);
+        let lines = activity
+            .get("wave-9-worker-1")
+            .expect("worker has activity");
+        assert_eq!(
+            lines.len(),
+            3,
+            "turn_start skipped, three structural records kept"
+        );
+        assert!(lines.iter().any(|line| line.contains("read")));
+        assert!(
+            lines.iter().any(|line| line.contains("error")),
+            "a failing op is visible as an error: {lines:?}"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// Partial lines arrive across polls; a record must only be emitted once its newline lands.
+    #[test]
+    fn activity_lines_are_only_emitted_when_complete() {
+        let root = fleet_tui_fixture("activity-partial");
+        let mut pending = String::new();
+        let whole = json!({"type":"tool_call","name":"grep"}).to_string();
+        let (head, tail) = whole.split_at(whole.len() / 2);
+
+        drain_activity_lines(&mut pending, head, &root, "w1");
+        assert!(
+            read_worker_activity(&root).is_empty(),
+            "a half-arrived line must not be projected"
+        );
+
+        drain_activity_lines(&mut pending, &format!("{tail}\n"), &root, "w1");
+        assert_eq!(read_worker_activity(&root).get("w1").map(Vec::len), Some(1));
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// The rail shows only five worker rows. Failed workers outrank completed ones, so without a
+    /// recency tiebreak four corpses from long-finished waves filled those slots and buried the one
+    /// running worker — observed live with `… 27 more` beneath them.
+    #[test]
+    fn current_wave_workers_outrank_older_corpses_of_the_same_status() {
+        assert!(
+            wave_recency(&Some("wave-286".into())) > wave_recency(&Some("wave-99".into())),
+            "numeric suffix, not string order"
+        );
+        assert_eq!(wave_recency(&None), 0, "an unattached worker sorts oldest");
+        assert!(
+            wave_recency(&Some("wave-286".into())) > wave_recency(&Some("wave-257".into())),
+            "the running wave's workers come first within a status class"
+        );
+    }
+
+    /// The header/rail must name the wave that is actually running. Observed live: `wave-257`
+    /// (`agent-turn-failed`) held the header while `wave-286` ran, because the old test was the
+    /// inverse of a short terminal list — so any unrecognised status counted as active — and
+    /// `BTreeMap::iter().find()` returned the OLDEST match.
+    #[test]
+    fn the_active_wave_is_the_newest_one_still_in_flight() {
+        let mut state = FleetState::default();
+        let wave = |status: &str| json!({"status": status, "items": ["flux/C-1"]});
+        state
+            .waves
+            .insert("wave-257".into(), wave("agent-turn-failed"));
+        state.waves.insert("wave-260".into(), wave("cancelled"));
+        state.waves.insert("wave-99".into(), wave("accepted"));
+        state.waves.insert("wave-286".into(), wave("accepted"));
+
+        let active = active_wave_view(&state, 10).expect("an in-flight wave is selected");
+
+        assert_eq!(
+            active.id, "wave-286",
+            "the newest in-flight wave wins, and wave-99 must not out-sort wave-286 lexically"
+        );
+        assert_eq!(active.status, "accepted");
+    }
+
+    /// A failed or finished wave is not "active" — the header should fall silent rather than pin a
+    /// stale id.
+    #[test]
+    fn no_wave_is_active_when_every_wave_has_stopped() {
+        let mut state = FleetState::default();
+        for (id, status) in [
+            ("wave-1", "agent-turn-failed"),
+            ("wave-2", "cancelled"),
+            ("wave-3", "green"),
+            ("wave-4", "applied"),
+        ] {
+            state
+                .waves
+                .insert(id.into(), json!({"status": status, "items": []}));
+        }
+
+        assert!(active_wave_view(&state, 10).is_none());
+    }
+
+    /// C-596: the integration task kind admits the native assemble operations. Without this the
+    /// authored integrator loop names `fleet.integrate`/`fleet.status`, the derived ceiling omits
+    /// them because native Fleet services live outside the capability bundles, and admission refuses
+    /// with "incompatible with its capability ceiling".
+    #[test]
+    fn the_integration_task_kind_admits_the_native_assemble_operations() {
+        let capabilities = ["read".to_string(), "edit".to_string(), "git".to_string()];
+
+        let (_, integrator) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &capabilities,
+            FLEET_INTEGRATION_TASK_KIND,
+        )
+        .expect("an integrator template normalizes");
+        assert!(integrator.contains(&"fleet.integrate".to_string()));
+        assert!(integrator.contains(&"fleet.status".to_string()));
+
+        // A story worker with the very same capabilities gets neither.
+        let (_, writer) = normalize_worker_capabilities_for(
+            FleetTaskMode::Write,
+            &capabilities,
+            FLEET_IMPLEMENTATION_TASK_KIND,
+        )
+        .expect("a writer template normalizes");
+        assert!(
+            !writer.contains(&"fleet.integrate".to_string()),
+            "assemble authority comes from the task kind, never from capabilities"
+        );
+    }
+
+    /// C-596: assemble authority follows the admitted record into the child process. A story worker
+    /// must never carry the integrator attachment, and the integrator must never carry the
+    /// coordinator's.
+    #[test]
+    fn only_an_admitted_integrator_carries_the_assemble_attachment() {
+        let base = AgentTurnSpec {
+            id: "wave-1-integrator".into(),
+            worktree: PathBuf::from("/tmp/wave-1"),
+            read_roots: vec![],
+            store: PathBuf::from("/tmp/wave-1/store"),
+            model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
+            instructions: "assemble".into(),
+            request: "integrate wave-1".into(),
+            resume_session: None,
+            enforce_operation_ceiling: true,
+            admitted_operations: vec!["fleet.integrate".into()],
+            capability_set: Value::Null,
+            shell_capability: false,
+            context_origin: Value::Null,
+            fleet_integrator: true,
+        };
+        let argv = agent_turn_argv(Path::new("/bin/flux"), &base, "integrate".into());
+        assert!(argv.iter().any(|a| a == "--native-fleet-integrator"));
+        assert!(
+            !argv.iter().any(|a| a == "--native-fleet-main"),
+            "the integrator never carries the coordinator attachment"
+        );
+
+        let worker = AgentTurnSpec {
+            id: "wave-1-worker-1".into(),
+            fleet_integrator: false,
+            ..base
+        };
+        let argv = agent_turn_argv(Path::new("/bin/flux"), &worker, "implement".into());
+        assert!(
+            !argv.iter().any(|a| a == "--native-fleet-integrator"),
+            "a story worker cannot attach as the integrator"
+        );
+    }
+
+    /// C-596: the coordinator delegates assembly rather than performing it. Keeping `fleet.integrate`
+    /// out of its catalogue is what stops the scheduler from also being the assembler.
+    #[test]
+    fn the_coordinator_cannot_integrate_a_wave_itself() {
+        let coordinator = native_fleet_main_operation_ceiling();
+
+        assert!(
+            !coordinator.contains(&"fleet.integrate".to_string()),
+            "the coordinator delegates integration; ceiling was {coordinator:?}"
+        );
+        assert!(
+            coordinator.contains(&"fleet.run".to_string()),
+            "the coordinator still dispatches work"
+        );
+    }
+
+    /// The operation maps to the deterministic host verb — it does not reimplement cherry-picking or
+    /// gating, and it carries the optimistic-concurrency guards every mutating Fleet call accepts.
+    #[test]
+    fn fleet_integrate_delegates_to_the_deterministic_host_verb() {
+        let args = NativeCoordinatorOperation::FleetIntegrate
+            .cli_args(
+                Path::new("/tmp/fleet-root"),
+                json!({"wave": "wave-263", "if_revision": 264}),
+            )
+            .expect("a valid integrate request builds argv");
+
+        assert!(args.iter().any(|arg| arg == "integrate"));
+        assert!(args.iter().any(|arg| arg == "wave-263"));
+        assert!(args.iter().any(|arg| arg == "--if-revision"));
+
+        let rejected = NativeCoordinatorOperation::FleetIntegrate
+            .cli_args(Path::new("/tmp/fleet-root"), json!({"wave": "   "}));
+        assert!(rejected.is_err(), "an empty wave id is refused client-side");
+    }
+
+    /// C-595 (failing first): a worker that commits and *then* exhausts a budget must stay
+    /// addressable. Fleet wave-257 lost `flux/C-562` this way — the loop committed 04e31775, the
+    /// next round crossed the 512 KiB history ceiling, and the turn was recorded as `failed` with
+    /// only a message: no `runtime_session`, no receipt, and therefore no `fleet rework`
+    /// re-dispatch (that path requires `runtime_session` to be a string).
+    #[test]
+    fn a_failed_turn_records_the_session_and_receipt_it_already_proved() {
+        let receipt = json!({
+            "schema": "flux.fleet-agent-turn/v1",
+            "agent": "wave-257-worker-2",
+            "session": "s_live_42",
+            "ack": "failed",
+            "events": [{"kind": "adaptive.call", "data": {"op": "git_commit"}}],
+        });
+        let error = anyhow::Error::new(AgentTurnFailure {
+            message: "transient-worker: agent wave-257-worker-2 turn failed: \
+                      authored segment history budget exceeded"
+                .to_string(),
+            receipt: receipt.clone(),
+        });
+
+        let mut agent = json!({"id": "wave-257-worker-2", "status": "working"});
+        record_failed_turn_evidence(&mut agent, &error);
+
+        assert_eq!(
+            agent["runtime_session"], "s_live_42",
+            "fleet rework gates on runtime_session being a string"
+        );
+        assert_eq!(
+            agent["last_turn"], receipt,
+            "the parsed receipt names what the failed turn already delivered"
+        );
+    }
+
+    /// The evidence path must not invent a receipt. A turn that never started (or whose stream could
+    /// not be parsed) has nothing to record, and must leave the agent record untouched rather than
+    /// writing a null session that later reads as "observed".
+    #[test]
+    fn a_turn_that_never_produced_a_receipt_records_no_evidence() {
+        let error = anyhow::anyhow!("transient-worker: agent wave-9-worker-1 could not start");
+
+        let mut agent = json!({"id": "wave-9-worker-1", "status": "working"});
+        record_failed_turn_evidence(&mut agent, &error);
+
+        assert!(
+            agent.get("runtime_session").is_none(),
+            "no session was proved"
+        );
+        assert!(agent.get("last_turn").is_none(), "no receipt was produced");
+    }
+
+    /// One fleet action, built the way the CLI builds it, so a test exercises the real arm.
+    fn fleet_command(root: &Path, action: FleetAction) -> FleetCommand {
+        FleetCommand {
+            root: root.to_path_buf(),
+            output: AgentOutput::Human,
+            request: None,
+            idempotency_key: None,
+            if_revision: None,
+            dry_run: false,
+            action,
+        }
+    }
+
     fn fleet_tui_fixture(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "flux-fleet-tui-{tag}-{}-{}",
@@ -10587,12 +19657,23 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(root.join(".flux/fleet")).unwrap();
+        fs::create_dir_all(root.join(".flux/fleet/loops")).unwrap();
         fs::create_dir_all(root.join("docs/stories")).unwrap();
         fs::create_dir_all(root.join("docs/decisions")).unwrap();
         fs::create_dir_all(root.join("docs/designs")).unwrap();
         fs::write(
             root.join(".flux/fleet.toml"),
-            "schema = \"flux.fleet/v1\"\nmax_workers = 5\nmax_wave = 10\nmax_rework = 2\n",
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\nmax_wave = 10\nmax_rework = 2\n\n[main]\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".flux/fleet/loops/main.flux"),
+            "flow fleet-main -> string\n  return \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".flux/fleet/loops/research.flux"),
+            "flow fleet-research -> string\n  return \"fixture research\"\n",
         )
         .unwrap();
         fs::write(
@@ -10665,7 +19746,7 @@ mod tests {
                         "worktree":format!("/worktrees/{index}"),
                         "handoff":{"summary":"bounded handoff","events":["x".repeat(10_000)]}
                     },
-                    "last_activity":"agent.turn.completed",
+                    "last_activity": if index == 0 { "agent.turn.delivered" } else { "agent.turn.completed" },
                     "last_turn":{"events":[{"type":"tool_result","name":"read","outcome":"ok"}]}
                 }),
             );
@@ -10705,7 +19786,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn fleet_tui_snapshot_is_typed_bounded_and_exact_about_unavailable_capacity() {
         let root = fleet_tui_fixture("snapshot");
-        write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
+        let mut populated = populated_fleet_tui_state();
+        populated.waves.insert(
+            "wave-cancelled-red".into(),
+            json!({
+                "status":"cancelled",
+                "topology":{"repositories":[{
+                    "id":"flux",
+                    "gate":{"status":"red","evidence":{"stderr":"historical failure"}}
+                }]}
+            }),
+        );
+        write_fleet_state(&root, &populated).unwrap();
         let source = FleetTuiSource {
             root: root.canonicalize().unwrap(),
         };
@@ -10714,6 +19806,10 @@ mod tests {
         assert_eq!(launch.root, root.canonicalize().unwrap());
         assert_eq!(launch.session.as_deref(), Some("s-main"));
         assert!(launch.store.ends_with("sessions/main"));
+        assert_eq!(launch.initial_snapshot.revision, 7);
+        assert_eq!(launch.initial_snapshot.main_status, "running");
+        assert!(launch.initial_snapshot.items.is_empty());
+        let initial_refresh_token = launch.source.refresh_token().unwrap();
 
         let snapshot = source.snapshot().unwrap();
 
@@ -10750,11 +19846,229 @@ mod tests {
             .any(|worker| worker.activity.first().map(String::as_str)
                 == Some("tool_result · read · ok")));
         assert_eq!(snapshot.items_total, 2);
+        // C-621: the projection hands the TUI the story's own prose, frontmatter dropped, so an
+        // expanded box renders the contract rather than the metadata its header already carries.
+        let active = snapshot
+            .items
+            .iter()
+            .find(|item| item.board_ref.ends_with("C-1"))
+            .expect("the active story is projected");
+        let body = active.body.as_deref().expect("its story body is projected");
+        assert!(body.starts_with("# Active story"), "{body}");
+        assert!(body.contains("- [ ] visible"), "{body}");
+        assert!(
+            !body.contains("id: C-1"),
+            "frontmatter is not prose: {body}"
+        );
         assert_eq!(snapshot.blocked_items, 1);
         assert_eq!(snapshot.decisions_total, 1);
         assert_eq!(snapshot.decisions[0].decision_ref, "workspace/D-1");
         assert_eq!(snapshot.metrics_schema, "flux.board-stats/v1");
         assert!(snapshot.attention_required);
+
+        let mut changed = read_fleet_state(&root).unwrap();
+        changed.revision += 100;
+        write_fleet_state(&root, &changed).unwrap();
+        assert_ne!(
+            launch.source.refresh_token().unwrap(),
+            initial_refresh_token
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attached_fleet_main_can_list_durable_workers_without_known_ids() {
+        let root = fleet_tui_fixture("native-agent-operation");
+        write_fleet_state(&root, &populated_fleet_tui_state()).unwrap();
+        let tools = native_fleet_main_tools(root.canonicalize().unwrap()).unwrap();
+        let agents = tools
+            .iter()
+            .find(|tool| tool.spec().name == "fleet.agents")
+            .expect("attached Fleet main must receive native worker enumeration");
+        let system = Arc::new(guarded_system(&root).unwrap());
+
+        let result = agents
+            .execute(&flux_runtime::ToolContext::new(system), json!({"limit": 2}))
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_str(&result.content).unwrap();
+
+        assert_eq!(payload["schema"], "flux.fleet-agents/v1");
+        assert_eq!(payload["workers_total"], 106);
+        assert_eq!(payload["workers"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["truncated"], true);
+        assert_eq!(payload["main_agent"]["id"], "main");
+        assert!(payload["workers"][0]["id"].is_string());
+        assert!(payload["workers"][0].get("instructions").is_none());
+        assert!(payload["workers"][0].get("last_turn").is_none());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_agents_cli_projection_lists_all_workers_without_turn_receipts() {
+        let mut state = populated_fleet_tui_state();
+        state.main_agent.last_turn = Some(json!({
+            "answer": "x".repeat(1_000_000),
+            "events": [{"payload": "y".repeat(1_000_000)}],
+        }));
+
+        let projection = fleet_agents_cli_projection(&state);
+        let encoded = serde_json::to_vec(&projection).unwrap();
+
+        assert_eq!(projection["schema"], "flux.fleet-agents/v1");
+        assert_eq!(projection["workers_total"], 106);
+        assert_eq!(projection["workers"].as_object().unwrap().len(), 106);
+        assert_eq!(projection["truncated"], false);
+        assert!(projection["main_agent"].get("last_turn").is_none());
+        assert!(projection["workers"]["worker-000"]
+            .get("last_turn")
+            .is_none());
+        assert!(projection["workers"]["worker-000"]
+            .get("instructions")
+            .is_none());
+        assert!(
+            encoded.len() < 100_000,
+            "census grew to {} bytes",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn attached_fleet_main_status_uses_the_bounded_native_snapshot() {
+        let root = Path::new("/workspace");
+        let args = NativeCoordinatorOperation::FleetStatus
+            .cli_args(root, json!({}))
+            .unwrap();
+
+        assert_eq!(
+            args,
+            [
+                "fleet",
+                "--root",
+                "/workspace",
+                "--output",
+                "json",
+                "inspect",
+                "snapshot",
+                "--limit",
+                "100",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "status"));
+    }
+
+    #[test]
+    fn fleet_inspect_snapshot_excludes_main_turn_payloads() {
+        let root = fleet_tui_fixture("bounded-inspect-snapshot");
+        let mut state = populated_fleet_tui_state();
+        state.main_agent.last_turn = Some(json!({
+            "answer": "x".repeat(1_000_000),
+            "events": [{"payload": "y".repeat(1_000_000)}],
+        }));
+
+        let snapshot =
+            fleet_inspect(&root, &state, InspectView::Snapshot, None, 100, None).unwrap();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+
+        assert_eq!(snapshot["data"]["main_agent"]["id"], "main");
+        assert_eq!(snapshot["data"]["main_agent"]["status"], "running");
+        assert!(snapshot["data"]["main_agent"].get("last_turn").is_none());
+        assert!(snapshot["data"]["main_agent"].get("last_error").is_none());
+        assert!(
+            encoded.len() < 4_096,
+            "snapshot grew to {} bytes",
+            encoded.len()
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn attached_fleet_main_and_research_child_catalogs_are_closed() {
+        let tool_names = native_fleet_main_tools_for_catalog()
+            .into_iter()
+            .map(|tool| tool.spec().name)
+            .collect::<BTreeSet<_>>();
+        let ceiling = native_fleet_main_operation_ceiling()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+
+        assert!(ceiling.contains("task"));
+        assert!(ceiling.contains("ai_segment"));
+        assert!(tool_names.contains("board.next"));
+        assert!(tool_names.contains("fleet.schedule"));
+        assert!(tool_names.contains("fleet.agents"));
+        assert!(tool_names.contains("fleet.run"));
+        for forbidden in [
+            "bash",
+            "read",
+            "edit",
+            "git_commit",
+            "web.fetch",
+            "pane.open",
+            "fleet.start",
+            "fleet.worker_status",
+            "fleet.dispatch",
+        ] {
+            assert!(!ceiling.contains(forbidden), "main exposed {forbidden}");
+        }
+
+        let research = native_fleet_research_operation_ceiling()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        for required in ["read", "grep", "git_status"] {
+            assert!(research.contains(required), "research omitted {required}");
+        }
+        for forbidden in [
+            "task",
+            "bash",
+            "write",
+            "edit",
+            "git_commit",
+            "board.next",
+            "fleet.status",
+        ] {
+            assert!(
+                !research.contains(forbidden),
+                "research exposed {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn attached_fleet_main_refuses_without_an_operator_authored_loop() {
+        let root = fleet_tui_fixture("missing-main-loop");
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\n",
+        )
+        .unwrap();
+
+        let error = match prepare_fleet_tui(&root) {
+            Ok(_) => panic!("Fleet TUI attached without an authored main loop"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("[main] loop"), "{error}");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn attached_fleet_main_refuses_without_an_operator_authored_research_loop() {
+        let root = fleet_tui_fixture("missing-research-loop");
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\nmax_workers = 5\n\n[main]\nloop = \".flux/fleet/loops/main.flux\"\n",
+        )
+        .unwrap();
+
+        let error = match prepare_fleet_tui(&root) {
+            Ok(_) => panic!("Fleet TUI attached without an authored research loop"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("[main] research_loop"), "{error}");
 
         fs::remove_dir_all(root).ok();
     }
@@ -10805,14 +20119,17 @@ mod tests {
     #[test]
     fn first_story_worker_prompt_does_not_inherit_fleet_wide_goals() {
         let spec = AgentTurnSpec {
+            fleet_integrator: false,
             id: "wave-1-worker-1".into(),
             worktree: PathBuf::from("/tmp/story-C-566"),
             read_roots: vec![],
             store: PathBuf::from("/tmp/story-C-566/store"),
             model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
             instructions: "Implement only the assigned story as a writer.".into(),
             request: "Work only on flux/C-566 at pinned base abc123.".into(),
-            resume: false,
+            resume_session: None,
             enforce_operation_ceiling: true,
             admitted_operations: vec!["read".into(), "edit".into()],
             capability_set: json!({"digest_sha256":"worker-one"}),
@@ -10836,14 +20153,17 @@ mod tests {
     #[test]
     fn parallel_story_worker_launches_use_fresh_distinct_stores() {
         let worker = |id: &str, item: &str, store: &str| AgentTurnSpec {
+            fleet_integrator: false,
             id: id.into(),
             worktree: PathBuf::from(format!("/tmp/{item}")),
             read_roots: vec![],
             store: PathBuf::from(store),
             model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
             instructions: "Implement only the assigned story as a writer.".into(),
             request: format!("Work only on {item}."),
-            resume: false,
+            resume_session: None,
             enforce_operation_ceiling: true,
             admitted_operations: vec!["read".into(), "edit".into()],
             capability_set: json!({"digest_sha256":id}),
@@ -10863,8 +20183,12 @@ mod tests {
             render_agent_turn_prompt(&second, "private main goal"),
         );
 
-        assert!(!first_argv.iter().any(|argument| argument == "--continue"));
-        assert!(!second_argv.iter().any(|argument| argument == "--continue"));
+        assert!(!first_argv
+            .iter()
+            .any(|argument| argument == "--resume-session"));
+        assert!(!second_argv
+            .iter()
+            .any(|argument| argument == "--resume-session"));
         assert!(first_argv
             .iter()
             .any(|argument| argument == "/stores/worker-1"));
@@ -10876,7 +20200,7 @@ mod tests {
         assert!(!second_argv.last().unwrap().contains("flux/C-566"));
 
         let mut continued_first = first.clone();
-        continued_first.resume = true;
+        continued_first.resume_session = Some("s-worker-1".into());
         continued_first.context_origin["session_mode"] = json!("continue");
         let continued_argv = agent_turn_argv(
             Path::new("/bin/flux"),
@@ -10884,8 +20208,8 @@ mod tests {
             render_agent_turn_prompt(&continued_first, "changed main goal"),
         );
         assert!(continued_argv
-            .iter()
-            .any(|argument| argument == "--continue"));
+            .windows(2)
+            .any(|pair| pair == ["--resume-session", "s-worker-1"]));
         assert!(continued_argv
             .iter()
             .any(|argument| argument == "/stores/worker-1"));
@@ -10905,14 +20229,17 @@ mod tests {
     #[test]
     fn story_worker_launch_argv_enforces_an_operation_ceiling() {
         let spec = AgentTurnSpec {
+            fleet_integrator: false,
             id: "wave-1-worker-1".into(),
             worktree: PathBuf::from("/tmp/story-C-565"),
             read_roots: vec![],
             store: PathBuf::from("/tmp/story-C-565/store"),
             model: None,
+            agent_loop: None,
+            agent_loop_binding: None,
             instructions: "Implement only the admitted story.".into(),
             request: "Work only on flux/C-565.".into(),
-            resume: false,
+            resume_session: None,
             enforce_operation_ceiling: true,
             admitted_operations: vec!["read".into(), "edit".into()],
             capability_set: json!({"digest_sha256":"worker-one"}),
@@ -11093,14 +20420,42 @@ mod tests {
         std::fs::create_dir_all(fleet.join(".flux")).unwrap();
         std::fs::write(
             fleet.join(".flux/fleet.toml"),
-            "schema = \"flux.fleet/v1\"\n\n[[repositories]]\nid = \"flux\"\nroot = \"../flux\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"connectors\"\nroot = \"../connectors\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"exchange\"\nroot = \"../exchange\"\ngate = [\"true\"]\n",
+            "schema = \"flux.fleet/v1\"\n\n[main]\nloop = \".flux/fleet/loops/main.flux\"\nresearch_loop = \".flux/fleet/loops/research.flux\"\n\n[[repositories]]\nid = \"flux\"\nroot = \"../flux\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"connectors\"\nroot = \"../connectors\"\ngate = [\"true\"]\n\n[[repositories]]\nid = \"exchange\"\nroot = \"../exchange\"\ngate = [\"true\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(fleet.join(".flux/fleet/loops")).unwrap();
+        fs::write(
+            fleet.join(".flux/fleet/loops/main.flux"),
+            "flow fleet-main -> string\n  return \"fixture\"\n",
+        )
+        .unwrap();
+        fs::write(
+            fleet.join(".flux/fleet/loops/research.flux"),
+            "flow fleet-research -> string\n  return \"fixture research\"\n",
         )
         .unwrap();
 
         let mut state = FleetState::default();
         state.main_agent.session = Some("continued-session".into());
         let spec = main_turn_spec(&fleet, &state, "inspect".into()).unwrap();
-        assert!(spec.resume);
+        assert_eq!(spec.resume_session.as_deref(), Some("continued-session"));
+        assert_eq!(
+            spec.agent_loop.as_deref(),
+            Some(".flux/fleet/loops/main.flux")
+        );
+        assert!(spec.enforce_operation_ceiling);
+        assert_eq!(
+            spec.admitted_operations,
+            native_fleet_main_operation_ceiling()
+        );
+        let argv = agent_turn_argv(Path::new("/bin/flux"), &spec, "inspect".into());
+        assert!(argv
+            .iter()
+            .any(|argument| argument == "--native-fleet-main"));
+        assert!(argv
+            .windows(2)
+            .any(|pair| { pair == ["--loop", ".flux/fleet/loops/main.flux"] }));
+        assert!(!argv.iter().any(|argument| argument == "bash"));
         assert_eq!(
             spec.read_roots,
             vec![
@@ -11151,6 +20506,21 @@ mod tests {
             &[],
             &fences,
         );
+        let loop_binding = flux_agent::AgentLoopBinding::native_flux(
+            "implementation",
+            "1",
+            "fleet-profile:implementation@1:test",
+            "work",
+            "flow work -> string\n  return \"done\"\n",
+        )
+        .unwrap();
+        snapshot_fleet_loop_binding(
+            &worktree,
+            &loop_binding,
+            FLEET_AGENT_LOOP_SOURCE,
+            FLEET_AGENT_LOOP_BINDING,
+        )
+        .unwrap();
         state.agents.insert(
             "wave-1-worker-1".into(),
             json!({
@@ -11164,6 +20534,9 @@ mod tests {
                 "writable_root": display_path(&worktree),
                 "read_roots": [],
                 "capability_set": capability_set,
+                "loop_binding": loop_binding.metadata(),
+                "loop_source": FLEET_AGENT_LOOP_SOURCE,
+                "loop_binding_receipt": FLEET_AGENT_LOOP_BINDING,
                 "runtime_session": "s_1",
                 "assignment": {
                     "board_ref": "flux/C-566",
@@ -11182,7 +20555,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(spec.resume);
+        assert_eq!(spec.resume_session.as_deref(), Some("s_1"));
         assert!(spec.read_roots.is_empty());
         assert_eq!(spec.worktree, worktree);
         assert_eq!(spec.context_origin["board_ref"], "flux/C-566");
@@ -11199,6 +20572,24 @@ mod tests {
             .unwrap_err();
             assert!(error.to_string().contains("not available for delivery"));
         }
+        std::fs::write(
+            worktree.join(FLEET_AGENT_LOOP_SOURCE),
+            "flow changed -> string\n  return \"drifted\"\n",
+        )
+        .unwrap();
+        let drift = addressed_turn_spec(
+            &fleet,
+            &state,
+            "wave-1-worker-1",
+            "This must preserve the admitted behavior.".into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(drift.contains("source_sha256"), "{drift}");
+        assert!(
+            drift.contains("explicit re-admission") || drift.contains("mismatch"),
+            "{drift}"
+        );
         std::fs::remove_dir_all(base).ok();
     }
 
@@ -11297,6 +20688,888 @@ mod tests {
         assert_eq!(terminal["payload_omitted"]["actual_bytes"], oversized.len());
         assert_eq!(stream_budget["omitted_event_count"], 1);
         assert!(!terminal.to_string().contains(&"x".repeat(event_limit)));
+    }
+
+    fn retained_turn_receipt(agent: &str, events: usize) -> Value {
+        json!({
+            "schema": "flux.fleet-agent-turn/v1",
+            "agent": agent,
+            "ack": "completed",
+            "session": "s_1",
+            "answer": "y".repeat(20_000),
+            "events": (0..events)
+                .map(|index| json!({
+                    "type": "tool_result",
+                    "name": "read",
+                    "outcome": "ok",
+                    "content": format!("{index}{}", "x".repeat(10_000)),
+                }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    /// The 2026-08-05 roadmap dogfood shape: repeated failed/continued turns whose receipts, intake
+    /// bodies and historical event arrays are all retained in durable Fleet state.
+    fn dogfood_shaped_fleet_state() -> FleetState {
+        let mut state = FleetState {
+            revision: 150,
+            running: true,
+            ..FleetState::default()
+        };
+        state.main_agent.status = "working".into();
+        state.main_agent.session = Some("s_9".into());
+        state.main_agent.goals_revision = 4;
+        state.main_agent.last_turn = Some(retained_turn_receipt("main", 40));
+        for index in 0..7 {
+            state.agents.insert(
+                format!("wave-346-worker-{index}"),
+                json!({
+                    "role": "writer",
+                    "status": if index == 0 { "working" } else { "failed" },
+                    "runtime_session": format!("s_{index}"),
+                    "last_activity": if index == 0 { "agent.turn.delivered" } else { "agent.turn.failed" },
+                    "last_error": if index == 0 { Value::Null } else { json!("transient-worker: targeted gate failed") },
+                    "assignment": {
+                        "board_ref": format!("flux/C-{}", 560 + index),
+                        "wave": "wave-346",
+                        "worktree": format!("/worktrees/{index}"),
+                    },
+                    "last_turn": retained_turn_receipt(&format!("wave-346-worker-{index}"), 40),
+                }),
+            );
+        }
+        for index in 1..=12 {
+            state.intake.insert(
+                format!("intake-{index}"),
+                json!({
+                    "id": format!("intake-{index}"),
+                    "ack": "completed",
+                    "source": "user",
+                    "text": "Continue the roadmap wave",
+                    "receipt": retained_turn_receipt("main", 20),
+                }),
+            );
+        }
+        for index in 340..=346 {
+            state.waves.insert(
+                format!("wave-{index}"),
+                json!({
+                    "status": if index == 346 { "working" } else { "red" },
+                    "items": ["flux/C-560", "flux/C-561", "flux/C-562"],
+                    "apply_eligible": false,
+                    "topology": {"repositories": [{
+                        "id": "flux",
+                        "gate": {"status": "red", "evidence": {
+                            "argv": ["cargo", "test"],
+                            "exit_code": 101,
+                            "stdout": "z".repeat(60_000),
+                        }},
+                    }]},
+                }),
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn default_fleet_status_stays_inside_its_reviewed_byte_budget() {
+        let root = fleet_tui_fixture("status-budget");
+        let state = dogfood_shaped_fleet_state();
+        let retained = serde_json::to_vec(&state).unwrap().len();
+        assert!(
+            retained > 2_500_000,
+            "fixture retained only {retained} bytes; it no longer reproduces the dogfood shape"
+        );
+
+        let data = fleet_status_projection(&root, &state).unwrap();
+        let encoded = serde_json::to_vec(&data).unwrap();
+        let human = fleet_status_human(&data);
+
+        assert!(
+            encoded.len() <= FLEET_STATUS_BUDGET_BYTES,
+            "default status projection was {} bytes for {retained} retained bytes",
+            encoded.len()
+        );
+        assert!(
+            human.len() <= FLEET_STATUS_HUMAN_BUDGET_BYTES,
+            "human status projection was {} bytes",
+            human.len()
+        );
+        let text = String::from_utf8(encoded).unwrap();
+        for payload in ["x".repeat(1_000), "y".repeat(1_000), "z".repeat(1_000)] {
+            assert!(
+                !text.contains(&payload),
+                "default status embedded retained turn payload"
+            );
+        }
+        assert!(
+            !text.contains("tool_result"),
+            "default status embedded historical tool events"
+        );
+        assert_eq!(data["schema"], "flux.fleet-status/v1");
+        assert_eq!(data["revision"], 150);
+        assert_eq!(data["running"], true);
+        assert_eq!(data["main"]["session"], "s_9");
+        assert_eq!(data["main"]["goals_revision"], 4);
+        assert_eq!(data["workers"]["total"], 7);
+        assert_eq!(data["workers"]["active"], 1);
+        assert_eq!(data["workers"]["attention"], 6);
+        assert_eq!(data["waves"]["total"], 7);
+        assert_eq!(data["intake"]["total"], 12);
+        assert_eq!(
+            data["workers"]["listed"][0]["board_ref"], "flux/C-560",
+            "status lost the exact BoardRef"
+        );
+        assert!(
+            human.contains("flux fleet inspect worker"),
+            "human status named no next inspect command: {human}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&fleet_status_projection(&root, &state).unwrap()).unwrap(),
+            serde_json::to_vec(&data).unwrap(),
+            "status projection changed between reads"
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_status_fixtures_cover_empty_active_concurrent_and_failing_states() {
+        let root = fleet_tui_fixture("status-fixtures");
+        let working = |item: &str, wave: &str, session: &str| {
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": session,
+                "last_activity": "agent.turn.delivered",
+                "assignment": {"board_ref": item, "wave": wave},
+            })
+        };
+        let mut one = FleetState {
+            revision: 3,
+            running: true,
+            ..FleetState::default()
+        };
+        one.agents.insert(
+            "wave-1-worker-1".into(),
+            working("flux/C-562", "wave-1", "s_1"),
+        );
+        let mut five = FleetState {
+            revision: 9,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 1..=5 {
+            five.agents.insert(
+                format!("wave-2-worker-{index}"),
+                working(
+                    &format!("flux/C-56{index}"),
+                    "wave-2",
+                    &format!("s_{index}"),
+                ),
+            );
+        }
+        let mut failures = FleetState {
+            revision: 21,
+            running: true,
+            ..FleetState::default()
+        };
+        for index in 1..=3 {
+            failures.agents.insert(
+                format!("wave-3-worker-{index}"),
+                json!({
+                    "role": "writer",
+                    "status": "failed",
+                    "last_activity": "agent.turn.failed",
+                    "last_error": "transient-worker: agent turn failed",
+                    "assignment": {"board_ref": format!("flux/C-56{index}"), "wave": "wave-3"},
+                    "last_turn": retained_turn_receipt(&format!("wave-3-worker-{index}"), 20),
+                }),
+            );
+        }
+
+        for (label, state, total, active, attention) in [
+            ("empty", FleetState::default(), 0, 0, 0),
+            ("one-active", one, 1, 1, 0),
+            ("five-concurrent", five, 5, 5, 0),
+            ("repeated-failures", failures, 3, 0, 3),
+            ("long-lived", dogfood_shaped_fleet_state(), 7, 1, 6),
+        ] {
+            let data = fleet_status_projection(&root, &state).unwrap();
+            let encoded = serde_json::to_vec(&data).unwrap();
+            let human = fleet_status_human(&data);
+            assert_eq!(data["workers"]["total"], total, "{label}");
+            assert_eq!(data["workers"]["active"], active, "{label}");
+            assert_eq!(data["workers"]["attention"], attention, "{label}");
+            assert!(
+                encoded.len() <= FLEET_STATUS_BUDGET_BYTES,
+                "{label} status projection was {} bytes",
+                encoded.len()
+            );
+            assert!(
+                human.contains("next: flux fleet "),
+                "{label} named no next command: {human}"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_status_redacts_before_budgeting_and_omits_one_huge_event() {
+        let root = fleet_tui_fixture("status-redaction");
+        let mut state = FleetState {
+            revision: 5,
+            running: true,
+            ..FleetState::default()
+        };
+        state.main_agent.last_error = Some("provider refused: api_key sk-live-adversarial".into());
+        state.agents.insert(
+            "wave-1-worker-1".into(),
+            json!({
+                "role": "writer",
+                "status": "failed",
+                "last_activity": "agent.turn.failed",
+                "last_error": "authorization: Bearer sk-live-adversarial recorded in the gate log",
+                "assignment": {"board_ref": "flux/C-562", "wave": "wave-1"},
+                "last_turn": {"ack": "failed", "events": [{
+                    "type": "tool_result",
+                    "content": "q".repeat(900_000),
+                }]},
+            }),
+        );
+
+        let data = fleet_status_projection(&root, &state).unwrap();
+        let text = serde_json::to_string(&data).unwrap();
+
+        assert!(text.len() <= FLEET_STATUS_BUDGET_BYTES);
+        assert!(
+            !text.contains("sk-live-adversarial"),
+            "adversarial secret survived the default projection: {text}"
+        );
+        assert!(
+            !text.contains(&"q".repeat(1_000)),
+            "one huge event survived the default projection"
+        );
+        assert_eq!(data["main"]["last_error"], "[redacted]");
+        assert_eq!(data["workers"]["listed"][0]["last_error"], "[redacted]");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fleet_status_and_dashboard_agree_on_active_workers() {
+        let root = fleet_tui_fixture("active-agreement");
+        let mut state = FleetState {
+            revision: 11,
+            running: true,
+            ..FleetState::default()
+        };
+        state.main_agent.status = "running".into();
+        state.main_agent.session = Some("s-main".into());
+        state.agents.insert(
+            "live".into(),
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": "s_1",
+                "last_activity": "agent.turn.delivered",
+                "assignment": {"board_ref": "flux/C-562", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "interrupted".into(),
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": "s_2",
+                "last_activity": "agent.turn.completed",
+                "last_turn": {"ack": "completed", "session": "s_2"},
+                "assignment": {"board_ref": "flux/C-561", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "continued".into(),
+            json!({
+                "role": "writer",
+                "status": "working",
+                "runtime_session": "s_3",
+                "last_activity": "agent.turn.delivered",
+                "last_turn": {"ack": "completed", "session": "s_3", "events": []},
+                "assignment": {"board_ref": "flux/C-557", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "broken".into(),
+            json!({
+                "role": "writer",
+                "status": "failed",
+                "last_activity": "agent.turn.failed",
+                "last_error": "validation/gate: targeted test failed",
+                "assignment": {"board_ref": "flux/C-560", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "stopped".into(),
+            json!({
+                "role": "writer",
+                "status": "cancelled",
+                "assignment": {"board_ref": "flux/C-559", "wave": "wave-1"},
+            }),
+        );
+        state.agents.insert(
+            "finished".into(),
+            json!({
+                "role": "writer",
+                "status": "completed",
+                "last_activity": "agent.turn.completed",
+                "assignment": {"board_ref": "flux/C-558", "wave": "wave-1"},
+            }),
+        );
+        write_fleet_state(&root, &state).unwrap();
+
+        let data = fleet_status_projection(&root, &state).unwrap();
+        let snapshot = FleetTuiSource {
+            root: root.canonicalize().unwrap(),
+        }
+        .snapshot()
+        .unwrap();
+
+        assert_eq!(data["workers"]["total"], 6);
+        assert_eq!(snapshot.capacity.registered, 6);
+        assert_eq!(
+            data["workers"]["active"], 2,
+            "status miscounted live and finished processes"
+        );
+        assert_eq!(
+            snapshot.capacity.active, 2,
+            "dashboard miscounted live and finished processes"
+        );
+        assert_eq!(data["workers"]["attention"], 2);
+        let listed = data["workers"]["listed"].as_array().unwrap();
+        let activity = |id: &str| {
+            listed
+                .iter()
+                .find(|worker| worker["id"] == id)
+                .unwrap_or_else(|| panic!("{id} missing from {listed:?}"))["activity"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(activity("live"), "active");
+        assert_eq!(
+            activity("continued"),
+            "active",
+            "a continued worker was settled by the receipt of its previous turn"
+        );
+        assert_eq!(activity("interrupted"), "attention");
+        assert_eq!(activity("broken"), "attention");
+        assert_eq!(activity("stopped"), "settled");
+        assert_eq!(activity("finished"), "settled");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_inspect_bounds_retained_evidence_with_omission_metadata() {
+        let root = fleet_tui_fixture("inspect-budget");
+        let state = dogfood_shaped_fleet_state();
+
+        let data = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Worker,
+            Some("wave-346-worker-1"),
+            100,
+            None,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&data).unwrap();
+
+        assert!(
+            encoded.len() <= FLEET_INSPECT_BUDGET_BYTES,
+            "inspect worker returned {} bytes",
+            encoded.len()
+        );
+        assert_eq!(data["bounded"], true);
+        assert_eq!(data["limit"], 100);
+        assert_eq!(data["budget_bytes"], FLEET_INSPECT_BUDGET_BYTES);
+        assert_eq!(data["data"]["assignment"]["board_ref"], "flux/C-561");
+        let omitted = data["omitted"].as_array().unwrap();
+        assert!(
+            !omitted.is_empty(),
+            "bounded inspect returned no omission metadata"
+        );
+        for record in omitted {
+            assert_eq!(record["schema"], "flux.fleet-inspect-omitted/v1");
+            let encoded = record.to_string();
+            assert!(encoded.len() < 512, "omission record grew to {encoded}");
+            assert!(
+                !encoded.contains(&"x".repeat(100)),
+                "omission metadata carried the omitted payload"
+            );
+        }
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_inspect_gate_prints_a_repository_gate_output_tail_first() {
+        let root = fleet_tui_fixture("inspect-gate");
+        let mut state = populated_fleet_tui_state();
+        let mut stdout = (1..=500)
+            .map(|unit| format!("compiling unit {unit}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        stdout.push_str("\nerror: test `keeps_the_contract` failed\n");
+        state.waves.insert(
+            "wave-gated".into(),
+            json!({
+                "status":"red",
+                "topology":{"repositories":[
+                    {"id":"flux","candidate":"abc123","gate":{
+                        "status":"red","runs":1,"candidate":"abc123",
+                        "evidence":{"argv":["cargo","test","--workspace"],"exit_code":101,
+                                    "stdout":stdout,"stderr":""}
+                    }},
+                    {"id":"api","candidate":"def456","gate":{
+                        "status":"green","runs":1,"candidate":"def456",
+                        "evidence":{"argv":["cargo","test"],"exit_code":0,"stdout":"ok","stderr":""}
+                    }}
+                ]}
+            }),
+        );
+
+        let data = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-gated"),
+            5,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(data["view"], "gate");
+        assert_eq!(data["bounded"], true);
+        assert_eq!(data["data"]["wave"], "wave-gated");
+        assert_eq!(data["data"]["order"], "tail-first");
+        let repositories = data["data"]["repositories"].as_array().unwrap();
+        assert_eq!(repositories.len(), 2);
+        let failing = &repositories[0];
+        assert_eq!(failing["id"], "flux");
+        assert_eq!(failing["status"], "red");
+        assert_eq!(failing["candidate"], "abc123");
+        assert_eq!(failing["exit_code"], 101);
+        assert_eq!(failing["argv"], json!(["cargo", "test", "--workspace"]));
+        let tail = failing["stdout"]["lines"].as_array().unwrap();
+        assert_eq!(
+            tail[0], "error: test `keeps_the_contract` failed",
+            "the gate's reason is the last line it wrote, so it must be printed first"
+        );
+        assert_eq!(tail[1], "compiling unit 500");
+        assert_eq!(tail.len(), 5);
+        assert_eq!(failing["stdout"]["line_count"], 501);
+        assert_eq!(failing["stdout"]["truncated"], true);
+        assert_eq!(failing["stderr"]["line_count"], 0);
+
+        let narrowed = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-gated"),
+            5,
+            Some("api"),
+        )
+        .unwrap();
+        assert_eq!(narrowed["repository"], "api");
+        let narrowed = narrowed["data"]["repositories"].as_array().unwrap().clone();
+        assert_eq!(narrowed.len(), 1);
+        assert_eq!(narrowed[0]["id"], "api");
+        assert_eq!(narrowed[0]["status"], "green");
+        assert_eq!(narrowed[0]["stdout"]["lines"], json!(["ok"]));
+        assert_eq!(narrowed[0]["stdout"]["truncated"], false);
+
+        let unknown_repository = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-gated"),
+            5,
+            Some("absent"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            unknown_repository.contains("not-found"),
+            "{unknown_repository}"
+        );
+        assert!(fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-absent"),
+            5,
+            None
+        )
+        .is_err());
+        assert!(fleet_inspect(&root, &state, InspectView::Gate, None, 5, None).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fleet_inspect_gate_keeps_the_failure_reason_inside_the_projection_budget() {
+        let root = fleet_tui_fixture("inspect-gate-budget");
+        let state = dogfood_shaped_fleet_state();
+
+        let data = fleet_inspect(
+            &root,
+            &state,
+            InspectView::Gate,
+            Some("wave-346"),
+            10_000,
+            None,
+        )
+        .unwrap();
+        let encoded = serde_json::to_vec(&data).unwrap();
+
+        assert!(
+            encoded.len() <= FLEET_INSPECT_BUDGET_BYTES,
+            "inspect gate returned {} bytes",
+            encoded.len()
+        );
+        let repository = &data["data"]["repositories"][0];
+        assert_eq!(repository["status"], "red");
+        assert_eq!(repository["exit_code"], 101);
+        assert!(repository["stdout"]["lines"][0]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// A fleet that is running, with no worker in flight and no wave claiming anything.
+    fn drive_fixture_state() -> FleetState {
+        FleetState {
+            running: true,
+            ..Default::default()
+        }
+    }
+
+    fn drive_fixture_schedule(items: &[&str]) -> Value {
+        json!({"waves": [{"id": "ready", "state": "active", "eligible": items}]})
+    }
+
+    /// C-631: the whole point of the reconcile gate. `wave-472` dispatched ten stories whose work was
+    /// already in `main` because an unread already-built set reads exactly like an empty one, so a tick
+    /// that cannot read reconcile must send nobody and say why.
+    #[test]
+    fn drive_dispatch_fails_closed_when_board_reconcile_cannot_be_read() {
+        let state = drive_fixture_state();
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+
+        let plan = drive_tick_plan(&state, &schedule, None, 3);
+
+        assert!(plan.dispatch.is_empty(), "{:?}", plan.dispatch);
+        let blocked = plan.blocked.expect("a refusal names what is missing");
+        assert!(blocked.contains("board reconcile"), "{blocked}");
+        assert!(blocked.contains("indistinguishable"), "{blocked}");
+    }
+
+    /// A story whose implementation is already present is WITHHELD and named, never silently dropped.
+    #[test]
+    fn drive_dispatch_withholds_an_item_whose_work_is_already_present() {
+        let state = drive_fixture_state();
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+        let reconcile = json!({"findings": [{
+            "id": "flux/C-1",
+            "signals": ["commit-subject"],
+            "transition_path": ["in-progress", "done"],
+        }]});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 3);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-2".to_string()]);
+        assert_eq!(plan.withheld.len(), 1);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-1");
+        assert_eq!(plan.withheld[0]["reason"], "already-built");
+        assert_eq!(plan.withheld[0]["signals"], json!(["commit-subject"]));
+        assert!(plan.blocked.is_none());
+    }
+
+    /// An item a live wave still holds an attempt at is not a second wave's to take.
+    #[test]
+    fn drive_dispatch_withholds_an_item_a_live_wave_still_claims() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-9".into(),
+            json!({"status": "awaiting-handoffs", "items": ["flux/C-2"]}),
+        );
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+        let reconcile = json!({"findings": []});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 3);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-2");
+        assert_eq!(plan.withheld[0]["reason"], "claimed");
+        assert!(
+            plan.withheld[0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("wave-9"),
+            "{:?}",
+            plan.withheld[0]
+        );
+    }
+
+    /// A parked wave keeps its claim — the work is still on disk and the pause is a human's to answer
+    /// — but the driver must name the park and its reason rather than report it as live work.
+    #[test]
+    fn drive_dispatch_names_the_park_that_holds_an_item_rather_than_a_generic_claim() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-9".into(),
+            json!({
+                "status": "parked",
+                "items": ["flux/C-2"],
+                "park": {"reason": "waiting on the API decision"},
+            }),
+        );
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2"]);
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&json!({"findings": []})), 3);
+
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+        assert_eq!(plan.withheld[0]["item"], "flux/C-2");
+        assert_eq!(plan.withheld[0]["reason"], "parked");
+        let detail = plan.withheld[0]["detail"].as_str().unwrap();
+        assert!(detail.contains("wave-9"), "{detail}");
+        assert!(detail.contains("waiting on the API decision"), "{detail}");
+
+        // Ending the wave releases the claim; the item is dispatchable again.
+        state.waves.insert(
+            "wave-9".into(),
+            json!({"status": "cancelled", "items": ["flux/C-2"]}),
+        );
+        let released = drive_tick_plan(&state, &schedule, Some(&json!({"findings": []})), 3);
+        assert_eq!(
+            released.dispatch,
+            vec!["flux/C-1".to_string(), "flux/C-2".to_string()]
+        );
+    }
+
+    /// C-631 (R-13, failing first): a wave parked by exhausted rework rounds must come back with its
+    /// budget reset. Restoring only the wave left the story `parked` — so the wave could never earn
+    /// `handoffs-ready` — and left `rework_attempts` at the ceiling, so the next review parked it again
+    /// on its first round and the human's answer bought nothing.
+    #[test]
+    fn unparking_resets_the_rework_budget_and_frees_the_stories_the_park_froze() {
+        let mut wave = json!({
+            "status": "parked",
+            "topology": {"repositories": [{"stories": [
+                {
+                    "board_ref": "flux/C-1",
+                    "status": "parked",
+                    "rework_attempts": 2,
+                    "handoff": {"status": "accepted", "commit": "abc123"},
+                },
+                {"board_ref": "flux/C-2", "status": "handoff-accepted"},
+            ]}]},
+        });
+
+        let reset = reset_parked_story_budgets(&mut wave);
+
+        let story = &wave["topology"]["repositories"][0]["stories"][0];
+        assert_eq!(story["status"], "handoff-accepted");
+        assert_eq!(story["rework_attempts"], 0);
+        assert_eq!(
+            reset.len(),
+            1,
+            "only the parked story is touched: {reset:?}"
+        );
+        assert_eq!(reset[0]["item"], "flux/C-1");
+        assert_eq!(reset[0]["restored"], true);
+        assert_eq!(reset[0]["rework_attempts_cleared"], 2);
+        assert_eq!(
+            wave["topology"]["repositories"][0]["stories"][1]["status"],
+            "handoff-accepted"
+        );
+    }
+
+    /// A story parked with no accepted handoff has no reviewed state to return to. Its counter still
+    /// resets, but the report says the status was left alone rather than inventing one.
+    #[test]
+    fn unparking_never_invents_a_status_for_a_story_that_holds_no_accepted_handoff() {
+        let mut wave = json!({
+            "topology": {"repositories": [{"stories": [
+                {"board_ref": "flux/C-3", "status": "parked", "rework_attempts": 1},
+            ]}]},
+        });
+
+        let reset = reset_parked_story_budgets(&mut wave);
+
+        assert_eq!(reset[0]["restored"], false);
+        assert_eq!(reset[0]["status"], "parked");
+        assert_eq!(reset[0]["rework_attempts_cleared"], 1);
+        assert_eq!(
+            wave["topology"]["repositories"][0]["stories"][0]["rework_attempts"],
+            0
+        );
+    }
+
+    /// Dispatch width is what is left of the configured worker count, and the overflow is reported.
+    #[test]
+    fn drive_dispatch_width_is_the_configured_ceiling_minus_live_workers() {
+        let mut state = drive_fixture_state();
+        state.agents.insert(
+            "wave-9-worker-1".into(),
+            json!({"status": "working", "supervisor_pid": std::process::id()}),
+        );
+        let schedule = drive_fixture_schedule(&["flux/C-1", "flux/C-2", "flux/C-3"]);
+        let reconcile = json!({"findings": []});
+
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 2);
+
+        assert_eq!(plan.width, 1);
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+        assert_eq!(plan.withheld.len(), 2);
+        assert!(plan.withheld.iter().all(|entry| entry["reason"] == "width"));
+    }
+
+    /// A stopped fleet dispatches nothing, and says so rather than reporting an empty schedule.
+    #[test]
+    fn drive_dispatch_refuses_while_the_fleet_is_stopped() {
+        let mut state = drive_fixture_state();
+        state.running = false;
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&["flux/C-1"]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+        assert!(plan.dispatch.is_empty());
+        assert!(plan.blocked.unwrap().contains("stopped"));
+    }
+
+    /// Advancement is earned by every story, and a parked wave is never re-decided.
+    #[test]
+    fn drive_advances_only_a_wave_every_story_handed_off_and_never_a_parked_one() {
+        let mut state = drive_fixture_state();
+        let ready = json!({
+            "status": "awaiting-handoffs",
+            "items": ["flux/C-1"],
+            "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+        });
+        let outstanding = json!({
+            "status": "awaiting-handoffs",
+            "items": ["flux/C-2"],
+            "topology": {"repositories": [{"stories": [
+                {"status": "handoff-accepted"}, {"status": "working"}
+            ]}]},
+        });
+        let mut parked = ready.clone();
+        parked["status"] = json!("parked");
+        parked["park"] = json!({"reason": "a human is deciding"});
+        state.waves.insert("wave-1".into(), ready);
+        state.waves.insert("wave-2".into(), outstanding);
+        state.waves.insert("wave-3".into(), parked);
+
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&[]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+
+        assert_eq!(plan.advance, vec!["wave-1".to_string()]);
+        assert_eq!(plan.reconstruct, vec!["wave-2".to_string()]);
+        assert_eq!(
+            drive_wave_next_status(&state.waves["wave-1"]),
+            Some("handoffs-ready")
+        );
+        assert_eq!(drive_wave_next_status(&state.waves["wave-3"]), None);
+    }
+
+    /// The fingerprint answers "did anything a tick acts on change?" — and only that.
+    #[test]
+    fn drive_fingerprint_tracks_the_facts_a_tick_decides_on() {
+        let mut state = drive_fixture_state();
+        state
+            .waves
+            .insert("wave-1".into(), json!({"status": "awaiting-handoffs"}));
+        let first = drive_fingerprint(&state);
+        assert_eq!(first, drive_fingerprint(&state), "same state, same value");
+
+        state.waves.insert(
+            "wave-1".into(),
+            json!({"status": "handoffs-ready", "note": "unread by the tick"}),
+        );
+        assert_ne!(first, drive_fingerprint(&state));
+    }
+
+    /// The CLI surface the unattended driver is invoked through.
+    #[test]
+    fn drive_takes_one_tick_or_an_interval_loop_but_never_both() {
+        use clap::Parser as _;
+
+        #[derive(clap::Parser, Debug)]
+        struct DriveCli {
+            #[command(subcommand)]
+            action: FleetAction,
+        }
+
+        let once = DriveCli::try_parse_from(["fleet", "drive", "--tick"]).unwrap();
+        let FleetAction::Drive {
+            tick,
+            run_loop,
+            interval,
+            max_ticks,
+        } = once.action
+        else {
+            panic!("expected drive")
+        };
+        assert!(tick && !run_loop && interval == 60 && max_ticks == 0);
+
+        let looped = DriveCli::try_parse_from([
+            "fleet",
+            "drive",
+            "--loop",
+            "--interval",
+            "5",
+            "--max-ticks",
+            "3",
+        ])
+        .unwrap();
+        let FleetAction::Drive {
+            run_loop,
+            interval,
+            max_ticks,
+            ..
+        } = looped.action
+        else {
+            panic!("expected drive")
+        };
+        assert!(run_loop && interval == 5 && max_ticks == 3);
+
+        assert!(DriveCli::try_parse_from(["fleet", "drive", "--tick", "--loop"]).is_err());
+    }
+
+    /// Drive is a dispatching mutation: a quiesced fleet must refuse the driver, not each tick's
+    /// dispatch after it has already advanced state.
+    #[test]
+    fn drive_is_a_dispatching_mutation_so_quiesce_refuses_it() {
+        let action = FleetAction::Drive {
+            tick: true,
+            run_loop: false,
+            interval: 60,
+            max_ticks: 0,
+        };
+        assert!(fleet_action_dispatches(&action));
+        assert!(fleet_action_mutates(&action));
+        assert!(fleet_operations().contains(&"drive"));
     }
 
     #[test]

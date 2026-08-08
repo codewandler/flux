@@ -49,6 +49,11 @@ pub struct ChatState {
     pub(super) turn_rounds: Vec<RoundUsage>,
     pub(super) cost_usd: Option<f64>,
     pub(super) cost_model: Option<(String, flux_core::PricingTable)>,
+    /// C-542: the engine's last published budget projection — spent versus declared for the enforced
+    /// envelope, straight from the ledger that enforces it. The surface renders this and re-derives
+    /// nothing, so the header can never disagree with the breach that stops the run. `None` means no
+    /// envelope has published yet: no budget to show, which is not the same as zero spent.
+    pub(super) budget: Option<flux_core::BudgetProjection>,
     pub(super) cost_unpriced: bool,
     pub(super) steps: usize,
     pub(super) last_elapsed: Option<Duration>,
@@ -159,6 +164,28 @@ pub struct ChatState {
     pub(super) fleet_rows: Vec<crate::fleet::WorkerRow>,
     /// Attached Board/Fleet operations projection. `None` is an explicitly standalone chat.
     pub(super) operations: Option<crate::operations::OperationsState>,
+    /// C-686: the agent this surface is attached to, when the whole agent lives on another
+    /// machine. `None` is the ordinary local agent.
+    ///
+    /// Its presence changes three things and nothing else: turns are dispatched to the remote
+    /// instead of the local engine, local-only slash commands are refused by name, and the header
+    /// says where you are. It deliberately does **not** create a local session — see
+    /// [`crate::attach`].
+    pub(crate) attachment: Option<crate::attach::Attachment>,
+    /// C-543: the loop binding the next start will run, as the engine resolved it (C-569) — the
+    /// profile, revision and digest it admitted, never an ambient filename. `None` before any
+    /// binding is known (headless construction), which renders no segment rather than a placeholder.
+    pub(super) loop_binding: Option<flux_core::AgentLoopBindingMetadata>,
+    /// The binding this session has already admitted. `Some` makes a selection an explicit
+    /// new-session/re-admission decision instead of a silent switch of a running agent.
+    pub(super) loop_admitted: Option<flux_core::AgentLoopBindingMetadata>,
+    /// Directories rescanned for `*.flux` loops on every selector open, so a loop authored while
+    /// the TUI runs (C-544) appears without a restart.
+    pub(super) loop_dirs: Vec<std::path::PathBuf>,
+    /// The open loop selector (C-543).
+    pub(super) loop_selector: Option<crate::agent_loop::LoopSelector>,
+    /// The short overlay a selection raises: the outer loop's structure and its description.
+    pub(super) loop_overlay: Option<crate::agent_loop::LoopOverlay>,
 }
 
 /// One model call of the turn in progress, as the `/usage` overlay renders it (C-140). Sourced from

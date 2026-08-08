@@ -61,3 +61,8 @@ performance without silently changing a worker contract or trading away verified
   pre-authorized ladder at a safe boundary, not mutating an opaque live harness.
 - C-583 owns the typed manual capacity actuator. This story may drive that same service from policy;
   it does not add a second concurrency mutation path.
+
+
+## Comments
+
+- Measurement foundation design filed: docs/designs/D-255-fleet-measurement-the-system-the-workers-and-the-assignments.md — cost-of-pass is the headline objective this controller optimizes; the single-agent calibration baseline and coordination-overhead trend are recorded inputs.

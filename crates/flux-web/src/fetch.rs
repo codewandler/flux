@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
 use serde_json::{json, Value};
 
 use flux_core::{Error, Result};
@@ -24,9 +23,11 @@ use flux_spec::{
     IntentSet, IntentTarget, Risk, ToolSpec,
 };
 use flux_system::net::PrivateNetAllow;
+use flux_system::port::{GuardedHttp, HttpRequest, HttpSecretScope};
 
 use crate::{
-    condense, egress, RecordSink, WebOptions, WEB_PAGE_RECORD_SUBJECT, WRITE_DB_EFFECT_TAG,
+    condense, egress, NativeHttp, RecordSink, WebOptions, WEB_PAGE_RECORD_SUBJECT,
+    WRITE_DB_EFFECT_TAG,
 };
 
 /// Cap on the returned document (bytes, char-boundary safe) — applied *after* condensation so the
@@ -38,32 +39,19 @@ const MAX_TIMEOUT_SECS: u64 = 300;
 /// `web.fetch`: fetch a URL and return its readable content as condensed markdown (HTML) or the raw
 /// body (everything else / `raw: true`).
 pub struct WebFetchTool {
-    http: reqwest::Client,
+    /// This op's own reviewed native HTTP backend — reached only when the operator selected no
+    /// execution substrate (C-652).
+    native: NativeHttp,
     private_net: PrivateNetAllow,
-    audit: Option<Arc<dyn flux_plugin::EgressAudit>>,
-    grant_source: String,
     records: Option<Arc<dyn RecordSink>>,
 }
 
 impl WebFetchTool {
     pub fn new(opts: &WebOptions) -> Self {
         Self {
-            http: egress::redirect_disabled_client(),
+            native: NativeHttp::new(opts),
             private_net: opts.private_net.clone(),
-            audit: opts.audit.clone(),
-            grant_source: opts
-                .grant_source
-                .clone()
-                .unwrap_or_else(|| "config:web".to_string()),
             records: opts.records.clone(),
-        }
-    }
-
-    fn audit_admit(&self, host: &str) {
-        if let Some(audit) = &self.audit {
-            if flux_system::net::host_resolves_private(host) {
-                audit.record_private_admit("web:web.fetch", host, &self.grant_source);
-            }
         }
     }
 }
@@ -175,42 +163,65 @@ impl Tool for WebFetchTool {
         set
     }
 
-    async fn execute(&self, _ctx: &ToolContext, params: Value) -> Result<ToolResult> {
+    async fn execute(&self, ctx: &ToolContext, params: Value) -> Result<ToolResult> {
         let raw_url = params
             .get("url")
             .and_then(Value::as_str)
             .ok_or_else(|| Error::Other("web.fetch: `url` required".into()))?;
         let raw_body = params.get("raw").and_then(Value::as_bool).unwrap_or(false);
 
-        let (url, pinned) = flux_system::net::guard_url_scoped_pinned(raw_url, &self.private_net)?;
-        let response = egress::send_guarded(
-            &self.http,
-            egress::GuardedRequest {
-                url,
-                pinned,
-                method: reqwest::Method::GET,
-                headers: HeaderMap::new(),
-                body: None,
-                timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
-            },
-            "web.fetch",
-            |raw| flux_system::net::guard_url_scoped_pinned(raw, &self.private_net),
-            |url| {
-                if let Some(host) = url.host_str() {
-                    self.audit_admit(host);
-                }
-            },
-        )
-        .await?;
+        // The same admission `guard_url_scoped_pinned` performed, kept as the correlated value the
+        // port carries. `web.fetch` sends no credential, so its secret scope is empty.
+        let request = HttpRequest {
+            operation: "web.fetch".into(),
+            method: "GET".into(),
+            target: flux_system::net::guard_url_scoped_for_secret(raw_url, &self.private_net)?,
+            headers: Vec::new(),
+            body: None,
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.min(MAX_TIMEOUT_SECS)),
+            max_response_bytes: MAX_BYTES,
+            secrets: HttpSecretScope::default(),
+        };
 
-        let status = response.status();
+        // The read lands wherever the operator said it lands (C-652). Only an *unselected* run
+        // reaches this op's own reviewed native backend.
+        let response = match ctx.selected_execution_system() {
+            Some(substrate) => substrate.http_request(&request, &self.private_net).await?,
+            None => {
+                self.native
+                    .http_request(&request, &self.private_net)
+                    .await?
+            }
+        };
+        // A private-destination admission that happened on another substrate lands in *this* turn's
+        // audit trail, stamped with where it happened (C-674).
+        self.native
+            .record_reported_admits("web.fetch", &response.admits);
+
+        // Rebuilt from the port's numeric status so `[200 OK]` keeps its reason phrase.
+        let status = reqwest::StatusCode::from_u16(response.status).map_err(|e| {
+            Error::Http(format!(
+                "web.fetch: the substrate reported an invalid status {}: {e}",
+                response.status
+            ))
+        })?;
         let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let capped = egress::read_body_capped(response, MAX_BYTES, "web.fetch").await?;
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default();
+        // Read off before the body is moved. `web.fetch` has one surface rather than the
+        // record/view split `http.request` has, so a rate-limit note lands in the read itself —
+        // which is where the unexplained latency would otherwise have been (C-701).
+        let retried = match response.retries.note() {
+            Some(note) => format!("{note}\n"),
+            None => String::new(),
+        };
+        let capped = egress::CappedBody {
+            bytes: response.body,
+            truncated: response.truncated,
+        };
 
         // Classify from the *raw bytes* + content-type before any lossy UTF-8 decode (which would
         // corrupt a binary PDF). A PDF is either declared (`application/pdf`) or sniffed by its
@@ -264,7 +275,7 @@ impl Tool for WebFetchTool {
         }
 
         Ok(ToolResult {
-            content: format!("[{status}]\n{rendered}"),
+            content: format!("[{status}]\n{retried}{rendered}"),
             view: None,
             is_error: !status.is_success(),
         })
@@ -427,6 +438,112 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// C-701, acceptance 4 — a read that rode out a rate limit says so.
+    ///
+    /// `web.fetch` has one surface rather than `http.request`'s record/view split, so the note lands
+    /// in the read itself — which is where the unexplained latency would otherwise have been. It
+    /// appears only when there was a wait: the second half of this test is a plain read, rendered
+    /// byte-for-byte as it always was.
+    #[tokio::test]
+    async fn a_read_that_rode_out_a_rate_limit_says_so_and_a_plain_one_is_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let script = [
+                "HTTP/1.1 429 Too Many Requests\r\nretry-after: 0\r\ncontent-length: 4\r\nconnection: close\r\n\r\nwait",
+                "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 6\r\nconnection: close\r\n\r\nserved",
+            ];
+            let mut turn = 0usize;
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let answer = script.get(turn).copied().unwrap_or(script[1]);
+                turn += 1;
+                let _ = sock.write_all(answer.as_bytes()).await;
+                let _ = sock.flush().await;
+            }
+        });
+
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+        let retried = tool
+            .execute(&ctx(), json!({ "url": format!("http://{addr}/") }))
+            .await
+            .expect("a rate-limited read that succeeds on the retry is a successful op");
+        assert!(
+            retried
+                .content
+                .starts_with("[200 OK]\nrate-limited, retried 1 time over "),
+            "the wait is explained right under the status line: {}",
+            retried.content
+        );
+        assert!(retried.content.ends_with("served"), "{}", retried.content);
+
+        let plain = one_shot("200 OK", "text/plain", "served").await;
+        let read = tool.execute(&ctx(), json!({ "url": plain })).await.unwrap();
+        assert_eq!(
+            read.content, "[200 OK]\nserved",
+            "a read that was not retried renders exactly as it always did"
+        );
+    }
+
+    /// C-652, unchanged in substance by C-674 — `web.fetch` is `SelectedExecutionSystem`, so the
+    /// read follows the operator's selection instead of being served from the coordinator's process.
+    ///
+    /// The wire now exists, so what is missing is the *delegate's* HTTP family rather than the
+    /// protocol's; the refusal is checked structurally, through the port's own typed `Unserved`,
+    /// which is how it is meant to be classified. The loopback server stands live and untouched,
+    /// which is what makes the assertion mean "the local client is off this path" rather than "the
+    /// fixture was unreachable".
+    #[tokio::test]
+    async fn a_selected_substrate_that_serves_no_http_refuses_the_read() {
+        struct ServesNothing;
+        impl flux_system::remote::Delegate for ServesNothing {}
+
+        let base = one_shot("200 OK", "text/html", "<html><body>local</body></html>").await;
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+        let selected = Arc::new(flux_system::remote::RemoteSystem::new(Arc::new(
+            ServesNothing,
+        )));
+        let ctx = ctx().with_execution_system(selected);
+
+        let error = tool
+            .execute(&ctx, json!({ "url": base }))
+            .await
+            .expect_err("a selected substrate that serves no HTTP must refuse the read");
+        assert_eq!(
+            flux_system::remote::failure_mode(&error),
+            Some(flux_system::remote::FailureMode::Unserved),
+            "the refusal must classify as a missing capability, not a guard saying no: {error}"
+        );
+        assert!(
+            !error.to_string().contains("local"),
+            "the request reached the network from the coordinator's process: {error}"
+        );
+    }
+
+    /// C-652 — and with nothing selected, the read is exactly what it was.
+    #[tokio::test]
+    async fn an_unselected_read_still_reaches_the_native_backend() {
+        let base = one_shot("200 OK", "text/html", "<html><body><p>hi</p></body></html>").await;
+        let tool = WebFetchTool::new(&WebOptions {
+            private_net: PrivateNetAllow::Any,
+            ..Default::default()
+        });
+
+        let result = tool
+            .execute(&ctx(), json!({ "url": base }))
+            .await
+            .expect("no substrate selected means the native backend serves");
+        assert!(result.content.starts_with("[200 OK]"), "{}", result.content);
+        assert!(result.content.contains("hi"), "{}", result.content);
     }
 
     /// Like [`one_shot`] but serves an arbitrary **binary** body (headers, then the raw bytes) — the

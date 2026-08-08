@@ -1,0 +1,110 @@
+# One replica per canonical workspace. See workspace-pvc.yaml for why that is the topology rather
+# than a starting point to scale out of.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flux-system
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: two pods must never hold the same workspace volume, and the ledger
+  # that prevents double execution is a file in it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: flux-system
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: flux-system
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        # The image's identity owns the workspace volume; without fsGroup a fresh PV is root-owned
+        # and the daemon cannot write its own ledger.
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: flux-system
+          # Tag pinned by kustomization.yaml to the release this profile ships with.
+          image: flux-system
+          # The image entrypoint is `flux system serve`; these are its arguments. `--no-sandbox` is
+          # required and deliberate: a serving surface defaults to a fail-closed sandbox floor that
+          # bubblewrap cannot satisfy inside a pod, and the pod's own isolation is what replaces it.
+          # The daemon prints a prominent UNCONFINED posture at startup. Removing this flag does not
+          # harden the pod; it stops the daemon from starting.
+          args:
+            - --no-sandbox
+            - --workspace
+            - /srv/flux/workspace
+            - --bind
+            - 0.0.0.0:8790
+            - --cert
+            - /run/flux-tls/tls.crt
+            - --key
+            - /run/flux-tls/tls.key
+          env:
+            # The token reaches the daemon through the environment and never through argv, so it
+            # cannot be read out of a process listing. The Secret is created out of band.
+            - name: FLUX_REMOTE_SYSTEM_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: flux-system-token
+                  key: token
+          ports:
+            - name: https
+              containerPort: 8790
+              protocol: TCP
+          # Every route on this daemon is authenticated — there is no unauthenticated health
+          # endpoint by design — so the probe is TCP. It proves the TLS listener accepts
+          # connections. Proving protocol readiness needs an authenticated
+          # GET /system/v1/handshake, which belongs in a trusted operator probe and not in a
+          # manifest that would then have to carry the bearer token.
+          readinessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: https
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 2Gi
+          volumeMounts:
+            - name: workspace
+              mountPath: /srv/flux/workspace
+            - name: tls
+              mountPath: /run/flux-tls
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      # Guarded process effects land on this substrate and may need to be stopped cleanly.
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: flux-system-workspace
+        - name: tls
+          secret:
+            secretName: flux-system-tls
+            defaultMode: 0400
+        - name: tmp
+          emptyDir: {}

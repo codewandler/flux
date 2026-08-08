@@ -889,6 +889,21 @@ impl AgentSink for CliSink {
                 "{}",
                 style::dim(&format!("⊙ context: dropped {dropped} of {total} members"))
             );
+        } else if o.kind == flux_evidence::KIND_BUDGET_PROJECTION {
+            // C-542: the enforcing ledger publishes spent-versus-declared on every charge. This
+            // surface is scrollback, not a live header (that is the TUI's budget segment), so it
+            // prints the crossings — one visible warning per target, then the hard-limit stop —
+            // instead of a line per model call. The figures are the ledger's own.
+            if let Some((line, stop)) = budget_crossing_line(&o.data) {
+                eprintln!(
+                    "{}",
+                    if stop {
+                        style::red(&line)
+                    } else {
+                        style::yellow(&line)
+                    }
+                );
+            }
         } else if o.kind == "turn.cancelled" {
             eprintln!("{}", style::dim("⊘ turn cancelled"));
         } else if o.kind == "loop.phase" {
@@ -1471,6 +1486,165 @@ impl AgentSink for GoalSink {
             if !stats.is_empty() {
                 eprintln!("{}", style::dim(stats));
             }
+        }
+    }
+}
+
+/// C-542: one budget figure, humanized the way the rest of the CLI humanizes that quantity — elapsed
+/// wall time, a bare call count, compact token counts.
+fn budget_amount(dimension: flux_core::BudgetDimension, value: u64) -> String {
+    match dimension {
+        flux_core::BudgetDimension::WallTime => {
+            style::fmt_elapsed(std::time::Duration::from_millis(value))
+        }
+        flux_core::BudgetDimension::ModelCalls => value.to_string(),
+        _ => style::fmt_tokens(value),
+    }
+}
+
+/// C-542: the CLI's projection of a crossed budget line — `(line, stops_the_run)`, or `None` when the
+/// published projection crosses nothing.
+///
+/// `data` is the enforcing ledger's `budget.projection` payload, and every figure printed here is
+/// read straight off it: this surface adds nothing up, so the number it shows is the number that
+/// actually stops the run. The distinction the vocabulary turns on stays legible — a crossed target
+/// warns and execution continues (`false`), a crossed hard limit is the stop line (`true`) — and the
+/// one-warning-per-dimension rule is the ledger's, so a later charge past the same target prints
+/// nothing again.
+pub(super) fn budget_crossing_line(data: &Value) -> Option<(String, bool)> {
+    let projection: flux_core::BudgetProjection =
+        serde_json::from_value(data.get("projection")?.clone()).ok()?;
+    let breach = |key: &str| -> Option<flux_core::BudgetBreach> {
+        serde_json::from_value(data.get(key)?.clone()).ok()
+    };
+    let (breach, stop) = match breach("exhausted") {
+        Some(breach) => (breach, true),
+        None => (breach("warning")?, false),
+    };
+    // A warning names the target it crossed, so say what the hard ceiling still is when one is
+    // declared — an undeclared dimension renders nothing rather than a reassuring zero.
+    let headroom = match projection.limit.get(breach.dimension) {
+        Some(limit) if !stop => {
+            format!(" (hard limit {})", budget_amount(breach.dimension, limit))
+        }
+        _ => String::new(),
+    };
+    let (label, tail) = if stop {
+        ("budget limit reached", "stopping at the next safe boundary")
+    } else {
+        ("budget target crossed", "execution continues")
+    };
+    Some((
+        format!(
+            "⚠ {label} — {} {} {} of {}{headroom} · {tail}",
+            breach.scope,
+            breach.dimension,
+            budget_amount(breach.dimension, breach.spent),
+            budget_amount(breach.dimension, breach.limit)
+        ),
+        stop,
+    ))
+}
+
+#[cfg(test)]
+mod budget_projection_tests {
+    use super::*;
+
+    /// One measured model call in the shared budget vocabulary (C-542). The real
+    /// [`flux_core::BudgetLedger`] produces every figure asserted below, so a CLI line can never be a
+    /// hand-summed total that disagrees with the stop that actually fires.
+    fn call(event_id: &str, total_tokens: u64) -> flux_core::BudgetUsageEvent {
+        flux_core::BudgetUsageEvent {
+            event_id: event_id.into(),
+            scope: flux_core::BudgetScope::Segment,
+            attribution: flux_core::BudgetAttribution {
+                run_id: "run-1".into(),
+                session_id: Some("s-1".into()),
+                turn_id: Some(1),
+                segment: Some("explore".into()),
+            },
+            spend: flux_core::BudgetSpend {
+                model_calls: 1,
+                total_tokens,
+                ..flux_core::BudgetSpend::default()
+            },
+            rollup: false,
+        }
+    }
+
+    /// Exactly the payload the enforcing ledger publishes on its `budget.projection` observation
+    /// (`EngineLoopHost::publish_budget`) — the single contract every surface reads.
+    fn published(ledger: &flux_core::BudgetLedger, outcome: &flux_core::BudgetOutcome) -> Value {
+        let mut data = serde_json::json!({ "projection": ledger.projection() });
+        if let Some(warning) = outcome.warning {
+            data["warning"] = serde_json::json!(warning);
+        }
+        if let Some(breach) = outcome.exhausted {
+            data["exhausted"] = serde_json::json!(breach);
+        }
+        data
+    }
+
+    /// C-542: the CLI projects the enforcing ledger's published budget contract instead of dropping
+    /// it. A crossed target is visible and does not stop the run; a crossed hard limit is the stop
+    /// line. Every figure is the ledger's own, so this surface and the stop cannot drift apart.
+    #[test]
+    fn cli_projects_target_warning_and_hard_stop_from_the_published_budget() {
+        let mut ledger = flux_core::BudgetLedger::new(flux_core::BudgetEnvelope {
+            scope: flux_core::BudgetScope::Run,
+            target: flux_core::BudgetLimits::with_total_tokens(1_000),
+            limit: flux_core::BudgetLimits::with_total_tokens(4_000),
+        });
+
+        let outcome = ledger.record(&call("call-1", 400));
+        assert!(
+            budget_crossing_line(&published(&ledger, &outcome)).is_none(),
+            "spend under every declared line crosses nothing"
+        );
+
+        let outcome = ledger.record(&call("call-2", 1_200));
+        let (line, stop) = budget_crossing_line(&published(&ledger, &outcome))
+            .expect("a crossed target must be visible");
+        assert!(line.contains("budget target crossed"), "{line}");
+        assert!(line.contains("run total_tokens 1.6k of 1.0k"), "{line}");
+        assert!(line.contains("hard limit 4.0k"), "{line}");
+        assert!(!stop, "a target never stops execution: {line}");
+
+        let outcome = ledger.record(&call("call-3", 3_000));
+        let (line, stop) = budget_crossing_line(&published(&ledger, &outcome))
+            .expect("a crossed hard limit must be visible");
+        assert!(line.contains("budget limit reached"), "{line}");
+        assert!(line.contains("run total_tokens 4.6k of 4.0k"), "{line}");
+        assert!(stop, "a hard limit is the stop line: {line}");
+    }
+
+    /// C-542: the one-warning rule belongs to the ledger, and the CLI inherits it rather than
+    /// re-deriving it — a target with no hard limit warns once and never reports a stop, however far
+    /// past it the run spends.
+    #[test]
+    fn a_target_without_a_hard_limit_warns_once_and_never_reports_a_stop() {
+        let mut ledger = flux_core::BudgetLedger::new(flux_core::BudgetEnvelope {
+            scope: flux_core::BudgetScope::Run,
+            target: flux_core::BudgetLimits::with_total_tokens(1_000),
+            limit: flux_core::BudgetLimits::default(),
+        });
+
+        let outcome = ledger.record(&call("call-1", 1_200));
+        let (line, stop) =
+            budget_crossing_line(&published(&ledger, &outcome)).expect("the crossed target warns");
+        assert!(line.contains("budget target crossed"), "{line}");
+        assert!(
+            !line.contains("hard limit"),
+            "nothing hard is declared: {line}"
+        );
+        assert!(!stop, "{line}");
+
+        for round in 0..3 {
+            let outcome = ledger.record(&call(&format!("later-{round}"), 1_200));
+            assert!(
+                budget_crossing_line(&published(&ledger, &outcome)).is_none(),
+                "the target warns once, not once per call: round {round}"
+            );
         }
     }
 }

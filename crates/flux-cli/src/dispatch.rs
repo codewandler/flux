@@ -163,6 +163,12 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         // Operator-facing reads, reports and local file writes. None of them starts a turn, none is
         // reachable from a model, and each runs in the foreground on argv the operator typed —
         // there is no autonomous execution here for the profile to bound.
+        // C-607: `flux fleet …` stays here, but for a narrower reason than the comment below gives.
+        // The *orchestrator* is operator-invoked and does legitimate repository management outside any
+        // one workspace — `git worktree add` into each member repository's shared git dir — so
+        // confining the dispatch process itself breaks wave preparation. The turns it starts are
+        // confined at the spawn site instead (`guarded_agent_run_async`), which is where the posture
+        // belongs: the worker is the thing with no approval boundary, not the command that launched it.
         Commands::Render { .. }
         | Commands::Board(..)
         | Commands::Fleet(..)
@@ -174,6 +180,7 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Export { .. }
         | Commands::Auth { .. }
         | Commands::Endpoint { .. }
+        | Commands::Host { .. }
         | Commands::Exchange { .. }
         | Commands::Integration { .. }
         | Commands::Policy { .. }
@@ -740,7 +747,20 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
                 }
                 run_prompt(agent, prompt).await
             }
-            Some(Commands::Tui { agent, fleet }) => run_tui(agent, fleet).await,
+            Some(Commands::Tui {
+                agent,
+                fleet,
+                attach,
+                attach_token_env,
+                attach_context,
+            }) => {
+                let attach = attach.map(|target| AttachSelection {
+                    target,
+                    token_env: attach_token_env,
+                    context_id: attach_context,
+                });
+                run_tui(agent, fleet, attach).await
+            }
             Some(Commands::Fork {
                 session,
                 at,
@@ -842,6 +862,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Auth { action }) => run_auth(action).await,
             Some(Commands::Plugin { action }) => run_plugin(action).await,
             Some(Commands::Endpoint { action }) => run_endpoint(action),
+            Some(Commands::Host { action }) => run_host(action).await,
             Some(Commands::Exchange { action }) => run_exchange_boundary(action),
             Some(Commands::Integration { action }) => run_integration_boundary(action),
             Some(Commands::Policy { action }) => run_policy(action),

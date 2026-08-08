@@ -24,6 +24,7 @@ mod a2a;
 mod listener;
 pub mod public_docs;
 mod resource;
+pub mod ssh;
 pub mod system;
 
 use std::convert::Infallible;
@@ -2028,8 +2029,8 @@ mod tests {
     use axum::routing::get;
     use flux_system::net::{BindExposure, InboundLimits, NetworkListener};
     use flux_system::port::{
-        ExecutionIdentity, ExecutionSystem, Guarded, GuardedEnv, GuardedHostFiles, GuardedNetwork,
-        GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
+        ExecutionIdentity, ExecutionSystem, Guarded, GuardedEnv, GuardedHostFiles, GuardedHttp,
+        GuardedMetrics, GuardedNetwork, GuardedProcess, GuardedWorkspaceFiles, SubstrateIdentity,
     };
     use tower::ServiceExt; // for `oneshot`
 
@@ -2054,6 +2055,10 @@ mod tests {
             None
         }
     }
+
+    // C-652 — this double is about the bind refusal, and it serves no HTTP: the port's fail-closed
+    // default is exactly what it wants to claim.
+    impl GuardedHttp for RefusingBindSystem {}
 
     impl GuardedProcess for RefusingBindSystem {
         fn run_with_env<'a>(
@@ -2104,6 +2109,9 @@ mod tests {
             refused("substituted bind reached")
         }
     }
+
+    // The bind probe measures nothing about itself; every metric inherits the port's `Unserved`.
+    impl GuardedMetrics for RefusingBindSystem {}
 
     impl ExecutionIdentity for RefusingBindSystem {
         fn substrate_identity(&self) -> SubstrateIdentity {

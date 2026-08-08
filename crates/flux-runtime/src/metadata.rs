@@ -279,6 +279,49 @@ pub fn persist_user_theme_in(theme: &str, env: &DiscoveryEnv) -> Result<()> {
     system.write_file_atomic(rel, &body)
 }
 
+/// The user-config `System` + relative path pair `persist_user_theme_in` writes through — a host
+/// binding is a machine-level declaration, so `flux host add`/`rm` edit the same user layer
+/// (`~/.flux/config.toml`), never the project one.
+fn user_config_surface(env: &DiscoveryEnv) -> Result<(System, &'static str)> {
+    let Some(home) = env.home().map(PathBuf::from) else {
+        return Err(Error::Config("HOME is not set".into()));
+    };
+    Ok(match trusted_flux_root(env)? {
+        Some((_, system)) => (system, "config.toml"),
+        None => (System::new(Workspace::new(&home)?), ".flux/config.toml"),
+    })
+}
+
+/// Atomically upsert one `[[host]]` declaration in `~/.flux/config.toml` (C-649), round-tripping
+/// every other setting via `flux-config`'s pure serializer. Creates `~/.flux` on first use.
+pub fn persist_user_host_in(host: flux_config::HostEntry, env: &DiscoveryEnv) -> Result<()> {
+    let (system, rel) = user_config_surface(env)?;
+    let current = system.read_optional_text(rel)?;
+    let body = flux_config::render_host_upsert(
+        current.as_deref().map(|text| ("~/.flux/config.toml", text)),
+        host,
+    )?;
+    system.write_file_atomic(rel, &body)
+}
+
+/// Atomically remove the `[[host]]` declaration named `id` from `~/.flux/config.toml` (C-649).
+/// Returns `false` when the user layer declares no such host (a project-declared binding is not
+/// this function's to remove — the caller reports where the entry actually lives).
+pub fn remove_user_host_in(id: &str, env: &DiscoveryEnv) -> Result<bool> {
+    let (system, rel) = user_config_surface(env)?;
+    let current = system.read_optional_text(rel)?;
+    match flux_config::render_host_removal(
+        current.as_deref().map(|text| ("~/.flux/config.toml", text)),
+        id,
+    )? {
+        Some(body) => {
+            system.write_file_atomic(rel, &body)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 /// Load guarded project and trusted user-global group manifests. Callers decide how to present a
 /// malformed optional manifest, but an escaping path is never converted to absence here.
 pub fn load_groups(cwd: &Path) -> Result<Vec<flux_evidence::ToolGroup>> {

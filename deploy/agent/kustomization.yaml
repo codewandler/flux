@@ -1,0 +1,37 @@
+# The Flux agent surface — `flux app run --serve` — as an ordinary Kubernetes workload.
+#
+# Render it:            kubectl kustomize deploy/agent
+# Apply it:             kubectl apply -k deploy/agent
+#
+# Two Secrets are deliberately absent from this base, because a checked-in manifest is exactly where
+# a bearer token and a model-provider credential must never be. Create them first — see
+# deploy/agent/README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: flux-agent
+
+resources:
+  - namespace.yaml
+  - state-pvc.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: flux-agent
+      app.kubernetes.io/component: agent-surface
+
+# The SAME image the substrate profile ships, and the same tag. There is no second image: the agent
+# surface is a different program inside one released binary, reached by the Deployment's `command:`
+# override. `deploy/kubernetes/kustomization.yaml` is the other place this pair is written, and
+# `deployment_artifacts.rs` derives one from the other so they cannot drift apart.
+#
+# `newTag` is restamped by the cut (`scripts/stamp-deployment-images.sh`); `newName` is the path the
+# release workflow publishes to. Neither is hand-maintained.
+images:
+  - name: flux-system
+    newName: ghcr.io/codewandler/flux-system
+    newTag: 0.59.0

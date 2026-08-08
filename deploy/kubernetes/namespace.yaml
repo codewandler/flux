@@ -1,0 +1,9 @@
+# A namespace of its own, so the default-deny NetworkPolicy in this profile has a boundary it can
+# actually own, and so the restricted Pod Security Standard applies to everything placed here.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flux-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

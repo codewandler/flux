@@ -120,6 +120,22 @@ impl ToolResult {
     }
 }
 
+/// Redact one tool-result face without corrupting structured JSON. Applying a text regex after
+/// serialization can consume JSON escape characters along with a credential-shaped value, turning
+/// an otherwise valid object into an opaque string at the Flux-Lang boundary. Preserve byte-exact
+/// output when no redaction fires; when it does, walk valid JSON as values and serialize it again.
+fn redact_tool_result_text(redactor: &Redactor, input: &str) -> String {
+    let redacted = redactor.redact(input);
+    if redacted == input {
+        return input.to_string();
+    }
+    let Ok(mut value) = serde_json::from_str::<Value>(input) else {
+        return redacted;
+    };
+    flux_core::redact_json_total(&mut value, &|text| redactor.redact(text));
+    serde_json::to_string(&value).unwrap_or(redacted)
+}
+
 /// What a sub-agent run produced: its final text plus enough to roll its spend into the parent turn
 /// (C-06). `model` is the role's resolved model (whatever `AgentSpec::into_engine` ran it as —
 /// the role's own override, or the spawner's default); `usage` is the child's accumulated per-turn
@@ -1369,6 +1385,9 @@ pub struct ToolContext {
     /// A remote target never changes `workspace`; operations migrated to this handle therefore
     /// cannot silently fall back to the local filesystem.
     execution_system: Option<Arc<dyn ExecutionSystem>>,
+    /// The selected binding's name (C-650), stamped into dispatch provenance beside the substrate
+    /// identity. A name, never an address — the audit trail stays free of path/URL disclosure.
+    execution_binding: Option<String>,
     pub redactor: Redactor,
     pub spawner: Option<Arc<dyn Spawner>>,
     /// D-188: on-demand skill-body loader, installed by the flow engine when the opt-in
@@ -1442,6 +1461,7 @@ impl ToolContext {
         Self {
             workspace,
             execution_system: None,
+            execution_binding: None,
             redactor: Redactor::new(),
             spawner: None,
             skill_loader: None,
@@ -1481,10 +1501,45 @@ impl ToolContext {
             .unwrap_or_else(|| self.workspace.active())
     }
 
+    /// The substrate the operator **selected**, or `None` when execution follows the native default.
+    ///
+    /// [`Self::execution_system`] resolves `None` to the native `System`, which is what a port-aware
+    /// op wants for every family the native backend serves. This is the narrower question, and one
+    /// op family has to ask it: `flux-system` holds no HTTP client by design (C-652), so the native
+    /// backend answers [`flux_system::port::GuardedHttp`] fail-closed and the reviewed
+    /// implementation lives a layer up with the client. A web effect therefore goes to the selected
+    /// substrate when there is one — including when that substrate refuses it — and to the op's own
+    /// reviewed native backend when the operator selected nothing. The distinction is *whether a
+    /// substrate was chosen*, never what kind it is, so nothing here can smuggle an effect past a
+    /// selection.
+    ///
+    /// C-675 lets a selected *native-composed* substrate serve that family — by composition rather
+    /// than by kind: the surface attaches the same reviewed client to the system the selection is
+    /// built from (`System::with_http`). This method is unchanged and still answers only whether a
+    /// substrate was chosen; what changed is that the answer for such a substrate is now a served
+    /// request instead of a refusal. It also makes `Some(native)` and `None` genuinely different
+    /// answers, so a caller must never manufacture the former from the latter — see `task`'s spawn
+    /// request, which carries this method's answer verbatim.
+    pub fn selected_execution_system(&self) -> Option<Arc<dyn ExecutionSystem>> {
+        self.execution_system.clone()
+    }
+
     /// Select the execution-facing guarded substrate while retaining the native control-plane
     /// system. This is host assembly, never a model-facing operation.
     pub fn with_execution_system(mut self, system: Arc<dyn ExecutionSystem>) -> Self {
         self.execution_system = Some(system);
+        self
+    }
+
+    /// The selected binding's name, when the substrate was selected through a named host binding
+    /// or the `--remote` sugar (C-650). `None` for the unselected native default.
+    pub fn execution_binding(&self) -> Option<&str> {
+        self.execution_binding.as_deref()
+    }
+
+    /// Name the selected binding for provenance. Host assembly, never a model-facing operation.
+    pub fn with_execution_binding(mut self, binding: impl Into<String>) -> Self {
+        self.execution_binding = Some(binding.into());
         self
     }
 
@@ -2868,6 +2923,8 @@ impl ExecutionAuthorization {
 pub struct ExecutionEnvironment {
     system: Arc<System>,
     execution_system: Option<Arc<dyn ExecutionSystem>>,
+    /// The selected binding's name (C-650), carried into the derived context for provenance.
+    execution_binding: Option<String>,
     registry: ToolRegistry,
     permissions: PermissionManager,
     approver: Arc<dyn Approver>,
@@ -2915,6 +2972,7 @@ impl ExecutionEnvironment {
         Self {
             system,
             execution_system: None,
+            execution_binding: None,
             registry,
             permissions,
             approver,
@@ -2945,9 +3003,11 @@ impl ExecutionEnvironment {
         context: ToolContext,
     ) -> Self {
         let execution_system = context.execution_system.clone();
+        let execution_binding = context.execution_binding.clone();
         Self {
             system: context.system(),
             execution_system,
+            execution_binding,
             registry,
             permissions,
             approver,
@@ -2983,6 +3043,16 @@ impl ExecutionEnvironment {
         self.execution_system = Some(system.clone());
         if let Some(context) = self.exact_context.take() {
             self.exact_context = Some(context.with_execution_system(system));
+        }
+        self
+    }
+
+    /// Name the selected binding (C-650) so every dispatch record's provenance carries it.
+    pub fn with_execution_binding(mut self, binding: impl Into<String>) -> Self {
+        let binding = binding.into();
+        self.execution_binding = Some(binding.clone());
+        if let Some(context) = self.exact_context.take() {
+            self.exact_context = Some(context.with_execution_binding(binding));
         }
         self
     }
@@ -3124,6 +3194,9 @@ impl ExecutionEnvironment {
                 .with_redactor(self.redactor);
                 if let Some(execution_system) = self.execution_system {
                     context = context.with_execution_system(execution_system);
+                }
+                if let Some(execution_binding) = self.execution_binding {
+                    context = context.with_execution_binding(execution_binding);
                 }
                 if let Some(spawner) = self.spawner {
                     context = context.with_spawner(spawner);
@@ -3767,13 +3840,19 @@ impl Executor {
 
     /// Host-stamped provenance for every dispatch record. Deliberately excludes the workspace and
     /// endpoint: evidence needs to say whether bytes were locally observed or remotely reported,
-    /// without turning the audit trail into a new path/address disclosure surface.
+    /// without turning the audit trail into a new path/address disclosure surface. The selected
+    /// binding's *name* (C-650) is compatible with that rule — a name is an operator-chosen label,
+    /// not an address — and is stamped only when a binding was explicitly selected.
     fn execution_provenance(&self) -> Value {
         let identity = self.ctx.execution_system().substrate_identity();
-        json!({
+        let mut provenance = json!({
             "kind": identity.kind,
             "remotely_reported": identity.remotely_reported,
-        })
+        });
+        if let Some(binding) = self.ctx.execution_binding() {
+            provenance["binding"] = Value::String(binding.to_string());
+        }
+        provenance
     }
 
     fn record_dispatch_event(
@@ -4824,8 +4903,10 @@ impl Executor {
         let result = match executed {
             Ok(mut r) => {
                 // Redact BOTH faces: the view can carry file content / diffs that include secrets.
-                r.content = self.ctx.redactor.redact(&r.content);
-                r.view = r.view.map(|v| self.ctx.redactor.redact(&v));
+                r.content = redact_tool_result_text(&self.ctx.redactor, &r.content);
+                r.view = r
+                    .view
+                    .map(|view| redact_tool_result_text(&self.ctx.redactor, &view));
                 r
             }
             Err(e) => ToolResult::error(self.ctx.redactor.redact(&e.to_string())),
@@ -4884,6 +4965,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn structured_tool_result_redaction_preserves_valid_json() {
+        let input = json!({
+            "kind": "intent",
+            "state": {
+                "message": "before api_key=sk-main-secret\".into()); after",
+                "nested": ["keep-me"],
+            },
+        })
+        .to_string();
+        let redacted = redact_tool_result_text(&Redactor::new(), &input);
+        let parsed: Value = serde_json::from_str(&redacted)
+            .expect("redaction must preserve the structured operation contract");
+
+        assert_eq!(parsed["kind"], "intent");
+        assert_eq!(parsed["state"]["nested"][0], "keep-me");
+        assert!(!redacted.contains("sk-main-secret"));
+    }
+
+    #[test]
+    fn tool_result_redaction_keeps_unmodified_json_byte_exact() {
+        let input = "{ \"kind\": \"intent\", \"state\": {} }";
+        assert_eq!(redact_tool_result_text(&Redactor::new(), input), input);
+    }
 
     #[derive(Default)]
     struct RecordingProgressSink(Mutex<Vec<ToolProgress>>);
@@ -5639,6 +5745,19 @@ mod tests {
         assert_eq!(remote.0["kind"], "loopback/native");
         assert_eq!(remote.0["remotely_reported"], true);
         assert_eq!(remote.1, remote.0, "call and result provenance must agree");
+
+        // C-650: a substrate selected through a named binding stamps the binding *name* beside
+        // kind + remotely_reported — a label, never an address — and an unselected native context
+        // carries no binding field at all.
+        assert!(local.0.get("binding").is_none(), "{:?}", local.0);
+        let native = test_ctx().execution_system();
+        let remote = Arc::new(flux_system::remote::RemoteSystem::loopback(native));
+        let bound_ctx = test_ctx()
+            .with_execution_system(remote)
+            .with_execution_binding("build-farm");
+        let bound = provenance(bound_ctx).await;
+        assert_eq!(bound.0["binding"], "build-farm");
+        assert_eq!(bound.1, bound.0, "call and result provenance must agree");
     }
 
     /// C-478 failing-first: one outer pack may mix control/native operations with operations whose

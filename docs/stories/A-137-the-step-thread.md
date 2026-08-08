@@ -110,3 +110,28 @@ things that change what to build:
 - Filed 2026-08-01 with the agent-loop-visibility epic.
 - 2026-08-02 — scope changed to "the TUI's main display with view options", owner-directed after driving
   A-144's mocks; A-145's real-run corrections folded in.
+- 2026-08-07 — **the three decisions taken, owner-directed**, and the axis work they imply landed:
+
+  1. **The conversation gets a permanent split** beside the loop view — both always visible, no mode.
+     ⚠ Still owed: A-146 measured the pane's floor at **64×10**, so the layout must state a fallback
+     for narrower terminals rather than draw a broken one.
+  2. **Condensing is three-valued** — `Off | Uniform | TopLevel` — which is A-146 section 2's fourth
+     decision. `Uniform` is the default; top-level withholds every non-focused turn's interior.
+  3. **No indentation axis.** The tree is the picture.
+
+  ⚠ **Taking decision 2 partly falsified A-146's headline, and the measurement is now in the tests.**
+  `TopLevel` *is* the split's rail rule, so the axes reach the split where a one-bit flag never could —
+  on **fan-out**, 36 of 42 eligible viewports. On the **recorded** nine-turn session, still 0 of 24.
+  The salient difference is that run's one real `git_stage` failure: `condensable` refuses to fold a
+  subtree holding a failure, so the root the rail would collapse stays open. ⚠ That mechanism is the
+  leading candidate, **not** a measured cause — `top_level_condensing_reaches_the_split_only_on_a_run_without_a_failure`
+  pins the numbers and says so. On real load, "condensing never swallows a failure" and the rail are in
+  tension, and the acceptance wins.
+
+  Landed: `Condense` with `cycle()`, `AXIS_SPACE` swept at the new setting, `render_axes_of` so the live
+  view can be the *same* renderer pointed at a live tree rather than a lookalike, A-146's claim rescoped
+  rather than deleted, recommendation section 2 rewritten, snapshots regenerated.
+
+  **Still to build**, in order: the live `UiEvent → Step` projection; the permanent-split layout with its
+  64×10 fallback; `show variables` through A-142's `Redactor` with the failure path tested; the escape
+  hatch to today's display. No acceptance box is ticked yet — none of them is finished.

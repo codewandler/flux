@@ -8,6 +8,521 @@ All notable changes to this project are documented in this file. The format is b
 
 ### Added
 
+- **An endpoint records the host it is reachable through (C-709).** `EndpointRef` recorded url,
+  product, credential_ref and labels and nothing about locality, so a ClusterIP endpoint looked
+  identical to a public one — a cluster-internal name is meaningless on a laptop and exactly right
+  inside the cluster, and the record could not tell the two apart. `EndpointRef` gains
+  `host: Option<String>`, the `[[host]]` binding id the endpoint is reachable through; absent means
+  "reachable from wherever the caller is", which is every endpoint declared before this field
+  existed, so the wire and store forms skip the key and old records read back unchanged.
+  `[[endpoint.static]]` may declare `host = "k8s-dev"`, `flux endpoint add` takes `--host`, and
+  `list`/`show`/`resolve` render it — `resolve` now answers "from where" alongside the credential
+  location it already answered "as whom" with. Naming an undeclared binding is a load-time error
+  naming the endpoint, the binding and the ones that do exist, not a dial-time surprise: malformed
+  entries stay warn-and-skip, but this one is fatal because skipping it would leave the endpoint
+  reachable-from-anywhere, so a typo'd binding name would silently *widen* where it is dialled
+  from. `StaticResolver` carries the session's selected binding and refuses a host-bound endpoint
+  from any other position, naming both, before any credential is materialized. An unbound endpoint
+  resolves exactly as before.
+
+### Fixed
+
+- **A tag build that publishes nothing is now red (C-719).** v0.59.0 was tagged and its Release
+  workflow reported success while creating no Release at all: no binaries, no attestation, no
+  image, no announcement. GitHub propagates `skipped` transitively through `needs`, so the chain
+  has to be broken at every hop rather than only the first — `host` already broke it with
+  `always()`, but the jobs below did not, so a correctly skipped `build-local-artifacts` flowed
+  through a successful `host` and took attest, publish-github-release and publish-container-image
+  with it. Those three now use `always()` and assert their upstreams actually succeeded, which
+  admits a transitively-skipped graph but never a failed or skipped dependency, and
+  `verify-published` fails the run when the ref was publishing and no Release was created.
+
+- **The plugins workspace resolves against flux-evidence 1.2.0 again (C-719).** The release bump
+  moved `codewandler-flux-evidence` to 1.2.0 while `plugins/Cargo.lock` still pinned 1.1.0, so every
+  job that resolves that workspace with `--locked` refused outright. That took down three CI jobs at
+  once — the plugins workspace fetch, and `plugin_builds_exclude_host_only_crates` in both the
+  sandboxed and unsandboxed test jobs, which resolve the same workspace.
+
+- **`codewandler-flux-evidence` moves to 1.2.0 so its published API matches its users (C-143).**
+  crates.io publication of 0.59.0 stopped at `codewandler-flux-flow`, which references
+  `flux_evidence::KIND_BUDGET_PROJECTION` — a constant that exists in this workspace but not in the
+  published flux-evidence 1.1.0. The constant predates v0.58.0, so the release-tag comparison never
+  flagged it: a protocol-line crate can drift from its published self without any diff against the
+  last release showing it. Already-published crates are skipped on re-run, so the remaining closure
+  resumes from this fix.
+
+## [0.59.0] - 2026-08-07
+
+### Added
+
+- **Recovery and inspection became verbs instead of hand-driven procedures (C-635, C-636, C-637,
+  C-638, C-639, C-641, C-642).** Every one of these questions had a single correct answer computable
+  from data the fleet already recorded, and every one was being asked by writing `jq` over
+  `state.json` — or worse, reimplemented: the unattended driver grew its own `/proc` scanner because
+  nothing reported a worker recorded `working` with no process behind it.
+
+  - `flux fleet doctor` reports **runtime** health, not only configuration — a worker recorded
+    `working` with no process, waves each holding an attempt at the same story, and the other
+    mechanical questions that were previously answered by reading state by hand.
+  - `flux fleet inspect gate <wave>` returns a repository gate's own captured output **tail first**,
+    so the verdict survives both the view's `--limit` and its structural byte budget. Why a wave went
+    red was the most-wanted recorded fact and the only one that still required knowing the shape of
+    `state.json`.
+  - `flux board reconcile` reports items whose work is **already present** while their status still
+    says outstanding. It reports and never repairs: detection is the whole value, since the fix is a
+    transition anyone can make once they know.
+  - `flux fleet repair` rebuilds structure a wave's topology names and disk lacks — the hand-written
+    `git worktree add` against a base read out of `state.json`, and the `git reset --hard <base>` an
+    integration worktree needed repeatedly before handoffs would verify.
+  - `flux fleet park <wave> --reason` / `flux fleet unpark <wave>` make parking a **recorded
+    lifecycle state of the wave** rather than a line in a driver-owned text file, and `fleet status`
+    reports the pause and its reason — so a parked wave is not re-decided every minute.
+  - `flux fleet handoff --from-worktree` derives the write set from the story worktree's `base..HEAD`
+    range and the owning worker from the agent that wave assigned to it, instead of asking for facts
+    the fleet already recorded.
+  - `flux fleet quiesce` records a durable maintenance window that refuses every dispatch and
+    confirms nothing is in flight; `flux fleet resume` lifts it. The hand-driven version — scan the
+    process table, then install — went wrong twice in one evening, once corrupting a full workspace
+    test run.
+
+- **Every agent start resolves and snapshots an explicit loop binding (C-569).** Loop selection is now
+  a required resolved field of the common agent-start contract, so a top-level, sub-agent, Fleet or
+  served start says exactly which behavior harness it is running. Previously each start path defaulted
+  its own loop independently and nothing durable recorded which one ran, leaving a Fleet writer, a
+  `task` child, an app agent and a served A2A task indistinguishable from a general CLI agent in the
+  record. A resolved `AgentLoopBinding` carries logical profile and revision, runner kind, an
+  immutable source reference and digest, entry point and required runtime features; receipts expose
+  bounded identity and digest metadata and never loop source or prompts. An omitted selector resolves
+  to the explicit versioned adaptive preset, a sub-agent resolves its own role policy and never
+  implicitly copies the parent's loop, and Fleet task roles require an explicit policy-selected
+  binding. Missing profiles, changed digests, invalid source and unsupported runtime features refuse
+  **before the first model call** with the exact mismatch. Message, restart, resume, rework and
+  recovery reconstruct the admitted binding; switching a live worker requires an explicit new
+  admission.
+
+- **A board item expands into its rendered story body, and the pane stays read-only (C-621, C-623).**
+  Expanding an item in the TUI renders Goal, Acceptance and Notes as markdown in place — headings,
+  lists, fenced code and checkbox state visually distinct from prose — so reading an item's contract
+  no longer means leaving the TUI. Rendering is width-aware and wraps within the pane, and a long body
+  scrolls inside its own box rather than pushing the board off screen. The pane remains strictly
+  read-only: no interaction changes status, priority or any other planning field, status changes stay
+  the Board CLI's responsibility so the transition is validated, and a test drives every board-pane
+  interaction asserting the board revision is unchanged afterwards.
+
+- **`[[host]]` declares named execution-substrate bindings (Decision 0018, C-648).** A host is now
+  a first-class entity: `id`, a typed `backend` kind (`local` | `sandboxed` | `container` |
+  `kubernetes` | `remote`; `microvm` joins them below with C-677, so the vocabulary this release
+  ships is all six), an optional bare `url`, a `credential_ref` *location* (the existing
+  `env/` / `plugin/` / `kubernetes/` reference vocabulary — never a value), and display labels.
+  The backend vocabulary is closed and an unknown kind is a hard config error, and — unlike
+  `[[endpoint.static]]` — a `[[host]]` entry refuses unknown keys outright, because a silently
+  dropped typo in a substrate binding would change where effects land. Declarations register in a
+  session `HostRegistry` (the `EndpointRegistry` persistence pattern: optional weak-ref TOML store,
+  config merged over it by id) at session start, and a `HostRef` joins `flux-secret`'s reference
+  vocabulary so a binding can be listed and inspected without ever holding credential material.
+  The entity is inert in this story: the `flux host` family arrives with C-649 and named selection
+  with C-650.
+
+- **The host entity is operable: `flux host` and an ambient-gated `host.*` op group (C-649).**
+  `flux host ls`/`show` render id, backend kind, address and a static availability statement
+  (`--output json`/`ndjson` is the automation API); `add`/`rm` edit the `[[host]]` table in
+  `~/.flux/config.toml` atomically through the same validated parts as the config path, refusing
+  inline secret values before anything is written; `probe` performs the backend's side-effect-free
+  identity check — the resolved substrate identity for a local binding, the protocol handshake
+  (identity route only, nothing executes) with the negotiated version for a remote one — and its
+  failures are a typed taxonomy (`credential_unavailable`, `backend_unwired`, `connect`), not
+  strings. The agent-facing mirror is `host.list`/`host.info`/`host.probe`, registered at
+  `LocalControlPlane` placement — bindings must stay inspectable precisely when a non-native
+  substrate is selected — behind the session-ambient `host` signal, with the op list pinned by the
+  placement census, the group manifest test, and the website ops reference. Integration-assembly
+  tools now carry their placement per pack instead of assuming one shared placement.
+
+- **A named host binding selects the execution substrate (C-650).** `flux --host <name>` resolves
+  a declared `[[host]]` binding through the session registry to the selected execution system —
+  the same guarded-port path `--remote <url>` walks, which stays as sugar and is now recorded as
+  the session's ephemeral `@session/remote` binding (the `@` prefix is reserved). Selection is
+  granted, never ambient (Decision 0018 rule 4): a binding carries `grant = ["operator" |
+  "unattended"]`, the default is deny, an unknown name is a typed startup refusal naming the known
+  bindings, and the classes are exact — `--yes`, fleet-attached and operation-ceiling surfaces
+  classify as `unattended` and never inherit an `operator` grant, so a serving surface cannot
+  widen a grant silently. A granted `local` binding keeps the native workspace-following path but
+  its name still rides provenance; `sandboxed`/`container`/`kubernetes` fail closed until their
+  backends wire in. Dispatch-record provenance now carries the binding *name* (a label, never an
+  address) beside `kind` and `remotely_reported`. The Exchange catalogue binding becomes nameable:
+  `[exchange] host = "<binding>"` resolves origin and token reference where the transitional
+  `FLUX_EXCHANGE_URL`/token pair is absent — the pair keeps working and wins until C-656 retires
+  it.
+
+- **`flux board next --independent` returns the largest wave-safe set instead of the
+  highest-priority prefix.** Dependency satisfaction says only that nothing an item *waits on* is
+  outstanding; it says nothing about whether two ready items can be built at the same time.
+  Integration refuses a wave in which two stories wrote the same path, and priority clusters by
+  subject — so the highest-priority `--limit` items are frequently the worst possible wave. On the
+  flux board the eight highest-priority ready stories all declared `flux-cli`, meaning
+  `board next --limit 8` returned eight workers' worth of guaranteed integration refusal.
+  `--independent` solves for mutual independence instead: different members never conflict, a
+  declared dependency or a shared `areas`/`design` entry does, and an item with no declared areas
+  fails closed because an unknown write set costs every worker in the wave when the guess is wrong.
+  The objective is deliberately lexicographic — more items beats better priority, since an idle
+  worker delivers nothing — and the result carries a `held_back` list naming, for every excluded
+  item, the batch member it collided with and why. That list is the point as much as the batch is:
+  a width that cannot be filled is a fact about the shape of the backlog. The native `board.next`
+  coordinator operation takes the same `independent` flag, because the coordinator is the caller
+  that actually chooses waves — a batch selector only a human can reach is one nothing uses.
+
+- **The guarded port measures the substrate itself: `GuardedMetrics` and a closed metric
+  vocabulary (Decision 0018 rule 6, C-653).** A typed, closed `MetricKind` vocabulary — CPU usage
+  and load, memory, swap, per-mount disk, uptime, hwmon temperature and fan — joins
+  `ExecutionSystem` with fail-closed `Unserved` defaults, and the answer taxonomy keeps two
+  negatives distinct: "this substrate serves no metrics" (`Unserved`) versus "this machine has no
+  such instrument" (`Unavailable`), so an absent thermometer can never render as 0 °C. The native
+  backend reads procfs/sysfs/statvfs inside `flux-system` with no new dependency; readings are
+  unit-bearing, bounded (32 mounts, 64 sensors, 64-byte labels) and carry a sampled-at timestamp.
+  `RemoteSystem` deliberately serves nothing until the remote protocol gains a versioned metrics
+  frame (C-654). The codegate census gains the family and two reviewed allowances.
+
+- **HTTP joins the guarded port, so web effects follow the selected substrate (Decision 0018
+  rule 5, C-652).** `GuardedHttp` joins `ExecutionSystem` with a fail-closed `Unserved` default;
+  `http.request` and `web.fetch` move from `NativeSystemOnly` to `SelectedExecutionSystem` and
+  route through the selected substrate whenever one is in force — the branch is on whether a
+  substrate was selected, never on its kind, so nothing can send locally under a selection. The
+  native implementation is `flux_web::NativeHttp`, wrapping the one reviewed egress client
+  (redirect-disabled, response-byte-capped, per-hop secret-scope re-authorization behind the
+  port); the codegate `Http` census still counts exactly two `reqwest::Client` construction
+  points. `RemoteSystem` answers a typed `Unserved` naming the missing wire support rather than
+  approximating; `browser.*` and `web.crawl` stay `NativeSystemOnly`, pinned by a new
+  placement-census test.
+
+- **Sandboxed is a selectable peer backend (Decision 0018 rules 3 and 8, C-651).**
+  `SandboxedSystem` in `flux-system` composes the native `System` with the OS sandbox and
+  implements all seven guarded port families by delegation — no added or removed permission, no
+  second spawn path; seven reviewed single-use codegate allowances plus a completeness test pin
+  it. Admission is evidence-gated: `resolve` admits only an active sandbox, and an
+  outer-confinement conclusion is inherited only from the ambient posture that already trusted
+  and audit-disclosed the `FLUX_SANDBOXED` marker — a bare marker fails closed with a refusal
+  naming it. A `Require` posture floor raises a named local binding to the sandboxed peer;
+  `--no-sandbox` never lowers an explicitly selected binding (tightest-wins);
+  `SubstrateIdentity` reports `kind = "sandboxed"` on every admission path, which keeps
+  `browser.*`/`web.crawl` hidden under a sandboxed selection. The `--sandbox`/`--no-sandbox`
+  modifier path is byte-for-byte unchanged, and an admitted peer is a workspace snapshot that
+  does not follow a later re-root (pinned by test). GuardedMetrics delegates to the composed
+  system (same machine, same narrowable roots); GuardedHttp inherits the port's `Unserved` until
+  a selected native substrate gains an HTTP backend.
+
+- **Host metrics ride the remote protocol and surface as `flux host metrics` (Decision 0018
+  rule 6, C-654).** `PROTOCOL_VERSION` 2→3: the handshake declares served `metric_kinds` as a
+  capability beside `operations`, negotiation stays exact-equality and refuses a mixed pair from
+  both seats, and a same-version peer declaring no kinds is answered with a typed `Unserved`
+  without a round trip. `RemoteSystem`'s `GuardedMetrics` delegates over the wire; every decoded
+  reading is re-bounded twice (decoder and hop, both routed through `bounded_reading`), and
+  `remotely_reported` provenance is stamped by the hop — the wire cannot forge it. The surface is
+  `flux host metrics <name>` plus the ambient-gated `host.metrics` operation at the host pack's
+  `LocalControlPlane` placement, carrying probe's exact authority pair (`network_fetch` +
+  `host_read` on the binding subject).
+
+- **A selected native substrate serves HTTP (C-675).** `System` carries an optional
+  `AttachedHttp` backend set at exactly one production site: the CLI attaches
+  `flux_web::NativeHttp` (the workspace's one egress client) to a clone handed to substrate
+  selection, so a sandboxed selection serves `http.request`/`web.fetch` through the same guard,
+  redactor and session-scoped audit sink an unselected run uses. The session's own system stays
+  bare — C-652's fail-closed path is byte-identical for unselected runs and named `local`
+  bindings — the routing branch stays kind-blind, and no census entry changed because nothing new
+  constructs a client. Sub-agent spawns now snapshot the parent's *selection* rather than its
+  resolved system, so a child of an unselected parent carries no selection.
+
+- **First-class remote-system deployment profiles (C-480).** `deploy/` gains three checked
+  profiles for `flux system serve`: a single-COPY non-root OCI image (entrypoint pinned, no ENV,
+  no secret or workspace in any layer — pinned by test), a Kubernetes Kustomize base (replicas 1
+  + Recreate, PVC, file-shaped TLS Secret at 0400, TCP probes, caps-drop-ALL, seccomp,
+  read-only rootfs, and a real default-deny NetworkPolicy), and a VM/microVM guest profile whose
+  hardened unit keeps the sandbox floor and installs bubblewrap — `--no-sandbox` never appears in
+  its ExecStart, pinned by test. Container and pod profiles take the documented `--no-sandbox`
+  escape with the UNCONFINED disclosure surviving into deployment logs; the review ruled an
+  image-level `FLUX_SANDBOXED=1` would have shipped C-651's forged-posture shape as a default.
+  A container integration test proves mount → connect → write/read → mismatch-refusal → restart →
+  persistence against real Docker, dispositioned plainly where Docker is absent.
+
+- **A microvm binding resolves to a served guest substrate (Decision 0018 rule 3, C-677).**
+  `microvm` joins the closed `HostBackend` vocabulary and reuses `RemoteSystem` through merged
+  `Remote | Microvm` arms in selection, probe and metrics — one wire implementation, so drift is
+  impossible, and the story adds no port implementation and therefore no census entry. A binding
+  may omit its `url`: it lists as unwired and refuses selection naming the missing endpoint,
+  distinct from an unwired *backend*. The guest's own `SubstrateIdentity` passes through rather
+  than being stamped, which is safe because `remotely_reported` is set unconditionally by every
+  `RemoteSystem` constructor and never rides the wire — that flag, not the kind string, is what
+  keeps `browser.*`/`web.crawl` hidden under the selection. A new `binding_availability` answers
+  at binding granularity where `static_availability` could only answer per kind. Nothing in the
+  change creates, starts, stops or destroys a guest.
+
+- **`/restart` in the terminal UI** relaunches flux on the currently installed binary, reusing the exact
+  command line and resuming the same durable session. It exists because the alternative is a four-step dance
+  performed by hand — confirm nothing is in flight, stop the surface, install, respawn — whose last step is
+  the one everybody forgets, and a surface stopped for an install and never restarted looks exactly like a
+  crash. The replacement happens only after the terminal has been handed back, since a process that replaces
+  itself on the alternate screen leaves its successor drawing into a screen it never set up. Arguments are
+  reused verbatim: a restart that quietly changed the model, the fleet root or the posture would be a
+  different session wearing the same name.
+
+- **A `fleet:` command namespace in the terminal UI**, with `/fleet:restart` and `/fleet:refresh`.
+  `/restart` changes the executable; `/fleet:restart` re-reads the *fleet* — configuration, every loop
+  binding, and the coordinator's recorded capability set — by running the same `fleet start` path the CLI
+  uses rather than a second copy of it. It refuses while a worker is genuinely active, because a
+  stop-and-start beneath a live turn orphans it, and the refusal uses the same activity derivation
+  `fleet status` reports so the two can never disagree. `/fleet:refresh` drops the snapshot cache and
+  reports what it found. An unrecognised `fleet:` name lists the available ones.
+
+  The operations boundary is widened deliberately and only this far: the surface still cannot push,
+  release, deploy, apply a candidate or clean worktrees. Restart publishes nothing and destroys nothing —
+  it re-reads files that already exist. `/fleet:reclaim` was considered and **excluded** for exactly that
+  reason: reclamation deletes worktrees, which is on the far side of the line.
+
+- **A Kubernetes profile for the agent surface (C-685).** `deploy/agent/` runs `flux app run
+  --serve` from the same released image as the substrate profile — the tag is derived from
+  `deploy/kubernetes/`, not restated — as a sibling base rather than an overlay, because a
+  different program, port, secret, volume and health posture would leave an overlay patching
+  everything it inherited and colliding on object names wherever both run. An unauthenticated
+  public listener is not expressible: the artifact test assembles argv from `command` and `args`,
+  errs toward "public" for any address it cannot parse, derives the token env-var name from the
+  server source so a rename breaks the test rather than the deployment, and refuses to pass
+  vacuously when extraction yields nothing. Probes target routes derived from flux-server's own
+  auth-exempt set (`/health` and the two agent-card paths), so a probe cannot drift onto a
+  protected route. `--yes` ships as the declared posture with `--remote-approval` one commented
+  line away and the C-687 caveat stated in all three places an operator reads.
+
+- **The native metrics reader is hardened against hostile mounts and pinned roots (C-673).**
+  Every arithmetic path reachable from parsed `/proc` content is checked: a counter that overflows
+  answers `ReadFailed` rather than panicking under debug or wrapping to a fabricated zero ratio
+  under release. Mount points longer than the label bound keep distinct identities through a
+  content digest instead of colliding on a shared prefix, cap truncation is visible in the answer
+  as `omitted_mounts` (counting distinct points, so an overmount stack counts once), and the
+  non-disk exclusion covers `fuse.*` generically plus 9p, ceph, glusterfs and davfs. The
+  metrics-roots census guard was rebuilt on the attribute-scoped visitor the credential-boundary
+  census already uses — the previous text heuristic skipped everything after a file's first
+  `#[cfg(test)]`, including the setter's own definition — and its review note now claims only the
+  half it mechanically checks. **Note for consumers:** the disk reading in `flux host metrics
+  --output json` and the `host.metrics` operation is now an object (`mounts` plus
+  `omitted_mounts`) rather than a bare array, under an unchanged `flux.host-metrics/v1` token;
+  the remote wire payload is byte-identical and the protocol version is unchanged.
+
+- **Guarded HTTP rides the remote protocol (Decision 0018 rule 5, C-674).** `PROTOCOL_VERSION`
+  3→4, and `RemoteSystem`'s `GuardedHttp` delegates where C-652 left a typed `Unserved`. HTTP gets
+  its own framed route rather than riding `execute`, deliberately: `execute` carries arguments as a
+  freely `Debug`-printable, freely serializable `serde_json::Value`, and a resolved credential in
+  there would defeat the story's own secret requirement. Header values become `port::HeaderValue` —
+  private field, no `Display`, no `Serialize`, and a hand-written `Debug` that prints length and
+  owner *including* for values a caller labelled literal, because a wrapper that trusted that label
+  would leak precisely when the label was wrong. The serving side re-runs the egress guard on the
+  URL it was handed (vetted addresses are not on the wire at all), caps the response itself, bounds
+  header and scope lists, and re-authorizes every hop against the union of the caller's declared
+  secrets and what the headers themselves declare. Private-destination admissions are reported back
+  stamped with the substrate that made them. A peer that declares no HTTP frame is answered a typed
+  `Unserved` from the handshake, without a request. **Known limitation, stated rather than hidden:**
+  the framed route does not use the delivery ledger, so it carries no at-most-once guarantee — the
+  same position every delegated operation is in today, since the client mints a fresh operation id
+  per call and never queries the recovery route.
+
+- **An ssh binding bootstraps a served substrate (Decision 0018 rule 3, C-683).** `ssh` joins the
+  closed backend vocabulary as a composition of delivered parts: a loopback port reserved through
+  `GuardedNetwork::bind_tcp`, an `ssh -N -L` client spawned through `System::spawn_background`
+  holding the forward, then the delivered remote protocol for everything else. The substrate that
+  resolves is `RemoteSystem`, tethered to the tunnel so the forward is released exactly when the
+  substrate is — no new guarded-port implementation exists anywhere in the change, which is why the
+  censuses needed no entry. Host-key checking is strict with `BatchMode` on, so a changed key is a
+  named refusal rather than a prompt; `-F none` makes the `[[host]]` entry the whole declaration
+  (and `ProxyJump` correspondingly unsupported); every word reaching the far side's shell passes an
+  allow-list that refuses rather than quotes, checked before anything spawns; and the bearer token
+  travels by *name* in argv, by value only in the ssh channel environment. Where nothing is serving,
+  a binding with far-side `cert`/`key` runs one pinned `system serve` command and re-handshakes;
+  `probe` never does, because a probe is side-effect-free family-wide. Idempotency has no lock: the
+  far side's `--bind` is the mutex, and a losing attempt exits rather than displacing the winner.
+
+- **The release publishes a container image and stamps the profiles with it (C-696).** A new
+  `publish-container-image` job repacks the *released, attested* binary artifact — never a fresh
+  source build — and pushes it to GHCR tagged with the release version, attested by digest. The
+  attestation-permission allowlist grows by exactly one job, which is the only shape that satisfies
+  the ordering at all: `publish-github-release` needs `attest`, so `attest` cannot need it back, so
+  "push only after the Release is public" is unachievable inside `attest`. The new job is pinned
+  structurally on both axes — its effective write set must equal exactly
+  `attestations`+`id-token`+`packages`, it must consume the staged assets, must not compile, must
+  attest the pushed digest unconditionally, and must `needs` host+attest+publish-github-release.
+  `cut-release.sh` now restamps both deployment profiles inside the path-limited release commit, so
+  a cut can no longer leave the manifests naming the previous version.
+
+- **The TUI attaches to an agent that lives on a host (C-686).** `flux tui --attach <url>` points
+  the chat UI at an agent served by `flux app run --serve`, refused at parse time alongside
+  `--remote`, `--host` and `--fleet` so the two remoting axes cannot be confused. A remote turn
+  never becomes a local session event: attach mode mints no local session, runs no local turn, and
+  crosses into the view model at one point with no write path to the local event store. The remote
+  is authoritative for history. Credentials are named by reference only, and a URL carrying
+  embedded credentials is refused without echoing it. Capability lines state what the protocol does
+  not carry — tool calls and results, pending C-705 — rather than leaving an unexplained empty pane.
+
+- **Guarded HTTP honors 429 and `Retry-After` (C-701).** The retry wraps the whole attempt in
+  `NativeHttp::send` rather than the redirect chain inside it, because the first hop's secret
+  re-authorization sits above that chain — a loop placed inside would leave every retry riding
+  attempt one's authorization decision. Each retry re-mints the guarded target and re-authorizes
+  every carried secret against the destination that admission produced, proven by a test whose
+  refusal could only be produced on the second attempt. Bounds: 3 retries, 30s per wait, 60s
+  total, and the request's own budget with headroom — a `Retry-After` asking for longer returns
+  the 429 with its header intact rather than waiting less and retrying anyway. `503` is
+  deliberately excluded: a 429 is a definite negative acknowledgement, while a 503 describes the
+  server's state and is often a gateway's, emitted after forwarding. Retries are visible in the
+  result rather than appearing as unexplained latency. **Protocol note:** the response frame gains
+  two `#[serde(default)]` counters without a version bump. That is sanctioned rather than an
+  implicit extension of the C-674 rule: the retry code and the fields ship in the same binary, so
+  a v4 peer lacking them never retried, and the zero default is the truthful reading rather than a
+  fabricated one.
+
+- **A named host binding trusts the private CA it declares (C-684).** `[[host]]` gains `ca_cert`, a
+  path to a trust anchor, honoured identically by `remote`, `microvm`, `ssh` and (once wired)
+  `kubernetes` bindings across selection, `probe` and the metrics read. Before this, `--remote-ca`
+  existed and the named binding — the entity Decision 0018 built to *replace* that flag — had no
+  equivalent, so every cluster-issued or self-signed endpoint was reachable by URL and not by name.
+  The CA is read through `GuardedHostFiles::read_file_scoped` with the declared path as both
+  request and scope, so naming a file admits that file and not its directory, both sides reduced to
+  physical identities first; `--remote-ca` moved to the same reader, because leaving the flag jailed
+  would have recreated the same defect with the flag as the odd one out. The read is capped where
+  the previous unscoped read had no cap at all, and an oversized file is refused for its size
+  rather than falling through to be reported as malformed. A certificate that does not chain is
+  refused with the TLS failure named — the error now walks its source chain — and no
+  `--insecure`-style escape exists.
+
+- **A TUI loop selector with a visualizing overlay (C-543).** The resolved loop binding — profile,
+  revision and digest as the engine admitted it under C-569, never an ambient filename — renders as
+  a header segment; a hotkey opens a selector over the `*.flux` loops found by rescanning the loop
+  directories on every open, so a loop authored while the UI runs appears without a restart; and a
+  selection raises an overlay visualizing the outer loop's structure alongside its description.
+  Selecting is an explicit new-session or re-admission decision rather than a silent switch of a
+  running agent, which is why the session tracks the binding it has already admitted separately
+  from the one the next start would use.
+
+- **`flux fleet drive` — native tick mechanics for the unattended driver (C-631, partial).** The
+  driver's control loop moves out of a 582-line bash script that parsed `state.json` three ways
+  with no revision guard and could not be edited while running. The native command inherits the
+  authored planner, retro and scribe loops unchanged — the judgment was always outside the script —
+  and replaces only the mechanics: status fingerprinting, wave-state advancement, handoff
+  reconstruction, snapshot accumulation and dispatch width, plus the park and claim contracts.
+  **Shipping incomplete by design:** the story's last acceptance item is deleting the bash
+  autopilot once drive reaches parity, which has not happened, so both exist in this release and
+  the story stays open.
+
+- **A far side that refused to start is told apart from one that is not installed (C-683).** The
+  start face was wrong in both directions: a confinement refusal reads "bwrap **not found** on
+  PATH", so a bare `not found` rule reported a missing binary, while a genuinely missing binary
+  never matched at all under a fish login shell (`Unknown command:`) and fell through to a
+  45-second timeout. Classification now keys on the far side's **exit status** — 127 not-found and
+  126 not-executable are consistent across sh, bash, dash, zsh and fish, ssh reserves 255, and any
+  other status means the far side ran and decided something. Two faces replace the wrong one:
+  `FarSideCannotConfine`, which names confinement and carries the fix for the *far* machine, and
+  `FarSideRefusedToStart` for an unrecognised refusal; both state that the binary is installed and
+  quote the far side verbatim. A phrase now only selects a sub-case within a bucket the exit status
+  already established, so a reworded refusal costs specificity rather than resurrecting a wrong
+  claim. A serve that exits is also reported immediately instead of at the deadline, taking the ssh
+  suite from 45s to about 3s.
+
+### Performance
+
+- **Fleet worker builds drop to `line-tables-only` debug info.** Full debug info dominates both link
+  time and the on-disk size that actually caps how many workers fit, and a worker's build output
+  exists only to explain a failing test — file and line in a panic is all of it that is ever read.
+  Set through the per-worker environment, so an operator's own rebuilds keep full debug info.
+
+- **Board and fleet operations no longer re-read every story with its own process.** Resolving a
+  workspace member ran one `git show` per story file: across this workspace's four members that is
+  roughly 1,690 guarded process spawns on *every* board call, including `board get`, which needs
+  exactly one story and took over six seconds to return 759 bytes. Every native coordinator
+  operation paid it twice over, because each one shells out to a nested CLI that resolves the board
+  again. Reads now go through `git cat-file --batch`, chunked against the guarded port's 1 MiB
+  output cap using the blob sizes `git ls-tree -l` already reports. Measured on this board,
+  interleaved: `board get` **6.32s to 0.85s**. Chunking is the load-bearing part — an unbounded
+  batch is truncated by the cap, fails to frame, and silently falls back to the per-file path, which
+  is exactly what the first attempt did on the two largest members while looking like it worked.
+
+### Fixed
+
+- **A resumed story worker no longer inherits the coordinator's inbox (C-618).** `fleet resume
+  <worker>` handed the resumed agent `main`'s pending messages, so a story worker was asked to answer
+  correspondence addressed to the coordinator — assignment context it was explicitly started without.
+  A resumed agent now receives only its own assignment.
+
+- **A finished worker turn now records its own handoff, so a wave advances with nobody watching
+  (C-670).** `handoff-accepted` was reachable only from `flux fleet handoff`, and no agent in the
+  fleet could invoke it: the story worker holds no fleet operations, the coordinator's native
+  operation set has no `fleet.handoff`, and the integrator's `fleet.integrate` refuses until every
+  story is already accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human
+  could move it — ten workers once ended their turns and left nine commits the fleet never recorded.
+  A wave now records each finished turn from the worktree it finished in, deriving branch, commit and
+  the `base..HEAD` write set, and reaches `handoffs-ready` on its own.
+
+  The record is **provisional and says so**. It proves the same git facts as the operator path
+  through a shared `verify_story_commit` — the commit is the worktree HEAD, the branch points at it,
+  it descends from the pinned base, the tree is clean, and the observed write set is non-empty — but
+  it carries no targeted validation evidence, because a turn that has already ended cannot be asked
+  to cite the argv it ran. The entry is marked `provisional` with an empty `test_argv`, and
+  integration still runs the repository's full gate, which is what decides whether the wave is green.
+  A turn that ends at its pinned base with no commit records *that*, rather than nothing, so an empty
+  worker is no longer indistinguishable from an unrecorded one. Recording can never fail a wave:
+  every refusal becomes a reason on the story. The worker gains no capability — the fleet observes
+  what it left behind rather than asking it to vouch for it.
+
+- **Concurrent handoffs no longer lose each other.** Three separate defects stacked here, and at width every
+  worker reaches handoff at once. A held state reservation is a queue, not a conflict — the error even said
+  "retry" and nothing did, so a handoff simply failed. A compare-and-set failure means the state moved and
+  must be recomputed, in both of its branches, not waited out. And recomputing has to be expressed as a
+  *delta*: a wave record holds every story, so recomputing a private copy and inserting it discards the
+  sibling stories other workers updated in the same instant — four concurrent handoffs each reported success
+  and the wave ended holding one. Handoff is now applied as a delta against whatever state is current, so a
+  wave advances to `handoffs-ready` only once the last sibling has genuinely landed.
+- **A worker's turn record lands on current state** rather than on the snapshot its call started from, so the
+  loser of a race no longer loses its receipt — including the failure evidence of a failed turn, which is
+  the most expensive thing to drop.
+
+## [0.58.0] - 2026-08-07
+
+### Added
+
+- **Time and token spend now has one target-versus-limit vocabulary from the runtime to the screen**
+  (C-542). `BudgetEnvelope` carries a soft target beside a hard limit for wall time, model calls and
+  input/output/total tokens; `BudgetUsageEvent` attributes measured spend to run, session, turn and
+  loop segment; and `BudgetLedger` is the only accountant — a repeated `event_id`, a pre-summed child
+  rollup and an ancestor's spend are each ignored with a distinct reason, so a total is never doubled
+  and elapsed wall time folds as a maximum instead of a sum. The engine host charges every model call
+  and clock sample once and publishes a `budget.projection` observation; the adaptive stage enforces a
+  hard limit at its safe boundary *after* charging the round that just finished, so a call still in
+  flight is never reported stopped. `--turn-budget` is now expressed in that vocabulary as a
+  turn-scope hard limit. The TUI header renders a live spent-versus-declared segment and the CLI
+  prints the crossings: a crossed target warns once and execution continues, a crossed hard limit
+  stops with a typed scope, dimension, spent and limit. No surface recalculates totals, which is the
+  same contract C-571's durable Fleet reservation/settlement ledger consumes.
+
+- **`flux fleet status` and `flux fleet dashboard` are now bounded projections** (C-562). The
+  default `flux.fleet-status/v1` view reports main state, active/attention/settled worker counts,
+  wave and item state, exact `BoardRef`s, repositories, current sessions, last transition/error
+  summaries and the current revision inside a reviewed fixed byte budget, instead of copying
+  retained `last_turn` receipts, intake receipts and historical event arrays into the default
+  output — the shape that reached 2,694,752 bytes on the 2026-08-05 roadmap dogfood run. Redaction
+  runs before budgeting, oversized values and trimmed arrays become payload-free
+  `flux.fleet-status-omitted/v1` records, and detail stays behind the explicitly bounded
+  `flux fleet inspect` route. Status and the TUI dashboard now share one worker-liveness
+  derivation, so a completed, failed, cancelled or interrupted process is never counted as active
+  because a stale receipt said `working`, while a delivered continuation is not settled by the
+  receipt of its previous turn.
+
+### Fixed
+
+- **A worker is granted the toolchain bundles its assigned repository actually surfaces**, not the ones
+  the coordinator's own root happens to reveal, so a wave dispatched against one repository no longer
+  offers its writer a toolchain that is not there (C-605).
+- **Operator permission denials and disabled tools now reach every sub-agent**, descending through nested
+  delegation for the same reason a resource ceiling does (C-612).
+- **The Board pane renders items as collapsed boxes** grouped by status and ordered as `board next` orders
+  them, paging to the selection so the rows built stay bounded by terminal height rather than by board
+  size (C-620).
+
+## [0.57.0] - 2026-08-06
+
+### Added
+
 - **A native workspace Board is now the complete cross-repository program authority** (C-588).
   A default `.flux/board.toml` binds member repositories and canonical refs, active milestone,
   ordered program lanes, cross-repository dependencies, configured waves and planning documents.
@@ -28,6 +543,23 @@ All notable changes to this project are documented in this file. The format is b
   Fleet-apply, cleanup, and capacity changes remain outside the TUI. Desired/draining capacity is
   shown as unavailable until canonical Fleet state carries it.
 
+- **The attached Fleet main now has a closed coordinator runtime instead of an ordinary coding
+  agent catalog** (C-556). Fleet config binds an explicit operator-authored Flux-Lang loop; each
+  turn supplies only the current request and a bounded native Board/Fleet catalog, bypassing the
+  generic intent/explore and retained-history budget path. The parent can manage Board and Fleet
+  state or start one `task`; that child uses a separately configured host-authored loop and an
+  independently closed read-only research catalog with no generic `create_plan`, shell, edit,
+  git-write, Board/Fleet mutation or nested delegation authority. Missing or invalid main/research
+  loop config refuses at startup instead of silently widening behavior.
+
+- **Every runnable agent now has a resolved, versioned loop binding** (C-569). General omission
+  resolves to the explicit `adaptive@1` preset; CLI/SDK, role, nested-task, app and served starts all
+  cross the same validation boundary. Start, status, stream and terminal receipts carry bounded
+  profile/revision/source-digest/runner metadata, while resume reconstructs digest-addressed source
+  and refuses a live-session switch. Fleet task kinds resolve through operator-authored loop policy,
+  validate against the admitted capability ceiling, and snapshot exact source for message, restart,
+  resume and rework. `fleet.run` receipts now also return admitted worker ids and wave linkage.
+
 ### Changed
 
 - **Board and Fleet public docs now define the complete domain model.** Concepts appears before
@@ -36,8 +568,265 @@ All notable changes to this project are documented in this file. The format is b
   show story states, eligibility, isolated worktrees, review/rework and the separate publication
   boundary.
 
+### Added
+
+- **`flux fleet reclaim [wave]`** reclaims a finished wave's build output, and its worktrees when they
+  provably hold no commit and no uncommitted change. Reclamation previously ran on acceptance alone, so
+  every wave that ended any other way — cancelled, parked, conflicted, gate-red — kept its target
+  directories and checkouts for as long as the fleet root existed. Disk is what caps how many workers can
+  run, so those are not free: the first run on a real fleet removed 47 stale worktrees and retained the
+  two that held work. Cancelling a wave now reclaims it in the same step. A wave that can still advance is
+  refused rather than reclaimed, since deleting a build it is about to use would cost work rather than
+  space.
+
+### Changed
+
+- **A Fleet agent no longer pays disk for incremental compilation it can never reuse.** Each story gets
+  a fresh worktree and a fresh target directory that is discarded when the wave is reclaimed, so
+  incremental artifacts were written and then deleted without ever being read — roughly half of a
+  checkout's build output. Disk, not model concurrency, is what caps how many workers can run, so this
+  is directly a width change. `CARGO_INCREMENTAL` also joins the forwarded environment allow-list,
+  without which the variable was dropped between the agent process and the `cargo` it runs and setting
+  it had no effect at all. `CARGO_TARGET_DIR` is deliberately *not* forwarded: it is a path, and one
+  shared target directory is locked exclusively by cargo, which would serialize the parallelism the
+  fleet exists to provide. An operator's own rebuilds keep incremental compilation.
+- **`flux board create` commits the document it creates**, path-scoped, with `--no-commit` to opt out.
+  Items are resolved at a git ref wherever a board is federated — a workspace member's stories are read
+  with `ls-tree`/`show` at its `canonical_ref` — so an uncommitted document is invisible to every read
+  that matters. Twenty-seven stories were filed, reported as created, and could not be scheduled: the
+  command had succeeded and nothing had happened. The commit names exactly the new path and never sweeps
+  in unrelated dirt, it goes to the current branch rather than a side branch (a side branch would
+  reproduce the same invisibility), it does nothing outside a git repository, and it refuses rather than
+  committing into an in-progress merge or rebase. The reported envelope carries the commit sha.
+
 ### Fixed
 
+### Added
+
+- **A repository may declare a `prepare` step that regenerates its candidate's derived artifacts before
+  the gate.** Some checked-in artifacts are derived from a whole wave rather than from one story — a
+  documentation mirror, a generated index — and they belong to the candidate, not to any story. Two
+  stories regenerating one artifact collide, and regenerating it on either branch alone produces an
+  artifact missing the other story's contribution. Observed on a real wave whose gate refused the
+  candidate with `embedded docs are stale` while both stories were correct in isolation. The step runs
+  once, after every cherry-pick for that repository and before its gate, and whatever it regenerates is
+  committed into the candidate so it survives into the accepted tag. A preparation failure is recorded as
+  that repository's failure rather than surfacing later as the stories being wrong.
+
+### Fixed
+
+- **Accepting a candidate no longer requires the repository to have stood still.** Two refusals were left
+  over from when applying MERGED the candidate: a merge has to land on the base it was tested against and
+  it touches the working tree, so a moved canonical ref and a dirty checkout were both real hazards.
+  Acceptance now writes an annotated tag on the candidate and nothing else — it does not read the working
+  tree, moves no branch, and cannot be invalidated by unrelated commits arriving on the canonical ref.
+  Keeping the checks cost a green wave: one passed both repository gates and was then refused with "moved
+  from its pinned base" because ordinary work had continued during the hours the wave took, which means the
+  longer a wave is worth accepting the more certain it becomes that it cannot be. The invariant that does
+  matter is still enforced — the candidate branch must point at the commit that was gated — and the base it
+  was gated against is now recorded in the acceptance entry, because the later step that writes the
+  canonical branch has to re-gate against whatever that branch has become. Acceptance is not landing.
+- **A concurrent write no longer throws away an entire integration.** Integration is the longest operation
+  the fleet performs — cherry-picks, candidate preparation and a full repository gate, tens of minutes from
+  cold — and it writes state several times along the way. Any coordinator write inside that window lost the
+  compare-and-set and discarded the whole run: one real integration died on `stale fleet revision 428;
+  current revision is 429` after both gates had already produced their verdicts. Each of those writes now
+  rebases onto current state, which is safe for the same reason it is safe for dispatch: the call replaces
+  the record of exactly one wave, and that wave is owned by the integration for its duration, with the
+  ownership recorded.
+- **A retry no longer re-judges a repository whose candidate is already accepted.** Acceptance is the end of
+  that repository's road — its candidate is pinned by a tag and nothing later in the wave can improve it —
+  so re-gating it spends the pipeline's longest operation to re-derive a known answer, and a re-gate that
+  came out red would make accepted work read as failed. Stale preparation evidence is cleared too, so a
+  retry cannot report work it did not do.
+- **Reclamation no longer removes a worktree an unfinished wave still needs.** Build output is regenerable
+  and always goes; a worktree is structure, and `worktree_holds_work` answers "does this contain work?"
+  rather than "is this still needed?". Reclaiming a wave whose worker turn had failed therefore removed its
+  integration worktree — legitimately empty and at its pinned base — while a story worktree in the same
+  wave held 940 uncommitted lines, leaving the wave with deliverable work, nowhere to assemble a candidate,
+  and no operation able to rebuild the missing structure. Worktrees are now removed only for a wave that is
+  applied or cancelled.
+- **A failed integration can be retried once its cause is fixed.** `conflict` and `red` were terminal, so
+  a wave that failed kept a memory of failing and no later `fleet integrate` would touch it — which made
+  fixing the cause pointless. Three delivered stories stayed unreachable after the defect that stranded
+  them was found, fixed and installed, refused with "not ready for integration". Retrying loses nothing:
+  the handoffs are still accepted and each integration worktree is reset to its pinned base first, which
+  the retry path must do or it refuses itself for a *different* reason than the original failure. The
+  guard worth keeping — never spend a second gate run on unchanged inputs — belongs to the candidate, not
+  the wave, and is now enforced by comparing the recomputed candidate with the one already gated. The
+  wave's verdict is also decided once, from the collected failures, rather than in each branch on its way
+  out: deciding it per branch is exactly how a path slipped through without setting one, leaving a wave
+  `integrating` with its owner released and permanently wedged.
+- **Clipped output keeps the end, where a failure explains itself.** Captured gate output was clipped
+  from the head, and a repository gate emits thousands of `Compiling …` and `test … ok` lines before
+  failing at the very end — so a failed gate's record filled its 16 KiB budget with progress and cut the
+  error off. On one real wave both streams were exactly 16385 bytes and the reason for the failure was
+  not recoverable from Fleet state at all. The budget is now split, two thirds to the tail, with an
+  explicit marker naming how many bytes were elided; completeness is never claimed silently.
+- **Integration applies the worker's whole commit range, not just the commit its handoff cited.** A
+  handoff names one commit and a story worker legitimately makes several — implementation, then its
+  record, which is the shape the contract asks for. Cherry-picking the cited commit therefore applied
+  only the LAST one and silently dropped everything before it: measured on one real wave, a two-commit
+  story contributed only its documentation commit and a five-commit story likewise. It surfaced as a
+  conflict, which was luck — a clean apply would have produced a candidate documenting code that was not
+  in it, and a gate that never compiles the missing part could even have passed it. The evidence already
+  assumed the range, since handoff verification computes the write set with `diff <base> <commit>`, so
+  the record described a range the integration never applied. A handoff citing its own base is now
+  refused outright rather than producing an unchanged candidate.
+- **A conflicted integration leaves its worktree reusable.** The half-applied cherry-pick was kept on
+  disk, which bought nothing (the conflict evidence is recorded in state) and cost the retry: a wedged
+  worktree fails the next attempt's "clean at its pinned base" check, so the wave reported a *different*
+  reason the second time and could never recover on its own.
+- **An interrupted integration can be retried.** `integrating` is transient and recorded no owner, so a
+  process dying mid-gate — the longest operation the fleet runs — left the wave `integrating` forever
+  with every retry refused as "not ready for integration" and no escape but hand-editing state, which the
+  operating rules forbid. Integration now records its supervisor and releases it on every exit, and a
+  wave held by a process that is gone may be retried.
+- **One repository's integration failure no longer discards another's candidate** (C-630). Integration
+  assembles and gates one candidate per repository, but the first repository to conflict, gate red, miss
+  a gate argv, or hold a dirty integration worktree aborted the run for all of them — so a
+  flux-internal collision threw away an exchange candidate whose stories were independent and perfectly
+  integrable. Each repository's outcome is now recorded on its own, the error names both the repositories
+  that failed and the ones that produced a green candidate, and `fleet apply <wave> --only <repository>`
+  accepts a named candidate from a wave that is not wholly green. The per-repository green-gate
+  requirement is unchanged: this relaxes which waves may be asked, not what counts as accepted. A named
+  apply reports what it left behind, does not change the wave's own verdict, and does not reclaim storage
+  the remaining repositories still need.
+- **A dispatch is no longer discarded by a concurrent write.** Creating a wave already happened on disk
+  — a worktree and a branch per story — before the state write. If the coordinator or an operator wrote
+  Fleet state in that window, the compare-and-set lost and the whole dispatch was thrown away with its
+  worktrees already created and nothing recording them; observed as a dispatch failing the moment the
+  coordinator accepted an intake. The write now rebases onto current state, which is safe here precisely
+  because the call only ever adds keys nothing else could have written: a fresh wave id and its fresh
+  worker ids. Re-running the action instead would be wrong, since worktree creation refuses an existing
+  wave root and integration would spend a second gate.
+- **Fleet state can now tell a live worker from a dead one.** A turn runs synchronously in the process
+  that recorded `working`, so that process dying is the one case where no terminal status is ever
+  written: a worker read `working` for hours with nothing behind it, inflating the active count, keeping
+  its wave out of reaping, and forcing the driver to reimplement liveness by scanning `/proc` because the
+  answer was not recoverable from state at all. The supervising process is recorded when a turn starts
+  and cleared on every terminal transition — on the wave path as well as the single-turn path, the wave
+  path being the one that produced the stuck record — and an active record whose supervisor is gone projects as
+  `interrupted` — which also routes it to the attention list, where it belongs. Records written before
+  this keep their recorded status rather than being downgraded. Pid reuse can still fool the check, which
+  is exactly the previous behaviour, so this is a strict improvement rather than a guarantee.
+- **A handoff is no longer refused because a sibling test target filtered to nothing.** `cargo test -p
+  <pkg> <filter>` runs the package's lib unittests *and* each of its integration-test binaries, so the
+  filter matches in one target and reports `0 passed; 0 failed; N filtered out` for every other. The
+  "did this run any tests" check was a substring search over the combined output, so it saw the
+  non-matching target and concluded no test had run — silently refusing a handoff whose cited test
+  genuinely ran and passed, and parking a wave that held delivered, committed work. Every summary is now
+  counted, in both libtest and nextest vocabulary, and the run counts as executed if any target ran a
+  test.
+- **A lost update no longer reports itself as a contradiction.** Fleet's compare-and-set printed `stale
+  fleet revision 392; current revision is 392` when a concurrent writer had already produced that
+  revision with different content. Same message for two unlike failures, and unactionable for the one it
+  described least. The two cases now say what happened and what to do.
+- **Two stories in one repository may now write the same file.** Integration refused any wave whose
+  stories' write sets intersected — a proxy for "these commits will not combine", and within one
+  repository wrong far more often than right. A wave of two delivered stories was parked because each
+  had appended an entry to one changelog, exactly as the worker contract asked; and since nearly every
+  story in a subsystem edits the same module, the proxy made more than one story per repository per
+  wave impossible. The real test already followed: each accepted commit is cherry-picked into the
+  integration worktree, where a genuine conflict fails with the conflicting files, git's own stderr and
+  the preserved candidate. Disjoint edits to one file now integrate; overlapping edits are refused by
+  git rather than guessed at. One writer per story remains enforced.
+- **A running wave is now visible while it runs** (C-599, C-602). A wave wrote durable state exactly
+  twice — once before its first worker started, once after the last joined — and the surface's refresh
+  token hashed only those files, so `flux tui --fleet` took zero snapshots for a wave's entire
+  duration and a working fleet looked frozen. The supervisor now projects each worker's stream to a
+  bounded activity sidecar as it arrives, the refresh token includes it, and a worker's rail entry
+  shows live progress instead of its previous turn's events. The projection is structural only —
+  event type, operation name, coarse outcome — so tool inputs, result bodies and the prompt never
+  reach it.
+- **The transcript no longer silently drops characters** (C-341 revised). The vertical scrollbar is
+  drawn as an overlay into the transcript's own rect, so any character wrapped into the last column
+  was overwritten with nothing on screen to indicate the loss — a path, SHA or command output read off
+  the screen could simply be wrong. That column is now reserved. This reverses C-341's "the overlaid
+  scrollbar must not consume transcript width": one column of width is a smaller price than corrupted
+  text.
+- **Board and Fleet results summarize their shape instead of their envelope** (C-599). Every
+  `board.*`/`fleet.*` card previewed the first bytes of a bounded envelope — the identical
+  `{"data":{"bounded":true,"byte_limit":262144,…` prefix for every call, and the widest possible line.
+  Cards now read `31 workers · 16 waves · r276`, with the full envelope one expand away.
+- **The Fleet header names the wave that is actually running** (C-599). Active-wave selection tested
+  the inverse of a four-item terminal list, so any unrecognised status — including
+  `agent-turn-failed` — counted as active, and `BTreeMap` iteration returned the oldest match. A
+  long-dead failed wave held the header while another ran, with the same panel's worker list
+  disagreeing. Selection is now a closed allow-list of in-flight statuses, newest first by wave
+  number. Worker rows also prefer the current wave within a status class, so finished workers stop
+  crowding out the running one.
+- **`flux fleet run --dry-run` validates without writing** (C-594). It promised "validate and return
+  the proposed result without writing" and skipped worktree creation accordingly — then wrote a loop
+  binding snapshot into a story worktree that deliberately did not exist, so every dry run failed with
+  `workspace root …/stories/<ID>: No such file or directory` before returning a topology.
+- **An operator-authored segment is no longer told its actions are only captured** (C-597). Every
+  `ai_segment` inherited the adaptive planner's system prompt, which states that Flux may capture an
+  action instead of executing it and directs the model to hand a plan back through `finalize_plan`.
+  That is correct for the plan-then-approve CLI path and wrong for an authored segment, where effects
+  really do execute through the approve/execute batch path — and Fleet story workers complied with
+  the prompt: one made 35 read-only calls, attempted no effect, and reported it could not run
+  anything, while holding `write`, `edit`, `bash` and `git_commit` in its admitted ceiling. Authored
+  segments now carry an execution contract instead; the evidence and grounding discipline is
+  unchanged, and the adaptive planner's prompt is untouched.
+- **An authored segment that reaches its history ceiling no longer destroys the turn** (C-595).
+  A Fleet story worker committed its complete deliverable and then had the whole turn discarded by a
+  retained-history budget it crossed by 0.43%, so Fleet reported the one story that actually
+  delivered as the wave's only failure. Crossing the ceiling in an authored `ai_segment` now sheds
+  the oldest tool-result payloads into `tool_result_omitted` digest receipts — the same shape an
+  oversized single result already used — and keeps running with the most recent exchange verbatim.
+  When elision cannot free enough, the segment returns its evidence ledger as a result instead of an
+  error. `ai_segment` accepts `max_history_bytes` to raise the ceiling for a long implementation
+  loop. Ordinary adaptive turns are unchanged.
+- **A failed worker turn now records the session and receipt it already proved** (C-595). The turn's
+  parsed session id and event stream — including any commit the loop made before it failed — were
+  read successfully and then discarded, leaving a `failed` worker with no discoverable deliverable
+  and no `fleet rework` re-dispatch (that path requires a recorded runtime session). Both are now
+  persisted on the failure path alongside the error.
+- **An operator-authored `ai_segment` now runs with the exact tool ceiling it declares** (C-593).
+  The adaptive intent router's four-family cap bounds what the *model* may select; it was also
+  applied to the deterministic family union an authored `tools:` ceiling expands to, so any authored
+  loop spanning five or more families failed before its first tool call with `adaptive capability
+  declaration selected N distinct families; the maximum is 4`. A Fleet story-implementation loop
+  naming read, write, git, shell, datasource and system operations could never start a worker. The
+  cap now applies only to a model-declared selection; the independent operation-count and
+  schema-character budgets still bound both paths, and an adaptive state serialized by an older
+  runtime still resumes capped.
+- Workspace-root errors now name the offending path. `Workspace::new` and `Workspace::with_root`
+  reported a bare `workspace root: No such file or directory` while `Workspace::new_optional`
+  already named its path, leaving failures reached through `System::rerooted` with nothing to go on.
+- `flux fleet status` and `dashboard` now return the bounded `flux.fleet-status/v1` operational
+  projection instead of embedding durable `last_turn` receipts, tool events, answers and intake
+  bodies. Current lifecycle state—not stale receipt text—drives active and attention counts, and
+  terminal cancelled/completed workers no longer keep old errors in the attention rail. The compact
+  response keeps exact worker, wave, Board ref, session and repository identity plus targeted
+  inspect commands for deeper evidence. Targeted Fleet inspection is bounded too: a 256 KiB
+  structural response ceiling preserves terminal facts and replaces oversized evidence with
+  indexed omission metadata referencing Fleet state or the event journal, including digests for
+  omitted strings.
+- Structured JSON tool results are now redacted as JSON values before reserialization. A
+  credential-shaped substring inside an escaped model-stage state can no longer consume an escape,
+  invalidate the object, and make an authored loop see its typed result as opaque text; results that
+  need no redaction remain byte-for-byte unchanged.
+- An agent attached through `flux tui --fleet` can now enumerate durable native Fleet workers with
+  the bounded `fleet.agents` operation instead of asking the operator to supply guessed worker ids.
+  The attachment-only read uses the same state as `flux fleet agents` and the Workers view and stays
+  distinct from the pointwise transient-process `fleet.worker_status` operation. Both census paths
+  return role, task kind and resolved loop identity without embedding instructions or historical
+  turn receipts. The validated attachment pre-authorizes this bounded census, while an
+  operator-authored deny still wins.
+- Fleet-main Board/Fleet reads now use bounded native projections and require no approval. In
+  particular, `fleet.status` reads the compact inspect snapshot rather than serializing historical
+  worker turns and waves into the model context. Typed mutations retain revision, idempotency and
+  acknowledgement guards, and the installed catalog cannot refresh back into general coding,
+  plugin, pane, eval or transient-process operations between turns.
+- Durable loop bindings now canonicalize the set-valued required-operation and runtime-feature
+  fields at every reconstruction and live-session comparison. Sessions admitted by an older build
+  resume when only insertion order differs, while source, digest, profile, revision, runner and
+  entry-point drift still require an explicit new session.
+- Fleet-attached TUI startup and refresh now build Board/Fleet projections away from the terminal
+  event loop. A cheap durable-state token avoids redundant rebuilds, explicit loading/unavailable
+  states replace a frozen screen, and a failed later refresh keeps the last-good view marked stale.
 - Concurrent `fleet.isolate` calls now serialize Git's shared worktree-administration mutation
   while retaining disjoint checkout allocation, preventing partially written `.git/worktrees`
   metadata from breaking a parallel Board/Fleet wave.
@@ -126,6 +915,11 @@ All notable changes to this project are documented in this file. The format is b
   and are mirrored in Prism, tree-sitter, TextMate and IntelliJ.
 
 ### Changed
+
+- **Greenfield Node ecosystem tasks now route to the dedicated Node tool family** (A-149).
+  Explicit npm, package.json, JavaScript, TypeScript, Vue, Vuex, and React requests can surface
+  `npm` and `node_run` before a project marker exists. Generic `bash` and `proc.run` remain
+  operator-gated and are not added as an automatic fallback.
 
 - **Every Fleet worker turn now retains its admitted capability ceiling** (C-565). Template or
   ad-hoc admission normalizes named capability bundles into an exact host-enforced operation set

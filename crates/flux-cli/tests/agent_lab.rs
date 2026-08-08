@@ -91,6 +91,7 @@ fn record_writes_a_fixture_that_flux_test_and_the_time_machine_both_read() {
     for f in [
         "events.db",
         "flow.db",
+        "agent-loops",
         "model.jsonl",
         "plan.flux.snap",
         "scenario.toml",

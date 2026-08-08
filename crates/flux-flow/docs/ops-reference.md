@@ -95,6 +95,10 @@ optional arguments are in `[brackets]`.
 | `endpoint.info` | `id` | Low | One endpoint reference in full by id (e.g. `@endpoint/monitoring-prometheus`): URL, product, protocol, labels, owner, health; never a secret |
 | `endpoint.select` | `id` | Low | Bind a discovered endpoint by id and return its weak reference, to reuse across turns; the host resolves it and injects the credential when a call runs |
 | `endpoint.import` | `id` | Medium | Persist an endpoint reference to the local endpoints store so it survives the session — the weak reference only (URL + credential *location*); the credential is re-resolved live each session |
+| `host.list` | | Low | The named execution-substrate bindings registered this session (`[[host]]` config + hosts store): backend kind, address, availability — weak references only |
+| `host.info` | `id` | Low | One host binding in full by name: backend kind, address, availability, labels and a credential *presence* marker; never a value |
+| `host.probe` | `id` | Low | The backend's side-effect-free identity check: substrate identity (kind, workspace, confinement, remotely_reported) and, for a remote backend, the negotiated protocol version — nothing executes on the substrate |
+| `host.metrics` | `id` | Low | One binding's own condition, measured by that substrate about itself: CPU, load, memory, swap, disk, uptime, temperature, fans. Typed and unit-bearing; a metric it cannot measure is explicitly unavailable with a reason, never zero; a remote binding's readings are marked remotely reported |
 | `flux_reload` | | High | **`--dev` only**: recompile `flux-cli` in place. The new binary lands on disk but this session keeps the old one, so it returns instructions to exit and re-run with `--resume`; it never replaces the running process (C-57) |
 
 `write`, `edit`, `patch`, `append`, `task`, `bash`, `proc.run`, and the toolchain ops (`cargo_*`, `go_*`,
@@ -195,6 +199,32 @@ workers in flight and reconcile them later.
 | `fleet.start` | `item[, worktree, context_id, model]` | High | Start a flux worker for one board item as a guarded child process and return `{worker_id, endpoint, context_id, runtime, state}`. `worktree` confines it to that checkout (cwd + sandbox writable set) and may sit outside the workspace root, which is what `fleet.isolate` returns; the returned `context_id` resumes the same worker session on a later `fleet.dispatch`. Refuses when the sandbox is active without network — a wrapped worker binds inside its own netns and nothing could reach it |
 | `fleet.worker_status` | `worker_id` | Low | Worker liveness → `{state: starting\|live\|dead, live, endpoint, context_id, exit_code, detail}`. A dead worker reports no endpoint and carries the tail of its own output. This is the worker, not a task — for a task use `fleet.status` |
 | `fleet.stop` | `worker_id` | Medium | Stop a worker started by `fleet.start`, terminating its process group. An unknown worker id is an error; an externally managed worker refuses |
+| `fleet.agents` | `[limit]` | Low | On an explicitly attached native Fleet main only, list bounded durable worker admissions and current statuses without requiring known worker ids. This reads `.flux/fleet/state.json`; it does not inspect the transient A2A/process workers used by the other operations in this table |
+
+An attached native Fleet main replaces the colliding transient `fleet.status` / `fleet.cancel`
+implementations and installs the following closed coordinator service catalog. These operations call
+the same versioned JSON Board/Fleet services as the CLI; they are absent from ordinary agents and
+story workers. `task` remains the only non-Board/Fleet model-facing operation and its child catalog
+is independently reduced to read-only research. `[main].research_loop` forces a second
+operator-authored loop onto every such child, so role defaults cannot restore generic planning.
+
+| op | signature and risk | description |
+|---|---|---|
+| `board.show` | `{}` · Low | Show the authoritative workspace Board and planning documents |
+| `board.get` | `id` · Low | Read one exact namespaced item from the authoritative workspace Board |
+| `board.next` | `[limit]` · Low | List dependency-satisfied ready Board items in deterministic priority order |
+| `board.check` | `{}` · Low | Validate workspace Board configuration and story contracts |
+| `board.start` | `id[, if_revision, idempotency_key]` · Medium | Move one authoritative item to `in-progress` |
+| `board.block` | `id, reason[, if_revision, idempotency_key]` · Medium | Block one authoritative item and record why |
+| `board.unblock` | `id[, if_revision, idempotency_key]` · Medium | Return one blocked item to ready |
+| `board.comment` | `id, text[, if_revision, idempotency_key]` · Medium | Append a durable item comment |
+| `board.evidence` | `id, text[, if_revision, idempotency_key]` · Medium | Append structured item evidence |
+| `fleet.status` | `{}` · Low | Read the bounded durable Fleet lifecycle snapshot; historical turn and wave bodies are excluded |
+| `fleet.schedule` | `{}` · Low | Read the dependency-aware native Fleet schedule derived from the Board |
+| `fleet.run` | `items[, prepare_only, if_revision, idempotency_key]` · Medium | Prepare and launch a native Fleet wave for 1–10 exact dependency-satisfied Board refs |
+| `fleet.message` | `target, message[, wait, if_revision, idempotency_key]` · Medium | Deliver an acknowledged message to an admitted native Fleet agent |
+| `fleet.cancel` | `target[, if_revision, idempotency_key]` · Medium | Cancel one exact durable native Fleet worker or wave |
+| `fleet.resume` | `target[, if_revision, idempotency_key]` · Medium | Resume one exact native Fleet target from durable admitted state |
 
 **Egress posture.** `worker` is a caller-supplied argument, not configuration, so it is
 model-reachable and treated as such:
@@ -217,6 +247,11 @@ The ops are force-on (group `fleet`, empty `surface_when`): the worker address i
 is no workspace signal that could gate them honestly. `.flux/groups.toml` can still reassign or gate
 the group. A worker behind `flux serve`'s required bearer token is not yet reachable — the token is
 operator configuration that does not exist yet.
+
+`fleet.agents` is the exception to that force-on catalog: it is installed only for the main agent
+started by `flux tui --fleet`. Its result is capped at 100 worker records, reports the untruncated
+total, and intentionally omits worker instructions and turn bodies. The validated attachment
+pre-authorizes this read, while an operator-authored deny rule still wins.
 
 ## Work board ops (`<domain>.list` / `.get` / `.create` / `.transition` / `.claim` / `.comment` / `.record_dispatch` / `.query` / `.comments` / `.reassign` / `.record_evidence`)
 
@@ -431,7 +466,7 @@ still dispatches through the same `Executor` envelope.
 | `approve_batch` | `batch` | Validate the live operation schemas, compute aggregate risk, request one batch approval, and return an `ApprovalReceipt`. The opaque receipt is bound to the exact batch, session, caller/authority context, and policy context. |
 | `execute_batch` | `batch, receipt` | Consume a matching one-shot receipt and execute the ordered actions through `Executor`. Missing, changed, stale, reused, denied, or cross-context receipts fail closed. Returns an `ExecutionReport`; after one action fails, later actions are marked skipped. |
 | `present_results` | `step` or `approval` | Render a terminal chat/error/decision step or an approval denial into user-facing text without giving that text execution semantics. |
-| `ai_segment` | `goal, tools, max_rounds[, until]` | Run a bounded adaptive segment inside a deterministic flow. The required authored `max_rounds` is the segment's exact provider-call ceiling (it is not clamped by the normal agent default). The authored `tools` list is a hard live capability ceiling; reads gather evidence, effects use the same batch path, and the result is returned as `{result, state[, decision]}`. Provider usage folds into the enclosing turn. |
+| `ai_segment` | `goal, tools, max_rounds[, current_turn, max_tokens, max_history_bytes]` | Run a bounded adaptive segment inside a deterministic flow. The required authored `max_rounds` is the segment's exact provider-call ceiling (it is not clamped by the normal agent default). The authored `tools` list is a hard live capability ceiling; reads gather evidence, effects use the same batch path, and the result is returned as `{result, state[, decision]}`. Retained history above `max_history_bytes` (512 KiB by default) sheds the oldest tool-result payloads into digest receipts rather than failing the turn. Provider usage folds into the enclosing turn. |
 | `op.register` | `source, scope[, replace, expose]` | Register exactly one top-level Flux-Lang composite `op` for later reuse. `scope` is `turn`, `session`, `project`, or `global`; project/global writes are guarded filesystem writes, and all registered inner ops still dispatch through the normal envelope. |
 | `observe` | `kind[, data]` | Append an observation to the shared evidence log. The adaptive loop records stage transitions, intent, action-batch proposal/approval/execution, and turn execution reports. |
 | `evidence` | `[kind]` | Read observations back as a JSON array (filtered by `kind`, or the whole log). |

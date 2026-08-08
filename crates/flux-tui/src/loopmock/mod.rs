@@ -56,7 +56,7 @@ mod thread;
 mod timeline;
 mod tree;
 
-pub use axes::{render_axes, Axes, Depth, Shape, AXIS_SPACE};
+pub use axes::{render_axes, render_axes_of, Axes, Condense, Depth, Shape, AXIS_SPACE};
 pub use capture::{Fidelity, FidelityRow, FIDELITY};
 pub use fixture::{
     fixture, Fixture, Flat, LoadCase, Provenance, Status, Step, StepKind, Usage, LOAD_CASES,
@@ -570,7 +570,10 @@ pub(crate) fn status_style(status: Status, theme: &Theme) -> Style {
 /// The recommendation this story exists to produce. Five pictures and no decision is the failure
 /// mode, so the decision ships in the artifact rather than only in a review comment.
 pub const RECOMMENDATION: &str = "\
-BUILD THE AXES, AND SHIP THESE DEFAULTS: depth ALL · condense ON · pane OFF.
+BUILD THE AXES, AND SHIP THESE DEFAULTS: depth ALL · condense UNIFORM · pane OFF.
+A-137 took section 2's fourth decision: condensing is THREE-VALUED (off / uniform / top-level),
+because one bit cannot express it. UNIFORM is the default — top-level withholds every
+non-focused turn's interior, which is more, not less.
 Do not adopt a picture. And do not expect the axes to give you mock 3 — they do not, and section 2
 is the measurement that says so.
 
@@ -600,6 +603,18 @@ a depth limit and an optional pane IS the split'.
    step PLUS THE FOCUSED TOP-LEVEL STEP'S ENTIRE SUBTREE — including that subtree's COMPLETED work,
    which condensing by definition folds away. So the rail discriminates on FOCUS and condensing
    discriminates on STATUS. With one root the two rules coincide; with nine turns they cannot.
+
+   ⚠⚠ A-137 TOOK THAT DECISION, AND IT PARTLY CLOSES THIS GAP. Condensing is now three-valued and
+   `top-level` IS the rail's rule. Re-measured over the same envelope:
+     fan-out (hand-authored, 0 failures)   42 eligible viewports, 36 reproduced by top-level
+     long run (recorded, 9 turns, 1 failure) 24 eligible viewports,  0 reproduced by top-level
+   So the split is reachable after all — on a run with no failure in it. On RECORDED load it is
+   still not, and the salient difference is that one recorded `git_stage` error: `condensable`
+   refuses to fold a subtree holding a failure, so the root the rail would fold to a single row
+   stays open. ⚠ That mechanism is the LEADING CANDIDATE, not a measured cause — the numbers are
+   pinned by `top_level_condensing_reaches_the_split_only_on_a_run_without_a_failure`, the mechanism
+   is not. Either way the useful reading is that on real load the acceptance criterion 'condensing
+   never swallows a failure' and the split's rail are in tension, and the acceptance wins.
 
    ⚠ WHAT A-137 ACTUALLY OWES, THEN: not a fourth picture but a fourth DECISION — condensing's
    GRANULARITY. 'Finished work collapses to one row' does not say at what level, and the answer
@@ -864,11 +879,16 @@ fn axes_section() -> String {
     for axes in AXIS_SPACE {
         let (c, r) = axes.floor();
         let what = match (axes.depth, axes.condense, axes.pane) {
-            (axes::Depth::All, false, false) => {
+            (axes::Depth::All, Condense::Off, false) => {
                 "**the flat thread's view** (and the tree's, on a real run) — exactly"
             }
-            (axes::Depth::All, false, true) => "the split *only* where the split hides nothing",
-            (axes::Depth::All, true, false) => "**the recommended default**",
+            (axes::Depth::All, Condense::Off, true) => {
+                "the split *only* where the split hides nothing"
+            }
+            (axes::Depth::All, Condense::Uniform, false) => "**the recommended default**",
+            (axes::Depth::All, Condense::TopLevel, false) => {
+                "the rail's *shape* — one row per finished top-level step, the focused one in full"
+            }
             _ => "—",
         };
         out.push_str(&format!("| `{}` | {c}×{r} | {what} |\n", axes.label()));
@@ -897,7 +917,7 @@ fn axes_section() -> String {
         (
             Axes {
                 depth: Depth::All,
-                condense: false,
+                condense: Condense::Off,
                 pane: false,
             },
             "**condense off** — the failure is 166 steps back, and the window has scrolled past it. \
@@ -932,7 +952,7 @@ fn axes_section() -> String {
             render_axes(
                 Axes {
                     depth: Depth::All,
-                    condense: false,
+                    condense: Condense::Off,
                     pane: false,
                 },
                 LoadCase::Tidy,
@@ -962,7 +982,7 @@ fn axes_section() -> String {
         (
             Axes {
                 depth: Depth::Levels(2),
-                condense: false,
+                condense: Condense::Off,
                 pane: false,
             },
             LoadCase::FanOut,
@@ -972,7 +992,7 @@ fn axes_section() -> String {
         (
             Axes {
                 depth: Depth::All,
-                condense: true,
+                condense: Condense::Uniform,
                 pane: true,
             },
             LoadCase::LongRun,

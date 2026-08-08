@@ -430,6 +430,30 @@ if release.is_a?(Hash)
     violations << 'release.yml: attestation must be a separate tag-triggered job named `attest`'
   end
 
+  # C-696 — the registry is a third authority, and it is declared here rather than left undeclared
+  # because it is the only job that can push a public object nobody can withdraw. It holds a
+  # registry session and an attestation identity and NOTHING else: no Release credential, no
+  # repository write, no long-lived secret. `packages: write` bounds the ambient GITHUB_TOKEN, which
+  # is why no registry PAT appears anywhere in this workflow.
+  container = jobs['publish-container-image']
+  if container.is_a?(Hash)
+    granted = writes(effective_permissions(release, container))
+    unless granted == %w[attestations id-token packages]
+      violations << 'release.yml: job `publish-container-image` must hold exactly ' \
+                    '`attestations: write`, `id-token: write` and `packages: write` ' \
+                    "(found #{granted.inspect})"
+    end
+    require_conjunct(violations, 'release.yml', 'publish-container-image', container,
+                     "needs.plan.outputs.publishing == 'true'")
+    unless Array(container['needs']).include?('publish-github-release')
+      violations << 'release.yml: the container image must be published only after the GitHub ' \
+                    'Release it packages; a pushed image cannot be withdrawn'
+    end
+  else
+    violations << 'release.yml: container image publication must be its own job ' \
+                  '`publish-container-image`'
+  end
+
   publish = jobs['publish-github-release']
   if publish.is_a?(Hash)
     require_conjunct(violations, 'release.yml', 'publish-github-release', publish,
@@ -714,6 +738,14 @@ when 'attestation-write-escalation'
   doc = load(dest, 'release.yml')
   doc['jobs']['attest']['permissions']['contents'] = 'write'
   store(dest, 'release.yml', doc)
+when 'container-registry-authority-escalation'
+  doc = load(dest, 'release.yml')
+  doc['jobs']['publish-container-image']['permissions']['contents'] = 'write'
+  store(dest, 'release.yml', doc)
+when 'container-publication-from-dispatch'
+  doc = load(dest, 'release.yml')
+  doc['jobs']['publish-container-image']['if'] = "${{ needs.plan.result == 'success' }}"
+  store(dest, 'release.yml', doc)
 when 'undeclared-release-workflow'
   File.write(File.join(dest, 'release-extra.yml'), {
     'name' => 'release-extra',
@@ -768,6 +800,8 @@ publication-from-a-forged-input
 wrong-workflow-tag
 manual-crates-publication
 attestation-write-escalation
+container-registry-authority-escalation
+container-publication-from-dispatch
 undeclared-release-workflow
 "
   count=0

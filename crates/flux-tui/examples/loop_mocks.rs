@@ -107,7 +107,7 @@ fn explore(term: &mut Terminal<ratatui::backend::CrosstermBackend<io::Stdout>>) 
             }
             KeyCode::Char('c') => {
                 pick.composed = true;
-                pick.axes.condense = !pick.axes.condense;
+                pick.axes.condense = pick.axes.condense.cycle();
             }
             KeyCode::Char('p') => {
                 pick.composed = true;

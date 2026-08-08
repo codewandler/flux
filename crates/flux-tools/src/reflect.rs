@@ -434,6 +434,16 @@ struct AiSegmentInput {
     tools: Vec<String>,
     /// the required cap on delegated model rounds (the segment is always bounded)
     max_rounds: u32,
+    /// use exactly the current turn's latest user request beside `goal`, excluding retained history
+    #[serde(default)]
+    current_turn: bool,
+    /// maximum output tokens for each delegated model round; bounded by the parent agent setting
+    #[serde(default)]
+    max_tokens: Option<u32>,
+    /// retained-history ceiling in bytes for this segment; defaults to 512 KiB. Raise it for a long
+    /// implementation loop that legitimately accumulates many in-budget tool results
+    #[serde(default)]
+    max_history_bytes: Option<u64>,
 }
 
 /// Where a registered composite op is reusable.
@@ -463,7 +473,7 @@ struct RegisterCompositeInput {
     expose: Option<bool>,
 }
 
-/// `ai_segment(goal, tools, max_rounds) -> {result}` — hand a bounded native-schema stage run to the
+/// `ai_segment(goal, tools, max_rounds, current_turn?, max_tokens?) -> {result}` — hand a bounded native-schema stage run to the
 /// loop under an exact capability scope, then return control. Proposed effects become action batches
 /// and traverse the same approval and execution seams as the default adaptive loop.
 struct AiSegmentOp;
@@ -476,6 +486,8 @@ impl Tool for AiSegmentOp {
             description: "Hand a bounded run of model turns to the loop under a capability scope and \
                           an explicit exit condition, then return control to the flow. `tools` is the \
                           scope the delegated model may call within; `max_rounds` caps the run; \
+                          `current_turn` supplies only the latest user request without retained \
+                          history; `max_tokens` is bounded by the parent agent setting; \
                           Returns {result}. Gather calls and approved actions run through the same \
                           authorization, approval, and guarded-IO envelope."
                 .into(),

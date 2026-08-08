@@ -23,6 +23,7 @@
 pub mod datasource;
 pub mod endpoint;
 pub mod harness;
+pub mod host;
 pub mod usage_observatory;
 
 pub use datasource::{
@@ -43,6 +44,11 @@ pub use endpoint::{
     CrossPluginApprover, CrossPluginAudit, CrossPluginGrants, EndpointBroker,
     EndpointBrokerHostCaps, EndpointRegistry, HostCredentialReader, HostProviderInvoker,
     PluginRegistry, ProviderEntry, ProviderInvoker, StaticResolver, ENDPOINT_GROUP,
+};
+pub use host::{
+    binding_availability, host_tools, metric_answer_json, register_host_ops, render_metric_answer,
+    static_availability, try_register_host_ops, HostMetrics, HostProbeFailure, HostProbeReport,
+    HostProber, HostRegistry, HOST_GROUP,
 };
 
 #[cfg(feature = "embeddings")]

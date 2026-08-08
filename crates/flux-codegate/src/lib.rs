@@ -1236,6 +1236,8 @@ const GUARDED_PORT_TRAITS: &[&str] = &[
     "GuardedHostFiles",
     "GuardedWorkspaceFiles",
     "GuardedNetwork",
+    "GuardedMetrics",
+    "GuardedHttp",
 ];
 
 /// A production `impl <port trait> for <type>` — a type declaring itself a guarded IO backend.
@@ -2618,6 +2620,28 @@ pub fn pinned_discovery_calls(
     discovery_calls_named(src, scope, &PINNED_DISCOVERY_ENTRY_POINTS)
 }
 
+/// The setter that can replace a `System`'s metric roots (C-673).
+///
+/// The metrics allowance in `no_unreviewed_guarded_port_backend_outside_system` rests on this name
+/// having no production caller: the roots the native reader consults are `/proc` and `/sys`
+/// because every entry point constructs `MetricsRoots::native()` and nothing operation-, CLI- or
+/// wire-shaped can replace them. That is a claim about the tree, so it is checked against the tree.
+pub const METRICS_ROOTS_SETTER: &str = "with_metrics_roots";
+
+/// Every **production** call to [`METRICS_ROOTS_SETTER`] in `src`, by line (C-673).
+///
+/// Structural, through the same visitor as [`plugin_response_ingest_sites`], which is what makes
+/// the answer trustworthy: the `pub fn with_metrics_roots` definition is not a call, prose and
+/// string literals naming it are not calls, and — the finding this replaced a text scan for — the
+/// production half of a file whose inline test module appears near the top is read rather than
+/// skipped.
+pub fn metrics_roots_setter_calls(src: &str) -> syn::Result<Vec<usize>> {
+    Ok(production_calls_named(src, &[METRICS_ROOTS_SETTER])?
+        .into_iter()
+        .map(|hit| hit.line)
+        .collect())
+}
+
 /// C-404 — one **production** call to `PluginHost::call_with_host`: a place where a
 /// plugin-authored response enters flux.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -2633,16 +2657,24 @@ pub struct PluginResponseIngest {
 /// `PluginHost::call` is a thin self-delegation this scanner sees as the call it is.
 pub const PLUGIN_RESPONSE_INGEST_METHOD: &str = "call_with_host";
 
-struct PluginIngestVisitor {
+/// Every production call to one of `names`, by line.
+///
+/// Shared by the C-404 plugin-response census and C-673's metrics-roots guard. Both ask the same
+/// question — *does non-test code call this?* — and the answer has to be anchored on the
+/// `#[cfg(test)]` attribute the way [`TestScope::CfgTestItems`] documents, not on the first
+/// occurrence of the marker in the file's text: production code follows an inline test module in
+/// 63 of this workspace's source files, and a text scan reads all of it as test code.
+struct ProductionCallVisitor<'a> {
+    names: &'a [&'a str],
     /// `true` once inside a `#[cfg(test)]` item — test code has no operator-visible surface to
     /// protect and is deliberately not counted.
     in_test: bool,
     hits: Vec<PluginResponseIngest>,
 }
 
-impl PluginIngestVisitor {
+impl ProductionCallVisitor<'_> {
     fn record(&mut self, callee: &proc_macro2::Ident) {
-        if self.in_test || *callee != PLUGIN_RESPONSE_INGEST_METHOD {
+        if self.in_test || !self.names.contains(&callee.to_string().as_str()) {
             return;
         }
         self.hits.push(PluginResponseIngest {
@@ -2687,7 +2719,7 @@ impl PluginIngestVisitor {
     }
 }
 
-impl<'ast> Visit<'ast> for PluginIngestVisitor {
+impl<'ast> Visit<'ast> for ProductionCallVisitor<'_> {
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
         let gated = has_cfg_test(&item.attrs);
         self.scoped(gated, item, |this, item| {
@@ -2745,8 +2777,20 @@ impl<'ast> Visit<'ast> for PluginIngestVisitor {
 /// written. Items carrying `#[cfg(test)]` are excluded; the method's own `pub async fn` definition
 /// is not a call and so is not a hit.
 pub fn plugin_response_ingest_sites(src: &str) -> syn::Result<Vec<PluginResponseIngest>> {
+    production_calls_named(src, &[PLUGIN_RESPONSE_INGEST_METHOD])
+}
+
+/// Every production call to one of `names` in `src`.
+///
+/// Structural rather than textual, which is the whole reason this replaced a doc-comment census:
+/// `syn` excludes comments and string literals for free, so the table *describing* a site is not
+/// itself counted as one — the failure mode that made the prose census wrong on the day it was
+/// written. Items carrying `#[cfg(test)]` are excluded by the attribute, not by their position in
+/// the file; a name's own `fn` definition is not a call and so is not a hit.
+fn production_calls_named(src: &str, names: &[&str]) -> syn::Result<Vec<PluginResponseIngest>> {
     let file = syn::parse_file(src)?;
-    let mut visitor = PluginIngestVisitor {
+    let mut visitor = ProductionCallVisitor {
+        names,
         in_test: false,
         hits: Vec::new(),
     };
@@ -3956,6 +4000,34 @@ impl Exec for Double {}
             ),
             ("crates/flux-system/src/port.rs", "GuardedEnv", "System"),
             ("crates/flux-system/src/port.rs", "GuardedNetwork", "System"),
+            // C-653. Read-only and measurement-only: the native metrics backend opens no file
+            // outside the roots it is given, starts no process, and writes nothing.
+            //
+            // Which roots those are is the reviewable part, and C-673 narrowed the claim to what
+            // the code actually enforces. `MetricsRoots::pinned` accepts *any* pair of paths —
+            // nothing type-level keeps it inside `/proc` and `/sys`, and the earlier note claiming
+            // a caller could only ever narrow them was describing a containment nothing enforces.
+            // What is true is narrower: every production entry point constructs
+            // `MetricsRoots::native()`, and the one setter that can replace them,
+            // `System::with_metrics_roots`, has no caller anywhere outside a test — no operation,
+            // no CLI flag and no wire field reaches it.
+            //
+            // The second half is checked rather than asserted:
+            // `the_metrics_roots_allowance_note_states_only_what_the_code_enforces` runs
+            // `metrics_roots_setter_calls` over every workspace source file, structurally, scoped
+            // on the `#[cfg(test)]` attribute the way `TestScope::CfgTestItems` documents. That
+            // scoping is the whole difference between a check and a claim: this guard's first cut
+            // scanned from the first `#[cfg(test)]` marker to end of file, which reads the
+            // production half of 63 source files as test code — including `flux-system/src/lib.rs`,
+            // where the setter itself lives. What no check covers is the *first* half: nothing
+            // stops a future entry point from calling `MetricsRoots::pinned` directly, and a
+            // reviewer adding one has to come here.
+            //
+            // What the review is actually about is the *answer* shape — an unsupported metric must
+            // stay explicitly unavailable rather than becoming a zero a projection would read as a
+            // measurement, and (C-673) a cap that drops mounts must say so in the answer rather
+            // than report a truncated list as a complete one.
+            ("crates/flux-system/src/port.rs", "GuardedMetrics", "System"),
             (
                 "crates/flux-system/src/remote.rs",
                 "GuardedProcess",
@@ -3980,6 +4052,149 @@ impl Exec for Double {}
                 "crates/flux-system/src/remote.rs",
                 "GuardedNetwork",
                 "RemoteSystem",
+            ),
+            // C-654: metrics now delegate, under the protocol version bump C-653 said they would
+            // need. Reviewable on the same grounds as the families above — the backend measures
+            // nothing itself, it asks the far side and relays the answer — plus two obligations
+            // this family alone carries, both of which are about *not trusting the reporter*:
+            //
+            // - The reading is re-bounded through `metrics::bounded_reading` on the way out. The
+            //   caps on labels, mounts and sensors are a construction-site convention over public
+            //   fields, not a type invariant, so a delegate could otherwise hand back a reading no
+            //   local reader would produce. The HTTPS decoder bounds too; that is depth, not a
+            //   substitute, because `Delegate` is implementable by anyone.
+            // - `remotely_reported` is stamped here rather than read off the answer. A far side
+            //   that could set it to `false` would be asserting that this process observed the
+            //   number — the exact substitution `SubstrateIdentity` exists to prevent.
+            //
+            // What must not drift: the two negatives stay distinct (`Unserved` = serves no metrics
+            // at all; `Unavailable` = serves the family, no such instrument), and neither ever
+            // becomes a zero.
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedMetrics",
+                "RemoteSystem",
+            ),
+            // C-652 — the HTTP family. Two of these three send nothing of their own and the third
+            // is the workspace's one HTTP client, which is why the family adds no new IO path.
+            //
+            // `System`'s impl constructs nothing: `flux-system` holds no HTTP client by design, so
+            // the native backend serves the backend a composition site attached to it (C-675's
+            // `System::with_http`, one call on an `Arc<dyn GuardedHttp>` it was handed) and answers
+            // the port's fail-closed default when nobody attached one — which is every `System`
+            // this crate constructs. The client count is unaffected: attaching decides who may ask
+            // an existing backend, never who builds one.
+            //
+            // `RemoteSystem`'s impl **delegates** since C-674, where C-652 left it answering a typed
+            // `Unserved` naming the missing wire. It still constructs no client and opens no socket:
+            // it hands the request to a `Delegate` and the far side makes it, which is the same
+            // shape as the four families above. What it adds — and what to re-read on any change —
+            // is the pair of obligations the metrics entry states, applied here:
+            //
+            // - The answer is re-bounded through `port::bounded_response` against the *request's*
+            //   own `max_response_bytes`, plus the header and admit-list caps, because the caps on
+            //   `HttpResponse` are the substrate's promise and `Delegate` is implementable by
+            //   anyone. The HTTPS decoder bounds too; that is depth, not a substitute.
+            // - `PrivateAdmit::substrate` is stamped here rather than read off the answer. A far
+            //   side that could set it to `None` would be asserting that this process admitted the
+            //   private destination — the substitution `SubstrateIdentity` exists to prevent.
+            //
+            // What must not drift: the far side owns admission for every hop (it re-runs the egress
+            // guard on the URL it was handed rather than trusting the pins this process vetted), the
+            // per-hop secret re-authorization, the redirect bound and the byte cap; and a delegate
+            // that does not serve the family still answers `Unserved` without a request rather than
+            // falling back to sending from the coordinator's own process.
+            ("crates/flux-system/src/port.rs", "GuardedHttp", "System"),
+            (
+                "crates/flux-system/src/remote.rs",
+                "GuardedHttp",
+                "RemoteSystem",
+            ),
+            // The one that actually performs HTTP, and the reason the family exists. `NativeHttp`
+            // adds no client: it wraps the redirect-disabled, proxy-free `reqwest::Client` that
+            // `flux-web`'s reviewed egress broker already owned, and every request still goes
+            // through `flux_system::net`'s admission, C-77's connection pin, the bounded redirect
+            // chain and the response-byte cap. What is new is only *who may ask* — so this reads as
+            // one reviewed backend on the existing egress path rather than a second path.
+            //
+            // It lives in `flux-web` (L5) rather than beside the port (L2) because that is where the
+            // client is, and `flux-codegate`'s `Http` census keeps the count of clients at one. The
+            // layer map forbids the alternative outright.
+            (
+                "crates/flux-web/src/native_http.rs",
+                "GuardedHttp",
+                "NativeHttp",
+            ),
+            // C-651's confinement peer. Reviewable on the same grounds as `remote.rs`'s entries,
+            // and on one narrower one: `SandboxedSystem` holds a native `System` and every served
+            // operation forwards straight back to that system — to its inherent guarded method
+            // where it has one (process, files, env), and to its own `port.rs` trait impl for the
+            // families that live there (network, metrics). Either way the callee is the reviewed
+            // native backend, so the peer can neither add a permission nor remove one: the
+            // guarantees stay exactly the ones `System` enforces, including the single
+            // `build_command` spawn choke point the sandbox wraps.
+            //
+            // What it owns is *admission*, and that is the part to re-read on any change. It
+            // refuses to exist unless the composed `Sandbox` confines this process's own spawns,
+            // and it will not revive a bare `FLUX_SANDBOXED` marker that the ambient posture left
+            // inert — the marker is trusted only where `apply_sandbox_env` already trusted and
+            // disclosed it. A future edit that widened this type beyond delegation, or softened
+            // that admission, would be a new backend wearing this allowance — read
+            // `crates/flux-system/src/sandboxed.rs` before extending it.
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedProcess",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedHostFiles",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedWorkspaceFiles",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedEnv",
+                "SandboxedSystem",
+            ),
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedNetwork",
+                "SandboxedSystem",
+            ),
+            // Metrics delegate rather than deny (C-653): the peer confines what this process
+            // *spawns*, and a metric read happens in this process against this machine — the same
+            // machine the composed `System` measures, through the same narrowable `/proc`+`/sys`
+            // roots. An `Unserved` here would be a false negative about a host flux can genuinely
+            // measure.
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedMetrics",
+                "SandboxedSystem",
+            ),
+            // HTTP (C-675) is one delegating call and nothing else:
+            // `GuardedHttp::http_request(&self.inner, request, allow)`, forwarding to the composed
+            // `System` exactly as the network and metrics families above do. It adds no IO path
+            // because it opens nothing and builds nothing — the callee is the native backend, which
+            // itself only serves a backend a composition site attached to it (`System::with_http`),
+            // and answers the port's `Unserved` when none was. So a peer composed over an
+            // unattached system still refuses by name (pinned by test), and one composed by
+            // `flux-cli` over the system carrying `flux_web::NativeHttp` serves web effects through
+            // the same reviewed egress client, guard and audit sink an unselected run uses.
+            //
+            // C-652 left this impl empty for the reason that still holds: the native client is at
+            // L5 and this L2 type may not reach it, so inventing a client here would be the second
+            // egress path the `Http` census exists to prevent. Delegation is how the peer gets one
+            // without reaching upward — an edit that constructed a client inside this allowance
+            // would be exactly the thing that reasoning forbids.
+            (
+                "crates/flux-system/src/sandboxed.rs",
+                "GuardedHttp",
+                "SandboxedSystem",
             ),
         ];
         let mut allowance_use = vec![0usize; ALLOW.len()];
@@ -4039,6 +4254,207 @@ impl Exec for Double {}
             violations.is_empty(),
             "guarded-IO port implemented outside the reviewed native backend:\n  {}",
             violations.join("\n  ")
+        );
+    }
+
+    /// The metrics-roots scanner's own pins (C-673 review).
+    ///
+    /// The first cut of this guard scanned from the first `#[cfg(test)]` marker to EOF and treated
+    /// everything below it as test code. That is the heuristic
+    /// [`TestScope::CfgTestItems`] exists to refuse: 63 of the 451 scanned files declare an inline
+    /// test module near the top and carry production code below it — including
+    /// `crates/flux-system/src/lib.rs`, which *defines* the setter at line 1511 while its first
+    /// `#[cfg(test)]` sits at line 842, so 4431 lines of the setter's own file went unread. A guard
+    /// that cannot see the file it is about is not evidence, and the census note claiming it was
+    /// the check that fails is exactly the overclaim acceptance 4 exists to remove.
+    ///
+    /// So: the early test module must not blind it, the definition and prose must not count, and a
+    /// call inside a macro body must.
+    #[test]
+    fn metrics_roots_setter_scanner_sees_production_calls_below_an_early_test_module() {
+        let src = r#"
+//! Prose naming `with_metrics_roots` is not a call.
+#[cfg(test)]
+mod early;
+
+impl System {
+    pub fn with_metrics_roots(mut self, roots: MetricsRoots) -> Self {
+        self.metrics_roots = roots;
+        self
+    }
+}
+
+fn production(system: System, roots: MetricsRoots) -> System {
+    let _ = "with_metrics_roots";
+    system.with_metrics_roots(roots)
+}
+
+fn ufcs(system: System, roots: MetricsRoots) -> System {
+    System::with_metrics_roots(system, roots)
+}
+
+fn in_a_macro(system: System, roots: MetricsRoots) {
+    assert!(system.with_metrics_roots(roots).is_ok());
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture(system: System, roots: MetricsRoots) -> System {
+        system.with_metrics_roots(roots)
+    }
+}
+"#;
+        let hits = metrics_roots_setter_calls(src).unwrap();
+        assert_eq!(
+            hits.len(),
+            3,
+            "the method call, the UFCS call and the one inside `assert!` — all of them below an \
+             early `#[cfg(test)]`, and none of the definition, the doc comment, the string literal \
+             or the real test module: {hits:?}"
+        );
+        let lines: Vec<&str> = src.lines().collect();
+        for line in &hits {
+            assert!(
+                lines[line - 1].contains("with_metrics_roots"),
+                "hit at line {line} does not name the setter: {:?}",
+                lines[line - 1]
+            );
+        }
+
+        // The vacuity floor: a file with no production call must read as none, or the census above
+        // passes because the scanner sees nothing anywhere.
+        let test_only = r#"
+#[cfg(test)]
+mod tests {
+    fn fixture(system: System, roots: MetricsRoots) -> System {
+        system.with_metrics_roots(roots)
+    }
+}
+"#;
+        assert!(metrics_roots_setter_calls(test_only).unwrap().is_empty());
+    }
+
+    /// C-673: the metrics allowance note must claim only the property the code enforces.
+    ///
+    /// The note reviewed with C-653 said a caller "can narrow but never widen" the metric roots.
+    /// Nothing enforces that: [`MetricsRoots::pinned`] takes any two paths, and `with_metrics_roots`
+    /// is a plain setter. The property that *is* true is narrower and grep-provable — every
+    /// production entry point takes the native `/proc` + `/sys` roots, and the only caller of the
+    /// setter anywhere in the tree is a test. This pins both halves: the wording, and the fact it
+    /// rests on.
+    #[test]
+    fn the_metrics_roots_allowance_note_states_only_what_the_code_enforces() {
+        const ENTRY: &str = "\"crates/flux-system/src/port.rs\", \"GuardedMetrics\", \"System\"";
+        // The name the census claims about is the one the scanner looks for — two spellings would
+        // eventually disagree, and the note would go on describing a check of something else.
+        let setter = METRICS_ROOTS_SETTER;
+
+        // The note is the run of comment lines immediately above the allowance entry, so this
+        // reads what a reviewer reads rather than the whole file.
+        let lines: Vec<&str> = include_str!("lib.rs").lines().collect();
+        let entry = lines
+            .iter()
+            .position(|line| line.contains(ENTRY))
+            .expect("the `GuardedMetrics`/`System` allowance entry");
+        let start = lines[..entry]
+            .iter()
+            .rposition(|line| !line.trim_start().starts_with("//"))
+            .map_or(0, |last| last + 1);
+        let note = lines[start..entry].join("\n");
+        assert!(
+            !note.contains("never widen"),
+            "the metrics allowance still claims a containment nothing enforces — \
+             `MetricsRoots::pinned` accepts any pair of paths:\n{note}"
+        );
+        assert!(
+            note.contains(setter),
+            "the allowance must name `{setter}`, the fact its narrower claim rests on:\n{note}"
+        );
+
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+        let files = workspace_source_files(repo_root);
+        assert!(
+            files.len() > 20,
+            "expected to scan a representative set of source files, found {}",
+            files.len()
+        );
+        let mut callers = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file).unwrap();
+            let hits = metrics_roots_setter_calls(&source).unwrap_or_else(|error| {
+                panic!(
+                    "parse {} for the metrics-roots scan: {error}",
+                    file.display()
+                )
+            });
+            let rel = file.strip_prefix(repo_root).unwrap_or(file);
+            for line in hits {
+                callers.push(format!("{}:{line}", rel.display()));
+            }
+        }
+        assert!(
+            callers.is_empty(),
+            "the allowance says only tests reach `{setter}`, but production code calls it:\n  {}",
+            callers.join("\n  ")
+        );
+    }
+
+    /// C-651: the **confinement peer** is a reviewed guarded-IO backend, and a complete one.
+    ///
+    /// Decision 0018 rule 3 makes `sandboxed` a selectable peer rather than only a spawn-time
+    /// modifier, which means a second type inside `flux-system` now claims to *be* a guarded
+    /// substrate. Two things have to hold, and neither is implied by the other:
+    ///
+    /// - It serves **every** port `ExecutionSystem` bundles. A peer that implemented four of the
+    ///   five would not be an `ExecutionSystem` at all, and the gap would show up as a confusing
+    ///   trait-bound error at a distant call site rather than here.
+    /// - Each of those impls is in the reviewed ALLOW of
+    ///   [`no_unreviewed_guarded_port_backend_outside_system`], which is what makes the claim a
+    ///   review rather than a formality. That test enforces the allowance half; this one enforces
+    ///   that the backend it allows actually exists and is whole.
+    #[test]
+    fn the_confinement_peer_backend_is_reviewed_and_complete() {
+        // The `ExecutionSystem` constituent ports as of C-651, plus C-653's `GuardedMetrics` and
+        // C-652's `GuardedHttp`. Deliberately spelled out rather than read from
+        // `GUARDED_PORT_TRAITS`: a port that joins the guarded set but not the execution bundle
+        // would otherwise be demanded of this backend by drift alone.
+        //
+        // Implementing a port is not the same as serving it: every impl here delegates to the
+        // composed `System`, and what that answers for `GuardedHttp` depends on whether a
+        // composition site attached a backend (C-675). The claim under test is that the peer *is* a
+        // complete `ExecutionSystem`, which is what makes an omission a compile error at a distant
+        // call site rather than a silent gap here.
+        const EXECUTION_PORTS: &[&str] = &[
+            "GuardedEnv",
+            "GuardedHostFiles",
+            "GuardedHttp",
+            "GuardedMetrics",
+            "GuardedNetwork",
+            "GuardedProcess",
+            "GuardedWorkspaceFiles",
+        ];
+        const PEER: &str = "SandboxedSystem";
+
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let peer_rs = crates_dir.join("flux-system/src/sandboxed.rs");
+        let source = std::fs::read_to_string(&peer_rs).unwrap_or_else(|error| {
+            panic!(
+                "the `sandboxed` peer backend must live at {}: {error}",
+                peer_rs.display()
+            )
+        });
+
+        let hits = guarded_port_impls(&source).unwrap();
+        let mut served: Vec<&str> = hits
+            .iter()
+            .filter(|hit| hit.backend == PEER)
+            .map(|hit| hit.port.as_str())
+            .collect();
+        served.sort_unstable();
+        assert_eq!(
+            served, EXECUTION_PORTS,
+            "the confinement peer must serve every execution port as a production impl: {hits:?}"
         );
     }
 
@@ -4219,9 +4635,11 @@ fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
     }
 
     /// Architecture guard: no production (non-test) tool/runtime/plugin path may construct a raw
-    /// std or Tokio process command. `flux-system` owns exactly two reviewed construction points:
-    /// the canonical std builder and its Tokio conversion. Allowances are single-use, so a second
-    /// constructor even inside either function fails.
+    /// std or Tokio process command. `flux-system` owns the two reviewed construction points every
+    /// effect goes through — the canonical std builder and its Tokio conversion — and the only
+    /// admitted constructor outside it is the TUI's self re-exec, which replaces this process
+    /// rather than running anything (see its entry below). Allowances are single-use, so a second
+    /// constructor even inside an already-allowed function fails.
     #[test]
     fn no_raw_process_command_outside_system() {
         let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -4238,6 +4656,23 @@ fn fixture() { std::fs::read_to_string(".flux/config.toml"); }
                 "crates/flux-system/src/lib.rs",
                 "build_tokio_command",
                 ProcessApi::Tokio,
+            ),
+            // `/restart` replaces the TUI process with the newly installed binary. It is the one
+            // process construction that must NOT go through the seam above, because that builder
+            // exists to run an *effect* under policy: it scrubs the environment down to `SAFE_ENV`,
+            // forces the working directory to the workspace root, and may wrap the argv in the
+            // sandbox. A re-exec has to preserve the process exactly — same executable, same argv,
+            // same environment, same directory — or the session that comes back is a different one
+            // wearing the same name, which is precisely what the restart contract forbids.
+            //
+            // It is admissible because it governs nothing: the program is `current_exe()` and the
+            // arguments are this process's own `args_os()`, so no untrusted input reaches it, and
+            // `exec` produces no child to confine — the successor inherits the same authority the
+            // operator already had.
+            (
+                "crates/flux-tui/src/lib.rs",
+                "exec_replacement",
+                ProcessApi::Std,
             ),
         ];
         let mut allowance_use = vec![0usize; ALLOW.len()];

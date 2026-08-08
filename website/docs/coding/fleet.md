@@ -26,14 +26,16 @@ epics, story status, milestones or the program schedule.
 |---|---|---|
 | Fleet | One local execution supervisor rooted at a workspace. | Fleet config plus runtime journal |
 | Main coordinator | The single reserved agent that accepts requirements and orchestrates dispatch. It selects from the Board; it does not replace Board authority. | Fleet runtime state |
-| Worker | One admitted sub-agent with one role, capability ceiling, persistent session and bounded assignment. In the normal story path, worker and sub-agent are 1:1. | Fleet admission/runtime state |
+| Worker | One admitted sub-agent with one role, capability ceiling, persistent session and bounded assignment. In the normal story path, worker and sub-agent are 1:1. Its recorded status is reconciled against the process supervising its turn, so a worker whose supervisor is gone reads `interrupted` rather than staying busy forever. | Fleet admission/runtime state |
 | Configured wave | Board-owned repository-local dispatch template. It has no worker, worktree or runtime lifecycle. | `.flux/board.toml` |
-| Dispatched wave instance | One pinned execution of selected BoardRefs, with integration bases, workers, receipts, reviews, gate and apply status. | `.flux/fleet/state.json` and events |
-| Handoff | Typed candidate result for one story: exact commit, write set and test evidence. It is not completion. | Fleet runtime state/events |
+| Dispatched wave instance | One pinned execution of selected BoardRefs, with integration bases, workers, receipts, reviews, gate and apply status. Integration cherry-picks each story's **whole commit range** from its pinned base to its cited commit, because a worker legitimately makes several commits and applying only the cited one silently drops the rest. A failed integration is retryable once its cause is fixed. | `.flux/fleet/state.json` and events |
+| Handoff | Typed candidate result for one story: exact commit, write set and test evidence. The host re-runs the cited argv at the pinned base and at the commit, in a checkout pinned at that base which integration never touches. It verifies *the argv it is given*, so a commit can still break a different test in the same story — a green handoff is not a green story, which is what the repository gate is for. It is not completion. | Fleet runtime state/events |
 | Review | Fresh read-only assessment of the exact candidate commit and story contract. A result is PASS, REWORK or PARK. | Fleet runtime state/events |
-| Gate | Repository command run against the assembled wave candidate. Green makes the wave apply-eligible; it does not publish it. | Fleet receipt/runtime state |
-| Apply | Explicit local integration of a green candidate into the configured checkout. | Git plus Fleet runtime state |
-| Release/deploy | Separate publication boundary after apply. Fleet never implies either from a green gate. | Release/deployment system |
+| Candidate preparation | Optional per-repository step that regenerates whatever the repository derives from a whole candidate, run after every cherry-pick and before the gate. Its output is committed into the candidate. | Fleet receipt/runtime state |
+| Gate | Repository command run against the assembled wave candidate. Green makes the wave apply-eligible; it does not publish it. One gate run per candidate: a retry that recomputes an identical candidate is refused rather than re-gated. | Fleet receipt/runtime state |
+| Accept (apply) | Pins a green candidate with an annotated `fleet/accepted/<wave>/<repository>` tag. It does not merge, does not touch a working tree, and does not require the canonical ref to have stood still. | Git tag plus Fleet runtime state |
+| Land | Writing the canonical branch from accepted candidates, re-gated against whatever that branch has become. Separate from acceptance, because a candidate is green against the base it was gated on. | Git plus the operator |
+| Release/deploy | Separate publication boundary after landing. Fleet never implies either from a green gate. | Release/deployment system |
 
 The word “wave” should therefore be qualified when it matters: a **configured wave** is planning
 configuration; a **dispatched wave instance** is mutable execution state.
@@ -64,13 +66,32 @@ decision_mode = "human" # or "auto"
 allow_ad_hoc_agents = true
 worktree_root = ".flux/fleet/worktrees"
 
+[loop_profiles.implementation]
+revision = "1"
+source = ".flux/fleet/loops/story-implementation.flux"
+entry = "work"
+
+[loop_profiles.research]
+revision = "1"
+source = ".flux/fleet/loops/research.flux"
+entry = "research"
+
+[loop_policy]
+implementation = "implementation"
+documentation = "implementation"
+maintenance = "implementation"
+research = "research"
+
 [main]
 instructions = ".flux/fleet/main.md"
 model = "codex/gpt-5.6-sol"
+loop = ".flux/fleet/loops/main-coordinator.flux"
+research_loop = ".flux/fleet/loops/research.flux"
 
 [[agent_templates]]
 id = "story-worker"
 role = "writer"
+task_kind = "implementation"
 instructions = ".flux/fleet/agents/story-worker.md"
 model = "codex/gpt-5.6-sol"
 mode = "write"
@@ -90,14 +111,32 @@ id = "web"
 root = "../web"
 canonical_ref = "origin/main"
 board = "product"
+# Optional. Regenerates whatever this repository derives from a whole candidate, once, after every
+# cherry-pick and before the gate. Committed into the candidate so it survives into the accepted tag.
+prepare = ["npm", "run", "build:docs"]
 gate = ["npm", "test"]
 ```
 
+A `prepare` step exists because some checked-in artifacts are derived from the whole wave rather than
+from any one story — a documentation mirror, a generated index, an aggregated manifest. No story can
+produce a correct one: two stories regenerating the same artifact collide, and regenerating it on
+either branch alone yields an artifact missing the other story's contribution. Preparation runs at the
+only point where the inputs are complete. A preparation failure is that repository's failure, so a
+stale derived artifact never reaches the gate disguised as the stories being wrong.
+
 Instruction paths are confined under the fleet root. Validation rejects duplicate/reserved ids,
 another coordinator role, invalid instance limits, overlapping roots, missing boards, invalid refs,
-and unsupported fields. Board validation separately rejects program dependency cycles,
+missing task-kind loop policy, unsupported loop runtime features, loop operations outside the
+template's capability ceiling, and unsupported fields. Board validation separately rejects program dependency cycles,
 cross-repository configured waves, or a wave over ten. Refresh and other read commands report
 dirty, stale, or diverged checkouts without fetching or modifying them.
+
+Fleet workers do not use the coordinator's loop and do not fall back to the general adaptive loop.
+Each template declares a `task_kind`; `[loop_policy]` maps that kind to an operator-authored
+`[loop_profiles.*]` binding. Admission validates the exact source and snapshots it with bounded
+profile/revision/digest metadata in the worker's fenced runtime directory. Message, restart, resume
+and rework reconstruct that snapshot, so later config or file edits affect new workers only. A new
+admission/session is required to change a live worker's loop.
 
 ### Configuration is not state
 
@@ -148,6 +187,21 @@ views; wide terminals also show an attention rail. Typed requirements are journa
 accepted, delivered, and completed/failed acknowledgement states. A stopped Fleet is observable but
 cannot accept input. See the [TUI guide](../agent/tui.md#board-and-fleet-operations) for navigation,
 decision confirmation, restart behavior, and the deliberately narrow mutation boundary.
+
+The attached main agent has a closed coordinator catalog: typed `board.*` operations for showing,
+checking, selecting and updating authoritative work; typed `fleet.*` operations for bounded status,
+schedule, complete worker enumeration, run, message, cancel and resume; and `task` for bounded
+read-only research. It does not receive shell, editing, git mutation, web/plugin, eval, pane, or the
+legacy transient-process Fleet operations. `fleet.agents` reads the same durable admissions shown by
+the Workers view and `flux fleet agents`, so the coordinator can discover ids before acting. Safe
+Board/Fleet reads are pre-authorized unless an operator-authored deny rule wins. A `task` child has
+its own read-only catalog and cannot inherit coordinator mutations or delegate again.
+
+`[main].loop` and `[main].research_loop` are required. Each free-form coordinator turn runs the
+first operator-authored Flux-Lang loop with only the current request and the closed coordinator
+catalog. Every `task` child runs the second operator-authored loop over its independent read-only
+catalog. Neither path falls back to the general adaptive intent/explore, `create_plan`, or
+retained-history budget path. Missing or invalid loop configuration refuses before a model call.
 
 The main agent plans against revisioned context rather than an untracked system prompt:
 
@@ -257,6 +311,56 @@ flux fleet task api "audit the next ready contract" --mode read-only --output js
 flux fleet task api/C-41 "implement the accepted story" --mode write --output json
 ```
 
+## Unattended driving
+
+`flux fleet drive` is the driver itself, as a verb. One tick runs four phases in a fixed order and
+nothing else:
+
+```sh
+flux fleet drive --tick --output json                       # exactly one tick
+flux fleet drive --loop --interval 60 --output json         # ticks until stopped or quiesced
+flux fleet drive --loop --interval 60 --max-ticks 20 --output json
+```
+
+| phase | what it does |
+|---|---|
+| report | fingerprints exactly the facts a tick acts on — revision, admission window, every wave and worker status |
+| advance | a wave whose every story holds an accepted handoff leaves `awaiting-handoffs` for `handoffs-ready` |
+| accumulate | records the tick on fleet state (`drive.ticks`, `drive.fingerprint`) and journals `fleet.drive.tick` |
+| dispatch | sends workers at the schedule, up to the free width |
+
+Judgment stays outside the driver: planner, retro and scribe remain authored `.flux` loops, and
+`drive` owns only these mechanics. Every read goes through the native store and every write through
+the revision-guarded delta path, so a tick can never race a coordinator or an operator.
+
+Dispatch consults `flux board reconcile` and **fails closed**. If reconcile cannot be read the
+tick dispatches nothing and says so, because an empty already-built set is indistinguishable from
+"nothing is already built" — the case that once sent ten workers at stories whose work was already
+merged. Anything held back is named with its reason rather than dropped:
+
+```json
+{
+  "schema": "flux.fleet-drive-tick/v1",
+  "tick": 12,
+  "idle": false,
+  "dispatch": {
+    "width": 2,
+    "items": ["api/C-41"],
+    "withheld": [
+      {"item": "api/C-40", "reason": "already-built", "signals": ["commit-subject"]},
+      {"item": "web/C-12", "reason": "claimed", "detail": "wave-88 still holds an attempt at this item"},
+      {"item": "db/C-7", "reason": "parked", "detail": "wave-91 is parked pending a decision: waiting on the API decision"}
+    ]
+  }
+}
+```
+
+`--loop` runs under a durable single-instance guard, so a second driver refuses and names the pid
+holding it; a lock naming a process that is gone is not a lock and needs no hand cleanup. The loop
+is stopped by durable facts rather than a signal: `flux fleet stop` and `flux fleet quiesce` both
+end it at the next tick boundary, and a quiesced fleet refuses `drive` outright because a tick
+dispatches.
+
 ## The typed handoff
 
 A worker result is not parsed from prose. Its `FleetHandoff` names:
@@ -284,6 +388,11 @@ flux fleet handoff wave-7 api/C-41 --commit FULL_SHA \
   --test-arg cargo --test-arg test --test-arg=-p --test-arg api \
   --failing-before --passing-after --summary "Implemented the accepted contract" --output json
 ```
+
+`--from-worktree` replaces the repeated `--write-set` when the commit range already proves it: the
+host derives the write set from `base..HEAD` in the story worktree, and the owning worker from the
+agent that wave assigned to that worktree. Neither recorded fact is retyped, so neither can be
+mistyped.
 
 ## Review and bounded rework
 
@@ -376,11 +485,111 @@ flux fleet status --output json
 flux fleet inspect integration wave-7 --output json
 flux fleet integrate wave-7 --if-revision 17 --idempotency-key integrate-wave-7 --output json
 flux fleet apply wave-7 --if-revision 18 --idempotency-key apply-wave-7 --output json
+flux fleet apply wave-7 --only api --output json
 ```
 
-`apply` revalidates the base, board revisions, gate record, and repository cleanliness, then merges
-locally in repository order. It never pushes, opens a pull request, tags, releases, deploys, or
-deletes a worktree. Those are separate operator decisions.
+`apply` **accepts** a candidate: it checks that the repository recorded exactly one green final gate
+and that the candidate branch still points at the commit that was gated, then pins that commit with
+an annotated `fleet/accepted/<wave>/<repository>` tag. It does not merge, and it does not require the
+canonical ref to have stood still — ordinary work continues while a wave is gated, and a candidate is
+no less valid for it. The tag is what makes accepted-but-unlanded work impossible to lose.
+
+Acceptance is deliberately not landing. Writing the canonical branch is a separate step with its own
+verification, because a candidate is green against *the base it was gated on* — the acceptance record
+names that base, and whether the canonical ref has moved since, precisely so the landing step knows it
+must re-gate.
+
+`apply <wave> --only <repository>` accepts one repository's candidate from a wave whose other
+repositories failed. Integration assembles and gates one candidate per repository, so a wave can hold
+a green candidate beside a conflicted one; without this, an independent repository's delivered work
+would be stranded by a collision it had no part in. A named apply reports what it left behind and does
+not change the wave's own verdict.
+
+`apply` never pushes, opens a pull request, pushes a tag, releases, deploys, or deletes a worktree.
+Those are separate operator decisions.
+
+## Reclaiming storage
+
+A wave's build directories are the largest thing the fleet leaves on disk, and disk is what actually
+caps how many workers can run. Acceptance reclaims automatically; `fleet reclaim` covers the waves
+that ended some other way.
+
+```sh
+flux fleet reclaim --dry-run --output json   # what would be freed
+flux fleet reclaim wave-7 --output json      # one wave
+flux fleet reclaim --output json             # every wave that is not in flight
+```
+
+Build output is regenerable and always goes. A **worktree** is removed only for a wave that is applied
+or cancelled — an unfinished wave keeps its shape, because a worktree that happens to be empty is not
+the same as one that is no longer needed, and a wave with deliverable work and nowhere to assemble a
+candidate cannot be repaired. A worktree that still holds a commit or an uncommitted change is
+retained with the reason, and a branch is deleted only when git agrees it holds nothing unique.
+
+A wave that can still advance is refused rather than reclaimed: deleting a build it is about to use
+would cost work rather than space.
+
+## Repairing a wave's structure
+
+Reclamation, a hand-deleted directory or an interrupted assembly can leave a wave whose topology names
+a worktree disk no longer has, or whose integration checkout sits somewhere other than the base it is
+pinned to. Both are mechanical to fix from records the fleet already holds — the source checkout, the
+branch, the pinned base — and both were previously hand-written `git` under pressure.
+
+```sh
+flux fleet repair wave-7 --dry-run --output json   # what it would rebuild
+flux fleet repair wave-7 --output json
+```
+
+A missing checkout is recreated on its **recorded branch**, so a worker's committed work comes back
+with it; only a branch that is gone too is created afresh at the pinned base. A derived worktree — the
+integration assembly and the pinned verification checkout — is put back on its base when it has
+drifted off. A story worktree is never rewound: its commits are the deliverable, and being ahead of the
+base is its correct state.
+
+Repair refuses anything that would discard work and reports the reason instead of acting: a worktree
+holding an uncommitted change, one git cannot inspect, and one sitting on the commit its gate recorded
+as the candidate. An applied or cancelled wave is refused outright, because its worktrees are gone on
+purpose.
+## Parking a wave
+
+Some waves have to wait for a human — an open question, an unavailable dependency, a review that has
+not happened. `park` records that pause on the wave itself, with the reason and the state the wave
+returns to.
+
+```sh
+flux fleet park wave-7 --reason "waiting on the API decision" --output json
+flux fleet status --output json          # the pause and its reason are on the wave row
+flux fleet unpark wave-7 --output json   # back to the state it held
+```
+
+Parking is a lifecycle state, not an annotation. `fleet status` reports the reason on the wave row in
+both its JSON and human forms, so a paused wave is legible without reading durable state and nothing
+re-decides it every minute; `unpark` restores the recorded previous status, so leaving the pause is a
+verb rather than an edit. A wave parked by exhausted rework rounds carries no recorded previous
+status and returns to `awaiting-handoffs`.
+
+**Parking harvests first.** A worker that committed its deliverable and then ran out of turn holds
+that work in a worktree nothing has recorded, and a pause written on top of it buries a finished
+story under a decision. `park` records those handoffs from the worktrees before it writes the pause,
+reports them as `data.harvested`, and journals `wave.park.harvested`.
+
+**Unparking resets the budget the park exhausted.** The pause has been answered, so every story the
+park froze returns to its accepted handoff and its `rework_attempts` counter is cleared, reported as
+`data.budget_reset`. Without that, the story stayed `parked` — so the wave could never earn
+`handoffs-ready` again — and the very next review parked it again on its first round, buying the
+human's answer nothing.
+
+A parked wave keeps its claim on its items: the work it holds is still on disk and the pause is a
+decision a human has yet to answer. `fleet drive` therefore withholds those items with
+`"reason": "parked"` and the recorded reason, rather than reporting them as live work. The claim is
+released only when the wave provably ends — applied or cancelled — and the items become dispatchable
+again.
+
+Parking never overwrites an existing reason: a second `park` is a `conflict/precondition`, as is
+unparking a wave that is not parked. A parked wave is not counted as requiring attention — the
+decision to pause has already been made — and its build output stays reclaimable, because its commits
+live on branches.
 
 ## Restart and resume
 
@@ -397,6 +606,42 @@ flux fleet stop --output json
 ```
 
 Status has an independent read lane, so a busy or stuck worker cannot make fleet inspection hang.
+
+Resume is addressed. Each pending item records the agent it was sent to — coordinator intake and
+tasks belong to `main`, a message belongs to the worker it names — and a resumed agent is asked to
+continue its own assignment plus the items addressed to it and nothing else. Resuming a worker
+therefore neither shows nor acknowledges the coordinator's queue, so every item is still delivered at
+most once, to the agent it was addressed to.
+### Quiescing before an install
+
+Installing a new Flux binary while a wave is in flight is the one maintenance act that can corrupt a
+run in progress. `fleet quiesce` makes it a verb instead of a procedure.
+
+```sh
+flux fleet quiesce --reason "install 0.9.0" --output json
+flux fleet resume --output json
+```
+
+`quiesce` records a durable maintenance window on fleet state and then reports what is still moving.
+The window is recorded first and unconditionally: `run`, `spawn` and `task` refuse while it is set,
+so no wave can be dispatched between the check and the install. The command itself **fails** with
+`conflict/precondition` while any worker turn is still in flight, naming each one, so
+`flux fleet quiesce && install` cannot walk past a live worker. Re-run it once they settle to
+confirm; `data.safe_to_install` is the machine-readable form of that confirmation.
+
+Inspection, `handoff`, `integrate`, `apply` and `reclaim` stay available while quiesced — the window
+stops new work, it does not blindfold the operator. `fleet status` reports the window under
+`quiesce`, and only `fleet resume` lifts it.
+
+`status` and `dashboard` are bounded projections, not a dump of durable state. They report main
+state, active and attention worker counts, wave and item state, exact board references,
+repositories, current sessions, the last transition or error summary and the current revision, and
+they stay inside a fixed byte budget however much turn history the fleet has retained. Answers, tool
+events, diffs, instruction bodies and repository contents are never copied into them; anything the
+budget drops is reported as payload-free omission metadata, and the human form names the next useful
+inspection or recovery command. A worker counts as active only while its recorded transition says a
+turn is in flight, so a completed, failed, cancelled or interrupted process is never active merely
+because an old receipt still says `working`.
 
 ## Bounded inspection replaces helper scripts
 
@@ -415,6 +660,8 @@ flux fleet inspect result api/C-41 --limit 100 --output json
 flux fleet inspect activity --limit 100 --output json
 flux fleet inspect worktree worker-1 --limit 100 --output json
 flux fleet inspect integration wave-7 --limit 100 --output json
+flux fleet inspect gate wave-7 --limit 100 --output json
+flux fleet inspect gate wave-7 --repository api --limit 100 --output json
 flux fleet inspect source api --limit 100 --output json
 flux fleet inspect search C-41 --limit 100 --output json
 flux fleet inspect story api/C-41 --limit 100 --output json
@@ -423,13 +670,42 @@ flux fleet note "Candidate preserved while CI is unavailable" --output json
 flux fleet dashboard --output json
 ```
 
+`flux fleet agents` lists every durable worker as a bounded summary: id, role, task kind, status,
+Board ref, wave, session and resolved loop identity. It never returns worker instructions or full
+historical turn receipts; use a targeted inspect view when deeper evidence is needed.
+
+`flux fleet inspect gate <wave>` answers the most-wanted question about a red wave — *why did the gate
+fail* — without knowing the shape of `state.json`. It returns each repository's gate status,
+candidate, argv, exit code and the gate's own captured `stdout`/`stderr`, **tail first**: the last
+line the gate wrote is the first line reported, because that is where the failure is and a gate log
+is far longer than any bound. Each stream reports `line_count` and `truncated`, so a bounded tail is
+never mistaken for a short log. `--repository <id>` narrows a multi-repository wave to one gate, and
+a gate that never ran reports its `reason` instead of evidence.
+
+`flux fleet status` and `dashboard` use the same bounded operational projection. They report current
+coordinator, worker, wave, Board-ref, session, repository and attention state without copying
+answers, tool events or intake bodies from durable receipts. The response names the targeted
+`inspect worker|wave|activity|snapshot` command for deeper evidence; terminal workers are not made
+active or attention-worthy merely because an older receipt or error said otherwise.
+
+Targeted inspection has a fixed structural byte ceiling in addition to its `--limit` item bound.
+Small terminal identity, status, outcome and session fields are retained first. Oversized strings,
+event collections, handoffs or reviews become indexed omission records that report the source path
+and reason; string omissions also report encoded size and digest, while collection omissions report
+kept and omitted counts. Structured JSON is never sliced into an invalid fragment.
+
 Events are redacted before persistence, not merely at display time. The corpus covers credentials,
 `.env`, key files, model commentary, commands, diffs, and JSON fields. Follow mode emits NDJSON so
 an agent does not parse terminal decoration.
 
 Fleet also bounds evidence before the supervisor retains it. Adaptive tool results larger than
 64 KiB become payload-free omission records; accumulated adaptive message history refuses above
-512 KiB and a complete provider request refuses above 1 MiB. Child NDJSON lines are limited to
+512 KiB and a complete provider request refuses above 1 MiB. An operator-authored `ai_segment` is
+bounded differently, because a long implementation loop accumulates many in-budget results and may
+already have committed by the time it reaches the ceiling: crossing its history budget sheds the
+oldest tool-result payloads into digest receipts and continues, and if elision cannot free enough the
+segment returns its evidence ledger as a result rather than failing the turn. Author
+`max_history_bytes` on the segment to raise that ceiling. Child NDJSON lines are limited to
 240 KiB (including the newline), below the 256 KiB parser boundary. An oversized nonterminal event
 becomes `event_omitted`; an oversized `turn_end` keeps its session, outcome, usage and cost while its
 answer/error payload becomes `payload_omitted`. `turn.budget`, `model.call` and the Fleet receipt's

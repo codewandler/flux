@@ -235,6 +235,46 @@ impl A2aClient {
             .ok_or_else(|| A2aError::Decode("response had neither result nor error".to_string()))
     }
 
+    /// A plain JSON GET against a **surface** route hanging off the same authenticated origin as
+    /// the A2A endpoint, returning `(status, body)`; a non-JSON body decodes as `Value::Null`.
+    ///
+    /// A2A itself is entirely JSON-RPC over one endpoint, so this is deliberately not part of the
+    /// protocol surface — it exists because a flux-served agent mounts C-453's `/approvals` beside
+    /// `/a2a` under the *same* bearer credential, and [`crate::attach`] must read that posture with
+    /// the client that already holds the credential and the origin lock. The status code is
+    /// returned rather than folded into an error because the interesting answers here (`501` "this
+    /// server asks nobody", `401` "not with this credential") are postures to report, not failures.
+    pub(crate) async fn origin_get(&self, path: &str) -> Result<(u16, Value)> {
+        let url = self
+            .base
+            .join(path.trim_start_matches('/'))
+            .map_err(|e| A2aError::Url(format!("{path}: {e}")))?;
+        let resp = self
+            .auth(self.http.get(url))
+            .send()
+            .await
+            .map_err(|e| A2aError::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Ok((status, serde_json::from_str(&body).unwrap_or(Value::Null)))
+    }
+
+    /// [`A2aClient::origin_get`]'s write half: POST `body` as JSON, returning `(status, body)`.
+    pub(crate) async fn origin_post(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        let url = self
+            .base
+            .join(path.trim_start_matches('/'))
+            .map_err(|e| A2aError::Url(format!("{path}: {e}")))?;
+        let resp = self
+            .auth(self.http.post(url).json(body))
+            .send()
+            .await
+            .map_err(|e| A2aError::Http(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    }
+
     /// `message/send` — send a message and get back a [`Task`] or a [`Message`]. With `blocking`,
     /// ask the agent to run to completion before responding.
     pub async fn send(&self, message: Message, blocking: bool) -> Result<SendOutcome> {
@@ -292,7 +332,35 @@ impl A2aClient {
             message,
             configuration: None,
         };
-        let req = JsonRpcRequest::new("message/stream", params);
+        self.stream_rpc("message/stream", params).await
+    }
+
+    /// `tasks/resubscribe` — re-attach an SSE stream to a task that is already running (or already
+    /// finished and still retained), without starting a turn.
+    ///
+    /// This is the reattach half of an attached session: a resubscriber is an **observer**, so
+    /// dropping the returned stream cancels nothing on the far side, unlike the stream
+    /// [`A2aClient::stream`] owns. A live task yields a snapshot frame and then follows to the
+    /// terminal one; a retained terminal task yields its final frame and closes.
+    ///
+    /// Only the **served** dispatch implements this; the reduced embeddable dispatch classifies it
+    /// unsupported (`-32004`), which arrives as [`A2aError::Rpc`].
+    pub async fn resubscribe(&self, task_id: &str) -> Result<EventStream> {
+        self.stream_rpc(
+            "tasks/resubscribe",
+            TaskGetParams {
+                id: task_id.to_string(),
+            },
+        )
+        .await
+    }
+
+    /// The shared body of every SSE-returning JSON-RPC call: POST `method` with `params`, insist on
+    /// an `text/event-stream` response, and decode each `data:` frame's JSON-RPC `result` into a
+    /// [`StreamEvent`]. Both `message/stream` and `tasks/resubscribe` are exactly this call with a
+    /// different method name, so the non-SSE refusal and the frame decoding cannot drift apart.
+    async fn stream_rpc<P: Serialize>(&self, method: &str, params: P) -> Result<EventStream> {
+        let req = JsonRpcRequest::new(method, params);
         let rb = self
             .auth(self.http.post(self.rpc_url.clone()).json(&req))
             .header("accept", "text/event-stream");
@@ -322,7 +390,7 @@ impl A2aClient {
             }
             let snippet: String = body.chars().take(200).collect();
             return Err(A2aError::Decode(format!(
-                "message/stream did not return an event stream: {snippet}"
+                "{method} did not return an event stream: {snippet}"
             )));
         }
 

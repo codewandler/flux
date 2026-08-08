@@ -27,7 +27,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use flux_agent::{register_agent_ops, AdaptiveLoopPolicy};
+use flux_agent::{register_agent_ops, AdaptiveLoopPolicy, AgentLoopBinding, AgentLoopSpec};
 use flux_core::{DispatchId, Error, Result, Usage};
 use flux_events::EventStore;
 use flux_flow::AgentSink;
@@ -133,6 +133,8 @@ pub struct LocalSpawner {
     default_model: String,
     default_thinking: bool,
     default_effort: Option<Effort>,
+    /// Host-owned outer loop forced onto every child. `None` preserves each role's configured loop.
+    agent_loop: Option<AgentLoopBinding>,
     /// Complete native intent/explore policy assigned to every role-derived child spec. Kept
     /// separate from `SpawnLimits`: those bound the whole child/outer loop, while this bounds the
     /// adaptive model stages inside one logical run.
@@ -153,6 +155,12 @@ pub struct LocalSpawner {
     /// [`ResourceLimits::independent_copy`] (same numbers, own concurrency budget — a shared one
     /// deadlocks). Default (unconfigured) leaves children unbounded, exactly as before.
     resource_limits: ResourceLimits,
+    /// C-612: the operator's permission rules, so a denial survives delegation. `None` keeps the
+    /// prior empty-manager behaviour.
+    permissions: Option<Arc<PermissionManager>>,
+    /// C-612: the operator's authored `[tools] disable` expressions, so an op the operator disabled
+    /// is disabled for sub-agents too. Empty (the default) keeps the prior behaviour.
+    disabled_patterns: Vec<String>,
     /// Current delegation depth (0 = a top-level agent's direct child). A child is a leaf when
     /// `depth + 1 >= max_depth`. The default `max_depth = 1` keeps every sub-agent a leaf.
     depth: usize,
@@ -176,12 +184,15 @@ impl LocalSpawner {
             default_model: default_model.into(),
             default_thinking: false,
             default_effort: None,
+            agent_loop: None,
             adaptive_policy: AdaptiveLoopPolicy::default(),
             limits: SpawnLimits::new(max_tokens),
             approver: None,
             auth: None,
             audit: None,
             resource_limits: ResourceLimits::new(),
+            permissions: None,
+            disabled_patterns: Vec::new(),
             depth: 0,
             max_depth: 1,
         }
@@ -206,6 +217,31 @@ impl LocalSpawner {
     /// is `N × max_live_agents`; with only the per-agent number set, it is still unbounded.
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
+        self
+    }
+
+    /// C-612: carry the operator's permission rules into every sub-agent.
+    ///
+    /// A child executor was built with `PermissionManager::new()` — empty. Since an empty manager
+    /// resolves every subject to `Ask` and `SubAgentApprover` answers `Allow` for anything
+    /// non-destructive, an operator's `[permissions] deny` rule evaporated at the delegation boundary
+    /// while still reading as enforced. `None` preserves that prior behaviour for embedders who
+    /// configured no permissions at all.
+    pub fn with_permissions(mut self, permissions: Option<Arc<PermissionManager>>) -> Self {
+        self.permissions = permissions;
+        self
+    }
+
+    /// C-612: carry the operator's `[tools] disable` expressions into every sub-agent.
+    ///
+    /// The child executor was built with no disabled set at all, so an op an operator had disabled
+    /// stayed advertised to a sub-agent's model and dispatched for real — `[tools] disable` bound the
+    /// agent the operator was watching and nothing it delegated to. These are the ORIGINAL authored
+    /// expressions (exact names or `family.*` globs), not the parent's resolved set: a child's catalog
+    /// is a different one (role ∩ scope narrowing, plus its own agent ops), so the names are resolved
+    /// against the child registry at spawn. Empty keeps the prior behaviour.
+    pub fn with_disabled_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.disabled_patterns = patterns;
         self
     }
 
@@ -242,6 +278,24 @@ impl LocalSpawner {
     pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
         self.default_thinking = thinking;
         self.default_effort = effort;
+        self
+    }
+
+    /// Force one host-authored outer loop onto every child, overriding role frontmatter.
+    ///
+    /// This is for implementors that own a specialized delegation contract (for example a
+    /// read-only Fleet research child) and must not fall back to the generic adaptive role loop.
+    /// Tool authority remains independently bounded by the child registry and role/scope
+    /// intersection; selecting a loop never widens it.
+    pub fn with_agent_loop(mut self, agent_loop: AgentLoopSpec) -> Self {
+        self.agent_loop = Some(AgentLoopBinding::from_spec(agent_loop));
+        self
+    }
+
+    /// Force one already-resolved host binding onto every child without losing its admitted
+    /// profile/revision/source identity.
+    pub fn with_agent_loop_binding(mut self, binding: AgentLoopBinding) -> Self {
+        self.agent_loop = Some(binding);
         self
     }
 
@@ -297,6 +351,7 @@ impl LocalSpawner {
             default_model: self.default_model.clone(),
             default_thinking: self.default_thinking,
             default_effort: self.default_effort,
+            agent_loop: self.agent_loop.clone(),
             adaptive_policy: self.adaptive_policy.clone(),
             limits: self.limits.clone(),
             approver: self.approver.clone(),
@@ -305,6 +360,10 @@ impl LocalSpawner {
             // C-299: the ceiling descends through nested delegation too — a grandchild counts
             // against the same budget as the agent that started the chain.
             resource_limits: self.resource_limits.clone(),
+            // C-612: descends through nested delegation for the same reason the resource ceiling does
+            // — a grandchild must not escape a denial its ancestor was subject to.
+            permissions: self.permissions.clone(),
+            disabled_patterns: self.disabled_patterns.clone(),
             depth,
             max_depth: self.max_depth,
         }
@@ -497,14 +556,34 @@ impl Spawner for LocalSpawner {
         // would make the child queue behind the very call awaiting it: a deadlock bounded only by
         // the queue timeout. Hence per agent — same numbers, own budget.
         // See `ResourceLimits::independent_copy`.
-        let executor = Executor::new_with_authorization(
-            registry,
-            PermissionManager::new(),
-            approver,
-            ctx,
-            authorization,
-        )
-        .with_resource_limits(self.resource_limits.independent_copy());
+        // C-612: the operator's rules, not an empty manager. An empty one resolves every subject to
+        // `Ask`, and `SubAgentApprover` allows anything non-destructive — so a `[permissions] deny`
+        // used to be silently lost here.
+        let permissions = self
+            .permissions
+            .as_ref()
+            .map(|manager| manager.as_ref().clone())
+            .unwrap_or_default();
+        let executor =
+            Executor::new_with_authorization(registry, permissions, approver, ctx, authorization)
+                .with_resource_limits(self.resource_limits.independent_copy());
+        // C-612: `[tools] disable` reaches the child too — before this the child executor carried no
+        // disabled set at all, so an op the operator disabled stayed in the child's advertised catalog
+        // and dispatched for real. Resolve the operator's expressions against the CHILD's own registry
+        // (role ∩ cap_scope narrowing plus its own agent ops make it a different catalog from the
+        // parent's) and keep the original expressions as well, so an op introduced by a later catalog
+        // generation is disabled at that generation's turn boundary — the same pair the top-level
+        // executor installs.
+        let executor = if self.disabled_patterns.is_empty() {
+            executor
+        } else {
+            let resolved = executor
+                .registry()
+                .resolve_disabled(&self.disabled_patterns);
+            executor
+                .with_disabled_ops(resolved.disabled)
+                .with_disabled_patterns(self.disabled_patterns.clone())
+        };
 
         // The role *is* the agent definition: body → system prompt, `tools` already applied to the
         // scoped registry above, model inherits the spawner default when the role doesn't override it.
@@ -518,6 +597,10 @@ impl Spawner for LocalSpawner {
         }
         spec.thinking = role.thinking.unwrap_or(self.default_thinking);
         spec.effort = role.effort.or(self.default_effort);
+        if let Some(agent_loop) = &self.agent_loop {
+            spec.agent_loop = agent_loop.spec().clone();
+            spec.agent_loop_binding = Some(agent_loop.clone());
+        }
         spec.adaptive_policy = self.adaptive_policy.clone();
         // A-41: a role's `model:` override speaks the same provider-prefixed spec form `-m` accepts
         // (e.g. `openrouter/deepseek/deepseek-v4-flash`), but sub-agents always run on the PARENT's
@@ -671,6 +754,8 @@ pub struct SubAgents {
     pub default_model: String,
     pub default_thinking: bool,
     pub default_effort: Option<Effort>,
+    /// Optional host-owned outer loop forced onto every child.
+    pub agent_loop: Option<AgentLoopSpec>,
     pub limits: SpawnLimits,
     pub approver: Option<Arc<dyn Approver>>,
     pub auth: Option<(AuthorizationPolicy, IdentityCell)>,
@@ -682,6 +767,12 @@ pub struct SubAgents {
     /// [`with_resource_limits`](Self::with_resource_limits) — the SDK's client builders and the CLI
     /// fill it in from what the host/operator configured, so a delegating host does not have to.
     pub resource_limits: ResourceLimits,
+    /// C-612: the operator's permission rules, carried into every sub-agent so a `[permissions] deny`
+    /// is not silently lost at the delegation boundary. `None` keeps the prior behaviour.
+    pub permissions: Option<Arc<PermissionManager>>,
+    /// C-612: the operator's authored `[tools] disable` expressions, carried into every sub-agent so
+    /// a disabled op is disabled for delegated work too. Empty keeps the prior behaviour.
+    pub disabled_patterns: Vec<String>,
 }
 
 impl SubAgents {
@@ -702,13 +793,29 @@ impl SubAgents {
             default_model: default_model.into(),
             default_thinking: false,
             default_effort: None,
+            agent_loop: None,
             limits: SpawnLimits::new(max_tokens),
             approver: None,
             auth: None,
             audit: None,
             max_depth: 1,
             resource_limits: ResourceLimits::new(),
+            permissions: None,
+            disabled_patterns: Vec::new(),
         }
+    }
+
+    /// C-612: carry the operator's permission rules into every sub-agent.
+    pub fn with_permissions(mut self, permissions: Arc<PermissionManager>) -> Self {
+        self.permissions = Some(permissions);
+        self
+    }
+
+    /// C-612: carry the operator's `[tools] disable` expressions into every sub-agent — see
+    /// [`LocalSpawner::with_disabled_patterns`].
+    pub fn with_disabled_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.disabled_patterns = patterns;
+        self
     }
 
     /// Give every sub-agent the parent runtime's resource ceilings (C-299) — **per agent**, see
@@ -751,6 +858,13 @@ impl SubAgents {
     pub fn with_reasoning(mut self, thinking: bool, effort: Option<Effort>) -> Self {
         self.default_thinking = thinking;
         self.default_effort = effort;
+        self
+    }
+
+    /// Force one host-authored outer loop onto every child. See
+    /// [`LocalSpawner::with_agent_loop`].
+    pub fn with_agent_loop(mut self, agent_loop: AgentLoopSpec) -> Self {
+        self.agent_loop = Some(agent_loop);
         self
     }
 
@@ -802,7 +916,12 @@ impl SubAgents {
         .with_max_depth(self.max_depth)
         // C-299: carry the parent's ceilings down. Unset is `ResourceLimits::new()` (unbounded),
         // so a host that configured nothing sees no behaviour change.
-        .with_resource_limits(self.resource_limits);
+        .with_resource_limits(self.resource_limits)
+        .with_permissions(self.permissions)
+        .with_disabled_patterns(self.disabled_patterns);
+        if let Some(agent_loop) = self.agent_loop {
+            spawner = spawner.with_agent_loop(agent_loop);
+        }
         if let Some(approver) = self.approver {
             spawner = spawner.with_approver(approver);
         }
@@ -1241,7 +1360,14 @@ impl Tool for TaskTool {
             // spawned inside a worktree session inherits the transitioned root (with its own
             // independent WorkspaceContext — a child transition never affects the parent).
             system: Some(ctx.system()),
-            execution_system: Some(ctx.execution_system()),
+            // C-675: the parent's **selection**, not the native fallback. `execution_system()`
+            // resolves an absent selection to the native `System`, so snapshotting that would hand
+            // every child a selection its parent never made — and one family can tell the two
+            // apart: `http.request`/`web.fetch` follow the selected substrate whenever there is
+            // one, so a fabricated `Some(native)` turns a sub-agent's web effect into a refusal in
+            // a run the operator selected nothing for. `None` keeps the child on the same
+            // native, worktree-following path its parent is on.
+            execution_system: ctx.selected_execution_system(),
             tool_registry: ctx.runtime_turn_context().tool_registry(),
             tool_registry_base: ctx.runtime_turn_context().tool_registry_base(),
         };
@@ -1489,6 +1615,48 @@ mod tests {
         }
     }
 
+    /// C-612 (failing first): an operator's permission rules must reach a sub-agent. The child
+    /// executor was built with `PermissionManager::new()` — empty — which resolves every subject to
+    /// `Ask`; `SubAgentApprover` then allows anything non-destructive, so a `[permissions] deny` rule
+    /// was silently lost at the delegation boundary while still reading as enforced.
+    #[test]
+    fn a_permission_manager_reaches_children_and_descends_through_nesting() {
+        let denied = Arc::new(PermissionManager::from_rules(&[], &["bash".to_string()]));
+
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        )
+        .with_permissions(Some(denied.clone()));
+        assert!(
+            spawner.permissions.is_some(),
+            "the spawner carries the operator's rules"
+        );
+
+        // And it descends: a grandchild must not escape a denial its ancestor was subject to, for the
+        // same reason the resource ceiling descends.
+        let nested = spawner.at_depth(1, ToolRegistry::new(), temp_system());
+        assert!(
+            nested.permissions.is_some(),
+            "permissions descend through nested delegation"
+        );
+
+        // Absent stays absent — embedders who configured nothing keep the prior behaviour.
+        let unconfigured = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        assert!(unconfigured.permissions.is_none());
+    }
+
     #[tokio::test]
     async fn spawner_runs_a_role_and_returns_text() {
         let mut roles = RoleRegistry::default();
@@ -1657,6 +1825,7 @@ mod tests {
                 max_tokens: Some(222),
                 max_calls: Some(1),
             },
+            max_history_bytes: None,
         };
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider_requests = requests.clone();
@@ -3091,6 +3260,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn host_authored_child_loop_overrides_the_generic_role_loop() {
+        let mut roles = RoleRegistry::default();
+        let mut role = parse_role("---\n---\nYou are a scout.", "scout");
+        role.agent_loop =
+            Some("flow role_loop -> string\n  return \"wrong role loop\"".to_string());
+        roles.insert(role);
+        let forced = flux_agent::AgentLoopSpec::parse(
+            "flow fleet_research -> string\n  return \"forced research loop\"",
+        )
+        .unwrap();
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1_024,
+        )
+        .with_agent_loop(forced);
+
+        let outcome = spawner
+            .spawn(
+                SpawnRequest::new("scout", "inspect only"),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.text, "forced research loop");
+    }
+
     // ---- sub-agent capability-scope intersection (L-11 acceptance #4) ----
     //
     // Reuses the module-level `Ping` (a marker-writing op) / `PingPlanMock` (plans one `ping` call then
@@ -4110,6 +4311,55 @@ mod tests {
         );
     }
 
+    /// C-612 (failing first): the operator's `[tools] disable` must reach a sub-agent. The child
+    /// executor was built with no disabled set at all, so an op the operator disabled stayed
+    /// advertised to the child's model and dispatched for real. `PINGED.marker` exists iff the
+    /// disabled op actually executed inside the child — assert on the effect, not on configuration.
+    #[tokio::test]
+    async fn disabled_ops_reach_the_sub_agent_and_descend_through_nesting() {
+        let system = unique_system("c612-disable");
+        let mut base = ToolRegistry::new();
+        base.register(Arc::new(Ping));
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [ping]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(PingPlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            system.clone(),
+            "mock",
+            1024,
+        )
+        .with_disabled_patterns(vec!["ping".to_string()]);
+
+        let outcome = spawner
+            .spawn(
+                SpawnRequest::new("scout", "scout the repo"),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            system.read_file("PINGED.marker").await.is_err(),
+            "an op the operator disabled must not execute inside a sub-agent"
+        );
+        assert!(
+            outcome.is_ok(),
+            "the refusal is a tool-level error, not a dead turn: {:?}",
+            outcome.err()
+        );
+
+        // And it descends: a grandchild must not resurrect an op an ancestor's operator disabled.
+        let nested = spawner.at_depth(1, ToolRegistry::new(), system.clone());
+        assert_eq!(nested.disabled_patterns, vec!["ping".to_string()]);
+    }
+
     /// WS3 (isolation): a sub-agent inherits the parent's workspace-confined `System`, so a child op
     /// cannot read outside the workspace — the filesystem half of account isolation.
     #[tokio::test]
@@ -4716,6 +4966,134 @@ mod tests {
         );
         // And nothing dragged the child back through the parent's state: the child really did move.
         assert_ne!(canon(&parent_worktree_root), canon(&child_worktree_root));
+    }
+
+    /// Records what the CHILD context says about the operator's **selection** — the narrower
+    /// question `ToolContext::selected_execution_system` asks, not the native-resolving
+    /// `execution_system`. `None` is the answer that matters: it is what an unselected run means,
+    /// and the family that reads it (`http.request` / `web.fetch`, C-652) behaves differently for
+    /// `Some(native)` than for `None`.
+    struct SelectionProbe {
+        seen: Arc<std::sync::Mutex<Option<Option<String>>>>,
+    }
+    #[async_trait]
+    impl Tool for SelectionProbe {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec::read_only("selection_probe", "p", json!({"type": "object"}))
+        }
+        async fn execute(&self, ctx: &ToolContext, _p: Value) -> Result<ToolResult> {
+            *self.seen.lock().unwrap() = Some(
+                ctx.selected_execution_system()
+                    .map(|substrate| substrate.substrate_identity().kind),
+            );
+            Ok(ToolResult::ok("probed"))
+        }
+    }
+
+    /// A provider that selects and calls `selection_probe`, then finishes with prose.
+    struct SelectionProbePlanMock {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for SelectionProbePlanMock {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        async fn stream(&self, request: Request) -> Result<ChunkStream> {
+            if request_has_tool(&request, "declare_intent") {
+                return Ok(Box::pin(futures::stream::iter(
+                    intent_chunks("probe the selection", &["core"])
+                        .into_iter()
+                        .map(Ok),
+                )));
+            }
+            let n = self
+                .calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let chunks = if n == 0 {
+                native_call("probe-1", "selection_probe", json!({}))
+            } else {
+                prose_chunks("done")
+            };
+            Ok(Box::pin(futures::stream::iter(chunks.into_iter().map(Ok))))
+        }
+    }
+
+    /// Spawn one sub-agent through the real `task` seam and report what the child observed about
+    /// the parent's substrate selection.
+    async fn spawned_child_selection(parent: &ToolContext) -> Option<String> {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut base = ToolRegistry::new();
+        base.try_register_from_with_placement(
+            "C-675 selection probe fixture",
+            Arc::new(SelectionProbe { seen: seen.clone() }),
+            OperationPlacement::SelectedExecutionSystem,
+        )
+        .unwrap();
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role(
+            "---\ntools: [selection_probe]\n---\nYou are a scout.",
+            "scout",
+        ));
+        let spawner: Arc<dyn Spawner> = Arc::new(LocalSpawner::new(
+            Arc::new(|| {
+                Ok(Box::new(SelectionProbePlanMock {
+                    calls: std::sync::atomic::AtomicUsize::new(0),
+                }))
+            }),
+            Arc::new(roles),
+            base,
+            parent.system(),
+            "mock",
+            1024,
+        ));
+        let out = TaskTool
+            .execute(
+                &parent.clone().with_spawner(spawner),
+                json!({"role": "scout", "task": "probe"}),
+            )
+            .await
+            .expect("the sub-agent runs");
+        assert!(!out.is_error, "the sub-agent must run: {}", out.content);
+        let seen = seen.lock().unwrap().clone();
+        seen.expect("the probe ran in the child")
+    }
+
+    /// C-675 (acceptance 3) — a spawned sub-agent's context carries the parent's **selected**
+    /// substrate, and carries *nothing* when the parent selected nothing.
+    ///
+    /// This is the open question C-652's review routed here. `task` snapshots the parent's
+    /// substrate onto the `SpawnRequest`, and the question is which of the two readings it
+    /// snapshots. `execution_system()` resolves an absent selection to the native `System`, so
+    /// passing that hands every child a selection its parent never made — and one family can tell
+    /// the difference: `http.request`/`web.fetch` route to the selected substrate *when there is
+    /// one*, and a bare `System` serves no HTTP. A fabricated `Some(native)` therefore turns a
+    /// sub-agent's web effect into a refusal in a run where the operator selected nothing.
+    ///
+    /// Both directions are asserted here because either alone is satisfiable by the wrong code: a
+    /// child that always inherits passes the first, a child that never inherits passes the second.
+    #[tokio::test]
+    async fn a_spawned_sub_agent_carries_the_parents_selected_substrate() {
+        let selected: Arc<dyn flux_system::port::ExecutionSystem> = Arc::new(
+            flux_system::remote::RemoteSystem::loopback(unique_system("c675-parent-selection")),
+        );
+        let chosen = selected.substrate_identity().kind;
+        let parent =
+            ToolContext::new(unique_system("c675-parent")).with_execution_system(selected.clone());
+
+        assert_eq!(
+            spawned_child_selection(&parent).await,
+            Some(chosen),
+            "a child must inherit the substrate the operator selected for the parent"
+        );
+
+        let unselected = ToolContext::new(unique_system("c675-unselected-parent"));
+        assert_eq!(
+            spawned_child_selection(&unselected).await,
+            None,
+            "a child of an unselected parent must not carry a selection its parent never made — \
+             `Some(native)` is not the same answer as `None` to the family that asks"
+        );
     }
 
     /// C-100: nested delegation re-bases the depth-incremented spawner on the CHILD's snapshot —

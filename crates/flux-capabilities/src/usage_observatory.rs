@@ -760,6 +760,7 @@ mod tests {
                 None,
                 1,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "secret sentinel".into(),
                     model: "gpt-5".into(),
                 },
@@ -778,6 +779,7 @@ mod tests {
                 Some(1),
                 3,
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "ok".into(),
                     iterations: 1,
                     answer: "secret sentinel".into(),

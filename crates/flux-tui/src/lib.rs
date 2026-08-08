@@ -6,6 +6,8 @@
 //! be resumed with their durable activity; PgUp/PgDn/wheel scroll; Ctrl-C interrupts; and guarded
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
+mod agent_loop;
+pub mod attach;
 mod controller;
 pub mod fleet;
 mod interaction;
@@ -20,6 +22,10 @@ pub mod splash;
 mod state;
 mod terminal_io;
 
+use attach::{
+    announce_attachment, apply_attach_update, refuse_local_only, replay_remote_history,
+    spawn_attached_approval_poll, spawn_attached_cancel, spawn_attached_turn, Attachment,
+};
 pub use controller::ApprovalView;
 use controller::{
     approval_key, send_action_event, show_next_approval, ApprovalAction, ChannelApprover,
@@ -104,8 +110,19 @@ pub struct TuiRunOptions {
     pub interaction_queue: Option<Arc<InteractionQueue>>,
     /// Typed Board/Fleet projection and bounded mutation bridge. `None` is explicitly standalone.
     pub operations_source: Option<operations::SharedFleetBoardSource>,
+    /// Cheap truthful attachment seed rendered while the first full projection loads off-thread.
+    pub operations_initial_snapshot: Option<operations::FleetBoardSnapshot>,
+    /// Source token corresponding to [`Self::operations_initial_snapshot`].
+    pub operations_refresh_token: Option<String>,
     /// Surface workspace root when it differs from the process cwd (Fleet-root attachment).
     pub workspace_root: Option<String>,
+    /// C-686: an agent that lives on another machine to attach to instead of running turns on the
+    /// local engine. `None` is the ordinary local agent.
+    ///
+    /// The engine still has to be handed in — the surface shell (themes, panes, the composer) is
+    /// built around one — but under an attachment it runs no turn and its event store is never
+    /// written to.
+    pub attached: Option<Arc<dyn attach::AttachedAgent>>,
 }
 
 impl TuiRunOptions {
@@ -120,7 +137,10 @@ impl TuiRunOptions {
             pane_queue: None,
             interaction_queue: None,
             operations_source: None,
+            operations_initial_snapshot: None,
+            operations_refresh_token: None,
             workspace_root: None,
+            attached: None,
         }
     }
 }
@@ -281,6 +301,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("model", "show or switch model"),
     ("effort", "show or set reasoning effort"),
     ("quit", "exit flux"),
+    (
+        "restart",
+        "relaunch on the installed binary, resuming this session",
+    ),
     ("usage", "live usage; `history` opens the observatory"),
     ("insights", "summarize current-session facts"),
     ("compact", "compact session context"),
@@ -291,7 +315,10 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
     ("sessions", "list recent sessions"),
     ("resume", "resume a session id"),
     ("queue", "manage queued follow-ups"),
-    ("fleet", "open Fleet operations"),
+    (
+        "fleet",
+        "operations pane · also /fleet:restart, /fleet:refresh",
+    ),
     ("board", "open Board work and decisions"),
     ("theme", "show or switch the color theme"),
 ];
@@ -364,6 +391,7 @@ const HELP_KEYS: &[(&str, &str)] = &[
     ),
     ("Ctrl-C", "interrupt · clear · quit"),
     ("Ctrl-D", "quit (empty input)"),
+    ("F3", "select the agent's loop · ↵ switch · Esc close"),
     ("F1 / Esc", "open/close this help"),
 ];
 
@@ -1129,6 +1157,7 @@ impl ChatState {
             cost_usd: None,
             cost_model: None,
             cost_unpriced: false,
+            budget: None,
             steps: 0,
             last_elapsed: None,
             model_call_start: None,
@@ -1164,7 +1193,26 @@ impl ChatState {
             fleet: crate::fleet::FleetProjection::new(),
             fleet_rows: Vec::new(),
             operations: None,
+            attachment: None,
+            loop_binding: None,
+            loop_admitted: None,
+            loop_dirs: Vec::new(),
+            loop_selector: None,
+            loop_overlay: None,
         }
+    }
+
+    /// A state for a conversation whose agent lives on another machine (C-686).
+    ///
+    /// ⚠ The session id is **empty by construction**, and that is the mechanism, not an omission:
+    /// an attached conversation has no local session, writes nothing to the local event store, and
+    /// must never appear in `flux sessions` or `flux replay`. The remote's own store is
+    /// authoritative and is read back through [`crate::attach::AttachedAgent::history`].
+    pub fn attached(model: String, attachment: crate::attach::Attachment) -> Self {
+        let mut state = Self::for_session(model, String::new());
+        crate::attach::apply_attached_invariants(&mut state);
+        state.attachment = Some(attachment);
+        state
     }
 
     /// Apply one pane command (C-221). Bounds — count, rows, width — are enforced by
@@ -1414,6 +1462,35 @@ impl ChatState {
                 None if flux_core::is_metered_cloud_spec(model) => self.cost_unpriced = true,
                 None => {}
             }
+        }
+    }
+
+    /// C-542: fold the engine's published budget projection into the surface.
+    ///
+    /// The projection *is* the number: this stores the enforcing ledger's snapshot and re-derives
+    /// nothing, so the header cannot disagree with the breach that stops the run. A crossed line
+    /// arrives with the event that crossed it, so the ledger's one-warning-per-dimension rule is
+    /// exactly what the transcript shows — a target is announced once, not once per model call.
+    pub(crate) fn record_budget(
+        &mut self,
+        projection: flux_core::BudgetProjection,
+        warning: Option<flux_core::BudgetBreach>,
+        exhausted: Option<flux_core::BudgetBreach>,
+    ) {
+        self.budget = Some(projection);
+        if let Some(breach) = warning {
+            self.push(Entry::Notice {
+                text: format!("⚠ budget target crossed — {breach}; execution continues"),
+                sev: Sev::Warn,
+            });
+        }
+        if let Some(breach) = exhausted {
+            self.push(Entry::Notice {
+                text: format!(
+                    "⛔ budget limit reached — {breach}; stopping at the next safe boundary"
+                ),
+                sev: Sev::Err,
+            });
         }
     }
 
@@ -2649,6 +2726,12 @@ impl ChatState {
             .map(|target| format!(" · {target}"))
             .unwrap_or_default();
         let mut identity = Vec::new();
+        // C-686: remoteness first and unmissable. An operator who forgets that the agent lives
+        // somewhere else reads its output as their own machine's — the same lesson C-436 learned
+        // for the substrate axis, and worse here, because the approval stage moved too.
+        if let Some(attachment) = &self.attachment {
+            identity.push(format!("attached {}", attachment.label));
+        }
         if let Some(surface) = surface {
             identity.push(surface);
         }
@@ -2675,6 +2758,18 @@ impl ChatState {
         // vec, so bar_line sheds everything else before it.
         if self.auto_approve {
             right.push(vec![Span::styled("auto-ok", t.warn_style())]);
+        }
+        // C-542: the live budget segment sits directly below `auto-ok` in precedence — a declared
+        // ceiling the run is about to hit outranks cumulative counters. Its figures are the engine's
+        // published projection; the surface adds nothing up itself.
+        if let Some(segment) = self.budget_segment() {
+            right.push(segment);
+        }
+        // C-543: which loop drives this agent outranks cumulative counters — an operator who cannot
+        // see the harness cannot tell an implementation loop from the general explorer. The figures
+        // are the engine's resolved binding (C-569), not a filename this surface guessed.
+        if let Some(segment) = self.loop_segment() {
+            right.push(segment);
         }
         // C-139: `↑` is now every prompt token the session sent (fresh + both cache tiers, summed
         // per model call), so the cache segment's hit % is a share OF it. The old `↑` was the
@@ -2733,13 +2828,74 @@ impl ChatState {
         if self.operations.is_none() {
             right.push(vec![Span::styled("standalone", t.muted_style())]);
         }
-        // Segment order [auto-ok, tokens, cache, cost, shell, gather, effort, standalone];
+        // Segment order [auto-ok, budget, tokens, cache, cost, shell, gather, effort, standalone];
         // bar_line drops from the end, so optional identity/badges shed first and auto-ok survives
         // the longest (C-102/C-116).
         for seg in right.iter_mut().skip(1) {
             seg.insert(0, Span::styled(" · ", t.muted_style()));
         }
         bar_line(left, right, width)
+    }
+
+    /// C-542: the header's live budget segment — `budget Σ1.6k/4.0k tok`, `budget 3/10 calls`,
+    /// `budget 12.0s/1.0m`.
+    ///
+    /// Every figure comes from the enforcing [`flux_core::BudgetLedger`]'s published projection, so
+    /// this surface and the stop that actually fires cannot drift apart. `None` when nothing is
+    /// declared: an undeclared dimension renders nothing rather than a reassuring zero ceiling.
+    fn budget_segment(&self) -> Option<Vec<Span<'static>>> {
+        let t = &self.theme;
+        let projection = self.budget.as_ref()?;
+        // One bounded segment shows the dimension nearest its declared figure — the one that will
+        // bite first. Five competing ratios would not survive a narrow bar anyway.
+        let dimension = flux_core::BudgetDimension::ALL
+            .into_iter()
+            .filter(|dimension| projection.declared(*dimension).is_some())
+            .max_by(|a, b| {
+                projection
+                    .fraction(*a)
+                    .unwrap_or(0.0)
+                    .total_cmp(&projection.fraction(*b).unwrap_or(0.0))
+            })?;
+        let declared = projection.declared(dimension)?;
+        let spent = projection.spent.get(dimension);
+        let figures = match dimension {
+            flux_core::BudgetDimension::WallTime => format!(
+                "{}/{}",
+                fmt_elapsed(Duration::from_millis(spent)),
+                fmt_elapsed(Duration::from_millis(declared))
+            ),
+            flux_core::BudgetDimension::ModelCalls => format!("{spent}/{declared} calls"),
+            flux_core::BudgetDimension::InputTokens => {
+                format!("↑{}/{} tok", fmt_count(spent), fmt_count(declared))
+            }
+            flux_core::BudgetDimension::OutputTokens => {
+                format!("↓{}/{} tok", fmt_count(spent), fmt_count(declared))
+            }
+            flux_core::BudgetDimension::TotalTokens => {
+                format!("Σ{}/{} tok", fmt_count(spent), fmt_count(declared))
+            }
+        };
+        // The distinction the whole vocabulary turns on stays legible: a crossed hard limit is a stop
+        // line and says `limit`; a crossed target is a warning and says that instead.
+        let (suffix, style) = if projection
+            .exhausted
+            .is_some_and(|breach| breach.dimension == dimension)
+        {
+            (" limit", t.err_style())
+        } else if projection
+            .warnings
+            .iter()
+            .any(|breach| breach.dimension == dimension)
+        {
+            (" over target", t.warn_style())
+        } else {
+            ("", t.muted_style())
+        };
+        Some(vec![Span::styled(
+            format!("budget {figures}{suffix}"),
+            style,
+        )])
     }
 
     /// The bottom footer bar: an animated spinner + phase + elapsed while running, else keybinding
@@ -3134,6 +3290,9 @@ impl ChatState {
         self.turn_rounds.clear();
         self.cost_usd = None;
         self.cost_unpriced = false;
+        // C-542: the budget projection belongs to the run whose ledger published it, so projecting a
+        // different session drops it rather than showing another run's spend.
+        self.budget = None;
         // C-221: panes are session-scoped, so projecting a different session (`/resume`) drops them
         // rather than attributing one session's panes to another.
         self.panes.clear();
@@ -3413,6 +3572,34 @@ fn fmt_tool_timing(outcome: &ToolOutcome) -> String {
 /// table overlaid by `~/.flux/pricing.toml` (same loader the CLI uses). Reads `FLUX_VERBOSE`
 /// (exported by `flux tui -v`, value-parsed — see [`flag_on`]) once at startup: verbose starts
 /// tool cards expanded and shows their output in full instead of capped at [`MAX_DETAIL`] lines.
+/// Set by `/restart`, read once the terminal has been handed back.
+///
+/// A restart cannot happen from inside the event loop: the loop owns the terminal in raw mode on the
+/// alternate screen, and a process that replaces itself there leaves the next one drawing into a screen it
+/// never set up. So the command only records the intent and asks the loop to end normally, and the re-exec
+/// happens after `TerminalGuard::restore` — the same teardown a quit performs.
+static RESTART_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Replace this process with the same command line, so a freshly installed binary takes over.
+///
+/// Exists because the alternative is a documented four-step dance an operator performs by hand — confirm
+/// nothing is in flight, stop the surface, install, respawn — and the step everybody forgets is the last
+/// one. A surface stopped for an install and never restarted looks exactly like a crash.
+///
+/// The durable session is on disk, so the replacement resumes the same conversation; nothing about the
+/// restart is a fresh start except the executable. Arguments are reused verbatim, which is what makes this
+/// safe to offer at all: a restart that quietly changed the model, the fleet root or the posture would be a
+/// different session wearing the same name.
+#[cfg(unix)]
+fn exec_replacement() -> anyhow::Result<std::convert::Infallible> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe()
+        .map_err(|error| anyhow::Error::new(error).context("resolve the running executable"))?;
+    let mut command = std::process::Command::new(exe);
+    command.args(std::env::args_os().skip(1));
+    Err(anyhow::Error::new(command.exec()).context("replace this process"))
+}
+
 pub async fn run(
     agent: FlowEngine,
     session_id: String,
@@ -3482,9 +3669,22 @@ pub async fn run_with_options(
     // same `FLUX_AUTO_RESURRECT=0` opt-out as the CLI's REPL and one-shot `flux run`) and before
     // `project_session`/`load_history` project the session below, so the resurrected turn's own
     // persisted messages show up in the transcript like any other turn's.
-    resurrect_on_open(&agent, &session_id).await;
+    //
+    // C-686: skipped under an attachment. An attach invocation has no local session to resurrect,
+    // and running an interrupted *local* turn to completion because the operator asked to watch a
+    // *remote* agent would be an effect nobody requested.
+    if options.attached.is_none() {
+        resurrect_on_open(&agent, &session_id).await;
+    }
 
     let mut state = session_state(&agent, &session_id, &options)?;
+    // C-686: seed the pane from the remote's own history before the terminal opens, so a reattach
+    // is truthful about what happened while the operator was detached. Awaited here rather than in
+    // `session_state` (which is sync) and rendered as a notice on failure rather than swallowed.
+    if let Some(attached) = options.attached.clone() {
+        let history = attached.history().await;
+        replay_remote_history(&mut state, history);
+    }
     // A-94: share the composer's follow-up queue with the engine, which drains it into the
     // running turn at the next planner consultation instead of waiting for the turn to finish.
     agent.set_steering(Some(state.queue.clone()));
@@ -3503,12 +3703,29 @@ pub async fn run_with_options(
         EventLoopServices {
             model_resolver: options.model_resolver,
             operations_source: options.operations_source,
+            operations_refresh_token: options.operations_refresh_token,
         },
         crossterm::event::EventStream::new(),
     )
     .await;
     let restore = guard.restore(terminal.backend_mut());
-    result.and(restore)
+    let outcome = result.and(restore);
+    // Only after the terminal is back in the shell's hands. A failed exec is reported rather than
+    // swallowed: the operator is left in a working shell believing a restart happened, which is worse than
+    // an error they can read.
+    if RESTART_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        outcome?;
+        #[cfg(unix)]
+        {
+            let error = exec_replacement().expect_err("exec only returns on failure");
+            return Err(error);
+        }
+        #[cfg(not(unix))]
+        return Err(anyhow::anyhow!(
+            "restart is only implemented where a process can replace itself; quit and relaunch"
+        ));
+    }
+    outcome
 }
 
 /// The [`ChatState`] the event loop draws from, assembled from the engine, the session and the
@@ -3561,11 +3778,26 @@ pub fn session_state(
         state = state.with_cost(spec, flux_credentials::load_pricing_table());
     }
     state.execution_target = options.execution_target.clone();
+    // C-686: an attached conversation has no local session. Do not project one, do not count local
+    // sessions as this session's neighbours, and leave `session_id` empty — the header then says
+    // "attached <agent>" and nothing claims a local transcript that does not exist. The composer's
+    // *input* history is still local, because that is this terminal's typing, not the agent's work.
+    if let Some(attached) = options.attached.clone() {
+        let attachment = Attachment::new(attached);
+        attach::apply_attached_invariants(&mut state);
+        announce_attachment(&mut state, &attachment);
+        state.attachment = Some(attachment);
+        state.history = load_history(&agent.events);
+        return Ok(state);
+    }
     state.project_session(&agent.events, session_id)?;
     state.previous_sessions = previous_session_count(&agent.events, session_id)?;
     state.history = load_history(&agent.events);
-    if let Some(source) = options.operations_source.as_ref() {
-        state.operations = Some(crate::operations::OperationsState::new(source.snapshot()?));
+    if options.operations_source.is_some() {
+        let snapshot = options.operations_initial_snapshot.clone().ok_or_else(|| {
+            anyhow::anyhow!("Fleet attachment is missing its initial operations snapshot")
+        })?;
+        state.operations = Some(crate::operations::OperationsState::loading(snapshot));
     }
     Ok(state)
 }
@@ -3622,6 +3854,7 @@ pub async fn drive_event_loop_headless(
         EventLoopServices {
             model_resolver: None,
             operations_source: None,
+            operations_refresh_token: None,
         },
         input,
     )
@@ -3644,6 +3877,7 @@ const HEADLESS_HEIGHT: u16 = 40;
 struct EventLoopServices {
     model_resolver: Option<Arc<dyn ModelResolver>>,
     operations_source: Option<operations::SharedFleetBoardSource>,
+    operations_refresh_token: Option<String>,
 }
 
 async fn event_loop<B, S>(
@@ -3666,7 +3900,25 @@ where
     let EventLoopServices {
         model_resolver,
         operations_source,
+        operations_refresh_token,
     } = services;
+
+    // C-543: the surface shows the loop binding the engine actually resolved (C-569) and offers the
+    // workspace's authored loops beside it. A session that already recorded a turn binding is
+    // admitted: the selector then names the new-session path instead of switching a running agent.
+    {
+        let engine = agent.read().await;
+        state.set_loop_binding(Some(engine.agent_loop_binding.metadata().clone()));
+        state.loop_dirs = agent_loop::loop_dirs_for(&engine.cwd);
+        let admitted = engine
+            .events
+            .turns(&state.session_id)
+            .ok()
+            .and_then(|turns| turns.last().and_then(|turn| turn.loop_binding.clone()));
+        if admitted.is_some() {
+            state.set_loop_admitted(admitted);
+        }
+    }
 
     let mut cancel = CancellationToken::new();
     let mut pending_reply: Option<(String, oneshot::Sender<ApprovalChoice>)> = None;
@@ -3684,6 +3936,28 @@ where
         Duration::from_secs(1),
     );
     operations_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // C-686: the attached agent's parked-approval poll. Its own ticker rather than the operations
+    // one, because it is armed by a different condition and must keep running while a turn is in
+    // flight — a guarded effect is parked *during* the turn, which is exactly when it must be seen.
+    let mut attach_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    );
+    attach_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let attach_approvals_answerable = state
+        .attachment
+        .as_ref()
+        .is_some_and(|a| a.capabilities.approvals.is_answerable());
+    // Ids already raised, so a request that stays parked between polls is not asked twice.
+    let attach_seen_approvals: Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Arc::default();
+    let mut operations_refresh_in_flight = false;
+    let mut operations_force_refresh_pending = false;
+    let mut operations_last_refresh_token = operations_refresh_token;
+    if let Some(source) = operations_source.as_ref() {
+        spawn_operations_snapshot(&tx, source.clone());
+        operations_refresh_in_flight = true;
+    }
 
     loop {
         // C-305: the agent's pane commands, applied BEFORE this iteration's UI events on purpose —
@@ -3793,6 +4067,11 @@ where
                 UiEvent::BackgroundUsage { model, usage } => {
                     state.record_background_usage(&model, &usage);
                 }
+                UiEvent::Budget {
+                    projection,
+                    warning,
+                    exhausted,
+                } => state.record_budget(*projection, warning, exhausted),
                 UiEvent::Retry {
                     attempt,
                     max_attempts,
@@ -3821,6 +4100,35 @@ where
                 UiEvent::SpawnActivity(activity) => {
                     state.record_spawn_activity(&activity, Instant::now())
                 }
+                UiEvent::OperationsSnapshot {
+                    result,
+                    refresh_token,
+                } => {
+                    operations_refresh_in_flight = false;
+                    if let Some(token) = refresh_token {
+                        operations_last_refresh_token = Some(token);
+                    }
+                    match *result {
+                        Ok(snapshot) => {
+                            if let Some(operations) = state.operations.as_mut() {
+                                operations.refresh(snapshot);
+                            }
+                        }
+                        Err(error) => {
+                            if let Some(operations) = state.operations.as_mut() {
+                                operations.refresh_failed(error);
+                            }
+                        }
+                    }
+                    if operations_force_refresh_pending {
+                        operations_force_refresh_pending = false;
+                        if let Some(source) = operations_source.as_ref() {
+                            source.invalidate_snapshot_cache();
+                            spawn_operations_snapshot(&tx, source.clone());
+                            operations_refresh_in_flight = true;
+                        }
+                    }
+                }
                 UiEvent::Steered(messages) => {
                     // The engine consumed these from the shared queue (the strip empties by
                     // itself); leave a transcript record that the running turn was steered.
@@ -3832,8 +4140,20 @@ where
                         });
                     }
                 }
+                // C-686: one update from an agent on another machine. It reaches the same
+                // transcript mutators a local turn uses, through the one crossing point that never
+                // touches the local event store.
+                UiEvent::Attached(update) => apply_attach_update(state, *update),
                 UiEvent::Finished => {
-                    complete_attached_requirements(state, operations_source.as_ref());
+                    if complete_attached_requirements(state, operations_source.as_ref()) {
+                        request_operations_snapshot(
+                            &tx,
+                            operations_source.as_ref(),
+                            &mut operations_refresh_in_flight,
+                            &mut operations_force_refresh_pending,
+                            true,
+                        );
+                    }
                     seal_interrupted_action(state, &mut interrupted_action_id);
                     if let Some((_tool, reply)) = pending_reply.take() {
                         let _ = reply.send(ApprovalChoice::Deny);
@@ -3899,7 +4219,28 @@ where
             // 62 ms lands redraws on the 16 fps boundaries of the animated footer bar.
             _ = tokio::time::sleep(Duration::from_millis(spinners::FPS_MS)), if state.running() => continue,
             _ = operations_tick.tick(), if operations_source.is_some() => {
-                refresh_operations_snapshot(state, operations_source.as_ref());
+                if !operations_refresh_in_flight {
+                    if let Some(source) = operations_source.as_ref() {
+                        match source.refresh_token() {
+                            Ok(token) if Some(&token) != operations_last_refresh_token.as_ref() => {
+                                spawn_operations_snapshot(&tx, source.clone());
+                                operations_refresh_in_flight = true;
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                if let Some(operations) = state.operations.as_mut() {
+                                    operations.refresh_failed(error.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                continue;
+            },
+            _ = attach_tick.tick(), if attach_approvals_answerable => {
+                if let Some(attachment) = state.attachment.clone() {
+                    spawn_attached_approval_poll(&attachment, &tx, attach_seen_approvals.clone());
+                }
                 continue;
             },
         };
@@ -3934,11 +4275,7 @@ where
                     .is_some_and(|operations| operations.open)
                 {
                     if let Some(operations) = state.operations.as_mut() {
-                        match m.kind {
-                            MouseEventKind::ScrollUp => operations.move_selection(-1),
-                            MouseEventKind::ScrollDown => operations.move_selection(1),
-                            _ => {}
-                        }
+                        operations.handle_mouse(m.kind);
                     }
                     continue;
                 }
@@ -4231,7 +4568,12 @@ where
                         }
                         state.interaction = None;
                         if interrupt_turn {
-                            interrupt_active_action(state, &cancel, &mut interrupted_action_id);
+                            interrupt_active_action(
+                                state,
+                                &tx,
+                                &cancel,
+                                &mut interrupted_action_id,
+                            );
                         }
                     }
                     continue;
@@ -4283,107 +4625,57 @@ where
                     .as_ref()
                     .is_some_and(|operations| operations.open)
                 {
-                    let mut decide = None;
-                    let mut refresh = false;
-                    if let Some(operations) = state.operations.as_mut() {
-                        match key.code {
-                            KeyCode::Esc if operations.confirm_decision => {
-                                operations.confirm_decision = false
-                            }
-                            KeyCode::Esc if operations.detail_open => {
-                                operations.detail_open = false;
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Esc | KeyCode::F(2) | KeyCode::Char('q') => {
-                                operations.open = false;
-                                operations.detail_open = false;
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                                let tab = operations.tab.cycle(-1);
-                                operations.select_tab(tab);
-                            }
-                            KeyCode::Tab => {
-                                let tab = operations.tab.cycle(1);
-                                operations.select_tab(tab);
-                            }
-                            KeyCode::Char('1') => {
-                                operations.select_tab(crate::operations::OperationsTab::Overview)
-                            }
-                            KeyCode::Char('2') => {
-                                operations.select_tab(crate::operations::OperationsTab::Board)
-                            }
-                            KeyCode::Char('3') => {
-                                operations.select_tab(crate::operations::OperationsTab::Workers)
-                            }
-                            KeyCode::Char('4') => {
-                                operations.select_tab(crate::operations::OperationsTab::Decisions)
-                            }
-                            KeyCode::Char('5') => {
-                                operations.select_tab(crate::operations::OperationsTab::Stats)
-                            }
-                            KeyCode::Up => operations.move_selection(-1),
-                            KeyCode::Down => operations.move_selection(1),
-                            KeyCode::PageUp => operations.move_selection(-10),
-                            KeyCode::PageDown => operations.move_selection(10),
-                            KeyCode::Left
-                                if operations.detail_open
-                                    && operations.tab
-                                        == crate::operations::OperationsTab::Decisions =>
+                    // C-623: the routing itself lives on `OperationsState`, so the read-only Board
+                    // pane can be driven by a test. Only `Decide` reaches a durable write.
+                    let command = state
+                        .operations
+                        .as_mut()
+                        .map(|operations| operations.handle_key(key))
+                        .unwrap_or_default();
+                    match command {
+                        crate::operations::OperationsCommand::Decide {
+                            decision_ref,
+                            outcome,
+                        } => {
+                            match operations_source
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    anyhow::anyhow!("Board/Fleet operations source is unavailable")
+                                })
+                                .and_then(|source| source.decide(&decision_ref, &outcome))
                             {
-                                operations.decision_option =
-                                    operations.decision_option.saturating_sub(1);
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Right
-                                if operations.detail_open
-                                    && operations.tab
-                                        == crate::operations::OperationsTab::Decisions =>
-                            {
-                                let options = operations
-                                    .selected_decision()
-                                    .map_or(0, |decision| decision.options.len());
-                                operations.decision_option =
-                                    (operations.decision_option + 1).min(options.saturating_sub(1));
-                                operations.confirm_decision = false;
-                            }
-                            KeyCode::Enter
-                                if operations.detail_open
-                                    && operations.tab
-                                        == crate::operations::OperationsTab::Decisions =>
-                            {
-                                decide = operations.confirm_selected_decision();
-                            }
-                            KeyCode::Enter => operations.detail_open = true,
-                            KeyCode::Char('r') => refresh = true,
-                            _ => {}
-                        }
-                    }
-                    if let Some((decision_ref, outcome)) = decide {
-                        match operations_source
-                            .as_ref()
-                            .ok_or_else(|| {
-                                anyhow::anyhow!("Board/Fleet operations source is unavailable")
-                            })
-                            .and_then(|source| source.decide(&decision_ref, &outcome))
-                        {
-                            Ok(ack) => {
-                                if let Some(operations) = state.operations.as_mut() {
-                                    operations.last_ack = Some(ack);
-                                    operations.confirm_decision = false;
-                                    operations.detail_open = false;
+                                Ok(ack) => {
+                                    if let Some(operations) = state.operations.as_mut() {
+                                        operations.last_ack = Some(ack);
+                                        operations.confirm_decision = false;
+                                        operations.detail_open = false;
+                                    }
+                                    request_operations_snapshot(
+                                        &tx,
+                                        operations_source.as_ref(),
+                                        &mut operations_refresh_in_flight,
+                                        &mut operations_force_refresh_pending,
+                                        true,
+                                    );
                                 }
-                                refresh_operations_snapshot(state, operations_source.as_ref());
-                            }
-                            Err(error) => {
-                                if let Some(operations) = state.operations.as_mut() {
-                                    operations.refresh_error = Some(error.to_string());
-                                    operations.confirm_decision = false;
+                                Err(error) => {
+                                    if let Some(operations) = state.operations.as_mut() {
+                                        operations.refresh_error = Some(error.to_string());
+                                        operations.confirm_decision = false;
+                                    }
                                 }
                             }
                         }
-                    } else if refresh {
-                        refresh_operations_snapshot(state, operations_source.as_ref());
+                        crate::operations::OperationsCommand::Refresh => {
+                            request_operations_snapshot(
+                                &tx,
+                                operations_source.as_ref(),
+                                &mut operations_refresh_in_flight,
+                                &mut operations_force_refresh_pending,
+                                true,
+                            );
+                        }
+                        crate::operations::OperationsCommand::None => {}
                     }
                     continue;
                 }
@@ -4408,6 +4700,70 @@ where
                 }
                 if key.code == KeyCode::F(1) {
                     state.help_open = true;
+                    continue;
+                }
+
+                // C-543: the selection overlay — Esc/Enter/q close, everything else is swallowed.
+                if state.loop_overlay.is_some() {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
+                        state.close_loop_overlay();
+                    }
+                    continue;
+                }
+
+                // C-543: the loop selector. Choosing hands the resolved binding to the engine
+                // through its one adoption boundary; a refusal (an admitted session, an unreadable
+                // or unparseable loop) is reported and changes nothing.
+                if state.loop_selector.is_some() {
+                    let command = state
+                        .loop_selector
+                        .as_mut()
+                        .map(|selector| selector.handle_key(key))
+                        .unwrap_or(agent_loop::LoopSelectorCommand::None);
+                    match command {
+                        agent_loop::LoopSelectorCommand::None => {}
+                        agent_loop::LoopSelectorCommand::Close => state.close_loop_selector(),
+                        agent_loop::LoopSelectorCommand::Choose(index) => {
+                            let previous = state.loop_binding.clone();
+                            match state.choose_loop(index) {
+                                agent_loop::LoopSwitch::Adopt(binding) => {
+                                    let label = format!(
+                                        "{}@{}",
+                                        binding.metadata().profile,
+                                        binding.metadata().revision
+                                    );
+                                    let adopted =
+                                        agent.write().await.adopt_agent_loop_binding(*binding);
+                                    match adopted {
+                                        Ok(()) => state.push(Entry::Notice {
+                                            text: format!("next start runs loop {label}"),
+                                            sev: Sev::Info,
+                                        }),
+                                        Err(error) => {
+                                            // The engine refused the loop; the header must not go
+                                            // on naming one that will never run.
+                                            state.set_loop_binding(previous);
+                                            state.close_loop_overlay();
+                                            state.push(Entry::Notice {
+                                                text: error.to_string(),
+                                                sev: Sev::Err,
+                                            });
+                                        }
+                                    }
+                                }
+                                agent_loop::LoopSwitch::Refused(reason) => {
+                                    state.push(Entry::Notice {
+                                        text: reason,
+                                        sev: Sev::Warn,
+                                    })
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if key.code == KeyCode::F(3) {
+                    state.open_loop_selector();
                     continue;
                 }
 
@@ -4830,7 +5186,12 @@ where
                     KeyCode::Char('c') if ctrl => {
                         if running {
                             state.clear_ctrl_c_arm();
-                            interrupt_active_action(state, &cancel, &mut interrupted_action_id);
+                            interrupt_active_action(
+                                state,
+                                &tx,
+                                &cancel,
+                                &mut interrupted_action_id,
+                            );
                             state.push(Entry::Notice {
                                 text: "(interrupting…)".into(),
                                 sev: Sev::Info,
@@ -4932,6 +5293,7 @@ where
                                 state,
                                 &mut cancel,
                                 model_resolver.as_ref(),
+                                operations_source.as_ref(),
                             )
                             .await?;
                             if wants_quit {
@@ -4939,6 +5301,7 @@ where
                                 if running {
                                     interrupt_active_action(
                                         state,
+                                        &tx,
                                         &cancel,
                                         &mut interrupted_action_id,
                                     );
@@ -4999,12 +5362,22 @@ where
 ///
 /// The action id is retained until its `Finished` event so a tool call that was already queued
 /// behind the keypress cannot reintroduce a running card after this immediate seal.
+///
+/// C-686: under an attachment the local token only stops *this client* pumping, which would leave
+/// the remote agent working while the operator watched a stopped spinner. So the same keypress also
+/// asks the remote to abort, and the outcome — including "this agent cannot be cancelled" — is
+/// reported into the transcript rather than swallowed.
 fn interrupt_active_action(
     state: &mut ChatState,
+    tx: &mpsc::UnboundedSender<UiEvent>,
     cancel: &CancellationToken,
     interrupted_action_id: &mut Option<u64>,
 ) {
     *interrupted_action_id = state.active_action_id;
+    if let (Some(attachment), Some(action_id)) = (state.attachment.clone(), state.active_action_id)
+    {
+        spawn_attached_cancel(&attachment, tx, action_id);
+    }
     state.cancel_running_tools();
     cancel.cancel();
 }
@@ -5025,6 +5398,7 @@ async fn handle_command(
     state: &mut ChatState,
     cancel: &mut CancellationToken,
     model_resolver: Option<&Arc<dyn ModelResolver>>,
+    operations_source: Option<&operations::SharedFleetBoardSource>,
 ) -> anyhow::Result<bool> {
     let command = text.trim().trim_start_matches('/');
     let (name, args) = command
@@ -5036,6 +5410,17 @@ async fn handle_command(
     if busy && !read_only && !matches!(name, "quit" | "exit") {
         state.push(Entry::Notice {
             text: format!("/{name} waits for an idle session — interrupt the current action first"),
+            sev: Sev::Warn,
+        });
+        return Ok(false);
+    }
+    // C-686: a command that acts on *this* machine's engine or session store is refused by name
+    // under an attachment. The failure it prevents is silent and specific: the operator believes
+    // they compacted (or switched the model of, or read the evidence of) the agent they are
+    // watching, and instead they touched an idle local engine producing none of the output.
+    if let Some(refusal) = refuse_local_only(state, name) {
+        state.push(Entry::Notice {
+            text: refusal,
             sev: Sev::Warn,
         });
         return Ok(false);
@@ -5061,6 +5446,63 @@ async fn handle_command(
         }
         "usage" => state.usage_open = true,
         "quit" | "exit" => return Ok(true),
+        // The `fleet:` family. Routed on the prefix rather than one arm per verb, so the verbs still to be
+        // written — doctor, gate, park/unpark, land, attention, each already a story — are one arm each, and
+        // an unrecognised name gets the list rather than silence.
+        name if name.starts_with("fleet:") => {
+            let Some(source) = operations_source else {
+                state.push(Entry::Notice {
+                    text:
+                        "standalone chat has no attached fleet · relaunch with `flux tui --fleet`"
+                            .into(),
+                    sev: Sev::Info,
+                });
+                return Ok(false);
+            };
+            match name.trim_start_matches("fleet:") {
+                "restart" => match source.restart() {
+                    Ok(ack) => state.push(Entry::Notice {
+                        text: format!("{} · revision {}", ack.message, ack.revision),
+                        sev: Sev::Info,
+                    }),
+                    Err(error) => state.push(Entry::Notice {
+                        text: format!("fleet restart refused: {error}"),
+                        sev: Sev::Warn,
+                    }),
+                },
+                "refresh" => {
+                    source.invalidate_snapshot_cache();
+                    match source.snapshot() {
+                        Ok(snapshot) => state.push(Entry::Notice {
+                            text: format!(
+                                "fleet refreshed · revision {} · {} active worker(s) · {} board item(s)",
+                                snapshot.revision,
+                                snapshot.capacity.active,
+                                snapshot.items.len()
+                            ),
+                            sev: Sev::Info,
+                        }),
+                        Err(error) => state.push(Entry::Notice {
+                            text: format!("fleet refresh failed: {error}"),
+                            sev: Sev::Err,
+                        }),
+                    }
+                }
+                other => state.push(Entry::Notice {
+                    text: format!("unknown fleet command `{other}` · available: restart, refresh"),
+                    sev: Sev::Warn,
+                }),
+            }
+        }
+        "restart" => {
+            RESTART_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            state.push(Entry::Notice {
+                text: "restarting on the installed binary — this session resumes from its durable store"
+                    .into(),
+                sev: Sev::Info,
+            });
+            return Ok(true);
+        }
         "queue" => {
             if state.queue.is_empty() {
                 state.push(Entry::Notice {
@@ -5533,29 +5975,44 @@ fn start_insights(
     cancel
 }
 
-/// Push `input` as a user message and spawn the agent turn that streams back into the transcript.
-/// Returns the turn's cancellation token (Ctrl-C cancels it).
-fn refresh_operations_snapshot(
-    state: &mut ChatState,
-    source: Option<&operations::SharedFleetBoardSource>,
+/// Build the potentially expensive Board/Fleet projection away from the terminal event loop.
+fn spawn_operations_snapshot(
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    source: operations::SharedFleetBoardSource,
 ) {
-    let (Some(source), Some(_)) = (source, state.operations.as_ref()) else {
+    let tx = tx.clone();
+    tokio::task::spawn_blocking(move || {
+        // The token is intentionally read before the snapshot. If durable state changes while the
+        // snapshot is being built, the next one-second poll observes a different token and starts
+        // another refresh instead of incorrectly treating the older projection as current.
+        let refresh_token = source.refresh_token().ok();
+        let result = source.snapshot().map_err(|error| error.to_string());
+        let _ = tx.send(UiEvent::OperationsSnapshot {
+            result: Box::new(result),
+            refresh_token,
+        });
+    });
+}
+
+fn request_operations_snapshot(
+    tx: &mpsc::UnboundedSender<UiEvent>,
+    source: Option<&operations::SharedFleetBoardSource>,
+    in_flight: &mut bool,
+    force_pending: &mut bool,
+    invalidate: bool,
+) {
+    let Some(source) = source else {
         return;
     };
-    match source.snapshot() {
-        Ok(snapshot) => {
-            if let Some(operations) = state.operations.as_mut() {
-                operations.refresh(snapshot);
-            }
-        }
-        Err(error) => {
-            if let Some(operations) = state.operations.as_mut() {
-                // Keep the last good projection. Clearing it would turn an IO failure into a
-                // fabricated empty Fleet, which is operationally dangerous.
-                operations.refresh_error = Some(error.to_string());
-            }
-        }
+    if *in_flight {
+        *force_pending |= invalidate;
+        return;
     }
+    if invalidate {
+        source.invalidate_snapshot_cache();
+    }
+    spawn_operations_snapshot(tx, source.clone());
+    *in_flight = true;
 }
 
 fn accept_attached_requirement(
@@ -5686,12 +6143,12 @@ fn acknowledge_steered_requirement(
 fn complete_attached_requirements(
     state: &mut ChatState,
     source: Option<&operations::SharedFleetBoardSource>,
-) {
+) -> bool {
     let Some(source) = source else {
-        return;
+        return false;
     };
     let Some(operations) = state.operations.as_ref() else {
-        return;
+        return false;
     };
     let failed = operations.turn_failed;
     let ids = operations
@@ -5725,7 +6182,7 @@ fn complete_attached_requirements(
             .retain(|pending| !pending.delivered || !ids.contains(&pending.id));
         operations.turn_failed = false;
     }
-    refresh_operations_snapshot(state, Some(source));
+    !ids.is_empty()
 }
 
 fn start_conversation_turn(
@@ -5750,6 +6207,11 @@ fn start_turn(
     input: String,
 ) -> CancellationToken {
     let action_id = state.begin_action();
+    // C-543/C-569: this turn is the session's behavior admission. From here the recorded binding is
+    // what every later start of this session reconstructs, so the selector stops offering a silent
+    // switch and names the new-session path instead.
+    let admitted = state.loop_binding.clone();
+    state.set_loop_admitted(admitted);
     // C-140: a new *turn* starts the overlay's per-turn view empty. Deliberately here rather than
     // in `begin_action`, which also covers `/compact` — a maintenance action that would otherwise
     // erase the usage of the turn the user just watched finish. Session totals are untouched.
@@ -5768,6 +6230,13 @@ fn start_turn(
     state.gather_mode = false;
 
     let cancel = CancellationToken::new();
+    // C-686: under an attachment the turn runs on the other machine. Everything above this line —
+    // the action id, the spinner, the steering queue, the transcript row — is identical, because
+    // the surface's turn bookkeeping must not learn which kind of turn it is watching.
+    if let Some(attachment) = state.attachment.clone() {
+        spawn_attached_turn(&attachment, tx, action_id, input);
+        return cancel;
+    }
     let task_agent = agent.clone();
     let task_sid = state.session_id.clone();
     let task_tx = tx.clone();
@@ -5851,6 +6320,7 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
     use ratatui::backend::TestBackend;
+    use std::sync::Barrier;
 
     /// A deterministic dispatch id for a test-constructed tool card (C-531). Live cards get theirs
     /// from the interpreter; a test states the pairing it means to exercise.
@@ -5872,6 +6342,142 @@ mod tests {
         match event {
             UiEvent::Tagged { event, .. } => *event,
             event => event,
+        }
+    }
+
+    fn fleet_snapshot() -> operations::FleetBoardSnapshot {
+        operations::FleetBoardSnapshot {
+            schema: "flux.tui-board-fleet/v1".into(),
+            root: "/workspace".into(),
+            running: true,
+            main_status: "running".into(),
+            main_session: Some("s-main".into()),
+            revision: 7,
+            goals_revision: 0,
+            goals: Vec::new(),
+            active_wave: None,
+            capacity: operations::FleetCapacityView {
+                configured: 5,
+                desired: None,
+                active: 0,
+                draining: None,
+                registered: 0,
+            },
+            workers: Vec::new(),
+            workers_total: 0,
+            items: Vec::new(),
+            items_total: 0,
+            decisions: Vec::new(),
+            decisions_total: 0,
+            documents: Vec::new(),
+            documents_total: 0,
+            metrics_schema: "unavailable".into(),
+            metrics: Vec::new(),
+            stats_facts: Vec::new(),
+            status_counts: Vec::new(),
+            history: Vec::new(),
+            failures: Vec::new(),
+            failures_total: 0,
+            intake: Vec::new(),
+            intake_total: 0,
+            blocked_items: 0,
+            attention_required: false,
+        }
+    }
+
+    struct BlockingFleetSource {
+        entered: Arc<Barrier>,
+        release: Arc<Barrier>,
+    }
+
+    impl operations::FleetBoardSource for BlockingFleetSource {
+        fn snapshot(&self) -> anyhow::Result<operations::FleetBoardSnapshot> {
+            self.entered.wait();
+            self.release.wait();
+            Ok(fleet_snapshot())
+        }
+
+        fn refresh_token(&self) -> anyhow::Result<String> {
+            Ok("revision-7".into())
+        }
+
+        fn attach_session(&self, _session: &str) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn accept_requirement(
+            &self,
+            _text: &str,
+            _session: &str,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn deliver_requirement(
+            &self,
+            _id: &str,
+            _session: &str,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn complete_requirement(
+            &self,
+            _id: &str,
+            _session: &str,
+            _succeeded: bool,
+            _error: Option<&str>,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+
+        fn decide(
+            &self,
+            _decision_ref: &str,
+            _outcome: &str,
+        ) -> anyhow::Result<operations::FleetAck> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn board_fleet_snapshot_does_not_block_the_terminal_event_loop() {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let source: operations::SharedFleetBoardSource = Arc::new(BlockingFleetSource {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        spawn_operations_snapshot(&tx, source);
+        tokio::task::spawn_blocking(move || entered.wait())
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), rx.recv())
+                .await
+                .is_err(),
+            "a blocked projection must not emit or block the async caller"
+        );
+        tokio::task::spawn_blocking(move || release.wait())
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            UiEvent::OperationsSnapshot {
+                result,
+                refresh_token,
+            } => {
+                let snapshot = result.unwrap();
+                assert_eq!(snapshot.revision, 7);
+                assert_eq!(refresh_token.as_deref(), Some("revision-7"));
+            }
+            _ => panic!("unexpected projection event"),
         }
     }
 
@@ -6715,6 +7321,14 @@ mod tests {
         let content = screen(&terminal);
         assert!(!content.contains('%'), "{content}");
         assert!(state.last_max_scroll.get() > 0);
+        // C-341 originally asserted `width == 60` — "the overlaid scrollbar must not consume
+        // transcript width". That invariant is what produced silent text corruption: the bar is
+        // drawn into the transcript's own `Rect` *after* the text, so any character wrapped into the
+        // last column was overwritten with nothing on screen to show a character had been lost
+        // (observed live as "…the current revi" + "ion, active worker c"). A scrollbar cannot
+        // overlay full-width text without destroying some of it, so the column is now reserved.
+        // Losing one column of width is strictly better than losing characters out of paths, SHAs
+        // and command output.
         assert_eq!(
             state
                 .transcript_layout
@@ -6722,8 +7336,8 @@ mod tests {
                 .as_ref()
                 .expect("overflow laid out")
                 .width,
-            60,
-            "the overlaid scrollbar must not consume transcript width"
+            59,
+            "the scrollbar column is reserved so wrapped text can never land under the bar"
         );
         let buffer = terminal.backend().buffer();
         let follow_thumb = (1..10)
@@ -6769,7 +7383,10 @@ mod tests {
     #[test]
     fn help_overlay_lists_keys_and_all_commands() {
         let mut state = ChatState::new("mock".into());
-        let mut terminal = Terminal::new(TestBackend::new(80, 26)).unwrap();
+        // Tall enough for the whole exact-fit panel: the overlay is clipped to the frame, so a
+        // terminal shorter than its content would drop the last command row rather than the key
+        // rows — C-543's `F3` row made 26 one short of the full list.
+        let mut terminal = Terminal::new(TestBackend::new(80, 28)).unwrap();
         terminal.draw(|f| render(f, &state)).unwrap();
         assert!(!screen(&terminal).contains("help · Esc close"));
 
@@ -10613,7 +11230,8 @@ mod tests {
         let action_id = state.begin_action();
         let cancel = CancellationToken::new();
         let mut interrupted_action_id = None;
-        interrupt_active_action(&mut state, &cancel, &mut interrupted_action_id);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        interrupt_active_action(&mut state, &tx, &cancel, &mut interrupted_action_id);
 
         assert!(cancel.is_cancelled());
         assert_eq!(interrupted_action_id, Some(action_id));
@@ -11083,6 +11701,141 @@ mod tests {
             }
             _ => panic!("expected UiEvent::Intent"),
         }
+    }
+
+    /// One measured model call, in the shared budget vocabulary (C-542). The real
+    /// [`flux_core::BudgetLedger`] produces every figure these tests assert on, so a surface number
+    /// can never be a hand-summed total that disagrees with what actually stops a run.
+    fn budget_call(event_id: &str, total_tokens: u64) -> flux_core::BudgetUsageEvent {
+        flux_core::BudgetUsageEvent {
+            event_id: event_id.into(),
+            scope: flux_core::BudgetScope::Segment,
+            attribution: flux_core::BudgetAttribution {
+                run_id: "run-1".into(),
+                session_id: Some("s-1".into()),
+                turn_id: Some(1),
+                segment: Some("explore".into()),
+            },
+            spend: flux_core::BudgetSpend {
+                model_calls: 1,
+                total_tokens,
+                ..flux_core::BudgetSpend::default()
+            },
+            rollup: false,
+        }
+    }
+
+    /// C-542: the engine's published budget projection is the single source of budget numbers. The
+    /// sink decodes it as its own `UiEvent` — projection plus the crossing that rides the event that
+    /// crossed it — instead of the surface re-deriving totals from raw usage.
+    #[test]
+    fn channel_sink_forwards_the_live_budget_projection() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelSink { tx, action_id: 1 };
+        let mut ledger = flux_core::BudgetLedger::new(flux_core::BudgetEnvelope {
+            scope: flux_core::BudgetScope::Run,
+            target: flux_core::BudgetLimits::with_total_tokens(100),
+            limit: flux_core::BudgetLimits::with_total_tokens(400),
+        });
+        let outcome = ledger.record(&budget_call("call-1", 150));
+
+        sink.observation(&flux_evidence::Observation::new(
+            flux_evidence::KIND_BUDGET_PROJECTION,
+            flux_evidence::Phase::Turn,
+            serde_json::json!({
+                "projection": ledger.projection(),
+                "warning": outcome.warning,
+            }),
+        ));
+        match untag(rx.try_recv().expect("a Budget event was sent")) {
+            UiEvent::Budget {
+                projection,
+                warning,
+                exhausted,
+            } => {
+                assert_eq!(projection.spent.total_tokens, 150);
+                assert_eq!(
+                    projection.declared(flux_core::BudgetDimension::TotalTokens),
+                    Some(400),
+                    "the surface renders the ledger's own declared figure"
+                );
+                let warning = warning.expect("the crossed target rides its own event");
+                assert_eq!(warning.limit, 100);
+                assert!(exhausted.is_none(), "a target is never a stop line");
+            }
+            _ => panic!("expected UiEvent::Budget"),
+        }
+    }
+
+    /// C-542: budget consumption is visible **while the run executes** — the header shows spent
+    /// versus declared and updates as spend accrues, and the two words the vocabulary turns on stay
+    /// distinguishable: a crossed target warns, a crossed hard limit is the stop line.
+    #[test]
+    fn header_shows_live_budget_consumption_and_separates_target_from_limit() {
+        let header = |state: &ChatState| -> String {
+            state
+                .header_line(140)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+        let transcript = |state: &ChatState| -> String {
+            state
+                .transcript_lines(140)
+                .iter()
+                .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+                .collect()
+        };
+        let mut state = ChatState::new("mock".into());
+        assert!(
+            !header(&state).contains("budget"),
+            "an undeclared budget renders nothing at all, never a zero ceiling"
+        );
+
+        let mut ledger = flux_core::BudgetLedger::new(flux_core::BudgetEnvelope {
+            scope: flux_core::BudgetScope::Run,
+            target: flux_core::BudgetLimits::with_total_tokens(1_000),
+            limit: flux_core::BudgetLimits::with_total_tokens(4_000),
+        });
+        let outcome = ledger.record(&budget_call("call-1", 400));
+        state.record_budget(ledger.projection(), outcome.warning, outcome.exhausted);
+        let running = header(&state);
+        assert!(running.contains("budget Σ400/4.0k tok"), "{running}");
+        assert!(!running.contains("target"), "{running}");
+
+        // Spend accrues: the header follows the ledger, and crossing the target warns visibly
+        // without claiming the run stopped.
+        let outcome = ledger.record(&budget_call("call-2", 1_200));
+        state.record_budget(ledger.projection(), outcome.warning, outcome.exhausted);
+        let over_target = header(&state);
+        assert!(
+            over_target.contains("budget Σ1.6k/4.0k tok"),
+            "{over_target}"
+        );
+        assert!(over_target.contains("over target"), "{over_target}");
+        assert!(
+            transcript(&state).contains("budget target crossed"),
+            "{}",
+            transcript(&state)
+        );
+        assert!(
+            !transcript(&state).contains("budget limit reached"),
+            "a target must not be reported as a stop: {}",
+            transcript(&state)
+        );
+
+        // The hard limit is the stop line, and both surfaces say so.
+        let outcome = ledger.record(&budget_call("call-3", 3_000));
+        state.record_budget(ledger.projection(), outcome.warning, outcome.exhausted);
+        let exhausted = header(&state);
+        assert!(exhausted.contains("budget Σ4.6k/4.0k tok"), "{exhausted}");
+        assert!(exhausted.contains("limit"), "{exhausted}");
+        assert!(
+            transcript(&state).contains("budget limit reached"),
+            "{}",
+            transcript(&state)
+        );
     }
 
     #[test]

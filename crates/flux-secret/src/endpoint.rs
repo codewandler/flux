@@ -46,6 +46,10 @@ pub struct EndpointRef {
     /// Where the credential lives — a *reference*, never a value. `None` for unauthenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<Ref>,
+    /// The `[[host]]` binding this endpoint is reachable through, by id. `None` means "reachable from
+    /// wherever the caller is", which is every endpoint declared before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Free-form non-secret labels (region, namespace, tags) for display/filtering.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
@@ -71,6 +75,7 @@ impl EndpointRef {
             protocol: None,
             source: SourceKind::Discovered,
             credential_ref: None,
+            host: None,
             labels: BTreeMap::new(),
         }
     }
@@ -84,6 +89,7 @@ impl EndpointRef {
             protocol: None,
             source: SourceKind::Config,
             credential_ref: None,
+            host: None,
             labels: BTreeMap::new(),
         }
     }
@@ -234,6 +240,62 @@ mod tests {
         .unwrap();
         let back: Wrap = toml::from_str(&body).unwrap();
         assert_eq!(back.endpoint, vec![rec]);
+    }
+
+    /// C-709: an endpoint records the `[[host]]` binding it is reachable through, by id. The field
+    /// is a *binding reference*, not an address, so it stays as model-safe as the rest of the weak
+    /// reference — and it round-trips through both the JSON wire form and the persisted TOML store.
+    #[test]
+    fn endpoint_records_the_host_binding_it_is_reachable_through() {
+        let bound = EndpointRef {
+            host: Some("k8s-dev".into()),
+            ..EndpointRef::named(
+                "pg-cluster",
+                "postgres://db.default.svc.cluster.local:5432/app",
+            )
+        };
+        let json = serde_json::to_string(&bound).unwrap();
+        assert!(json.contains(r#""host":"k8s-dev""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<EndpointRef>(&json).unwrap(),
+            bound,
+            "the binding round-trips"
+        );
+
+        // The persisted store form keeps it too, or discover → import → use would drop the fact.
+        #[derive(Serialize, Deserialize)]
+        struct Wrap {
+            endpoint: Vec<EndpointRecord>,
+        }
+        let record = EndpointRecord::config(bound.clone());
+        let body = toml::to_string(&Wrap {
+            endpoint: vec![record.clone()],
+        })
+        .unwrap();
+        assert!(body.contains(r#"host = "k8s-dev""#), "{body}");
+        let back: Wrap = toml::from_str(&body).unwrap();
+        assert_eq!(back.endpoint, vec![record]);
+    }
+
+    /// C-709: an endpoint with no host binding is unchanged — locality is added where it is known,
+    /// never required. The field is skipped on the wire, so every record written before it existed
+    /// reads back as "reachable from wherever the caller is".
+    #[test]
+    fn an_endpoint_with_no_host_binding_is_unchanged() {
+        let anywhere = EndpointRef::named("pg-public", "postgres://db.example.com:5432/app");
+        assert_eq!(anywhere.host, None);
+        let json = serde_json::to_string(&anywhere).unwrap();
+        assert!(
+            !json.contains(r#""host""#),
+            "an absent binding writes no key: {json}"
+        );
+        // A record predating the field deserializes as unbound rather than failing.
+        let legacy: EndpointRef = serde_json::from_str(
+            r#"{"id":"pg-public","url":"postgres://db.example.com:5432/app","source":"config"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.host, None);
+        assert_eq!(legacy, anywhere);
     }
 
     #[test]

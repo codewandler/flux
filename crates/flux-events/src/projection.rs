@@ -7,7 +7,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use flux_core::{is_subscription, CostSource, Message, Money, PricingTable, Usage};
+use flux_core::{
+    is_subscription, AgentLoopBindingMetadata, CostSource, Message, Money, PricingTable, Usage,
+};
 use flux_lang::ast::RunEvent;
 
 use crate::kind::{EventKind, StoredEvent};
@@ -177,6 +179,8 @@ pub struct TurnSummary {
     pub turn_id: i64,
     pub user_input: String,
     pub model: String,
+    /// Resolved behavior identity recorded when the turn opened (`None` for legacy turns).
+    pub loop_binding: Option<AgentLoopBindingMetadata>,
     pub outcome: String,
     pub iterations: u32,
     pub answer: Option<String>,
@@ -198,13 +202,18 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
     let mut by_turn: BTreeMap<i64, TurnSummary> = BTreeMap::new();
     for e in events {
         match &e.kind {
-            EventKind::TurnStarted { user_input, model } => {
+            EventKind::TurnStarted {
+                user_input,
+                model,
+                loop_binding,
+            } => {
                 by_turn.insert(
                     e.global_seq,
                     TurnSummary {
                         turn_id: e.global_seq,
                         user_input: user_input.clone(),
                         model: model.clone(),
+                        loop_binding: loop_binding.clone(),
                         outcome: "pending".to_string(),
                         iterations: 0,
                         answer: None,
@@ -245,6 +254,7 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                 iterations,
                 answer,
                 usage,
+                loop_binding,
             } => {
                 if let Some(t) = e.turn_id.and_then(|tid| by_turn.get_mut(&tid)) {
                     t.outcome = outcome.clone();
@@ -252,6 +262,9 @@ pub fn turns(events: &[StoredEvent]) -> Vec<TurnSummary> {
                     t.answer = Some(answer.clone());
                     t.ended_at_ms = Some(e.ts_ms);
                     t.usage = usage.clone();
+                    if t.loop_binding.is_none() {
+                        t.loop_binding = loop_binding.clone();
+                    }
                 }
             }
             EventKind::CallUsage { usage, .. } => {
@@ -1080,6 +1093,7 @@ mod tests {
                 0,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "do it".into(),
                     model: "m".into(),
                 },
@@ -1119,6 +1133,7 @@ mod tests {
                 3,
                 Some(10),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 2,
                     answer: "done".into(),
@@ -1197,6 +1212,7 @@ mod tests {
             0,
             None,
             EventKind::TurnStarted {
+                loop_binding: None,
                 user_input: "hi".into(),
                 model: "m".into(),
             },
@@ -1228,6 +1244,7 @@ mod tests {
                 0,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "do the thing".into(),
                     model: "model-a".into(),
                 },
@@ -1264,6 +1281,7 @@ mod tests {
                 4,
                 Some(1),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 2,
                     answer: "done".into(),
@@ -1308,6 +1326,7 @@ mod tests {
                 0,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "go".into(),
                     model: "m".into(),
                 },
@@ -1335,6 +1354,7 @@ mod tests {
                 3,
                 Some(1),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "ok".into(),
                     iterations: 2,
                     answer: "done".into(),
@@ -1372,6 +1392,7 @@ mod tests {
         push(
             None,
             EventKind::TurnStarted {
+                loop_binding: None,
                 user_input: "a".into(),
                 model: "m".into(),
             },
@@ -1393,6 +1414,7 @@ mod tests {
         push(
             Some(1),
             EventKind::TurnEnded {
+                loop_binding: None,
                 outcome: "ok".into(),
                 iterations: 3,
                 answer: "x".into(),
@@ -1402,6 +1424,7 @@ mod tests {
         push(
             None,
             EventKind::TurnStarted {
+                loop_binding: None,
                 user_input: "b".into(),
                 model: "m".into(),
             },
@@ -1416,6 +1439,7 @@ mod tests {
         push(
             Some(5),
             EventKind::TurnEnded {
+                loop_binding: None,
                 outcome: "ok".into(),
                 iterations: 1,
                 answer: "y".into(),
@@ -1425,6 +1449,7 @@ mod tests {
         push(
             None,
             EventKind::TurnStarted {
+                loop_binding: None,
                 user_input: "never ends".into(),
                 model: "m".into(),
             },
@@ -1473,6 +1498,7 @@ mod tests {
         push(
             None,
             EventKind::TurnStarted {
+                loop_binding: None,
                 user_input: "a".into(),
                 model: "m".into(),
             },
@@ -1485,6 +1511,7 @@ mod tests {
         push(
             Some(1),
             EventKind::TurnEnded {
+                loop_binding: None,
                 outcome: "ok".into(),
                 iterations: 3,
                 answer: "x".into(),
@@ -1496,6 +1523,7 @@ mod tests {
         push(
             None,
             EventKind::TurnStarted {
+                loop_binding: None,
                 user_input: "b".into(),
                 model: "m".into(),
             },
@@ -1504,6 +1532,7 @@ mod tests {
         push(
             Some(8),
             EventKind::TurnEnded {
+                loop_binding: None,
                 outcome: "ok".into(),
                 iterations: 1,
                 answer: "y".into(),
@@ -1622,6 +1651,7 @@ mod tests {
                 0,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "first".into(),
                     model: "claude-sonnet-4-6".into(),
                 },
@@ -1647,6 +1677,7 @@ mod tests {
                 2,
                 Some(1),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 1,
                     answer: "done".into(),
@@ -1659,6 +1690,7 @@ mod tests {
                 3,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "second".into(),
                     model: "claude-sonnet-4-6".into(),
                 },
@@ -1681,6 +1713,7 @@ mod tests {
                 5,
                 Some(4),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 1,
                     answer: "done".into(),
@@ -1693,6 +1726,7 @@ mod tests {
                 6,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "third".into(),
                     model: "gpt-5.5".into(),
                 },
@@ -1711,6 +1745,7 @@ mod tests {
                 8,
                 Some(7),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 1,
                     answer: "done".into(),
@@ -1767,6 +1802,7 @@ mod tests {
                 0,
                 None,
                 EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "hi".into(),
                     model: "claude-opus-4-8".into(),
                 },
@@ -1777,6 +1813,7 @@ mod tests {
                 1,
                 Some(1),
                 EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 1,
                     answer: "done".into(),
@@ -1938,6 +1975,7 @@ mod tests {
             }
             items.push(Logical {
                 kind: EventKind::TurnStarted {
+                    loop_binding: None,
                     user_input: "summarize the log".into(),
                     model: "m".into(),
                 },
@@ -1966,6 +2004,7 @@ mod tests {
             });
             items.push(Logical {
                 kind: EventKind::TurnEnded {
+                    loop_binding: None,
                     outcome: "accepted".into(),
                     iterations: 1,
                     answer: "here's the summary".into(),
@@ -2174,6 +2213,7 @@ mod tests {
         let hash = flux_lang::runtime::stmt_hash16(&ast.body[0]);
 
         let turn = TurnSummary {
+            loop_binding: None,
             turn_id: 1,
             user_input: "go".into(),
             model: "m".into(),

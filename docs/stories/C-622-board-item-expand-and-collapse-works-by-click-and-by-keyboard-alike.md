@@ -1,0 +1,29 @@
+---
+id: C-622
+title: "Board item expand and collapse works by click and by keyboard alike"
+pillar: "Core"
+status: ready
+priority: 22
+epic: tui-board-surface
+areas: [flux-tui]
+design: docs/designs/the-tui-board-is-a-real-board-collapsed-expandable-clickable-items-rendering-markdown-detail.md
+---
+
+# Board item expand and collapse works by click and by keyboard alike
+
+## Goal
+
+Expand and collapse work identically by mouse click and by keyboard, and the selection survives a board refresh.
+
+## Acceptance
+
+- [ ] Clicking a collapsed box expands it; clicking an expanded box collapses it.
+- [ ] The same expand/collapse is reachable by keyboard alone, with the binding discoverable in the pane's own help.
+- [ ] Selection and expansion state survive a board data refresh — a periodic refresh must not collapse what the operator opened or move the selection.
+- [ ] Failing first: a test drives expand by key and by click and asserts identical resulting state.
+
+## Notes
+
+Keyboard parity is a hard requirement, not a nicety: this TUI is normally run inside tmux, where mouse capture is not always available or wanted. Refresh-stable state matters because the Fleet view updates while an operator is reading an item.
+
+- Design: [docs/designs/the-tui-board-is-a-real-board-collapsed-expandable-clickable-items-rendering-markdown-detail.md](../designs/the-tui-board-is-a-real-board-collapsed-expandable-clickable-items-rendering-markdown-detail.md)

@@ -6,7 +6,7 @@ status: backlog
 epic: task-agent-backends
 design: docs/designs/task-agent-backends.md
 areas: [flux-orchestrate, flux-cli, flux-process]
-depends_on: [C-552, C-567, C-572]
+depends_on: [C-552, C-572]
 note: "local harness CLIs are task backends; each maps only loop/report/yield/budget behavior it can prove and refuses the rest"
 ---
 
@@ -36,5 +36,6 @@ the generic task-agent lifecycle and fleet evidence rules.
 
 ## Notes
 
-- The urgent native workhorse/reviewer loops land in C-567/C-572. This later story proves equivalent
-  declared profiles over foreign CLIs without making them alternate coordinators.
+- Native authored-loop binding and reviewer behavior land in C-569/C-572. This later story proves
+  equivalent declared profiles over foreign CLIs without making them alternate coordinators;
+  postponed C-567 is not a prerequisite.

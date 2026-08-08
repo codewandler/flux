@@ -210,6 +210,27 @@ Custom loops are analyzed before a turn starts. They can combine deterministic o
 `detect_intent`, `explore`, `approve_batch`, `execute_batch`, `present_results`, `ai_segment`,
 `observe`, and `await`; they cannot bypass the envelope.
 
+## Resolved loop bindings
+
+Before an agent can run, Flux resolves its selection into a versioned loop binding. The binding
+records the logical profile and revision, runner kind, immutable source reference and SHA-256,
+entry point, required operations, and required runtime features. An omitted general selector is not
+left as `None`; it becomes the explicit built-in `adaptive@1` binding.
+
+Turn-start, status, streaming, and terminal receipts expose this bounded identity and digest, never
+the loop source or prompts. Flux validates the source digest, syntax, required operation catalog,
+and runtime features before the first model request. A missing profile or capability mismatch is
+therefore an admission error, not a silent fallback to another loop.
+
+Bindings belong to sessions. Resume and restart reconstruct the admitted source from its
+digest-addressed snapshot, so editing a selected file affects only new sessions. Passing a
+different `--loop` while resuming a live session is refused; start a new session to change behavior.
+Required operations and runtime features are compared as canonical sorted sets, so a receipt from
+an older build is not rejected merely because insertion order changed; every other identity field
+remains exact.
+Roles and `task` children resolve their own declared bindings rather than inheriting the parent's
+loop or conversation.
+
 ## Flow versus journey
 
 A **flow** is a reusable deterministic computation: typed inputs, explicit operations and control

@@ -135,11 +135,14 @@ use std::time::Duration;
 
 use flux_core::{Error, Result};
 
+pub mod metrics;
 pub mod net;
 pub mod port;
 pub mod remote;
 pub mod sandbox;
+pub mod sandboxed;
 pub mod secret_scope;
+pub mod ssh;
 pub mod websocket;
 
 use sandbox::{Confinement, Sandbox, SandboxSettings, SpawnPolicy};
@@ -170,6 +173,16 @@ pub struct Workspace {
     read_roots: Vec<PathBuf>,
     /// When set, path confinement is lifted (read + write anywhere).
     unconfined: bool,
+}
+
+/// Cheap filesystem identity for deciding whether a guarded workspace file needs to be reread.
+///
+/// This is deliberately metadata-only: callers may use it as a cache invalidation token, never as
+/// a substitute for reading and validating the file that owns the actual state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FileRevision {
+    pub len: u64,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// An owned, process-local workspace for untrusted ephemeral projects.
@@ -249,10 +262,10 @@ impl Drop for ScratchWorkspace {
 impl Workspace {
     /// Create a workspace rooted at `root` (canonicalized; must exist).
     pub fn new(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
         let root = root
-            .as_ref()
             .canonicalize()
-            .map_err(|e| Error::Config(format!("workspace root: {e}")))?;
+            .map_err(|e| Error::Config(format!("workspace root {}: {e}", root.display())))?;
         Ok(Self {
             root,
             named: HashMap::new(),
@@ -289,10 +302,10 @@ impl Workspace {
     /// This is the seam a context-local worktree transition uses — the plain constructors would
     /// drop the widened roots and so break `@named`-root operations inside the new root (C-97).
     pub fn with_root(&self, root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
         let root = root
-            .as_ref()
             .canonicalize()
-            .map_err(|e| Error::Config(format!("workspace root: {e}")))?;
+            .map_err(|e| Error::Config(format!("workspace root {}: {e}", root.display())))?;
         Ok(Self {
             root,
             named: self.named.clone(),
@@ -308,6 +321,57 @@ impl Workspace {
 
     /// Add a **read-only** allowed root (canonicalized; must exist) — reads/globs/greps may reach under
     /// it, writes stay confined to the primary root (C-21). Chainable.
+    /// Derive a **strictly narrower** view of this workspace (C-613).
+    ///
+    /// The counterpart the model was missing. `add_read_root`, `add_named_root` and
+    /// `set_unconfined(true)` all widen, and [`Workspace::with_root`] deliberately *preserves* the
+    /// access posture, so before this there was no way to hand a child less than the parent held —
+    /// which is why a `task` sub-agent inherited the parent's read roots and `unconfined` flag whole.
+    ///
+    /// Narrowing only, by construction:
+    /// - the new primary root must be at or below the current one, and must already be reachable
+    ///   through it (so this cannot be used to jump sideways);
+    /// - read roots are **intersected** with `keep_read_roots` — an entry not already held is
+    ///   ignored rather than granted;
+    /// - `@named` roots are dropped, because they are write-capable and a narrowing derive must not
+    ///   carry write reach forward implicitly;
+    /// - `unconfined` can only be cleared, never set. A narrowing of an unconfined workspace yields a
+    ///   confined one.
+    ///
+    /// Composes monotonically for the same reason `Executor::push_cap_scope` does: repeated narrowing
+    /// can only shrink, so a grandchild cannot recover reach an ancestor removed.
+    pub fn narrowed(&self, root: impl AsRef<Path>, keep_read_roots: &[PathBuf]) -> Result<Self> {
+        let requested = root.as_ref();
+        let root = requested
+            .canonicalize()
+            .map_err(|e| Error::Config(format!("narrowed root {}: {e}", requested.display())))?;
+        // Reachable through the current view, so narrowing cannot become a lateral move. An
+        // unconfined parent is exempt from the containment test but still yields a confined child.
+        if !self.unconfined && !root.starts_with(&self.root) {
+            return Err(Error::Config(format!(
+                "narrowed root {} is not inside the current workspace root {}",
+                root.display(),
+                self.root.display()
+            )));
+        }
+        let keep = keep_read_roots
+            .iter()
+            .filter_map(|path| path.canonicalize().ok())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            root,
+            // Write-capable; a narrowing derive does not carry them forward.
+            named: HashMap::new(),
+            read_roots: self
+                .read_roots
+                .iter()
+                .filter(|held| keep.iter().any(|wanted| wanted == *held))
+                .cloned()
+                .collect(),
+            unconfined: false,
+        })
+    }
+
     pub fn add_read_root(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let p = path
             .as_ref()
@@ -1382,6 +1446,11 @@ pub struct System {
     workspace: Workspace,
     sandbox: Sandbox,
     worktree_base: WorktreeBase,
+    metrics_roots: metrics::MetricsRoots,
+    /// The HTTP backend a composition site attached (C-675). Empty by default and on every
+    /// construction path in this crate — see [`port::AttachedHttp`] for why the one family whose
+    /// client lives a layer up travels as a value rather than as a client built here.
+    http: port::AttachedHttp,
 }
 
 impl System {
@@ -1399,6 +1468,8 @@ impl System {
             workspace,
             sandbox: Sandbox::disabled(),
             worktree_base: WorktreeBase::from_process(),
+            metrics_roots: metrics::MetricsRoots::native(),
+            http: port::AttachedHttp::default(),
         }
     }
 
@@ -1413,6 +1484,8 @@ impl System {
             workspace,
             sandbox,
             worktree_base: WorktreeBase::from_process(),
+            metrics_roots: metrics::MetricsRoots::native(),
+            http: port::AttachedHttp::default(),
         })
     }
 
@@ -1435,6 +1508,49 @@ impl System {
     /// The base this system allocates worktree parents under.
     pub fn worktree_base(&self) -> &WorktreeBase {
         &self.worktree_base
+    }
+
+    /// Pin the kernel interfaces the host-metrics reader consults (C-653) — the same
+    /// value-held-environment shape as [`System::with_worktree_base`]. Production keeps the
+    /// default `/proc` + `/sys`; a test points them at procfs/sysfs fixtures it owns, so both the
+    /// served and the explicitly-unavailable face are reachable without depending on what the
+    /// running machine happens to expose.
+    pub fn with_metrics_roots(mut self, roots: metrics::MetricsRoots) -> Self {
+        self.metrics_roots = roots;
+        self
+    }
+
+    /// The kernel interfaces this system reads host metrics from.
+    pub fn metrics_roots(&self) -> &metrics::MetricsRoots {
+        &self.metrics_roots
+    }
+
+    /// Attach the HTTP backend this system serves [`port::GuardedHttp`] with (C-675) — the builder
+    /// a **composition site** calls, and the only way this family is ever served.
+    ///
+    /// The workspace's one HTTP client lives a layer above this crate, so the surface that holds it
+    /// hands it down: `flux-cli` builds `flux_web::NativeHttp` over the session's resolved egress
+    /// wiring and attaches it to the system it hands to substrate selection. A substrate composed
+    /// from that system — the confinement peer today, a container backend next — then serves web
+    /// effects through the same reviewed client an unselected run uses, rather than losing them
+    /// because the client is out of reach downward.
+    ///
+    /// Deliberately **not** applied to the session's own native system: leaving the default
+    /// unattached keeps "a bare `System` serves no HTTP" true for every path that did not ask for
+    /// a substrate, which is the C-652 posture and the reason a selection cannot be silently
+    /// approximated by the caller's process.
+    ///
+    /// This adds no IO path. The backend's guarantees are the backend's; attaching only decides who
+    /// may ask it. See [`port::AttachedHttp`].
+    pub fn with_http(mut self, backend: Arc<dyn port::GuardedHttp>) -> Self {
+        self.http = port::AttachedHttp::new(backend);
+        self
+    }
+
+    /// The HTTP backend attached to this system, if any. Read by the [`port::GuardedHttp`] impl and
+    /// by substrates that compose a `System` and delegate the family to it.
+    pub(crate) fn attached_http(&self) -> &port::AttachedHttp {
+        &self.http
     }
 
     /// Allocate a fresh private worktree parent under this system's base — the guarded entry point
@@ -1465,6 +1581,11 @@ impl System {
             workspace: self.workspace.with_root(root)?,
             sandbox: self.sandbox.clone(),
             worktree_base: self.worktree_base.clone(),
+            metrics_roots: self.metrics_roots.clone(),
+            // An attached HTTP backend is not workspace-relative: it carries the egress guard and
+            // the client, neither of which changes with a root, so a re-rooted system serves the
+            // same family it served before the transition.
+            http: self.http.clone(),
         })
     }
 
@@ -1834,6 +1955,51 @@ impl System {
         let p = self.workspace.resolve_read(path)?;
         let meta = tokio::fs::metadata(&p).await?;
         Ok(meta.modified()?)
+    }
+
+    /// Read a cheap metadata-only revision through the workspace confinement boundary.
+    /// Missing files return `None`; an escaping path or another metadata error remains explicit.
+    pub fn file_revision(&self, path: &str) -> Result<Option<FileRevision>> {
+        let resolved = self.workspace.resolve_read(path)?;
+        let metadata = match std::fs::metadata(resolved) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(Some(FileRevision {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        }))
+    }
+
+    /// Metadata-only revisions for direct children of a guarded directory, sorted by name.
+    /// Missing directories are empty; every child is independently confinement-checked so a
+    /// symlink cannot turn cache invalidation into an unguarded project-metadata read.
+    pub fn directory_revisions(&self, dir: &str) -> Result<Vec<(String, FileRevision)>> {
+        let root = self.workspace.resolve_read(dir)?;
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = entries
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        names.sort();
+
+        let base = dir.trim_end_matches('/');
+        let mut revisions = Vec::with_capacity(names.len());
+        for name in names {
+            let path = if base.is_empty() {
+                name.clone()
+            } else {
+                format!("{base}/{name}")
+            };
+            if let Some(revision) = self.file_revision(&path)? {
+                revisions.push((path, revision));
+            }
+        }
+        Ok(revisions)
     }
 
     /// List the entries of a directory within the workspace (names only).
@@ -2426,6 +2592,17 @@ impl System {
             "RUSTUP_HOME",
             "CARGO_HOME",
             "RUSTUP_TOOLCHAIN",
+            // A build-shape knob, not a location. A Fleet worker's target directory is created for one
+            // story and discarded with its worktree, so incremental artifacts are never reused and are
+            // pure disk cost — roughly half of a checkout's build output. Without this entry the
+            // variable was dropped between the agent process and the `cargo` it runs, so setting it had
+            // no effect at all.
+            //
+            // `CARGO_TARGET_DIR` is deliberately NOT here, for the same reason `FLUX_ADD_DIRS` is not:
+            // it is a path, and forwarding an operator's value would point every concurrent worker at
+            // one shared target directory — which cargo locks exclusively, serializing exactly the
+            // parallelism the fleet exists to provide.
+            "CARGO_INCREMENTAL",
             // The nested-sandbox marker (D-130) is deliberately NOT here. It used to be, forwarded
             // like any other allow-listed value, which is what left it forgeable: a caller-supplied
             // `FLUX_SANDBOXED` landed after this loop and there was nothing after *that* unless the
@@ -2940,6 +3117,75 @@ mod tests {
         assert!(ws.with_root(dir_b.join("missing")).is_err());
     }
 
+    /// C-613 (failing first): `Workspace` had only widening operations, so nothing could hand a child
+    /// less than the parent held — which is why a `task` sub-agent inherited the parent's read roots
+    /// and `unconfined` flag whole. `narrowed` is the missing counterpart, and it must only ever
+    /// shrink.
+    #[test]
+    fn narrowed_only_ever_shrinks_the_view() {
+        let (base, _guard) = temp_workspace();
+        let inner = base.join("inner");
+        let kept = base.join("kept-read");
+        let dropped = base.join("dropped-read");
+        let sideways = base.join("sideways");
+        for dir in [&inner, &kept, &dropped, &sideways] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+
+        let mut ws = Workspace::new(&base).unwrap();
+        ws.add_read_root(&kept).unwrap();
+        ws.add_read_root(&dropped).unwrap();
+        ws.add_named_root("global_flows", &sideways).unwrap();
+        ws.set_unconfined(true);
+
+        let child = ws.narrowed(&inner, std::slice::from_ref(&kept)).unwrap();
+
+        assert_eq!(child.root(), inner.canonicalize().unwrap());
+        assert!(
+            child.read_roots().contains(&kept.canonicalize().unwrap()),
+            "an explicitly kept read root survives"
+        );
+        assert!(
+            !child
+                .read_roots()
+                .contains(&dropped.canonicalize().unwrap()),
+            "a read root not kept is dropped, not inherited"
+        );
+        assert!(
+            !child.has_named_root("global_flows"),
+            "named roots are write-capable and must not carry forward through a narrowing"
+        );
+        assert!(
+            !child.is_unconfined(),
+            "narrowing an unconfined workspace yields a confined one"
+        );
+
+        // A read root the parent never held cannot be granted by asking for it.
+        let forged = ws
+            .narrowed(&inner, std::slice::from_ref(&sideways))
+            .unwrap();
+        assert!(
+            forged.read_roots().is_empty(),
+            "narrowing intersects; it never grants: {:?}",
+            forged.read_roots()
+        );
+
+        // Narrowing composes monotonically — a grandchild cannot recover the dropped root.
+        let grandchild = child
+            .narrowed(&inner, &[kept.clone(), dropped.clone()])
+            .unwrap();
+        assert!(!grandchild
+            .read_roots()
+            .contains(&dropped.canonicalize().unwrap()));
+
+        // A confined parent refuses a lateral move.
+        let confined = Workspace::new(&inner).unwrap();
+        assert!(
+            confined.narrowed(&sideways, &[]).is_err(),
+            "narrowing cannot escape the current root"
+        );
+    }
+
     /// C-97: `System::rerooted` keeps the resolved sandbox (posture object identity is opaque, so
     /// assert via settings) while swapping the workspace root.
     #[test]
@@ -3191,6 +3437,32 @@ mod tests {
         sys.write_file("m.txt", "ab").await.unwrap();
         let t2 = sys.file_mtime("m.txt").await.unwrap();
         assert!(t2 >= t1, "mtime should not go backwards");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn guarded_file_revisions_are_sorted_metadata_only_and_missing_safe() {
+        let (dir, sys) = temp_workspace();
+        sys.write_file("decisions/002.md", "second").await.unwrap();
+        sys.write_file("decisions/001.md", "first").await.unwrap();
+
+        assert_eq!(sys.file_revision("missing.md").unwrap(), None);
+        assert_eq!(
+            sys.file_revision("decisions/001.md").unwrap().unwrap().len,
+            5
+        );
+        assert_eq!(
+            sys.directory_revisions("decisions")
+                .unwrap()
+                .into_iter()
+                .map(|(path, revision)| (path, revision.len))
+                .collect::<Vec<_>>(),
+            vec![
+                ("decisions/001.md".into(), 5),
+                ("decisions/002.md".into(), 6)
+            ]
+        );
+        assert!(sys.file_revision("../escape").is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
