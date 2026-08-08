@@ -1043,6 +1043,23 @@ pub(super) enum FleetAction {
         #[arg(long)]
         summary: String,
     },
+    /// Have an agent that is not the writer examine each candidate, and record its typed verdict.
+    ///
+    /// C-587. Nothing adversarial used to read a Fleet candidate: `rework` took a `--reviewer`
+    /// string, so "reviewer" named a field a finding could cite rather than an agent anyone
+    /// dispatched. The reviewer admitted here is fresh, read-only, and given one packet — the story
+    /// contract at the reviewed commit plus the exact normalized diff — and nothing else. Its
+    /// `PASS` at the exact handoff commit is what `integrate` now requires.
+    Review {
+        wave: String,
+        /// Review only this candidate. Omit to review every candidate of the wave still owed one.
+        #[arg(long, value_name = "BOARD/ITEM")]
+        item: Option<String>,
+        /// Record an external reviewer's typed `flux.fleet-review/v1` document instead of
+        /// dispatching one. Validated identically, and refused when it names the story's own writer.
+        #[arg(long, value_name = "FILE|-")]
+        from: Option<String>,
+    },
     /// Return structured review findings to the same worker session; the third request parks.
     Rework {
         wave: String,
@@ -1119,6 +1136,19 @@ pub(super) enum FleetAction {
         /// candidate beside a conflicted one. Without this, that green candidate was unreachable: apply
         /// demanded the whole wave be green, and an independent repository's delivered work was stranded
         /// by a collision it had no part in.
+        #[arg(long)]
+        only: Option<String>,
+    },
+    /// Land every member's accepted candidates on its LOCAL canonical branch, in dependency order.
+    ///
+    /// C-681. `apply` accepts and pins; this is the step that writes the branch. Per member, in the
+    /// order `depends_on` declares: accumulate the accepted candidates that the canonical ref does not
+    /// already contain, merge them in a throwaway worktree branched from that ref, gate the result
+    /// there, and only then advance the branch — by a compare-and-swap ref update, so no working tree
+    /// anywhere is touched. A conflicting candidate is left out and named. A red gate anywhere leaves
+    /// EVERY member's branch untouched. Nothing is pushed, released or deployed.
+    Promote {
+        /// Promote only this repository.
         #[arg(long)]
         only: Option<String>,
     },
@@ -1389,6 +1419,18 @@ struct MainAgentState {
     /// the wrong conclusion about which agent was confined. `default` keeps older state files loadable.
     #[serde(default)]
     capability_set: Option<Value>,
+    /// C-600: the transcript segments this coordinator has retired, oldest first.
+    ///
+    /// The coordinator's durable session is an *operator* artifact, and it had no lifecycle: the
+    /// model never reads it back and compaction is structurally unreachable for an authored loop, so
+    /// one recorded session reached 8.2 MB after ~75 intake items and kept growing. Rolling over is
+    /// the bound; this index is how a retired segment stays findable afterwards. The transcripts
+    /// themselves are never deleted — every segment is minted in the SAME store, so
+    /// `flux sessions --store <git-dir>/flux-fleet/sessions/main` and the TUI session picker still
+    /// list all of them. The index is bounded because a list that only grows is how one state file
+    /// reached 12.9MB; the store, not this field, is the durable record.
+    #[serde(default)]
+    session_history: Vec<String>,
 }
 
 impl Default for MainAgentState {
@@ -1403,7 +1445,30 @@ impl Default for MainAgentState {
             last_turn: None,
             last_error: None,
             capability_set: None,
+            session_history: Vec::new(),
         }
+    }
+}
+
+impl MainAgentState {
+    /// Record the coordinator's current transcript segment, retaining the one it replaces.
+    ///
+    /// C-600: a rollover must never lose operator history, so the id being replaced is pushed onto
+    /// the index rather than overwritten. Recording the same id again is a resume, not a roll.
+    fn record_session(&mut self, session: Option<String>) {
+        let replaced = self
+            .session
+            .take()
+            .filter(|previous| session.as_deref() != Some(previous.as_str()));
+        if let Some(previous) = replaced {
+            self.session_history.push(previous);
+            let overflow = self
+                .session_history
+                .len()
+                .saturating_sub(COORDINATOR_TRANSCRIPT_HISTORY);
+            self.session_history.drain(..overflow);
+        }
+        self.session = session;
     }
 }
 
@@ -1442,7 +1507,30 @@ struct FleetConfig {
     #[serde(default = "default_worktree_root")]
     worktree_root: PathBuf,
     #[serde(default)]
+    promote: PromoteConfig,
+    #[serde(default)]
     repositories: Vec<FleetRepository>,
+}
+
+/// When accumulated acceptance is worth spending a full repository gate on.
+///
+/// C-681. This was `SNAPSHOT_EVERY` in one operator's shell driver — an environment variable read by
+/// a script that lived outside the product, so no other deployment had it and nothing validated it.
+/// Landing is a first-class fleet operation, so its one tuning knob is first-class configuration.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromoteConfig {
+    /// Accepted candidates a member must have waiting before promotion gates and lands it.
+    #[serde(default = "default_promote_threshold")]
+    threshold: usize,
+}
+
+impl Default for PromoteConfig {
+    fn default() -> Self {
+        Self {
+            threshold: default_promote_threshold(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1586,6 +1674,15 @@ struct FleetRepository {
     fences: Vec<String>,
     #[serde(default)]
     concurrency: Option<usize>,
+    /// Repositories whose promotion must precede this one.
+    ///
+    /// C-681. Which member lands first is a property of the DEPLOYMENT, not of Flux: the roadmap
+    /// workspace's decision 0005 fixes `flux → connectors → exchange`, and a fleet with one repository
+    /// declares nothing at all. So the order is read from this graph rather than written into the
+    /// product, and no member id appears in Flux's own source. Declaration order breaks ties, so an
+    /// operator who simply lists repositories in dependency order already gets it.
+    #[serde(default)]
+    depends_on: Vec<String>,
 }
 
 const fn default_max_workers() -> usize {
@@ -1601,6 +1698,11 @@ const fn default_true() -> bool {
     true
 }
 const fn default_template_instances() -> usize {
+    1
+}
+/// Land as soon as anything is accepted. Raising it batches several waves into one gate run, at the
+/// cost of leaving accepted work off the canonical branch for longer.
+const fn default_promote_threshold() -> usize {
     1
 }
 /// The task kind that grants a template the dedicated wave-integrator catalogue. Declaring it in
@@ -2399,7 +2501,11 @@ pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
     configured_main_research_loop_with(&root, &config)?;
     let state = read_fleet_state(&root)?;
     let store = agent_store_path(&root, "main")?;
-    let session = state.main_agent.session.clone();
+    // C-600: decide the transcript segment BEFORE the surface projects it. A segment that reached
+    // the rollover ceiling is not resumed — the attach mints a fresh one in the same store, and
+    // `attach_session` records the roll — so attach time is bounded by one segment rather than by
+    // the coordinator's total history.
+    let session = coordinator_resume_session(&store, state.main_agent.session.as_deref());
     let initial_snapshot = fleet_tui_initial_snapshot(&root, &state, &config);
     Ok(FleetTuiLaunch {
         root: root.clone(),
@@ -3241,17 +3347,25 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             });
         }
         if let Some(existing) = state.main_agent.session.as_deref() {
-            bail!(
-                "conflict/precondition: Fleet main records session {existing}, refusing to attach {session}"
-            )
+            // C-600: a segment that reached the rollover ceiling rolls over instead of pinning the
+            // coordinator to one transcript forever. `prepare_fleet_tui` has already declined to
+            // resume it, so the surface arrives holding a freshly minted id; every other mismatch is
+            // still the conflict it was.
+            let store = agent_store_path(&self.root, "main")?;
+            if !coordinator_transcript_is_full(&store, existing) {
+                bail!(
+                    "conflict/precondition: Fleet main records session {existing}, refusing to attach {session}"
+                )
+            }
         }
         self.mutate("fleet.tui.attached", |state| {
             state.revision += 1;
-            state.main_agent.session = Some(session.to_string());
+            let rolled_from = state.main_agent.session.clone();
+            state.main_agent.record_session(Some(session.to_string()));
             Ok((
                 "main".into(),
                 "attached".into(),
-                json!({"agent":"main","session":session,"status":state.main_agent.status}),
+                json!({"agent":"main","session":session,"status":state.main_agent.status,"rolled_from":rolled_from}),
             ))
         })
     }
@@ -3379,7 +3493,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                 if let Some(error) = error {
                     intake["error"] = json!(redact(error));
                 }
-                state.main_agent.session = Some(session.to_string());
+                state.main_agent.record_session(Some(session.to_string()));
                 state.main_agent.status = if succeeded {
                     if state.running { "running" } else { "stopped" }
                 } else {
@@ -4923,11 +5037,15 @@ worktree_root = ".flux/fleet/worktrees"
 # fences = [".git/**", ".flux/fleet/**"]
 # max_instances = {max_workers}
 
+# [promote]
+# threshold = 1 # accepted candidates a member accumulates before promotion gates and lands it
+
 # [[repositories]]
 # id = "repo"
 # root = "."
 # board = "default"
-# canonical_ref = "origin/main"
+# canonical_ref = "main" # a LOCAL branch: promotion cannot write a remote-tracking ref
+# depends_on = [] # repositories that must be promoted before this one
 # gate = ["cargo", "test", "--workspace"]
 "#,
                         ),
@@ -5708,10 +5826,14 @@ worktree_root = ".flux/fleet/worktrees"
                 // state — so the wave waited for a human who, on the night this was found, was not
                 // there. Recording now, from the worktrees the turns just finished in, is what makes a
                 // wave able to advance on its own.
-                let handoffs = record_provisional_handoffs(&mut state, &wave);
+                let handoffs = record_turn_handoffs(&mut state, &wave);
                 let handed_off = handoffs
                     .iter()
                     .filter(|report| report["recorded"] == json!(true))
+                    .count();
+                let verified = handoffs
+                    .iter()
+                    .filter(|report| report["verified"] == json!(true))
                     .count();
                 if let Some(record) = state.waves.get_mut(&wave) {
                     let outstanding = record["topology"]["repositories"]
@@ -5731,7 +5853,7 @@ worktree_root = ".flux/fleet/worktrees"
                     });
                     record["agent_turns"] = json!(receipts);
                     record["agent_errors"] = json!(errors);
-                    record["provisional_handoffs"] = json!(handoffs);
+                    record["turn_handoffs"] = json!(handoffs);
                 }
                 state.revision += 1;
                 persist_fleet_mutation(
@@ -5754,7 +5876,8 @@ worktree_root = ".flux/fleet/worktrees"
                 }
                 return Ok((
                     format!(
-                        "{wave} agents completed; {handed_off} of {} handed off provisionally",
+                        "{wave} agents completed; {handed_off} of {} handed off, {verified} with \
+                         verified targeted validation",
                         handoffs.len()
                     ),
                     json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "completed", "topology": topology, "receipts": receipts, "handoffs": handoffs}),
@@ -5799,6 +5922,16 @@ worktree_root = ".flux/fleet/worktrees"
                 passing_after: *passing_after,
                 no_failing_test_reason: no_failing_test_reason.as_deref(),
                 summary,
+            },
+        ),
+        FleetAction::Review { wave, item, from } => fleet_review(
+            command,
+            root,
+            state,
+            ReviewInput {
+                wave,
+                item: item.as_deref(),
+                from: from.as_deref(),
             },
         ),
         FleetAction::Rework {
@@ -6031,6 +6164,7 @@ worktree_root = ".flux/fleet/worktrees"
         FleetAction::Apply { wave, only } => {
             apply_wave(command, root, state, wave, only.as_deref())
         }
+        FleetAction::Promote { only } => promote_members(command, root, state, only.as_deref()),
         FleetAction::Call { operation } => fleet_call(command, root, state, operation, request),
     }
 }
@@ -6142,6 +6276,10 @@ fn fleet_action_dispatches(action: &FleetAction) -> bool {
         FleetAction::Run { .. }
             | FleetAction::Spawn { .. }
             | FleetAction::Task { .. }
+            // C-587: review admits a fresh reviewer and runs its turn, so it is dispatch like any
+            // other and a quiesced fleet must refuse it rather than start a model call into a
+            // binary that is about to be replaced.
+            | FleetAction::Review { .. }
             // C-631: a tick's last phase sends workers at the schedule, so a quiesced fleet must
             // refuse the driver itself rather than let each tick walk into the dispatch it wraps.
             | FleetAction::Drive { .. }
@@ -6163,6 +6301,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Spawn { .. }
             | FleetAction::Run { .. }
             | FleetAction::Handoff { .. }
+            | FleetAction::Review { .. }
             | FleetAction::Rework { .. }
             | FleetAction::Integrate { .. }
             | FleetAction::Task { .. }
@@ -6173,6 +6312,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Reopen { .. }
             | FleetAction::Resume { .. }
             | FleetAction::Apply { .. }
+            | FleetAction::Promote { .. }
             | FleetAction::Note { .. }
             | FleetAction::Reclaim { .. }
             | FleetAction::Repair { .. }
@@ -6337,6 +6477,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "spawn",
         "run",
         "handoff",
+        // Review DISPATCHES: it admits a fresh read-only agent and runs its turn.
+        "review",
         "rework",
         "integrate",
         "task",
@@ -6348,6 +6490,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "reopen",
         "resume",
         "apply",
+        // Promote MUTATES: it advances a member's local canonical branch.
+        "promote",
         "status",
         "schedule",
         // Drive MUTATES and DISPATCHES: one tick advances waves, accumulates its own record, and
@@ -6446,7 +6590,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, deploys, or deletes worktrees. Only an explicit green `apply` may merge locally.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, or deploys. `apply` accepts a green candidate and pins it with a tag; `promote` is the only operation that writes a member's local canonical branch.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet review WAVE --output json\nflux fleet apply WAVE --if-revision REV --output json\nflux fleet promote --dry-run --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet promote` is the last mile: per member, in the order `depends_on` declares, it accumulates the accepted candidates its canonical ref lacks, merges and gates them in a throwaway worktree, and advances the local branch by a compare-and-swap ref update — a conflicting candidate is left out and named, a red gate anywhere leaves every member's branch untouched, and a member whose `canonical_ref` is remote-tracking is refused because only a push could move it. `[promote] threshold` in `.flux/fleet.toml` sets how many accepted candidates a member accumulates first; it defaults to `1`. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Every candidate is examined by a fresh read-only agent that is not its writer before it may be integrated: `flux fleet review WAVE` records a typed PASS/REWORK verdict with structured findings over the exact handoff commit, and a review that could not run records `examined: false` rather than a pass. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -13585,7 +13729,11 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
     };
-    let resume_session = state.main_agent.session.clone();
+    let store = agent_store_path(root, "main")?;
+    // C-600: the headless driving path applies the same ceiling the TUI attach does — it is where
+    // ~75 intake turns grew a single session to 8.2 MB, so bounding only the attach would leave the
+    // artifact unbounded for a coordinator nobody is watching.
+    let resume_session = coordinator_resume_session(&store, state.main_agent.session.as_deref());
     let context_origin = agent_context_origin(
         "main",
         &instructions,
@@ -13599,7 +13747,7 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         id: "main".into(),
         worktree: root.to_path_buf(),
         read_roots,
-        store: agent_store_path(root, "main")?,
+        store,
         model: config.main.model,
         agent_loop: Some(agent_loop),
         agent_loop_binding: None,
@@ -13809,6 +13957,62 @@ fn agent_store_path(worktree: &Path, id: &str) -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     Ok(worktree.join(".flux/fleet/sessions").join(segment))
+}
+
+/// C-600: how many durable events one coordinator transcript segment may hold before the next
+/// resume starts a new one.
+///
+/// **Why the coordinator is exempt from `compaction_attempt`, deliberately.** The growth is a
+/// *transcript* problem, not a context problem. `FlowEngine::compaction_attempt` runs only for
+/// `TurnProgram::Adaptive`, and an authored coordinator loop is `TurnProgram::Authored`, so it can
+/// never fire here — and it should not: `.flux/fleet/loops/main-coordinator.flux` sets
+/// `current_turn: true`, so every coordinator turn is instructions plus the current request plus the
+/// typed Board/Fleet catalogue. Turn 75 never sees turn 1. Compaction would therefore rewrite the
+/// operator's only readable record to relieve a context pressure the model does not experience.
+/// Rolling the segment over bounds the artifact and leaves every prior transcript intact instead.
+///
+/// The ceiling is counted in events because events are what an attach pays for: `flux tui --fleet`
+/// rebuilds the transcript through `ChatState::project_session`, whose cost is the segment's event
+/// count, not the store's total history. See
+/// [docs/designs/coordinator-transcript-rollover.md](../../../docs/designs/coordinator-transcript-rollover.md).
+const COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS: i64 = 1_000;
+
+/// How many retired segment ids `state.json` indexes before the oldest drops out of the index.
+///
+/// Only the *pointer* is bounded: every retired transcript remains a complete session in the
+/// coordinator's store, which is what `flux sessions --store` and the TUI picker enumerate.
+const COORDINATOR_TRANSCRIPT_HISTORY: usize = 50;
+
+/// The transcript segment a coordinator resume attaches to, applying C-600's rollover ceiling.
+///
+/// `None` means "mint a fresh one" — either nothing is recorded, or the recorded segment is full.
+fn coordinator_resume_session(store: &Path, recorded: Option<&str>) -> Option<String> {
+    let recorded = recorded?;
+    (!coordinator_transcript_is_full(store, recorded)).then(|| recorded.to_string())
+}
+
+/// Whether a recorded segment has reached [`COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS`].
+///
+/// Fails *open*: an absent or unreadable store keeps the recorded identity rather than silently
+/// starting a second transcript. Fleet deliberately resumes the recorded main session, so a
+/// transient IO failure must never be able to fork that identity.
+fn coordinator_transcript_is_full(store: &Path, session: &str) -> bool {
+    coordinator_transcript_events(store, session)
+        .is_some_and(|events| events >= COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS)
+}
+
+/// Events recorded in one segment, or `None` when the store cannot answer.
+///
+/// Reads the stream head from the session registry, never the events themselves — the check that
+/// keeps attach cheap must not itself be proportional to the history it bounds.
+fn coordinator_transcript_events(store: &Path, session: &str) -> Option<i64> {
+    let database = store.join("events.db");
+    if !database.is_file() {
+        return None;
+    }
+    let events = flux_events::EventStore::open(&database).ok()?;
+    let head = events.head_seq(session).ok()?;
+    (head >= 0).then_some(head + 1)
 }
 
 fn scoped_goals(state: &FleetState) -> String {
@@ -14337,7 +14541,7 @@ fn execute_and_record_agent_turn(
                 } else {
                     "stopped".into()
                 };
-                state.main_agent.session = session;
+                state.main_agent.record_session(session);
                 state.main_agent.last_turn = Some(receipt.clone());
                 state.main_agent.last_error = None;
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
@@ -14931,7 +15135,7 @@ fn park_wave(
         // were parked as failures, and a human dug the commits out days later. The delta is recomputed
         // on every attempt, so a retry rebuilds this report rather than double-counting it.
         harvested.clear();
-        harvested.extend(record_provisional_handoffs(state, wave_id));
+        harvested.extend(record_turn_handoffs(state, wave_id));
         let wave = state
             .waves
             .get_mut(wave_id)
@@ -15701,6 +15905,8 @@ struct DrivePlan {
     advance: Vec<String>,
     /// Waves with outstanding stories whose finished turns can still be reconstructed into handoffs.
     reconstruct: Vec<String>,
+    /// C-730: waves that have earned their integrator and do not already have one running.
+    integrate: Vec<String>,
     /// C-724: claims this tick releases because the wave holding them has no live supervisor.
     released: Vec<Value>,
     /// Items this tick will send workers at.
@@ -15744,6 +15950,92 @@ fn drive_wave_next_status(wave: &Value) -> Option<&'static str> {
         .iter()
         .all(|story| story["status"].as_str() == Some("handoff-accepted"))
         .then_some("handoffs-ready")
+}
+
+/// Is this wave's integrator already running?
+///
+/// Integration resets the integration worktree it cherry-picks into, so a second integrator sent
+/// over a live first is not a duplicate report — it is two processes rewriting the same checkout.
+fn wave_has_live_integrator(state: &FleetState, wave_id: &str) -> bool {
+    state.agents.values().any(|agent| {
+        agent["task_kind"].as_str() == Some(FLEET_INTEGRATION_TASK_KIND)
+            && agent["assignment"]["wave"].as_str() == Some(wave_id)
+            && matches!(worker_activity(agent), WorkerActivity::Active)
+    })
+}
+
+/// How many integrator turns one wave may be given before the driver stops paying for them.
+///
+/// A successful integration moves the wave off `handoffs-ready` (to `green`, `red` or `conflict`),
+/// which is what normally ends this. But a turn that *completes without calling* `fleet.integrate`
+/// leaves the wave exactly where it was — and the tick would then re-dispatch it, and the next one
+/// again, spending a model turn per tick forever on a wave that is not moving. Deliberately the same
+/// small number as `max_rework`: the second attempt is a retry, the third is a loop.
+const MAX_INTEGRATOR_ATTEMPTS_PER_WAVE: u64 = 2;
+
+fn wave_integrator_attempts(wave: &Value) -> u64 {
+    wave["integrator_attempts"].as_u64().unwrap_or(0)
+}
+
+/// Waves that have earned their integrator and do not already have one.
+///
+/// C-730. `handoffs-ready` was where a wave went to stop: `drive_wave_next_status` moved it there
+/// and nothing ever read that state again. `.flux/fleet.toml` declares an `integrator` role and an
+/// `integration` loop profile pointing at `wave-integration.flux`, and the string `integrator`
+/// appeared nowhere in this crate — the role and its loop were configuration the driver could not
+/// dispatch, so every wave whose writers finished waited for a human to type `flux fleet integrate`.
+fn drive_integration_targets(state: &FleetState) -> Vec<String> {
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| wave["status"].as_str() == Some("handoffs-ready"))
+        .filter(|(_, wave)| wave_integrator_attempts(wave) < MAX_INTEGRATOR_ATTEMPTS_PER_WAVE)
+        .filter(|(id, _)| !wave_has_live_integrator(state, id))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Waves that have earned an integrator and spent every attempt at one without moving.
+///
+/// Reported rather than merely skipped. A wave that silently stops being dispatched is
+/// indistinguishable from one nobody ever looked at, and "the driver quietly gave up" is precisely
+/// the failure this epic is removing from the pipeline.
+fn drive_integration_exhausted(state: &FleetState) -> Vec<Value> {
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| wave["status"].as_str() == Some("handoffs-ready"))
+        .filter(|(_, wave)| wave_integrator_attempts(wave) >= MAX_INTEGRATOR_ATTEMPTS_PER_WAVE)
+        .map(|(id, wave)| {
+            json!({
+                "wave": id,
+                "dispatched": false,
+                "attempts": wave_integrator_attempts(wave),
+                "reason": format!(
+                    "wave {id} has spent its {MAX_INTEGRATOR_ATTEMPTS_PER_WAVE} integrator \
+                     attempt(s) and is still awaiting integration; `flux fleet integrate {id}` is \
+                     the deterministic host verb that assembles it"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// C-732: waves whose candidate is accepted and pinned, and whose member's canonical ref does not
+/// contain it yet.
+///
+/// `awaiting-delivery` is exactly the state C-721 has `apply` record when it accepted a candidate it
+/// could not deliver — so it is the evidence that the last mile is owed, rather than a guess. Used
+/// only to decide whether a tick spends a `promote` at all: the verb is idempotent and refuses on
+/// its own, but calling it every interval costs a config read and a git probe per member for
+/// nothing.
+fn drive_promotion_ready(state: &FleetState) -> Vec<String> {
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| wave["status"].as_str() == Some(WAVE_AWAITING_DELIVERY))
+        .map(|(id, _)| id.clone())
+        .collect()
 }
 
 /// What a tick would decide on, rendered as one stable value.
@@ -16283,6 +16575,11 @@ fn drive_tick_plan(
             plan.reconstruct.push(id.clone());
         }
     }
+    // C-730. Computed from the pre-tick state, so this names the waves that were ALREADY sitting at
+    // `handoffs-ready` when the tick began. A wave `plan.advance` moves there during this tick is
+    // picked up from current state after the mutation, exactly as dispatch is — a plan is a decision
+    // about what it read, not a prediction of what it is about to write.
+    plan.integrate = drive_integration_targets(state);
 
     let active = state
         .agents
@@ -16375,6 +16672,147 @@ fn drive_tick_plan(
         }
     }
     plan
+}
+
+/// The request a dispatched integrator is given. Deliberately narrow: its ceiling is two operations,
+/// and the only one that does anything is `fleet.integrate` on this exact wave.
+fn wave_integrator_request(wave_id: &str) -> String {
+    format!(
+        "Assemble wave {wave_id} and stop. Every story in it holds an accepted handoff. Call \
+         `fleet.integrate` for {wave_id} exactly once, then report the candidate and the gate \
+         verdict it returned. Do not merge to a canonical branch, do not push, do not publish, do \
+         not transition a Board item, and do not dispatch further work — a green gate is where your \
+         authority ends."
+    )
+}
+
+/// Dispatch the configured `integrator` role at a wave whose stories have all handed off.
+///
+/// C-730. The whole ceiling for this already existed — `NATIVE_INTEGRATOR_OPERATIONS`,
+/// `AgentTurnSpec::fleet_integrator`, `--native-fleet-integrator` — and nothing ever built the agent
+/// that uses it. This admits one from the template that declares the `integration` task kind, which
+/// is what routes it through `loop_policy.integration` to the configured `wave-integration.flux`.
+///
+/// It is admitted at the FLEET ROOT, not in the wave's integration worktree. The native integrator
+/// catalogue is constructed from the child process's cwd and refuses unless that cwd holds
+/// `.flux/fleet.toml`; a repository checkout does not, so an integrator placed in the integration
+/// worktree could never start. `integrate_wave` reaches the wave's worktrees on its own, and the
+/// template's `.flux/fleet/**` fence is what keeps a root-rooted writer off the ledger.
+fn dispatch_wave_integrator(command: &FleetCommand, root: &Path, wave_id: &str) -> Result<Value> {
+    let config = read_fleet_config(root)?;
+    let template = config
+        .agent_templates
+        .iter()
+        .find(|template| template.task_kind == FLEET_INTEGRATION_TASK_KIND)
+        .with_context(|| {
+            format!(
+                "not-found: no agent template declares the {FLEET_INTEGRATION_TASK_KIND} task kind, \
+                 so wave {wave_id} has no integrator to dispatch"
+            )
+        })?;
+    // Resolve and parse the loop before anything is written: a Fleet task never falls back to the
+    // general adaptive harness, and an invalid profile must not reach a model call.
+    let loop_binding = resolve_fleet_loop_binding(root, &config, &template.task_kind)?;
+    let instructions =
+        read_configured_instructions(root, &template.instructions, "wave-integrator instructions")?;
+    if instructions.trim().is_empty() {
+        bail!("input/schema: wave-integrator instructions cannot be empty")
+    }
+    let mode = template.mode;
+    let (capabilities, operations) = normalize_worker_capabilities_in(
+        mode,
+        &template.capabilities,
+        &template.task_kind,
+        Some(root),
+    )?;
+    validate_loop_capability_compatibility(&loop_binding, &operations)?;
+    let fences = normalize_fences(template.fences.iter().cloned());
+    let read_roots = config
+        .repositories
+        .iter()
+        .map(|repository| repository_root(root, repository))
+        .collect::<Result<Vec<_>>>()?;
+    let capability_set =
+        capability_set_manifest(mode, &capabilities, &operations, root, &read_roots, &fences);
+
+    let id = format!("{wave_id}-integrator");
+    let loop_dir = format!(".flux/fleet/agents/{}", safe_ref_segment(&id));
+    let loop_source = format!("{loop_dir}/agent-loop.flux");
+    let loop_binding_receipt = format!("{loop_dir}/agent-loop-binding.json");
+    if command.dry_run {
+        return Ok(json!({
+            "wave": wave_id,
+            "agent": id,
+            "role": template.role,
+            "task_kind": template.task_kind,
+            "loop_binding": loop_binding.metadata(),
+            "dispatched": false,
+            "dry_run": true,
+        }));
+    }
+    snapshot_fleet_loop_binding(root, &loop_binding, &loop_source, &loop_binding_receipt)?;
+
+    // Re-read: the mutation that advanced this wave has already landed, and an integrator record
+    // written onto a stale snapshot would lose the compare-and-set along with every sibling write.
+    let mut state = read_fleet_state(root)?;
+    state.revision += 1;
+    // Counted BEFORE the turn runs, and persisted with the admission. A turn that dies mid-flight
+    // still spent an attempt, and a counter incremented afterwards would never record the attempts
+    // that fail hardest.
+    let attempts = state.waves.get(wave_id).map_or(0, wave_integrator_attempts) + 1;
+    if let Some(wave) = state.waves.get_mut(wave_id) {
+        wave["integrator_attempts"] = json!(attempts);
+    }
+    let registration = json!({
+        "schema": "flux.fleet-agent-registration/v1",
+        "id": id,
+        "role": template.role,
+        "task_kind": template.task_kind,
+        "parent": "main",
+        "created_by": "drive",
+        "status": "accepted",
+        "transport": "flux-local",
+        "session": format!("{wave_id}-integrator-session"),
+        // No `worktree`: `addressed_turn_spec` falls back to the fleet root, which is the only place
+        // the native integrator catalogue can be constructed.
+        "assignment": {"wave": wave_id},
+        "template": template.id,
+        "model": template.model,
+        "mode": mode,
+        "instructions": redact(&instructions),
+        "capabilities": capabilities,
+        "fences": fences,
+        "writable_root": display_path(root),
+        "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
+        "capability_set": capability_set,
+        "loop_binding": loop_binding.metadata(),
+        "loop_source": loop_source,
+        "loop_binding_receipt": loop_binding_receipt,
+    });
+    state.agents.insert(id.clone(), registration.clone());
+    persist_fleet_mutation(
+        command,
+        root,
+        &state,
+        "wave.integrator.admitted",
+        json!({"wave": wave_id, "agent": id, "role": template.role, "attempt": attempts, "loop_binding": loop_binding.metadata()}),
+    )?;
+    let spec = addressed_turn_spec(root, &state, &id, wave_integrator_request(wave_id))?;
+    let receipt = execute_and_record_agent_turn(command, root, &mut state, spec, None)?;
+    // Report the wave's status as it now READS, not as the turn claimed. `fleet.integrate` is
+    // host-side and durable, so the record is the artifact — and this whole epic exists because
+    // reports were being written from intent.
+    let observed = read_fleet_state(root)?;
+    Ok(json!({
+        "wave": wave_id,
+        "agent": id,
+        "role": template.role,
+        "task_kind": template.task_kind,
+        "dispatched": true,
+        "attempt": attempts,
+        "wave_status": observed.waves.get(wave_id).map(|wave| wave["status"].clone()),
+        "session": receipt["session"].clone(),
+    }))
 }
 
 /// Read `board reconcile` the way the board CLI reads it, so the driver and an operator see the
@@ -16538,7 +16976,8 @@ fn drive_one_tick(
         && plan.dispatch.is_empty()
         && plan.advance.is_empty()
         && plan.reconstruct.is_empty()
-        && plan.released.is_empty();
+        && plan.released.is_empty()
+        && plan.integrate.is_empty();
 
     let reconstruct = plan.reconstruct.clone();
     let fingerprint = plan.fingerprint.clone();
@@ -16549,6 +16988,7 @@ fn drive_one_tick(
         "fingerprint": fingerprint,
         "advance": plan.advance,
         "reconstruct": plan.reconstruct,
+        "integrate": plan.integrate,
         "release": plan.released,
         "dispatch": plan.dispatch,
         "withheld": plan.withheld,
@@ -16569,13 +17009,35 @@ fn drive_one_tick(
             reconstructed.clear();
             released.clear();
             for wave in &reconstruct {
-                let reports = record_provisional_handoffs(state, wave);
+                let reports = record_turn_handoffs(state, wave);
                 let recorded = reports
                     .iter()
                     .filter(|report| report["recorded"] == json!(true))
                     .count();
                 if recorded > 0 {
-                    reconstructed.push(json!({"wave": wave, "recorded": recorded}));
+                    // C-730: which of them carry evidence, and the reason each unverified one does
+                    // not. A bare count reads identically for a verified handoff and an empty claim,
+                    // which is the ambiguity this epic exists to remove.
+                    let verified = reports
+                        .iter()
+                        .filter(|report| report["verified"] == json!(true))
+                        .count();
+                    reconstructed.push(json!({
+                        "wave": wave,
+                        "recorded": recorded,
+                        "verified": verified,
+                        "unverified": reports
+                            .iter()
+                            .filter(|report| {
+                                report["recorded"] == json!(true)
+                                    && report["verified"] != json!(true)
+                            })
+                            .map(|report| json!({
+                                "item": report["item"].clone(),
+                                "reason": report["reason"].clone(),
+                            }))
+                            .collect::<Vec<_>>(),
+                    }));
                 }
             }
             for (id, wave) in state.waves.iter_mut() {
@@ -16602,6 +17064,19 @@ fn drive_one_tick(
         },
     )?;
     let tick = state.drive.clone().unwrap_or_default().ticks;
+
+    // C-587, and after the advance phase for a reason: that phase is what produces `handoffs-ready`,
+    // so this is the first point at which a candidate is finished enough to be examined — and it is
+    // still before dispatch, so nothing downstream can reach integration holding an unexamined one.
+    let (reviewed, review_warnings) = if command.dry_run {
+        (Vec::new(), Vec::new())
+    } else {
+        drive_review_phase(command, root)
+    };
+    warnings.extend(review_warnings);
+    if let Ok(latest) = read_fleet_state(root) {
+        state = latest;
+    }
 
     // Dispatch last, and never from the plan's stale view: the phases above moved the very waves
     // whose claims decide what is dispatchable.
@@ -16653,12 +17128,81 @@ fn drive_one_tick(
             }
         }
     }
+    // C-730, and last for a reason. Integration is the longest operation in the pipeline, so putting
+    // it ahead of dispatch would make every writer wait on one wave's gate. Its targets are read from
+    // CURRENT state rather than `plan.integrate`, because the advance phase above is what creates
+    // most of them — a wave that reached `handoffs-ready` in this very tick must not wait for the
+    // next one to be noticed.
+    //
+    // Deliberately NOT gated on `!command.dry_run`. b90e1f4c's lesson: a dry run that
+    // short-circuits cannot answer the question it exists to answer. `dispatch_wave_integrator`
+    // resolves the template, the loop profile and the whole capability ceiling before its own
+    // dry-run return, so a dry tick reports exactly which waves it would integrate — and still
+    // writes nothing.
+    let mut integration = Vec::new();
+    let current = read_fleet_state(root)?;
+    integration.extend(drive_integration_exhausted(&current));
+    for wave in drive_integration_targets(&current) {
+        match dispatch_wave_integrator(command, root, &wave) {
+            Ok(record) => integration.push(record),
+            Err(error) => {
+                // Same contract as a failed dispatch: a fact to report, never a reason to lose a
+                // tick that already recorded handoffs.
+                let message = redact(&error.to_string());
+                warnings.push(format!("integrator dispatch failed for {wave}: {message}"));
+                integration.push(json!({"wave": wave, "dispatched": false, "error": message}));
+                // A dry run reports the refusal; it does not journal it.
+                if !command.dry_run {
+                    append_fleet_event(
+                        root,
+                        "fleet.drive.integrator-failed",
+                        json!({"wave": wave, "error": message}),
+                    )?;
+                }
+            }
+        }
+    }
+    // C-732, and the last operator-invoked step in the pipeline. Integration assembles a candidate
+    // and `apply` accepts it, but until this call *landing* was still a verb a human typed — so a
+    // fleet left alone finished every wave and delivered none of them, which is the whole gap
+    // between "the harness runs" and "the harness ships".
+    //
+    // Deliberately calls the same `promote_members` the CLI verb does, rather than reimplementing
+    // the rules here: it honours `command.dry_run` itself, refuses a member whose `canonical_ref` is
+    // remote-tracking, leaves every branch untouched on a red gate, and re-reads containment after
+    // landing. A second copy of those rules would drift, and the copy that drifted would be the
+    // unattended one.
+    let mut promotion = Value::Null;
+    let awaiting = drive_promotion_ready(&read_fleet_state(root)?);
+    if !awaiting.is_empty() {
+        match promote_members(command, root, read_fleet_state(root)?, None) {
+            Ok((summary, result, mut promote_warnings, _)) => {
+                warnings.append(&mut promote_warnings);
+                promotion = json!({"waves": awaiting, "summary": summary, "result": result});
+            }
+            Err(error) => {
+                // Same contract as a failed dispatch or a failed integrator: a fact to report, never
+                // a reason to lose a tick that already recorded handoffs and reviews.
+                let message = redact(&error.to_string());
+                warnings.push(format!("promotion failed: {message}"));
+                promotion = json!({"waves": awaiting, "promoted": false, "error": message});
+                if !command.dry_run {
+                    append_fleet_event(
+                        root,
+                        "fleet.drive.promotion-failed",
+                        json!({"waves": awaiting, "error": message}),
+                    )?;
+                }
+            }
+        }
+    }
     let revision = read_fleet_state(root)?.revision;
     let data = json!({
         "schema": DRIVE_TICK_SCHEMA,
         "tick": tick,
         "fingerprint": plan.fingerprint,
         "idle": idle,
+        "promotion": promotion,
         "report": {
             "revision": revision,
             "previous_fingerprint": previous.fingerprint,
@@ -16667,20 +17211,41 @@ fn drive_one_tick(
         },
         "advanced": advanced,
         "reconstructed": reconstructed,
+        "reviewed": reviewed,
         // What was written, not what was proposed: `plan.released` is the candidate set and this is
         // the set that survived the compare-and-set.
         "released": released,
         "dispatch": dispatch,
+        "integration": integration,
     });
     Ok((
         format!(
-            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s)",
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), reviewed {} wave(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s), integrated {} wave(s), promoted {}",
             advanced.len(),
             reconstructed.len(),
+            reviewed.len(),
             released.len(),
             dispatch["items"].as_array().map_or(0, Vec::len),
             dispatch["withheld"].as_array().map_or(0, Vec::len),
             dispatch["released"].as_array().map_or(0, Vec::len),
+            integration
+                .iter()
+                .filter(|record| record["dispatched"] == json!(true))
+                .count(),
+            // The last mile has to be legible in the one line an unattended loop prints, or nobody
+            // can tell a fleet that delivered from one that only looked busy. Says what promotion
+            // ANSWERED, not that it was attempted: no wave owed one, or the summary promote itself
+            // produced, or the refusal.
+            match &promotion {
+                Value::Null => "nothing (no wave awaiting delivery)".to_string(),
+                value => value["summary"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!(
+                        "FAILED: {}",
+                        value["error"].as_str().unwrap_or("unknown error")
+                    )),
+            },
         ),
         data,
         warnings,
@@ -17773,15 +18338,147 @@ fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
     }))
 }
 
+/// Run one story's targeted validation at both ends and judge the result.
+///
+/// C-730 extracted this from `fleet_handoff` for the same reason `verify_story_commit` was extracted
+/// before it: a handoff recorded when a turn ends must be judged by the SAME rules as one an
+/// operator types, and two copies of these rules would drift. This is the half that was still
+/// missing — the automatic path proved the git facts and then recorded `test_argv: []`, so every
+/// unattended handoff was evidence-free by construction.
+///
+/// The two runs and the verdict on them. `Err` is reserved for an argv that could not be *executed*;
+/// a run that executed and was then judged against is a `refusal` carrying both records, because the
+/// automatic path has to record WHY it withheld verification and re-running to find out would cost a
+/// second pair of compiles.
+struct TargetedValidation {
+    before: Value,
+    /// `Null` when the pre-state already refused, which is where the operator path stops too.
+    after: Value,
+    refusal: Option<String>,
+}
+
+fn run_targeted_validation(
+    base_worktree: &Path,
+    story_worktree: &Path,
+    argv: &[String],
+) -> Result<TargetedValidation> {
+    let before = run_typed_argv(base_worktree, argv)?;
+    if before["success"].as_bool() != Some(false) && !ran_no_tests(&before) {
+        return Ok(TargetedValidation {
+            before,
+            after: Value::Null,
+            refusal: Some(
+                "validation/gate: failing-before validation unexpectedly passed on the pinned base"
+                    .into(),
+            ),
+        });
+    }
+    let after = run_typed_argv(story_worktree, argv)?;
+    if after["success"].as_bool() != Some(true) {
+        return Ok(TargetedValidation {
+            before,
+            after,
+            refusal: Some(
+                "validation/gate: passing-after validation failed at the returned commit".into(),
+            ),
+        });
+    }
+    // A test-first commit adds its test, so the SAME argv matches nothing at the pinned base — and a
+    // runner that filters to zero tests reports success (`cargo test <new name>` prints
+    // "0 passed; 0 failed; N filtered out" and exits 0). Demanding a non-zero exit there rejects the
+    // normal TDD shape outright, which is why no commit in this pipeline could ever be handed off.
+    //
+    // "Nothing ran at base, and the same argv runs and passes at the commit" IS failing-first
+    // evidence: the absence of the test is the pre-state. It is only accepted together with the
+    // passing-after check above and the requirement that the commit actually ran tests — so a typo'd
+    // or non-existent test name still fails, because it would match nothing at the commit either.
+    let refusal = (ran_no_tests(&before) && ran_no_tests(&after)).then(|| {
+        "validation/gate: targeted validation matched no test at the base or the commit — cite an \
+         argv that actually runs the failing-first test"
+            .to_string()
+    });
+    Ok(TargetedValidation {
+        before,
+        after,
+        refusal,
+    })
+}
+
+/// [`run_targeted_validation`] for the caller that must refuse rather than record: the operator's
+/// `flux fleet handoff`, whose whole contract is that an unproven claim does not become a handoff.
+fn targeted_validation_evidence(
+    base_worktree: &Path,
+    story_worktree: &Path,
+    argv: &[String],
+) -> Result<(Value, Value)> {
+    let validation = run_targeted_validation(base_worktree, story_worktree, argv)?;
+    if let Some(refusal) = validation.refusal {
+        bail!("{refusal}")
+    }
+    Ok((validation.before, validation.after))
+}
+
+/// Where a story's pre-state is measured.
+///
+/// The wave's `verify` checkout is pinned to the base and never written to. Waves dispatched before
+/// it existed fall back to the integration worktree, which is how this was always done — wrong, but
+/// no worse for them than it already was.
+fn story_base_worktree(repository: &Value) -> Option<PathBuf> {
+    repository["verify"]["worktree"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            repository["integration"]["worktree"]
+                .as_str()
+                .map(PathBuf::from)
+        })
+}
+
+/// The targeted validation argv a finished worker actually ran, recovered from its own turn.
+///
+/// A turn that has ended cannot be asked to cite anything, but it does not have to be: every typed
+/// tool call it made is already in the receipt Fleet stored. The story's failing-first test is the
+/// `cargo_test` call that NAMES it, so a call carrying a `filter` wins, then one naming a `package`.
+///
+/// An untargeted `cargo test --workspace` is deliberately not accepted as targeted evidence. It is
+/// the integrator's gate wearing a worker's clothes: re-running it at both ends, per story, would
+/// cost more than the gate it is standing in for and would still prove nothing about *this* story.
+fn worker_recorded_test_argv(agent: &Value) -> Option<Vec<String>> {
+    let calls = agent["last_turn"]["events"]
+        .as_array()?
+        .iter()
+        .filter(|event| {
+            event["type"].as_str() == Some("tool_call")
+                && event["name"].as_str() == Some("cargo_test")
+        })
+        .map(|event| &event["input"])
+        .collect::<Vec<_>>();
+    let targeted = calls
+        .iter()
+        .rev()
+        .find(|input| {
+            input["filter"]
+                .as_str()
+                .is_some_and(|f| !f.trim().is_empty())
+        })
+        .or_else(|| {
+            calls.iter().rev().find(|input| {
+                input["package"]
+                    .as_str()
+                    .is_some_and(|p| !p.trim().is_empty())
+            })
+        })?;
+    Some(flux_tools::cargo::cargo_test_argv(targeted))
+}
+
 /// Verify that a commit really is what a story worktree delivered, and return its observed write set.
 ///
-/// Extracted so the operator-driven handoff and the provisional one recorded when a turn ends
-/// (`C-670`) prove the *same* git facts. Two copies would drift, and the copy that drifted would be
-/// the automatic one — the one nobody reads until a wave has already been assembled from it.
+/// Extracted so the operator-driven handoff and the one recorded when a turn ends (`C-670`) prove
+/// the *same* git facts. Two copies would drift, and the copy that drifted would be the automatic
+/// one — the one nobody reads until a wave has already been assembled from it.
 ///
-/// This is deliberately only the git half. Targeted validation evidence is the operator's claim and
-/// stays in `fleet_handoff`, which is exactly what makes a provisional record weaker and why it is
-/// marked as such rather than quietly presented as the same thing.
+/// This is only the git half; [`targeted_validation_evidence`] is the other, and both paths run both.
 fn verify_story_commit(
     worktree: &Path,
     branch: &str,
@@ -17827,15 +18524,29 @@ fn verify_story_commit(
 /// accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human could move it.
 /// Ten workers once ended their turns and left nine commits the fleet never recorded.
 ///
-/// What is recorded here is **provisional**: the git facts are proved by the same
-/// [`verify_story_commit`] the operator path uses, but there is no targeted validation evidence,
-/// because a turn that has already ended cannot be asked to cite the argv it ran. That is why the
-/// entry says so. Integration still runs the repository's full gate, which is what actually decides
-/// whether the wave is green — a provisional handoff moves work forward, it does not bless it.
+/// C-730. What is recorded here is **verified wherever it can be**. The git facts are proved by the
+/// same [`verify_story_commit`] the operator path uses, and the targeted validation is proved by the
+/// same [`targeted_validation_evidence`] — re-run here, not believed. "A turn that has ended cannot
+/// be asked to cite the argv it ran" was true of the model and false of the record: every typed tool
+/// call it made is in the receipt, so [`worker_recorded_test_argv`] recovers the argv and this runs
+/// it at the pinned base and at the delivered commit.
+///
+/// Three outcomes, and each says which it is:
+///
+///  - the argv ran and the evidence held: `verified: true`, with both runs attached;
+///  - the argv ran and the evidence did not hold: `verified: false` and the refusal itself is the
+///    recorded `unverified_reason`;
+///  - the worker cited no targeted test: `verified: false` and an explicit `no_failing_test_reason`,
+///    the same shape `flux fleet handoff --no-failing-test-reason` already models.
+///
+/// An empty `test_argv` with no stated reason is exactly the claim-backed-by-nothing this epic
+/// exists to remove, so it is never written. Integration still runs the repository's full gate,
+/// which is what actually decides whether the wave is green.
 ///
 /// This can never fail the wave. Every refusal becomes a recorded reason on the story, because a
-/// wave that dies during bookkeeping is strictly worse than one that reports what it could not do.
-fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Value> {
+/// wave that dies during bookkeeping is strictly worse than one that reports what it could not do —
+/// and a wave that cannot advance without an operator is the defect this whole path exists to fix.
+fn record_turn_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Value> {
     let Some(record) = state.waves.get(wave_id).cloned() else {
         return Vec::new();
     };
@@ -17891,7 +18602,9 @@ fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Val
                     continue;
                 }
             };
-            let entry = json!({
+            // The evidence half. Everything below is derived from what the worker itself did, and
+            // never from what the record wishes it had done.
+            let mut entry = json!({
                 "schema": "flux.fleet-handoff/v1",
                 "board_ref": item,
                 "worker": worker,
@@ -17905,8 +18618,56 @@ fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Val
                 "passing_after": Value::Null,
                 "summary": "recorded from the worker's worktree when its turn ended",
                 "status": "accepted",
-                "provisional": true,
+                "verified": false,
             });
+            match worker_recorded_test_argv(agent) {
+                None => {
+                    entry["no_failing_test_reason"] = json!(
+                        "the worker's turn recorded no targeted test call, so this handoff carries \
+                         no targeted validation evidence; integration's full gate is the only check \
+                         this story has had"
+                    );
+                }
+                Some(argv) => {
+                    entry["test_argv"] = json!(argv);
+                    // No pinned base checkout means no measurable pre-state. Say that, rather than
+                    // measuring the pre-state somewhere it is not.
+                    match story_base_worktree(repository) {
+                        None => {
+                            entry["unverified_reason"] = json!(
+                                "the wave has no pinned base checkout, so the failing-before \
+                                 pre-state could not be measured"
+                            );
+                        }
+                        Some(base_worktree) => {
+                            match run_targeted_validation(&base_worktree, &worktree_path, &argv) {
+                                // Both runs are attached either way. A refusal that cannot be
+                                // inspected is just a different way of saying nothing.
+                                Ok(validation) => {
+                                    entry["failing_before"] = validation.before;
+                                    entry["passing_after"] = validation.after;
+                                    match validation.refusal {
+                                        Some(refusal) => {
+                                            entry["unverified_reason"] = json!(redact(&refusal));
+                                        }
+                                        None => {
+                                            entry["verified"] = json!(true);
+                                            entry["summary"] = json!(
+                                                "verified from the worker's own targeted validation \
+                                                 when its turn ended"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    entry["unverified_reason"] = json!(redact(&error.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let entry = entry;
             if let Some(story) = state.waves.get_mut(wave_id).and_then(|record| {
                 record["topology"]["repositories"]
                     .get_mut(repository_index)
@@ -17925,9 +18686,22 @@ fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Val
                 agent["status"] = json!("handoff-accepted");
                 agent["commit"] = json!(commit);
             }
-            reports.push(
-                json!({"item": item, "worker": worker, "recorded": true, "commit": commit, "write_set": entry["write_set"]}),
-            );
+            // The verdict travels with the report, so a tick can say which handoffs it verified and
+            // which it merely recorded. A count alone reads the same for both.
+            reports.push(json!({
+                "item": item,
+                "worker": worker,
+                "recorded": true,
+                "commit": commit,
+                "write_set": entry["write_set"],
+                "verified": entry["verified"],
+                "test_argv": entry["test_argv"],
+                "reason": entry
+                    .get("unverified_reason")
+                    .or_else(|| entry.get("no_failing_test_reason"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }));
         }
     }
     reports
@@ -18035,36 +18809,15 @@ fn fleet_handoff(
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
         .unwrap_or_else(|| integration_worktree.clone());
-    let before = if documentation_only {
-        Value::Null
-    } else {
-        let evidence = run_typed_argv(&base_worktree, input.test_argv)?;
-        if evidence["success"].as_bool() != Some(false) && !ran_no_tests(&evidence) {
-            bail!(
-                "validation/gate: failing-before validation unexpectedly passed on the pinned base"
-            )
+    let (before, after) = if documentation_only {
+        let after = run_typed_argv(&worktree, input.test_argv)?;
+        if after["success"].as_bool() != Some(true) {
+            bail!("validation/gate: passing-after validation failed at the returned commit")
         }
-        evidence
+        (Value::Null, after)
+    } else {
+        targeted_validation_evidence(&base_worktree, &worktree, input.test_argv)?
     };
-    let after = run_typed_argv(&worktree, input.test_argv)?;
-    if after["success"].as_bool() != Some(true) {
-        bail!("validation/gate: passing-after validation failed at the returned commit")
-    }
-    // A test-first commit adds its test, so the SAME argv matches nothing at the pinned base — and a
-    // runner that filters to zero tests reports success (`cargo test <new name>` prints
-    // "0 passed; 0 failed; N filtered out" and exits 0). Demanding a non-zero exit there rejects the
-    // normal TDD shape outright, which is why no commit in this pipeline could ever be handed off.
-    //
-    // "Nothing ran at base, and the same argv runs and passes at the commit" IS failing-first
-    // evidence: the absence of the test is the pre-state. It is only accepted together with the
-    // passing-after check above and the requirement that the commit actually ran tests — so a typo'd
-    // or non-existent test name still fails, because it would match nothing at the commit either.
-    if !documentation_only && ran_no_tests(&before) && ran_no_tests(&after) {
-        bail!(
-            "validation/gate: targeted validation matched no test at the base or the commit — cite \
-             an argv that actually runs the failing-first test"
-        )
-    }
     // Same exclusion as the pre-handoff check: Fleet's own loop-binding snapshot is not something the
     // validation run produced. Fixing only the earlier check moved this refusal later rather than
     // removing it — wave-346's `exchange/X-138` passed the first gate and failed here on the identical
@@ -18357,6 +19110,1129 @@ fn fleet_rework(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// C-587 — every candidate is examined by an agent that is not its author.
+//
+// Until this existed, nothing adversarial ever read a Fleet candidate. `fleet rework` took a
+// `--reviewer` STRING, so "reviewer" named a field a finding could cite and never an agent anyone
+// dispatched; `.flux/fleet.toml` bound the `review` task kind to the read-only research loop and no
+// code path ever selected it. A candidate therefore carried exactly one piece of evidence into the
+// repository gate — the claim of the writer that produced it — and `integrate` spent the longest
+// operation in the pipeline on that claim alone.
+// ---------------------------------------------------------------------------
+
+/// The record a review produces, and the document an external reviewer submits. One schema, so an
+/// externally produced review is validated by exactly the same code as a dispatched one.
+const FLEET_REVIEW_SCHEMA: &str = "flux.fleet-review/v1";
+/// What the dispatched reviewer is given — and the only thing it is given.
+const FLEET_REVIEW_PACKET_SCHEMA: &str = "flux.fleet-review-packet/v1";
+/// The Fleet task kind whose `loop_policy` binding selects the reviewer's loop.
+const FLEET_REVIEW_TASK_KIND: &str = "review";
+/// The reviewer's ceiling. Read, and nothing else: an agent that can edit the code it judges is not
+/// a reviewer, and `mode = read-only` is what [`normalize_worker_capabilities_in`] enforces it with.
+const REVIEW_CAPABILITIES: [&str; 1] = ["read"];
+/// Largest normalized diff a review packet may carry.
+///
+/// A packet that does not fit is not silently shortened into something that reads complete. The
+/// guarded process port caps a child's captured output at 1 MiB, so anything at or above this budget
+/// is reported as incomplete WITHOUT claiming to know how much is missing.
+const REVIEW_DIFF_BUDGET_BYTES: usize = 512 * 1024;
+/// How many consecutive times the host re-dispatches a review that examined nothing before it stops
+/// and records `attention` instead. A retry loop with no bound is a tick cost with no end.
+const REVIEW_ATTEMPT_LIMIT: u64 = 3;
+
+/// The closed vocabularies a finding is written in, so findings can be counted and routed rather
+/// than read. Anything outside them is malformed, and malformed never becomes a pass.
+const REVIEW_CATEGORIES: [&str; 7] = [
+    "contract",
+    "correctness",
+    "safety",
+    "evidence",
+    "scope",
+    "regression",
+    "maintainability",
+];
+const REVIEW_SEVERITIES: [&str; 3] = ["blocker", "major", "minor"];
+const REVIEW_CONFIDENCES: [&str; 3] = ["high", "medium", "low"];
+
+struct ReviewInput<'a> {
+    wave: &'a str,
+    item: Option<&'a str>,
+    from: Option<&'a str>,
+}
+
+/// One candidate under review: the exact range, resolved from the wave's own record.
+struct ReviewCandidate<'a> {
+    wave: &'a str,
+    item: &'a str,
+    repository: &'a str,
+    /// The checkout whose object database holds both ends of the range. The repository source root
+    /// is preferred over the story worktree because the worktree moves on after a rework and the
+    /// range must stay resolvable.
+    source: PathBuf,
+    base: String,
+    commit: String,
+    writer: Option<String>,
+    writer_session: Option<String>,
+}
+
+/// One attempt at obtaining a verdict for one candidate.
+#[derive(Clone, Copy)]
+struct ReviewAttempt<'a> {
+    candidate: &'a ReviewCandidate<'a>,
+    packet: &'a Value,
+    attempt: u64,
+    /// A typed document an external reviewer already produced, instead of dispatching one.
+    external: Option<&'a Value>,
+}
+
+/// What actually happened to a candidate, in the shape the record stores it.
+struct ReviewOutcome {
+    /// Why this record is what it is: `reviewed`, `not-run`, `incomplete-context`, `failed`,
+    /// `attention`.
+    state: &'static str,
+    verdict: &'static str,
+    /// **The field the whole story turns on.** A clean review and a review that never happened both
+    /// carry zero findings; without this they serialize identically and "nobody looked" reads as
+    /// "nothing was wrong".
+    examined: bool,
+    reason: Option<String>,
+    findings: Vec<Value>,
+    reviewer: Value,
+}
+
+/// Why this candidate may not be integrated, or `None` when an agent that is not its author examined
+/// the exact commit being handed off and passed it.
+///
+/// Fails closed at every branch. The phrase `independent review` appears in all of them, so the
+/// refusal is greppable out of a wave that reported nothing else.
+fn candidate_review_refusal(story: &Value) -> Option<String> {
+    let Some(commit) = story["handoff"]["commit"].as_str() else {
+        return Some("has no accepted handoff commit for an independent review to examine".into());
+    };
+    let review = &story["review"];
+    let Some(reviewed) = review["reviewed_commit"].as_str() else {
+        return Some(format!("has no independent review of {commit}"));
+    };
+    if reviewed != commit {
+        return Some(format!(
+            "has a stale independent review: it examined {reviewed}, not the handoff commit {commit}"
+        ));
+    }
+    if review["examined"].as_bool() != Some(true) {
+        return Some(format!(
+            "has an independent review of {commit} that never examined it ({}{})",
+            review["state"].as_str().unwrap_or("unknown"),
+            review["reason"]
+                .as_str()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default(),
+        ));
+    }
+    match review["verdict"].as_str() {
+        Some("PASS") => None,
+        verdict => Some(format!(
+            "independent review of {commit} returned {}",
+            verdict.unwrap_or("no verdict")
+        )),
+    }
+}
+
+/// Whether this candidate still owes the wave a review the host has not already obtained.
+///
+/// A verdict already reached for this exact commit is never re-litigated, whatever it said — the
+/// point of recording it is that it does not have to be paid for twice.
+fn candidate_awaits_review(story: &Value) -> bool {
+    if story["status"].as_str() != Some("handoff-accepted") {
+        return false;
+    }
+    let Some(commit) = story["handoff"]["commit"].as_str() else {
+        return false;
+    };
+    let review = &story["review"];
+    if review["reviewed_commit"].as_str() == Some(commit)
+        && review["examined"].as_bool() == Some(true)
+    {
+        return false;
+    }
+    story["review_attempts"].as_u64().unwrap_or(0) < REVIEW_ATTEMPT_LIMIT
+}
+
+/// The body of one `## Heading` section, up to the next heading at the same or a higher level.
+fn markdown_section(body: &str, heading: &str) -> Option<String> {
+    let mut collected: Option<Vec<&str>> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            if rest.trim().eq_ignore_ascii_case(heading) {
+                collected = Some(Vec::new());
+                continue;
+            }
+            if collected.is_some() {
+                break;
+            }
+        }
+        if trimmed.starts_with("# ") && collected.is_some() {
+            break;
+        }
+        if let Some(lines) = collected.as_mut() {
+            lines.push(trimmed);
+        }
+    }
+    let text = collected?.join("\n").trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The story's Goal and Acceptance as they stood AT the reviewed commit.
+///
+/// Read out of the commit rather than off disk. The worktree moves on — a rework advances it within
+/// minutes — and a reviewer judging a candidate against a contract that candidate never saw is
+/// judging the wrong thing.
+fn story_contract_at(source: &Path, commit: &str, item: &str) -> Option<Value> {
+    let id = item.rsplit('/').next().unwrap_or(item);
+    let listing = git_output(
+        source,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            commit,
+            RECONCILE_BOARD_PREFIX,
+        ],
+    )?;
+    let path = listing.lines().find(|candidate| {
+        candidate
+            .strip_prefix(RECONCILE_BOARD_PREFIX)
+            .is_some_and(|name| name == format!("{id}.md") || name.starts_with(&format!("{id}-")))
+    })?;
+    let body = git_output(source, &["show", &format!("{commit}:{path}")])?;
+    let prose = story_prose(&body);
+    let acceptance = markdown_section(prose, "Acceptance")?;
+    Some(json!({
+        "path": path,
+        "goal": markdown_section(prose, "Goal"),
+        "acceptance": acceptance,
+    }))
+}
+
+/// Build the only thing a dispatched reviewer is given.
+///
+/// Every field is host-derived: the write set comes from the range rather than the writer's claim,
+/// the contract comes from the commit rather than the writer's summary, and there is no writer
+/// conversation, no fleet goal and no arbitrary repository file in it at all.
+fn review_packet(candidate: &ReviewCandidate<'_>) -> Value {
+    let range = format!("{}..{}", candidate.base, candidate.commit);
+    let diff = guarded_git(
+        &candidate.source,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--find-renames",
+            "--unified=3",
+            &range,
+        ],
+    )
+    .ok()
+    .filter(|output| output.exit_code == 0)
+    .map(|output| output.stdout);
+    let shortstat = git_output(&candidate.source, &["diff", "--shortstat", &range]);
+    let write_set = diff_write_set(&candidate.source, &candidate.base, &candidate.commit).ok();
+    let contract = story_contract_at(&candidate.source, &candidate.commit, candidate.item);
+    // What the reviewer would actually be shown.
+    //
+    // `redact` is deliberately blunt: one credential pattern anywhere collapses the WHOLE string.
+    // That is right for an error message and catastrophic for a diff — a candidate that merely
+    // mentions `api_key`, or touches `.env.example` or a `.pem`, arrives as the ten characters
+    // `[redacted]`. Judging completeness on the RAW diff would then mark that packet whole, and a
+    // reviewer handed nothing could return PASS over a change no one ever saw. So completeness is
+    // judged on the redacted form, which is the only form that reaches the model.
+    let shown = diff.as_deref().map(redact);
+    // Named rather than merely absent, because "incomplete" is acted on and a reason nobody recorded
+    // is a reason nobody can fix.
+    let incomplete_reason = if diff.is_none() {
+        Some("the diff could not be read from the repository checkout")
+    } else if shown.as_deref() == Some("[redacted]") {
+        Some(
+            "the diff carries a credential pattern, so it cannot be shown to a model without \
+             redacting all of it",
+        )
+    } else if shown
+        .as_deref()
+        .is_some_and(|shown| shown.len() >= REVIEW_DIFF_BUDGET_BYTES)
+    {
+        // At or above the budget the guarded port's own 1 MiB capture cap may also have clipped it,
+        // so this reports that the packet is short WITHOUT pretending to know by how much.
+        Some("the diff exceeds the reviewable packet budget")
+    } else if contract.is_none() {
+        Some("no story contract is present at the reviewed commit")
+    } else if write_set.is_none() {
+        Some("the write set could not be observed from the range")
+    } else {
+        None
+    };
+    json!({
+        "schema": FLEET_REVIEW_PACKET_SCHEMA,
+        "wave": candidate.wave,
+        "board_ref": candidate.item,
+        "repository": candidate.repository,
+        "base_commit": candidate.base,
+        "candidate_commit": candidate.commit,
+        // Over the raw range, so the candidate's identity is the candidate's, not the redaction's.
+        "diff_digest": diff.as_deref().map(flux_lang::runtime::sha256_hex),
+        "diff_bytes": diff.as_ref().map(String::len),
+        "shortstat": shortstat,
+        "write_set": write_set,
+        "story": contract,
+        "diff": shown,
+        "complete": incomplete_reason.is_none(),
+        "incomplete_reason": incomplete_reason,
+    })
+}
+
+/// The packet-input strict-review protocol.
+///
+/// Deliberately says what the reviewer may NOT do as loudly as what it must: it holds no operation
+/// that could edit anything, so an instruction to "fix" what it finds would only produce a turn that
+/// fails. Only the story's own writer repairs, through the rework budget.
+fn reviewer_instructions() -> String {
+    format!(
+        "You are an independent reviewer in a Flux Fleet. You did not write this change and you \
+         cannot modify it: you hold read operations only, and the story's own writer is the only \
+         agent that may apply a finding.\n\n\
+         Your entire input is one `{FLEET_REVIEW_PACKET_SCHEMA}` packet: the story's Goal and \
+         Acceptance as they stood at the reviewed commit, the exact normalized diff, the \
+         host-observed write set, and the candidate/base identities. Judge the diff against that \
+         contract and against the repository's declared invariants. Do not ask for more context and \
+         do not speculate about code the packet does not contain — if the packet is insufficient to \
+         judge an acceptance item, that is itself a finding in the `evidence` category.\n\n\
+         Return exactly one fenced ```json block and nothing else that parses as JSON:\n\n\
+         ```json\n\
+         {{\"schema\": \"{FLEET_REVIEW_SCHEMA}\", \"verdict\": \"PASS\", \"findings\": []}}\n\
+         ```\n\n\
+         `verdict` is `PASS` or `REWORK`. `PASS` carries zero findings and means every Acceptance \
+         item is satisfied by this diff and no invariant is crossed. `REWORK` carries at least one \
+         finding. You cannot park, cancel or accept work; the host owns the rework budget.\n\n\
+         Every finding is an object with:\n\
+         - `category`: one of {REVIEW_CATEGORIES:?}\n\
+         - `severity`: one of {REVIEW_SEVERITIES:?}\n\
+         - `confidence`: one of {REVIEW_CONFIDENCES:?}\n\
+         - `component`: the file or module the finding is about\n\
+         - `evidence`: exactly one of {{\"path\": \"repo/relative/path\", \"line\": N}}, \
+         {{\"command\": \"...\"}} or {{\"invariant\": \"...\"}}\n\
+         - `detail`: one sentence naming what is wrong and what would satisfy the contract\n\n\
+         Cite evidence; never paste the diff back."
+    )
+}
+
+/// Pull the single `flux.fleet-review/v1` document out of a reviewer's answer.
+///
+/// Deterministic and total: whole-answer JSON, then the last fenced block that parses, then the
+/// outermost brace span. Anything else yields `None`, which is a refusal — never a pass.
+fn extract_review_document(text: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        return Some(value);
+    }
+    let mut found = None;
+    let mut rest = text;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        let Some(newline) = after.find('\n') else {
+            break;
+        };
+        let body_start = newline + 1;
+        let Some(close) = after[body_start..].find("```") else {
+            break;
+        };
+        if let Ok(value) =
+            serde_json::from_str::<Value>(after[body_start..body_start + close].trim())
+        {
+            found = Some(value);
+        }
+        rest = &after[body_start + close + 3..];
+    }
+    if found.is_some() {
+        return found;
+    }
+    let open = text.find('{')?;
+    let close = text.rfind('}')?;
+    serde_json::from_str::<Value>(text.get(open..=close)?).ok()
+}
+
+/// Validate one finding against the closed vocabularies and bind it to a single piece of evidence.
+///
+/// `source` separates model assessment from host-derived fact and is set here, never read from the
+/// document — a reviewer cannot promote its own opinion to something the host observed.
+fn review_finding(raw: &Value, source: &str) -> Result<Value> {
+    let vocabulary = |name: &str, allowed: &[&str]| -> Result<String> {
+        let value = raw[name]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !allowed.contains(&value.as_str()) {
+            bail!("input/schema: review finding {name} must be one of {allowed:?}, found {value:?}")
+        }
+        Ok(value)
+    };
+    let category = vocabulary("category", &REVIEW_CATEGORIES)?;
+    let severity = vocabulary("severity", &REVIEW_SEVERITIES)?;
+    let confidence = vocabulary("confidence", &REVIEW_CONFIDENCES)?;
+    let component = raw["component"].as_str().unwrap_or_default().trim();
+    if component.is_empty() {
+        bail!("input/schema: review finding must name the affected component")
+    }
+    let detail = raw["detail"].as_str().unwrap_or_default().trim();
+    if detail.is_empty() {
+        bail!("input/schema: review finding must carry a detail")
+    }
+    let evidence = &raw["evidence"];
+    let mut finding = json!({
+        "category": category,
+        "severity": severity,
+        "confidence": confidence,
+        "component": redact(component),
+        "detail": redact(detail),
+        "source": source,
+    });
+    if let (Some(path), Some(line)) = (evidence["path"].as_str(), evidence["line"].as_u64()) {
+        if line == 0 {
+            bail!("input/schema: review finding line must be a positive integer")
+        }
+        let path = normalize_write_set(&[path.to_string()])?
+            .pop()
+            .context("input/schema: review finding path is empty")?;
+        finding["kind"] = json!("path-line");
+        finding["path"] = json!(path);
+        finding["line"] = json!(line);
+    } else if let Some(command) = evidence["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        finding["kind"] = json!("command-output");
+        finding["command"] = json!(redact(command));
+    } else if let Some(invariant) = evidence["invariant"]
+        .as_str()
+        .map(str::trim)
+        .filter(|invariant| !invariant.is_empty())
+    {
+        finding["kind"] = json!("invariant");
+        finding["invariant"] = json!(redact(invariant));
+    } else {
+        bail!(
+            "input/schema: review finding evidence must cite {{path,line}}, {{command}} or {{invariant}}"
+        )
+    }
+    Ok(finding)
+}
+
+/// Read a typed verdict out of a review document, refusing everything that is not one.
+///
+/// A `PASS` carrying findings is malformed rather than generously reinterpreted: the two fields
+/// disagree, and the safe reading of a disagreement is that the document cannot be trusted.
+fn parse_review_document(document: &Value, source: &str) -> Result<(&'static str, Vec<Value>)> {
+    if document["schema"].as_str() != Some(FLEET_REVIEW_SCHEMA) {
+        bail!("input/schema: a review document must declare schema {FLEET_REVIEW_SCHEMA}")
+    }
+    let verdict = match document["verdict"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "PASS" => "PASS",
+        "REWORK" => "REWORK",
+        other => bail!("input/schema: review verdict must be PASS or REWORK, found {other:?}"),
+    };
+    let raw = document["findings"].as_array().cloned().unwrap_or_default();
+    let findings = raw
+        .iter()
+        .map(|finding| review_finding(finding, source))
+        .collect::<Result<Vec<_>>>()?;
+    if verdict == "PASS" && !findings.is_empty() {
+        bail!("input/schema: a PASS review cannot carry findings")
+    }
+    if verdict == "REWORK" && findings.is_empty() {
+        bail!("input/schema: a REWORK review must carry at least one finding")
+    }
+    Ok((verdict, findings))
+}
+
+/// Project structured findings onto the three shapes [`fleet_rework`] already accepts, so review
+/// consumes the existing budget rather than inventing a second one beside it.
+fn rework_inputs_from_findings(findings: &[Value]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut commands = Vec::new();
+    let mut invariants = Vec::new();
+    for finding in findings {
+        let label = format!(
+            "[{}/{}] {}",
+            finding["severity"].as_str().unwrap_or("major"),
+            finding["category"].as_str().unwrap_or("correctness"),
+            finding["detail"].as_str().unwrap_or("(no detail)"),
+        );
+        match finding["kind"].as_str() {
+            Some("path-line") => paths.push(format!(
+                "{}:{}:{label}",
+                finding["path"].as_str().unwrap_or_default(),
+                finding["line"].as_u64().unwrap_or(1),
+            )),
+            Some("command-output") => commands.push(format!(
+                "{}: {label}",
+                finding["command"].as_str().unwrap_or_default()
+            )),
+            _ => invariants.push(format!(
+                "{}: {label}",
+                finding["invariant"]
+                    .as_str()
+                    .or_else(|| finding["component"].as_str())
+                    .unwrap_or("invariant"),
+            )),
+        }
+    }
+    (paths, commands, invariants)
+}
+
+/// The durable receipt: who looked, at what, under which loop, and what they concluded.
+fn review_receipt(
+    candidate: &ReviewCandidate<'_>,
+    packet: &Value,
+    attempt: u64,
+    outcome: &ReviewOutcome,
+) -> Value {
+    let mut counts = BTreeMap::new();
+    for finding in &outcome.findings {
+        *counts
+            .entry(finding["severity"].as_str().unwrap_or("major").to_string())
+            .or_insert(0u64) += 1;
+    }
+    json!({
+        "schema": FLEET_REVIEW_SCHEMA,
+        "wave": candidate.wave,
+        "board_ref": candidate.item,
+        "repository": candidate.repository,
+        "base_commit": candidate.base,
+        "reviewed_commit": candidate.commit,
+        "candidate_digest": packet["diff_digest"],
+        "attempt": attempt,
+        "max_attempts": REVIEW_ATTEMPT_LIMIT,
+        "reviewer": outcome.reviewer,
+        // Recorded so independence is a property of the record, not of a comment.
+        "writer": candidate.writer,
+        "writer_session": candidate.writer_session,
+        "state": outcome.state,
+        "verdict": outcome.verdict,
+        "examined": outcome.examined,
+        "reason": outcome.reason,
+        "findings": outcome.findings,
+        "finding_counts": counts,
+        "packet": {
+            "schema": packet["schema"],
+            "complete": packet["complete"],
+            "diff_bytes": packet["diff_bytes"],
+            "shortstat": packet["shortstat"],
+            "story_contract": packet["story"]["path"],
+            "write_set": packet["write_set"],
+        },
+    })
+}
+
+/// Admit the fresh, read-only agent that examines one candidate.
+///
+/// Deliberately NOT routed through [`fleet_spawn`]. The ceiling below is the entire point of the
+/// story and is pinned here rather than inherited from whatever template or ad-hoc default a
+/// workspace happens to configure — and the reviewer's workspace root is a per-candidate sandbox
+/// holding only its packet, so it cannot read fleet state, the writer's transcript, or any
+/// repository checkout.
+fn admit_candidate_reviewer(
+    root: &Path,
+    config: &FleetConfig,
+    state: &mut FleetState,
+    candidate: &ReviewCandidate<'_>,
+    attempt: u64,
+    packet: &Value,
+) -> Result<String> {
+    let mut id = format!(
+        "review-{}-{}-{attempt}",
+        safe_ref_segment(candidate.wave),
+        safe_ref_segment(candidate.item),
+    );
+    // A re-review of a candidate whose verdict was already reached reuses the attempt number, and a
+    // reviewer is never resumed — so disambiguate rather than refuse. Refusing here would have
+    // turned an operator's explicit second look into a recorded review failure.
+    if state.agents.contains_key(&id) {
+        id = format!("{id}-{}", state.revision + 1);
+    }
+    if candidate.writer.as_deref() == Some(id.as_str()) {
+        bail!("permission: a story's writer cannot be its reviewer")
+    }
+    let loop_binding = resolve_fleet_loop_binding(root, config, FLEET_REVIEW_TASK_KIND)?;
+    let sandbox_relative = format!(
+        ".flux/fleet/reviews/{}/{}/{attempt}",
+        safe_ref_segment(candidate.wave),
+        safe_ref_segment(candidate.item),
+    );
+    // Written through the guarded port, which creates the sandbox on the way. It must exist before
+    // the loop snapshot below can be confined to it.
+    guarded_system(root)?
+        .write_file_atomic(
+            &format!("{sandbox_relative}/packet.json"),
+            &serde_json::to_string_pretty(packet)?,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let sandbox = confined_root(root)?.join(&sandbox_relative);
+    let loop_dir = format!(".flux/fleet/agents/{}", safe_ref_segment(&id));
+    let loop_source = format!("{loop_dir}/agent-loop.flux");
+    let loop_binding_receipt = format!("{loop_dir}/agent-loop-binding.json");
+    snapshot_fleet_loop_binding(&sandbox, &loop_binding, &loop_source, &loop_binding_receipt)?;
+    let capabilities = REVIEW_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect::<Vec<_>>();
+    let (capabilities, operations) = normalize_worker_capabilities_in(
+        FleetTaskMode::ReadOnly,
+        &capabilities,
+        FLEET_REVIEW_TASK_KIND,
+        Some(&sandbox),
+    )?;
+    validate_loop_capability_compatibility(&loop_binding, &operations)?;
+    let fences = normalize_fences(vec![".git/**".to_string()]);
+    let read_roots: Vec<PathBuf> = Vec::new();
+    let capability_set = capability_set_manifest(
+        FleetTaskMode::ReadOnly,
+        &capabilities,
+        &operations,
+        &sandbox,
+        &read_roots,
+        &fences,
+    );
+    state.revision += 1;
+    let registration = json!({
+        "schema": "flux.fleet-agent-registration/v1",
+        "id": id,
+        "parent": "main",
+        "role": "reviewer",
+        "task_kind": FLEET_REVIEW_TASK_KIND,
+        "template": Value::Null,
+        "ephemeral": true,
+        "transport": "flux-local",
+        "model": config.main.model,
+        "mode": FleetTaskMode::ReadOnly,
+        "board_ref": candidate.item,
+        "instructions": reviewer_instructions(),
+        "instructions_source": Value::Null,
+        "capabilities": capabilities,
+        "fences": fences,
+        "writable_root": display_path(&sandbox),
+        "read_roots": Vec::<String>::new(),
+        "capability_set": capability_set,
+        "loop_binding": loop_binding.metadata(),
+        "loop_source": loop_source,
+        "loop_binding_receipt": loop_binding_receipt,
+        "status": "admitted",
+        "assignment": {
+            "wave": candidate.wave,
+            "board_ref": candidate.item,
+            "worktree": display_path(&sandbox),
+            "reviewed_commit": candidate.commit,
+        },
+        "lease": {"generation": state.revision, "holder": id, "status": "active"},
+        "created_by": "host",
+    });
+    state.agents.insert(id.clone(), registration);
+    Ok(id)
+}
+
+/// Read an external reviewer's typed document from a file or standard input.
+fn read_review_document(path: &str) -> Result<Value> {
+    let text = if path == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+            .context("input/schema: review document could not be read from stdin")?;
+        buffer
+    } else {
+        fs::read_to_string(path)
+            .with_context(|| format!("not-found: review document {path} could not be read"))?
+    };
+    extract_review_document(&text)
+        .with_context(|| format!("input/schema: {path} holds no {FLEET_REVIEW_SCHEMA} document"))
+}
+
+/// The reasons a reviewer is never dispatched at all, and what the record says instead.
+///
+/// Kept whole and pure so the fail-closed table is one readable thing rather than four early
+/// returns scattered through a function that also runs a model. Every arm returns
+/// `examined: false` — nothing here looked at the candidate, and the record must not imply it did.
+fn review_refused_before_dispatch(
+    running: bool,
+    candidate: &ReviewCandidate<'_>,
+    packet: &Value,
+    attempt: u64,
+) -> Option<ReviewOutcome> {
+    let blocked = |state: &'static str, reason: String| ReviewOutcome {
+        state,
+        verdict: "BLOCKED",
+        examined: false,
+        reason: Some(reason),
+        findings: Vec::new(),
+        reviewer: Value::Null,
+    };
+    if !running {
+        return Some(blocked(
+            "not-run",
+            "the main coordinator is stopped, so no reviewer could be dispatched".into(),
+        ));
+    }
+    if packet["story"]["acceptance"].as_str().is_none() {
+        return Some(blocked(
+            "not-run",
+            format!(
+                "no story contract for {} is present at {}, so there is nothing to review against",
+                candidate.item, candidate.commit
+            ),
+        ));
+    }
+    if packet["complete"].as_bool() != Some(true) {
+        // NOT a refusal that wedges the wave. A candidate that cannot be examined is itself a
+        // finding, and routing it as one spends the rework budget and terminates in the host's PARK
+        // rather than in a deadlock only an operator can clear.
+        let detail = format!(
+            "this candidate cannot be examined: {}{}. Split it, or remove what forces the redaction, \
+             so a reviewer can judge it against its acceptance",
+            packet["incomplete_reason"]
+                .as_str()
+                .unwrap_or("the review packet is incomplete"),
+            packet["shortstat"]
+                .as_str()
+                .map(|shortstat| format!(" ({shortstat})"))
+                .unwrap_or_default(),
+        );
+        return Some(ReviewOutcome {
+            state: "incomplete-context",
+            verdict: "REWORK",
+            examined: false,
+            reason: Some("the review packet is incomplete".into()),
+            findings: vec![json!({
+                "kind": "invariant",
+                "category": "evidence",
+                "severity": "blocker",
+                "confidence": "high",
+                "component": candidate.item,
+                "invariant": "a candidate must fit a reviewable packet",
+                "detail": detail,
+                // Host-derived, and labelled so. No model asserted this.
+                "source": "host",
+            })],
+            reviewer: json!({"id": Value::Null, "source": "host", "session": Value::Null}),
+        });
+    }
+    if attempt > REVIEW_ATTEMPT_LIMIT {
+        return Some(blocked(
+            "attention",
+            format!(
+                "{REVIEW_ATTEMPT_LIMIT} reviews of {} examined nothing; this candidate needs an operator",
+                candidate.commit
+            ),
+        ));
+    }
+    None
+}
+
+/// Obtain a verdict for one candidate: dispatch a fresh reviewer, or accept an external one.
+///
+/// Every branch that could not obtain a model assessment returns `examined: false`. That is the
+/// invariant the integration gate depends on — no path through here can produce a `PASS` that
+/// nothing actually looked at.
+fn review_candidate(
+    command: &FleetCommand,
+    root: &Path,
+    config: &FleetConfig,
+    state: &mut FleetState,
+    review: &ReviewAttempt<'_>,
+) -> ReviewOutcome {
+    let ReviewAttempt {
+        candidate,
+        packet,
+        attempt,
+        external,
+    } = *review;
+    let blocked = |state: &'static str, reason: String| ReviewOutcome {
+        state,
+        verdict: "BLOCKED",
+        examined: false,
+        reason: Some(reason),
+        findings: Vec::new(),
+        reviewer: Value::Null,
+    };
+
+    if let Some(document) = external {
+        let reviewer = document["reviewer"].as_str().unwrap_or_default().trim();
+        return match parse_review_document(document, "reviewer") {
+            Ok((verdict, findings)) => ReviewOutcome {
+                state: "reviewed",
+                verdict,
+                examined: true,
+                reason: None,
+                findings,
+                reviewer: json!({
+                    "id": reviewer,
+                    "source": "external",
+                    "session": Value::Null,
+                    "model": Value::Null,
+                    "loop": Value::Null,
+                }),
+            },
+            Err(error) => blocked("failed", redact(&error.to_string())),
+        };
+    }
+
+    if let Some(outcome) = review_refused_before_dispatch(state.running, candidate, packet, attempt)
+    {
+        return outcome;
+    }
+
+    let reviewer = match admit_candidate_reviewer(root, config, state, candidate, attempt, packet) {
+        Ok(reviewer) => reviewer,
+        Err(error) => return blocked("failed", redact(&error.to_string())),
+    };
+    let request = format!(
+        "Review this candidate. Your entire input is the packet below.\n\n{}",
+        serde_json::to_string_pretty(packet).unwrap_or_else(|error| error.to_string()),
+    );
+    let spec = match addressed_turn_spec(root, state, &reviewer, request) {
+        Ok(spec) => spec,
+        Err(error) => return blocked("failed", redact(&error.to_string())),
+    };
+    let model = spec.model.clone();
+    let receipt = match execute_and_record_agent_turn(command, root, state, spec, None) {
+        Ok(receipt) => receipt,
+        Err(error) => return blocked("failed", redact(&error.to_string())),
+    };
+    let identity = json!({
+        "id": reviewer,
+        "source": "agent",
+        "session": receipt["session"],
+        "model": model,
+        "loop": loop_binding_summary(&receipt["loop_binding"]),
+    });
+    let answer = receipt["answer"].as_str().unwrap_or_default();
+    let Some(document) = extract_review_document(answer) else {
+        return ReviewOutcome {
+            reviewer: identity,
+            ..blocked(
+                "failed",
+                format!("reviewer {reviewer} returned no {FLEET_REVIEW_SCHEMA} document"),
+            )
+        };
+    };
+    match parse_review_document(&document, "reviewer") {
+        Ok((verdict, findings)) => ReviewOutcome {
+            state: "reviewed",
+            verdict,
+            examined: true,
+            reason: None,
+            findings,
+            reviewer: identity,
+        },
+        Err(error) => ReviewOutcome {
+            reviewer: identity,
+            ..blocked("failed", redact(&error.to_string()))
+        },
+    }
+}
+
+fn fleet_review(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    input: ReviewInput<'_>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let config = read_fleet_config(root)?;
+    let wave = state
+        .waves
+        .get(input.wave)
+        .cloned()
+        .with_context(|| format!("not-found: wave {}", input.wave))?;
+    if !matches!(
+        wave["status"].as_str(),
+        Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+    ) {
+        bail!("conflict/precondition: review is only available before integration")
+    }
+    let external = match input.from {
+        Some(path) => Some(read_review_document(path)?),
+        None => None,
+    };
+    let mut selected = Vec::new();
+    if let Some(item) = input.item {
+        validate_board_refs(&[item.to_string()])?;
+        selected.push(wave_story_indices(&wave, item)?);
+    } else {
+        if external.is_some() {
+            bail!("input/schema: --from reviews exactly one candidate; name it with --item")
+        }
+        for (repository_index, repository) in wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (story_index, story) in repository["stories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if candidate_awaits_review(story) {
+                    selected.push((repository_index, story_index));
+                }
+            }
+        }
+    }
+
+    let mut reviews = Vec::new();
+    let mut warnings = Vec::new();
+    for (repository_index, story_index) in selected {
+        // Re-read per candidate rather than working off the snapshot taken above. Reviewing one
+        // story routes findings through `fleet_rework`, which can park the whole wave — and the next
+        // candidate must not then be reviewed against a wave that has already stopped.
+        let wave = state
+            .waves
+            .get(input.wave)
+            .cloned()
+            .with_context(|| format!("not-found: wave {}", input.wave))?;
+        if !matches!(
+            wave["status"].as_str(),
+            Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+        ) {
+            warnings.push(format!(
+                "{} stopped being reviewable ({}) before every candidate was examined",
+                input.wave,
+                wave["status"].as_str().unwrap_or("unknown"),
+            ));
+            break;
+        }
+        let repository = &wave["topology"]["repositories"][repository_index];
+        let story = &repository["stories"][story_index];
+        let item = story["board_ref"]
+            .as_str()
+            .context("validation/gate: wave story has no board ref")?
+            .to_string();
+        let handoff = &story["handoff"];
+        if handoff["status"].as_str() != Some("accepted") {
+            bail!("conflict/precondition: {item} has no accepted handoff to review")
+        }
+        let commit = handoff["commit"]
+            .as_str()
+            .context("validation/gate: accepted handoff has no commit")?
+            .to_string();
+        let writer = handoff["worker"].as_str().map(str::to_string);
+        let writer_session = handoff["session"].as_str().map(str::to_string);
+        // An external document names its own reviewer, and that name is checked against the story's
+        // writer BEFORE anything is recorded. This is the whole difference between an escape hatch
+        // and a bypass: the agent that produced the candidate can never clear it.
+        if let Some(document) = external.as_ref() {
+            let reviewer = document["reviewer"].as_str().unwrap_or_default().trim();
+            if reviewer.is_empty() {
+                bail!("input/schema: an external review must name its reviewer")
+            }
+            if Some(reviewer) == writer.as_deref() || Some(reviewer) == writer_session.as_deref() {
+                bail!(
+                    "permission: {reviewer} wrote {item}; a writer cannot review its own candidate"
+                )
+            }
+            let reviewed = document["reviewed_commit"].as_str().unwrap_or_default();
+            if reviewed != commit {
+                bail!(
+                    "conflict/precondition: this review examined {reviewed}, not the accepted handoff commit {commit}"
+                )
+            }
+        }
+        let candidate = ReviewCandidate {
+            wave: input.wave,
+            item: &item,
+            repository: repository["id"].as_str().unwrap_or("default"),
+            source: repository["source_root"]
+                .as_str()
+                .or_else(|| story["worktree"].as_str())
+                .map(PathBuf::from)
+                .context("validation/gate: wave repository has no checkout to read the range in")?,
+            base: story["base_commit"]
+                .as_str()
+                .context("validation/gate: story assignment has no base commit")?
+                .to_string(),
+            commit,
+            writer,
+            writer_session,
+        };
+        let packet = review_packet(&candidate);
+        let attempt = story["review_attempts"].as_u64().unwrap_or(0) + 1;
+        let review = ReviewAttempt {
+            candidate: &candidate,
+            packet: &packet,
+            attempt,
+            external: external.as_ref(),
+        };
+        let outcome = review_candidate(command, root, &config, &mut state, &review);
+        let mut receipt = review_receipt(&candidate, &packet, attempt, &outcome);
+        // A review that examined the candidate ends the retry run, whatever its verdict: the bound
+        // exists for reviews that looked at nothing, not for ones that found something.
+        let attempts_after = if outcome.examined { 0 } else { attempt };
+        let recorded = receipt.clone();
+        let wave_id = input.wave.to_string();
+        persist_delta_mutation(
+            command,
+            root,
+            &mut state,
+            "story.review.recorded",
+            recorded.clone(),
+            move |state| {
+                let record = state
+                    .waves
+                    .get_mut(&wave_id)
+                    .with_context(|| format!("not-found: wave {wave_id}"))?;
+                let story = &mut record["topology"]["repositories"][repository_index]["stories"]
+                    [story_index];
+                if !story["review_receipts"].is_array() {
+                    story["review_receipts"] = json!([]);
+                }
+                story["review_receipts"]
+                    .as_array_mut()
+                    .expect("review receipts is an array")
+                    .push(recorded.clone());
+                story["review"] = recorded.clone();
+                story["review_attempts"] = json!(attempts_after);
+                Ok(())
+            },
+        )?;
+
+        if outcome.verdict == "REWORK" {
+            let (paths, command_outputs, invariants) =
+                rework_inputs_from_findings(&outcome.findings);
+            let reviewer = receipt["reviewer"]["id"]
+                .as_str()
+                .filter(|reviewer| !reviewer.is_empty())
+                .unwrap_or("independent-review")
+                .to_string();
+            let current = read_fleet_state(root).unwrap_or_else(|_| state.clone());
+            match fleet_rework(
+                command,
+                root,
+                current,
+                ReworkInput {
+                    wave: input.wave,
+                    item: &item,
+                    reviewer: &reviewer,
+                    reviewed_commit: &candidate.commit,
+                    paths: &paths,
+                    command_outputs: &command_outputs,
+                    invariants: &invariants,
+                },
+            ) {
+                Ok((_, rework, _, _)) => {
+                    receipt["rework"] = json!({
+                        "decision": rework["decision"],
+                        "attempt": rework["attempt"],
+                        "max_attempts": rework["max_attempts"],
+                        "ack": rework["ack"],
+                    });
+                }
+                Err(error) => {
+                    let message = redact(&error.to_string());
+                    warnings.push(format!("{item} findings could not be delivered: {message}"));
+                    receipt["rework"] = json!({"error": message});
+                }
+            }
+            if let Ok(latest) = read_fleet_state(root) {
+                state = latest;
+            }
+        }
+        reviews.push(receipt);
+    }
+
+    let examined = reviews
+        .iter()
+        .filter(|review| review["examined"] == json!(true))
+        .count();
+    let passed = reviews
+        .iter()
+        .filter(|review| review["verdict"] == json!("PASS"))
+        .count();
+    Ok((
+        format!(
+            "{}: {} candidate(s) reviewed, {examined} examined, {passed} passed",
+            input.wave,
+            reviews.len()
+        ),
+        json!({
+            "schema": "flux.fleet-review-report/v1",
+            "wave": input.wave,
+            "reviews": reviews,
+        }),
+        warnings,
+        state.revision,
+    ))
+}
+
+/// Review every candidate the tick just made ready, with nobody watching.
+///
+/// Runs after the advance phase — which is what produces `handoffs-ready` — and before dispatch, so
+/// no wave can reach integration holding an unexamined candidate. It can never fail the tick: a
+/// review that could not run leaves its recorded refusal and is reported.
+fn drive_review_phase(command: &FleetCommand, root: &Path) -> (Vec<Value>, Vec<String>) {
+    let mut reviewed = Vec::new();
+    let mut warnings = Vec::new();
+    let Ok(state) = read_fleet_state(root) else {
+        return (reviewed, warnings);
+    };
+    let waves = state
+        .waves
+        .iter()
+        .filter(|(_, wave)| {
+            matches!(
+                wave["status"].as_str(),
+                Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+            )
+        })
+        .filter(|(_, wave)| {
+            wave["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+                .any(candidate_awaits_review)
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for wave in waves {
+        let Ok(current) = read_fleet_state(root) else {
+            break;
+        };
+        match fleet_review(
+            command,
+            root,
+            current,
+            ReviewInput {
+                wave: &wave,
+                item: None,
+                from: None,
+            },
+        ) {
+            Ok((_, data, mut review_warnings, _)) => {
+                warnings.append(&mut review_warnings);
+                reviewed.push(json!({"wave": wave, "reviews": data["reviews"]}));
+            }
+            Err(error) => warnings.push(format!(
+                "{wave} could not be reviewed: {}",
+                redact(&error.to_string())
+            )),
+        }
+    }
+    (reviewed, warnings)
+}
+
 fn integration_order(root: &Path, selected: &[String]) -> Result<Vec<String>> {
     let stories = if root.join(".flux/board.toml").is_file() {
         workspace_stories(root)?
@@ -18548,6 +20424,14 @@ fn integrate_wave(
             || handoff["status"].as_str() != Some("accepted")
         {
             bail!("conflict/precondition: {item} has no accepted handoff")
+        }
+        // C-587: the writer's own claim is not evidence. A candidate reaches the repository gate —
+        // the longest operation in the pipeline — only after an agent that is not its author examined
+        // this exact commit and passed it. `candidate_review_refusal` fails closed: no review, a
+        // review of some other commit, and a review that never got to look are all refusals, and each
+        // says which it is.
+        if let Some(reason) = candidate_review_refusal(story) {
+            bail!("conflict/precondition: {item} {reason}")
         }
         let worker = handoff["worker"]
             .as_str()
@@ -19288,6 +21172,823 @@ fn reopen_wave(
         state.revision,
     ))
 }
+/// The order members are landed in: the declared dependency graph, stable-sorted by declaration.
+///
+/// C-681. Decision 0005 fixes a cross-repository publication order, and it belongs to the workspace
+/// that has those repositories — so it is read from `depends_on` rather than encoded here. A fleet
+/// that declares no dependencies promotes in the order its `fleet.toml` lists, which is what an
+/// operator writing that file already means.
+fn promotion_order(repositories: &[FleetRepository]) -> Result<Vec<usize>> {
+    let declared = repositories
+        .iter()
+        .map(|repository| repository.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for repository in repositories {
+        for dependency in &repository.depends_on {
+            if dependency == &repository.id {
+                bail!(
+                    "input/schema: fleet repository {} declares itself as its own promotion dependency",
+                    repository.id
+                )
+            }
+            if !declared.contains(dependency.as_str()) {
+                bail!(
+                    "not-found: fleet repository {} depends on {dependency}, which is not a configured repository",
+                    repository.id
+                )
+            }
+        }
+    }
+    let mut placed = vec![false; repositories.len()];
+    let mut satisfied = BTreeSet::<&str>::new();
+    let mut order = Vec::with_capacity(repositories.len());
+    while order.len() < repositories.len() {
+        let next = repositories.iter().enumerate().find(|(index, repository)| {
+            !placed[*index]
+                && repository
+                    .depends_on
+                    .iter()
+                    .all(|dependency| satisfied.contains(dependency.as_str()))
+        });
+        let Some((index, repository)) = next else {
+            let stuck = repositories
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !placed[*index])
+                .map(|(_, repository)| repository.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "input/schema: fleet repository promotion dependencies form a cycle among {stuck}"
+            )
+        };
+        placed[index] = true;
+        satisfied.insert(repository.id.as_str());
+        order.push(index);
+    }
+    Ok(order)
+}
+
+/// Waves are numbered, and `wave-10` must accumulate after `wave-9` rather than after `wave-1`.
+fn wave_sequence(id: &str) -> (u64, String) {
+    let number = id
+        .rsplit('-')
+        .next()
+        .and_then(|tail| tail.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    (number, id.to_string())
+}
+
+/// One candidate a green gate accepted, pinned by its tag, waiting for a canonical branch.
+#[derive(Clone, Debug)]
+struct AcceptedCandidate {
+    wave: String,
+    candidate: String,
+    tag: String,
+}
+
+/// Every candidate `apply` accepted for one member, oldest wave first.
+///
+/// The acceptance record IS the fact, so this reads `applied` rather than filtering on wave status:
+/// a candidate that passed its gate and was pinned by an annotated tag is exactly what promotion
+/// exists to land, whatever the wave went on to be recorded as.
+fn accepted_candidates(state: &FleetState, member: &str) -> Vec<AcceptedCandidate> {
+    let mut waves = state.waves.iter().collect::<Vec<_>>();
+    waves.sort_by_key(|(id, _)| wave_sequence(id));
+    let mut accepted = Vec::new();
+    for (id, wave) in waves {
+        for entry in wave["applied"].as_array().into_iter().flatten() {
+            if entry["repository"].as_str() != Some(member) {
+                continue;
+            }
+            let (Some(candidate), Some(tag)) =
+                (entry["candidate"].as_str(), entry["accepted_tag"].as_str())
+            else {
+                continue;
+            };
+            accepted.push(AcceptedCandidate {
+                wave: id.clone(),
+                candidate: candidate.to_string(),
+                tag: tag.to_string(),
+            });
+        }
+    }
+    accepted
+}
+
+/// Which local branch, if any, promotion is allowed to advance for this member.
+///
+/// Decision 0021 §2: a canonical ref names where work lands, so it must be a ref the fleet can
+/// write. `origin/main` is not one — only a push moves it and promotion never pushes — and reporting
+/// anything but a refusal for such a member is the over-claim C-721 exists to prevent.
+enum PromotionTarget {
+    Branch(String),
+    Refused(String),
+}
+
+fn promotion_target(source: &Path, canonical_ref: &str) -> PromotionTarget {
+    match git_output(source, &["rev-parse", "--symbolic-full-name", canonical_ref]) {
+        Some(full) if full.starts_with("refs/heads/") => PromotionTarget::Branch(full),
+        Some(full) if full.starts_with("refs/remotes/") => PromotionTarget::Refused(format!(
+            "canonical_ref {canonical_ref} is the remote-tracking ref {full}; only a push could move it and promotion never pushes, so this member cannot be landed — declare a local branch instead"
+        )),
+        Some(full) if !full.is_empty() => PromotionTarget::Refused(format!(
+            "canonical_ref {canonical_ref} resolves to {full}, which is not a local branch, so promotion has no branch to advance"
+        )),
+        _ => PromotionTarget::Refused(format!(
+            "canonical_ref {canonical_ref} does not resolve in {}",
+            display_path(source)
+        )),
+    }
+}
+
+/// Build space for one member's accumulation, deliberately outside the wave worktree namespace.
+///
+/// `orphaned_wave_dirs` treats every directory under `worktree_root` as a wave that state has lost,
+/// so a promotion checkout there would be reported as an orphaned wave. It is neither a wave nor a
+/// record: its tree is anchored by an annotated tag before the gate runs, and the directory itself is
+/// removed on every exit path.
+fn promote_worktree_path(root: &Path, member: &str) -> PathBuf {
+    root.join(".flux/fleet/promote")
+        .join(safe_ref_segment(member))
+}
+
+/// Checkouts other than the promotion worktree that have this branch checked out.
+///
+/// Promotion advances the branch with a ref update and touches no working tree, which is what keeps
+/// it out of shared checkouts — but a checkout sitting on that branch then holds an index and files
+/// from the previous tip, and that is a hazard an operator has to be told about in words.
+fn worktrees_on_branch(source: &Path, branch: &str, exclude: &Path) -> Vec<String> {
+    let Some(listing) = git_output(source, &["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+    let mut holders = Vec::new();
+    let mut path: Option<String> = None;
+    for line in listing.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+            path = Some(value.to_string());
+        } else if let Some(value) = line.strip_prefix("branch ") {
+            if value == branch {
+                if let Some(path) = path.as_deref() {
+                    if Path::new(path) != exclude {
+                        holders.push(path.to_string());
+                    }
+                }
+            }
+        }
+    }
+    holders
+}
+
+/// A member whose accumulation passed its gate and is waiting for the whole train to be green.
+struct GatedMember {
+    id: String,
+    source: PathBuf,
+    canonical_ref: String,
+    branch: String,
+    from: String,
+    accumulation: String,
+    tag: String,
+    merged: Vec<AcceptedCandidate>,
+}
+
+/// Accumulate, gate and land every member's accepted candidates.
+///
+/// C-681, and the last mile of decision 0021 §0: the fleet's autonomous job ends when accepted work
+/// is on a member's LOCAL canonical branch. `apply` stops one step short of that on purpose — it pins
+/// a candidate with an annotated tag and reports `merged_locally: false` — and until now the only
+/// thing that closed the gap was `snapshot_and_merge()` in one operator's `autopilot.sh`: called once,
+/// hardcoded to a single member, with that machine's absolute path as its argument. Every other
+/// deployment's release train silently never ran.
+///
+/// The shape is the bash version's learned invariants, which are the contract rather than a starting
+/// point, plus the two things it got wrong:
+///
+///  * The gate runs in a THROWAWAY WORKTREE branched from the canonical ref, so a long gate cannot be
+///    disturbed by concurrent work and a red gate leaves the branch untouched.
+///  * A candidate that will not combine is EXCLUDED AND NAMED, never forced. Forcing would land an
+///    ungated tree; abandoning the accumulation would strand delivered work behind a collision it had
+///    no part in.
+///  * The landing itself is a COMPARE-AND-SWAP REF UPDATE, not a merge in a checkout. The bash merged
+///    into the operator's primary checkout — a surface other sessions are working in — and a merge
+///    there also fails outright whenever that checkout is dirty. A ref update is atomic, refuses if
+///    the branch moved while the gate ran, and writes no working tree at all.
+///  * The verdict is RE-READ FROM GIT. `merged_locally` was once reported from an exit code and was
+///    false for weeks (C-721); here the canonical ref is resolved again after the update and each
+///    candidate's containment is asked of git, so `landed` describes the ref rather than the attempt.
+///
+/// Nothing here pushes, tags a release or deploys. Decision 0021 §0 keeps those out of scope.
+fn promote_members(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    only: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let config = read_fleet_config(root)?;
+    if config.repositories.is_empty() {
+        bail!(
+            "conflict/precondition: no fleet repositories are configured, so there is no canonical branch to promote onto"
+        )
+    }
+    if let Some(only) = only {
+        if !config
+            .repositories
+            .iter()
+            .any(|repository| repository.id == only)
+        {
+            bail!("not-found: fleet repository {only}")
+        }
+    }
+    let threshold = config.promote.threshold;
+    if threshold == 0 {
+        bail!("input/schema: [promote] threshold must be at least 1")
+    }
+    let order = promotion_order(&config.repositories)?;
+    let mut warnings = Vec::new();
+    // One report per member, in promotion order. A member that never reaches the gate is settled
+    // here; a member that passes it is finished in the landing phase below.
+    let mut reports: Vec<Value> = Vec::new();
+    let mut gated: Vec<Option<GatedMember>> = Vec::new();
+    let mut blocked_by: Vec<String> = Vec::new();
+
+    for index in &order {
+        let repository = &config.repositories[*index];
+        if only.is_some_and(|only| only != repository.id) {
+            continue;
+        }
+        let id = repository.id.clone();
+        let canonical_ref = repository.canonical_ref.clone();
+        let settle = |status: &str, reason: String, extra: Value| {
+            let mut report = json!({
+                "member": id,
+                "canonical_ref": canonical_ref,
+                "status": status,
+                "reason": reason,
+            });
+            for (key, value) in extra.as_object().into_iter().flatten() {
+                report[key] = value.clone();
+            }
+            report
+        };
+        let source = match repository_root(root, repository) {
+            Ok(source) => source,
+            Err(error) => {
+                let reason = format!("{error:#}");
+                warnings.push(format!("{}: {reason}", repository.id));
+                reports.push(settle("refused", reason, Value::Null));
+                gated.push(None);
+                continue;
+            }
+        };
+        // The writability question comes FIRST, before any accumulation: a member configured with a
+        // ref the fleet cannot write is a defect worth reporting whether or not it has work waiting.
+        let branch = match promotion_target(&source, &repository.canonical_ref) {
+            PromotionTarget::Branch(branch) => branch,
+            PromotionTarget::Refused(reason) => {
+                warnings.push(format!("{} cannot be promoted: {reason}", repository.id));
+                reports.push(settle("refused", reason, Value::Null));
+                gated.push(None);
+                continue;
+            }
+        };
+        let Some(from) = git_output(&source, &["rev-parse", &repository.canonical_ref]) else {
+            let reason = format!(
+                "canonical_ref {} does not resolve to a commit",
+                repository.canonical_ref
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle("refused", reason, Value::Null));
+            gated.push(None);
+            continue;
+        };
+        let accepted = accepted_candidates(&state, &repository.id);
+        let mut pending = Vec::new();
+        let mut contained = Vec::new();
+        let mut excluded = Vec::new();
+        for candidate in accepted {
+            // "Absent" and "will not combine" are different operator problems with different answers,
+            // and a merge failure would report the first as the second. Ask git which one it is before
+            // spending a merge on it.
+            if git_output(
+                &source,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    &format!("{}^{{commit}}", candidate.candidate),
+                ],
+            )
+            .is_none()
+            {
+                let reason = format!(
+                    "candidate is absent from {}, so it cannot be accumulated; its accepted tag {} no longer resolves there",
+                    display_path(&source),
+                    candidate.tag
+                );
+                warnings.push(format!(
+                    "{} candidate {} from {} was excluded: {reason}",
+                    repository.id, candidate.candidate, candidate.wave
+                ));
+                excluded.push(json!({
+                    "wave": candidate.wave,
+                    "candidate": candidate.candidate,
+                    "accepted_tag": candidate.tag,
+                    "reason": reason,
+                }));
+                continue;
+            }
+            let already = guarded_git(
+                &source,
+                &[
+                    "merge-base",
+                    "--is-ancestor",
+                    &candidate.candidate,
+                    &repository.canonical_ref,
+                ],
+            )
+            .map(|output| output.exit_code == 0)
+            .unwrap_or(false);
+            if already {
+                contained.push(json!({"wave": candidate.wave, "candidate": candidate.candidate}));
+            } else {
+                pending.push(candidate);
+            }
+        }
+        let waiting = pending
+            .iter()
+            .map(|candidate| json!({"wave": candidate.wave, "candidate": candidate.candidate, "accepted_tag": candidate.tag}))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            let (status, reason) = if excluded.is_empty() {
+                (
+                    "up-to-date",
+                    format!(
+                        "{} already contains every accepted candidate",
+                        repository.canonical_ref
+                    ),
+                )
+            } else {
+                (
+                    "unchanged",
+                    format!(
+                        "no candidate could be accumulated; {} were excluded",
+                        excluded.len()
+                    ),
+                )
+            };
+            reports.push(settle(
+                status,
+                reason,
+                json!({"contained": contained, "excluded": excluded}),
+            ));
+            gated.push(None);
+            continue;
+        }
+        if pending.len() < threshold {
+            reports.push(settle(
+                "withheld",
+                format!(
+                    "{}/{threshold} accepted candidate(s) accumulated",
+                    pending.len()
+                ),
+                json!({"accumulated": waiting, "contained": contained, "excluded": excluded}),
+            ));
+            gated.push(None);
+            continue;
+        }
+        if command.dry_run {
+            reports.push(settle(
+                "preview",
+                format!(
+                    "would merge {} accepted candidate(s) into {} at {from}, gate the result, then advance the branch",
+                    pending.len(),
+                    repository.canonical_ref
+                ),
+                json!({"from": from, "would_merge": waiting, "contained": contained, "excluded": excluded}),
+            ));
+            gated.push(None);
+            continue;
+        }
+
+        let worktree = promote_worktree_path(root, &repository.id);
+        // Build space from an interrupted run is not a record — its tree was anchored by a tag before
+        // any gate ran — so it is replaced rather than treated as a conflict.
+        let _ = guarded_git(&source, &["worktree", "prune"]);
+        if worktree.exists() {
+            let _ = guarded_git(
+                &source,
+                &["worktree", "remove", "--force", &display_path(&worktree)],
+            );
+        }
+        if let Some(parent) = worktree.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let added = guarded_git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                &display_path(&worktree),
+                &from,
+            ],
+        )?;
+        if added.exit_code != 0 {
+            let reason = format!(
+                "could not create the promotion worktree: {}",
+                clipped_redacted(added.stderr.as_bytes())
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle("failed", reason, json!({"from": from})));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+
+        let mut merged = Vec::new();
+        for candidate in &pending {
+            let message = format!(
+                "Fleet promotion: accumulate {} candidate {} for {}",
+                candidate.wave, candidate.candidate, repository.id
+            );
+            let outcome = guarded_git(
+                &worktree,
+                &[
+                    "merge",
+                    "--no-ff",
+                    "--no-edit",
+                    "-m",
+                    &message,
+                    &candidate.candidate,
+                ],
+            )?;
+            if outcome.exit_code == 0 {
+                merged.push(candidate.clone());
+                continue;
+            }
+            // Read the conflicting paths before aborting, or the evidence goes with the merge.
+            let conflicts = git_output(&worktree, &["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
+            let _ = guarded_git(&worktree, &["merge", "--abort"]);
+            let reason = if conflicts.trim().is_empty() {
+                "conflict with the accumulated tree".to_string()
+            } else {
+                format!(
+                    "conflict with the accumulated tree in {}",
+                    conflicts.lines().collect::<Vec<_>>().join(", ")
+                )
+            };
+            warnings.push(format!(
+                "{} candidate {} from {} was excluded from this promotion: {reason}; it stays pinned by {} and can be re-integrated",
+                repository.id, candidate.candidate, candidate.wave, candidate.tag
+            ));
+            excluded.push(json!({
+                "wave": candidate.wave,
+                "candidate": candidate.candidate,
+                "accepted_tag": candidate.tag,
+                "reason": reason,
+            }));
+        }
+        let merged_report = merged
+            .iter()
+            .map(|candidate| json!({"wave": candidate.wave, "candidate": candidate.candidate, "accepted_tag": candidate.tag}))
+            .collect::<Vec<_>>();
+        let remove_worktree = |source: &Path, worktree: &Path| {
+            let _ = guarded_git(
+                source,
+                &["worktree", "remove", "--force", &display_path(worktree)],
+            );
+            let _ = guarded_git(source, &["worktree", "prune"]);
+        };
+        if merged.is_empty() {
+            remove_worktree(&source, &worktree);
+            reports.push(settle(
+                "unchanged",
+                "every accumulated candidate conflicts with the canonical branch".to_string(),
+                json!({"from": from, "excluded": excluded, "contained": contained}),
+            ));
+            gated.push(None);
+            continue;
+        }
+        let Some(accumulation) = git_output(&worktree, &["rev-parse", "HEAD"]) else {
+            remove_worktree(&source, &worktree);
+            let reason = "the accumulation worktree has no resolvable HEAD".to_string();
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle("failed", reason, json!({"from": from})));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        };
+        // The anchor, written BEFORE the gate. It is what makes a red gate triageable and what keeps
+        // the accumulation reachable once this worktree is gone; naming it after the newest wave in
+        // the set keeps a retry of the same accumulation on the same tag instead of minting a new one.
+        let newest = merged
+            .last()
+            .expect("a non-empty accumulation")
+            .wave
+            .clone();
+        let tag = format!(
+            "fleet/promote/{}/{}",
+            safe_ref_segment(&repository.id),
+            safe_ref_segment(&newest)
+        );
+        let tagged = guarded_git(
+            &worktree,
+            &[
+                "tag",
+                "-f",
+                "-a",
+                &tag,
+                &accumulation,
+                "-m",
+                &format!(
+                    "Fleet accumulated {} accepted candidate(s) for {} onto {} at {from}; gated before landing.",
+                    merged.len(),
+                    repository.id,
+                    repository.canonical_ref
+                ),
+            ],
+        )?;
+        if tagged.exit_code != 0 {
+            remove_worktree(&source, &worktree);
+            let reason = format!(
+                "could not anchor the accumulation with tag {tag}: {}",
+                clipped_redacted(tagged.stderr.as_bytes())
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle(
+                "failed",
+                reason,
+                json!({"from": from, "merged": merged_report, "excluded": excluded}),
+            ));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+        if repository.gate.is_empty() {
+            remove_worktree(&source, &worktree);
+            let reason = format!(
+                "no configured gate; promotion refuses to land an unproven tree — {tag} is retained for triage"
+            );
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle(
+                "red",
+                reason,
+                json!({"from": from, "tag": tag, "merged": merged_report, "excluded": excluded}),
+            ));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+        let gate = run_typed_argv(&worktree, &repository.gate)?;
+        let green = gate["success"].as_bool() == Some(true);
+        // Pure build space. The tag holds the tree, so removing this costs nothing and disk is what
+        // caps how wide the fleet can run.
+        remove_worktree(&source, &worktree);
+        if !green {
+            let reason =
+                format!("the gate failed on the accumulated tree; {tag} is retained for triage");
+            warnings.push(format!("{}: {reason}", repository.id));
+            reports.push(settle(
+                "red",
+                reason,
+                json!({"from": from, "tag": tag, "merged": merged_report, "excluded": excluded, "gate": gate}),
+            ));
+            gated.push(None);
+            blocked_by.push(repository.id.clone());
+            continue;
+        }
+        reports.push(json!({
+            "member": repository.id,
+            "canonical_ref": repository.canonical_ref,
+            "status": "gated",
+            "reason": format!("the accumulated tree passed the gate at {tag}"),
+            "from": from,
+            "to": accumulation,
+            "tag": tag,
+            "merged": merged_report,
+            "excluded": excluded,
+            "contained": contained,
+            "gate": gate,
+        }));
+        gated.push(Some(GatedMember {
+            id: repository.id.clone(),
+            source,
+            canonical_ref: repository.canonical_ref.clone(),
+            branch,
+            from,
+            accumulation,
+            tag,
+            merged,
+        }));
+    }
+
+    // PARTIAL SUCCESS ACROSS MEMBERS IS NOT SUCCESS.
+    //
+    // The members are a release train, ordered by the dependency graph, so a red gate anywhere makes
+    // the whole set unproven — landing the green half would leave a state nobody can reason about
+    // later and no verb can undo. Refusals and below-threshold skips are NOT red gates and never
+    // withhold anybody: they mean a member had nothing to contribute, not that its work failed.
+    let mut promoted = Vec::new();
+    let mut landed_waves = BTreeSet::new();
+    for (report, member) in reports.iter_mut().zip(gated.iter()) {
+        let Some(member) = member else {
+            continue;
+        };
+        if !blocked_by.is_empty() {
+            report["status"] = json!("blocked");
+            report["landed"] = json!(false);
+            report["reason"] = json!(format!(
+                "gated green, but {} did not, so no member's canonical branch was written; {} is retained and will be re-gated on the next promotion",
+                blocked_by.join(", "),
+                member.tag
+            ));
+            continue;
+        }
+        // Compare-and-swap: the gate ran for as long as the gate runs, and this refuses rather than
+        // clobbering anything that reached the branch in the meantime.
+        let updated = guarded_git(
+            &member.source,
+            &[
+                "update-ref",
+                "-m",
+                &format!(
+                    "flux fleet promote: land {} accepted candidate(s) from {}",
+                    member.merged.len(),
+                    member.tag
+                ),
+                &member.branch,
+                &member.accumulation,
+                &member.from,
+            ],
+        )?;
+        // The verdict is re-read from git, never taken from the update's exit code.
+        let tip = git_output(&member.source, &["rev-parse", &member.canonical_ref]);
+        let containment = member
+            .merged
+            .iter()
+            .map(|candidate| {
+                let contained = guarded_git(
+                    &member.source,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &candidate.candidate,
+                        &member.canonical_ref,
+                    ],
+                )
+                .map(|output| output.exit_code == 0)
+                .unwrap_or(false);
+                json!({"wave": candidate.wave, "candidate": candidate.candidate, "contained": contained})
+            })
+            .collect::<Vec<_>>();
+        let landed = tip.as_deref() == Some(member.accumulation.as_str())
+            && containment
+                .iter()
+                .all(|entry| entry["contained"] == json!(true));
+        report["landed"] = json!(landed);
+        report["tip"] = json!(tip);
+        report["containment"] = json!(containment);
+        if landed {
+            report["status"] = json!("promoted");
+            report["reason"] = json!(format!(
+                "{} contains every merged candidate and now points at {}",
+                member.canonical_ref, member.accumulation
+            ));
+            promoted.push(member.id.clone());
+            for candidate in &member.merged {
+                landed_waves.insert(candidate.wave.clone());
+            }
+            for holder in worktrees_on_branch(
+                &member.source,
+                &member.branch,
+                &promote_worktree_path(root, &member.id),
+            ) {
+                warnings.push(format!(
+                    "{holder} has {} checked out. Promotion advanced the ref without touching that working tree, so its index and files still hold {} — `git commit -am` there would revert the work just landed. Reconcile that checkout before committing in it.",
+                    member.branch, member.from
+                ));
+            }
+        } else {
+            report["status"] = json!("failed");
+            report["reason"] = json!(format!(
+                "{} was not advanced to {}: {}; {} is retained for triage",
+                member.canonical_ref,
+                member.accumulation,
+                if updated.exit_code == 0 {
+                    "git reported success but the ref does not contain the accumulation".to_string()
+                } else {
+                    clipped_redacted(updated.stderr.as_bytes())
+                },
+                member.tag
+            ));
+            warnings.push(format!(
+                "{} did not land: {}",
+                member.id,
+                report["reason"].as_str().unwrap_or_default()
+            ));
+        }
+    }
+
+    // C-721's question, re-asked now that the refs have moved. A wave becomes `applied` only where
+    // every accepted repository's canonical ref is OBSERVED to contain its candidate — the same
+    // verdict `apply` computes, from the same helpers, so promoting cannot make a claim that
+    // `fleet doctor` would then contradict.
+    let mut deliveries = Vec::new();
+    for wave_id in &landed_waves {
+        let Some(wave) = state.waves.get(wave_id) else {
+            continue;
+        };
+        if wave["status"].as_str() == Some("applied") {
+            continue;
+        }
+        let verdicts = wave_delivery_verdicts(wave, git_delivery_probe);
+        if wave_is_delivered(&verdicts) {
+            deliveries.push((wave_id.clone(), verdicts));
+        }
+    }
+    let applied = deliveries
+        .iter()
+        .map(|(wave, _)| wave.clone())
+        .collect::<Vec<_>>();
+    let data = json!({
+        "schema": "flux.fleet-promotion/v1",
+        "dry_run": command.dry_run,
+        "threshold": threshold,
+        "only": only,
+        "order": order
+            .iter()
+            .map(|index| config.repositories[*index].id.clone())
+            .collect::<Vec<_>>(),
+        "members": reports,
+        "promoted": promoted,
+        "blocked_by": blocked_by,
+        "applied_waves": applied,
+        "pushed": false,
+        "released": false,
+        "deployed": false,
+    });
+    // A run that touched nothing leaves no trace. `fleet reclaim` spent nineteen consecutive runs
+    // writing a journal entry indistinguishable from progress while freeing zero bytes (b90e1f4c),
+    // and promotion is invoked on exactly the same cadence — so a sweep that found every member
+    // up to date or below its threshold neither bumps the revision nor journals.
+    let acted = reports.iter().any(|report| {
+        matches!(
+            report["status"].as_str(),
+            Some("promoted" | "red" | "failed" | "blocked" | "unchanged")
+        )
+    });
+    if !command.dry_run {
+        if deliveries.is_empty() {
+            if acted {
+                append_fleet_event(root, "fleet.promoted", data.clone())?;
+            }
+        } else {
+            let recorded = deliveries.clone();
+            persist_delta_mutation(
+                command,
+                root,
+                &mut state,
+                "fleet.promoted",
+                data.clone(),
+                |state| {
+                    for (wave_id, verdicts) in &recorded {
+                        let Some(wave) = state.waves.get_mut(wave_id) else {
+                            continue;
+                        };
+                        wave["status"] = json!("applied");
+                        wave["apply_eligible"] = json!(false);
+                        wave["delivery"] = json!({"delivered": true, "repositories": verdicts});
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    let human = if command.dry_run {
+        format!(
+            "promotion preview: {} member(s) would land accepted candidates; nothing was merged, gated or written",
+            reports
+                .iter()
+                .filter(|report| report["status"] == json!("preview"))
+                .count()
+        )
+    } else if !blocked_by.is_empty() {
+        format!(
+            "promotion withheld: {} gated red, so no member's canonical branch was written — every accumulation tag is retained for triage",
+            blocked_by.join(", ")
+        )
+    } else if promoted.is_empty() {
+        "promotion landed nothing: no member had accepted candidates above its threshold"
+            .to_string()
+    } else {
+        format!(
+            "promoted {} onto their local canonical branches; nothing was pushed, released or deployed",
+            promoted.join(", ")
+        )
+    };
+    Ok((human, data, warnings, state.revision))
+}
+
 fn fleet_call(
     command: &FleetCommand,
     root: &Path,
@@ -20234,17 +22935,23 @@ mod tests {
         let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-auto");
         let mut state = wave_with_one_story(&worktree, &branch, &base);
 
-        let reports = record_provisional_handoffs(&mut state, "wave-1");
+        let reports = record_turn_handoffs(&mut state, "wave-1");
 
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
         assert_eq!(reports[0]["commit"], json!(commit));
         let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
         assert_eq!(story["status"], json!("handoff-accepted"));
-        // Distinguishable from an operator-verified handoff: it proved the commit, not the tests.
-        assert_eq!(story["handoff"]["provisional"], json!(true));
         assert_eq!(story["handoff"]["write_set"], json!(["delivered.rs"]));
+        // C-730: this worker's fixture cites no test, so the record must say WHY it is unverified
+        // rather than present an empty argv as if the field were merely absent.
+        assert_eq!(story["handoff"]["verified"], json!(false));
         assert_eq!(story["handoff"]["test_argv"], json!([]));
+        assert!(
+            story["handoff"]["no_failing_test_reason"].is_string(),
+            "{:?}",
+            story["handoff"]
+        );
         assert_eq!(
             state.agents["wave-1-worker-1"]["status"],
             json!("handoff-accepted")
@@ -20260,7 +22967,7 @@ mod tests {
         guarded_git(&worktree, &["reset", "--hard", &base]).expect("rewind to base");
         let mut state = wave_with_one_story(&worktree, &branch, &base);
 
-        let reports = record_provisional_handoffs(&mut state, "wave-1");
+        let reports = record_turn_handoffs(&mut state, "wave-1");
 
         assert_eq!(reports[0]["recorded"], json!(false), "{reports:?}");
         assert!(
@@ -20313,6 +23020,724 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    fn story_with_accepted_handoff(commit: &str) -> Value {
+        json!({
+            "board_ref": "flux/C-1",
+            "status": "handoff-accepted",
+            "handoff": {
+                "status": "accepted",
+                "commit": commit,
+                "worker": "wave-1-worker-1",
+                "session": "s-1",
+            },
+        })
+    }
+
+    /// C-587 — the distinction the whole story exists for.
+    ///
+    /// "The reviewer looked and found nothing" and "nothing looked" both carry zero findings. Read
+    /// `findings` alone and they are the same row, which is precisely how an absent review comes to
+    /// read as a clean one. They are separated by `examined`, and only one of them opens the gate.
+    #[test]
+    fn a_clean_review_and_a_review_that_never_looked_are_different_records() {
+        let commit = "a".repeat(40);
+        let other = "b".repeat(40);
+        let mut story = story_with_accepted_handoff(&commit);
+
+        let unreviewed = candidate_review_refusal(&story).expect("no review is a refusal");
+        assert!(unreviewed.contains("no independent review"), "{unreviewed}");
+
+        story["review"] = json!({
+            "reviewed_commit": commit, "state": "reviewed",
+            "verdict": "PASS", "examined": true, "findings": [],
+        });
+        assert_eq!(candidate_review_refusal(&story), None);
+        assert!(
+            !candidate_awaits_review(&story),
+            "a reached verdict is not re-paid for"
+        );
+
+        // Same commit, same empty `findings`, opposite meaning.
+        story["review"] = json!({
+            "reviewed_commit": commit, "state": "failed",
+            "verdict": "BLOCKED", "examined": false, "findings": [],
+            "reason": "the reviewer returned no document",
+        });
+        let unexamined =
+            candidate_review_refusal(&story).expect("an unexamined candidate is refused");
+        assert!(unexamined.contains("never examined it"), "{unexamined}");
+        assert!(
+            unexamined.contains("the reviewer returned no document"),
+            "the refusal must carry why nothing looked: {unexamined}"
+        );
+
+        story["review"] = json!({
+            "reviewed_commit": other, "state": "reviewed",
+            "verdict": "PASS", "examined": true, "findings": [],
+        });
+        let stale =
+            candidate_review_refusal(&story).expect("a pass over another commit is refused");
+        assert!(stale.contains("stale independent review"), "{stale}");
+        assert!(
+            candidate_awaits_review(&story),
+            "a moved candidate owes a new review"
+        );
+
+        // Findings are not advisory.
+        story["review"] = json!({
+            "reviewed_commit": commit, "state": "reviewed",
+            "verdict": "REWORK", "examined": true, "findings": [{"severity": "blocker"}],
+        });
+        let reworked = candidate_review_refusal(&story).expect("REWORK does not integrate");
+        assert!(reworked.contains("returned REWORK"), "{reworked}");
+
+        // The retry run is bounded, so a review that never examines anything stops costing a tick.
+        story["review"] = json!({"reviewed_commit": other, "examined": false});
+        story["review_attempts"] = json!(REVIEW_ATTEMPT_LIMIT);
+        assert!(!candidate_awaits_review(&story), "retries are bounded");
+    }
+
+    fn review_fixture(label: &str) -> std::path::PathBuf {
+        let root = reclaim_test_dir(label);
+        fs::create_dir_all(root.join(".flux/fleet/loops")).expect("fixture loops");
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\n\n[loop_profiles.review]\nrevision = \"1\"\nsource = \".flux/fleet/loops/review.flux\"\nentry = \"review\"\n\n[loop_policy]\nreview = \"review\"\n",
+        )
+        .expect("fixture config");
+        fs::write(
+            root.join(".flux/fleet/loops/review.flux"),
+            "flow review -> string\n  $turn = ai_segment({ goal: \"review the packet\", tools: [\"read\"], max_rounds: 4, current_turn: true })\n  return $turn.result\n",
+        )
+        .expect("fixture loop");
+        root
+    }
+
+    /// The reviewer is a different agent from the writer, and it holds nothing that could change
+    /// what it is judging. AGENTS.md states the rule directly — "Read-only review may inspect the
+    /// exact commit; only the story owner applies findings" — and this is the mechanism.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reviewer_is_a_fresh_agent_that_cannot_edit_what_it_judges() {
+        let root = review_fixture("reviewer-ceiling");
+        let config = read_fleet_config(&root).expect("fixture fleet config");
+        let mut state = FleetState {
+            running: true,
+            ..FleetState::default()
+        };
+        let candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: root.clone(),
+            base: "b".repeat(40),
+            commit: "a".repeat(40),
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let packet = json!({"schema": FLEET_REVIEW_PACKET_SCHEMA, "complete": true});
+
+        let id = admit_candidate_reviewer(&root, &config, &mut state, &candidate, 1, &packet)
+            .expect("the reviewer is admitted");
+
+        let reviewer = &state.agents[&id];
+        assert_ne!(
+            id, "wave-1-worker-1",
+            "the writer cannot be its own reviewer"
+        );
+        assert_eq!(reviewer["role"], json!("reviewer"));
+        assert_eq!(reviewer["mode"], json!("read-only"));
+        assert_eq!(reviewer["board_ref"], json!("flux/C-1"));
+        // Fresh. A reviewer resuming the writer's session would BE the writer, holding its whole
+        // conversation and every justification it already talked itself into.
+        assert!(reviewer["session"].is_null(), "{reviewer}");
+        assert!(reviewer["runtime_session"].is_null(), "{reviewer}");
+        assert_eq!(reviewer["capabilities"], json!(["read"]));
+        // No repository root at all: its workspace is the packet sandbox, so it cannot reach fleet
+        // state, the writer's transcript, or any checkout.
+        assert_eq!(reviewer["read_roots"], json!([]));
+        let sandbox = reviewer["writable_root"].as_str().expect("a writable root");
+        assert!(sandbox.contains(".flux/fleet/reviews/"), "{sandbox}");
+        assert!(
+            std::path::Path::new(sandbox).join("packet.json").is_file(),
+            "the packet is the reviewer's only input and must be on disk at {sandbox}"
+        );
+
+        // The ceiling the admission resolved. `read-only` mode is what enforces it, and this is the
+        // list a turn would actually be launched with.
+        let (_, operations) = normalize_worker_capabilities_in(
+            FleetTaskMode::ReadOnly,
+            &[REVIEW_CAPABILITIES[0].to_string()],
+            FLEET_REVIEW_TASK_KIND,
+            Some(&root),
+        )
+        .expect("the reviewer ceiling resolves");
+        for forbidden in [
+            "write",
+            "edit",
+            "append",
+            "patch",
+            "bash",
+            "proc.run",
+            "git_stage",
+            "git_commit",
+        ] {
+            assert!(
+                !operations.iter().any(|operation| operation == forbidden),
+                "a reviewer must not hold {forbidden}: {operations:?}"
+            );
+        }
+        assert!(operations.iter().any(|operation| operation == "read"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Findings are written in closed vocabularies and bound to evidence, so a finding can be
+    /// counted and routed rather than read — and they land in the rework budget that already exists
+    /// rather than a second one beside it.
+    #[test]
+    fn review_findings_are_structured_evidence_and_route_into_the_rework_budget() {
+        let document = json!({
+            "schema": FLEET_REVIEW_SCHEMA,
+            "verdict": "REWORK",
+            "findings": [
+                {"category":"contract","severity":"blocker","confidence":"high",
+                 "component":"crates/x/src/y.rs","evidence":{"path":"crates/x/src/y.rs","line":42},
+                 "detail":"acceptance item two is not implemented"},
+                {"category":"evidence","severity":"major","confidence":"medium",
+                 "component":"tests","evidence":{"command":"cargo test -p x"},
+                 "detail":"the cited argv matches no test"},
+                {"category":"safety","severity":"blocker","confidence":"high",
+                 "component":"flux-system","evidence":{"invariant":"all process IO goes through flux-system"},
+                 "detail":"a raw Command bypasses the guarded port"},
+            ],
+        });
+
+        let (verdict, findings) =
+            parse_review_document(&document, "reviewer").expect("a typed REWORK");
+
+        assert_eq!(verdict, "REWORK");
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0]["kind"], json!("path-line"));
+        assert_eq!(findings[0]["line"], json!(42));
+        assert_eq!(findings[0]["severity"], json!("blocker"));
+        // Set by the host, never read from the document: a reviewer cannot promote its own opinion
+        // into something the host observed.
+        assert_eq!(findings[0]["source"], json!("reviewer"));
+        assert_eq!(findings[1]["kind"], json!("command-output"));
+        assert_eq!(findings[2]["kind"], json!("invariant"));
+
+        let (paths, commands, invariants) = rework_inputs_from_findings(&findings);
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(
+            paths[0].starts_with("crates/x/src/y.rs:42:[blocker/contract]"),
+            "a finding must reach the writer as PATH:LINE:DETAIL: {paths:?}"
+        );
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(invariants.len(), 1, "{invariants:?}");
+
+        // The vocabularies are closed. An invented severity is malformed, not quietly downgraded.
+        let invented = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict": "REWORK", "findings": [
+            {"category":"contract","severity":"catastrophic","confidence":"high","component":"x",
+             "evidence":{"invariant":"i"},"detail":"d"}]});
+        assert!(parse_review_document(&invented, "reviewer").is_err());
+
+        // A finding nothing can be checked against is not a finding.
+        let unevidenced = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict": "REWORK", "findings": [
+            {"category":"contract","severity":"blocker","confidence":"high","component":"x",
+             "evidence":{},"detail":"it feels wrong"}]});
+        assert!(parse_review_document(&unevidenced, "reviewer").is_err());
+    }
+
+    /// Every way a review document can fail to say something, and none of them says PASS.
+    #[test]
+    fn a_review_document_that_cannot_be_read_is_never_a_pass() {
+        let finding = json!({"category":"contract","severity":"minor","confidence":"low",
+                             "component":"x","evidence":{"invariant":"i"},"detail":"d"});
+
+        // The two fields disagree; the safe reading of a disagreement is that neither is trustworthy.
+        let passing_with_findings =
+            json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"PASS", "findings":[finding]});
+        assert!(parse_review_document(&passing_with_findings, "reviewer").is_err());
+
+        let empty_rework =
+            json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"REWORK", "findings":[]});
+        assert!(parse_review_document(&empty_rework, "reviewer").is_err());
+
+        // The reviewer's vocabulary is PASS and REWORK. It cannot park a wave: a model that can end
+        // work unilaterally is not bounded by the host's rework budget at all.
+        let parked = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"PARK", "findings":[]});
+        assert!(parse_review_document(&parked, "reviewer").is_err());
+
+        let wrong_schema = json!({"schema": "something/v1", "verdict":"PASS", "findings":[]});
+        assert!(parse_review_document(&wrong_schema, "reviewer").is_err());
+
+        // A reviewer that narrates around its verdict has still reviewed; one that only narrates
+        // has not, and must not be read as approval.
+        let narrated = "I checked each acceptance item.\n\n```json\n{\"schema\":\"flux.fleet-review/v1\",\"verdict\":\"PASS\",\"findings\":[]}\n```\n";
+        let document = extract_review_document(narrated).expect("a fenced verdict is found");
+        assert_eq!(
+            parse_review_document(&document, "reviewer")
+                .expect("a typed PASS")
+                .0,
+            "PASS"
+        );
+        assert!(extract_review_document("Looks good to me!").is_none());
+    }
+
+    /// The reasons a reviewer is never dispatched, and what each one records instead.
+    #[test]
+    fn an_unreviewable_candidate_is_a_host_finding_and_never_a_silent_pass() {
+        let candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: std::path::PathBuf::from("/nonexistent"),
+            base: "b".repeat(40),
+            commit: "a".repeat(40),
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let complete = json!({"complete": true, "story": {"acceptance": "- [ ] ship"}});
+
+        assert!(
+            review_refused_before_dispatch(true, &candidate, &complete, 1).is_none(),
+            "a complete packet on a running fleet is dispatched, not refused"
+        );
+
+        let stopped = review_refused_before_dispatch(false, &candidate, &complete, 1)
+            .expect("a stopped fleet cannot review");
+        assert_eq!(stopped.verdict, "BLOCKED");
+        assert!(!stopped.examined);
+
+        let no_contract = json!({"complete": true, "story": Value::Null});
+        let missing = review_refused_before_dispatch(true, &candidate, &no_contract, 1)
+            .expect("there is nothing to review against");
+        assert_eq!(missing.state, "not-run");
+        assert_eq!(missing.verdict, "BLOCKED");
+        assert!(!missing.examined);
+
+        // An unreviewably large candidate becomes a REWORK the budget can spend, carrying a finding
+        // the HOST derived — so it terminates in the host's park rather than a deadlock only an
+        // operator can clear.
+        let oversized = json!({
+            "complete": false,
+            "story": {"acceptance": "- [ ] ship"},
+            "shortstat": "900 files changed, 120000 insertions(+)",
+        });
+        let unreviewable = review_refused_before_dispatch(true, &candidate, &oversized, 1)
+            .expect("an incomplete packet is never dispatched as if it were whole");
+        assert_eq!(unreviewable.state, "incomplete-context");
+        assert_eq!(unreviewable.verdict, "REWORK");
+        assert!(!unreviewable.examined, "nothing read this candidate");
+        assert_eq!(unreviewable.findings[0]["source"], json!("host"));
+        assert!(
+            unreviewable.findings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("900 files changed")),
+            "{:?}",
+            unreviewable.findings
+        );
+
+        let exhausted =
+            review_refused_before_dispatch(true, &candidate, &complete, REVIEW_ATTEMPT_LIMIT + 1)
+                .expect("the retry run is bounded");
+        assert_eq!(exhausted.state, "attention");
+        assert_eq!(exhausted.verdict, "BLOCKED");
+        assert!(!exhausted.examined);
+    }
+
+    /// The reviewer judges the contract the candidate was written against, read out of the candidate
+    /// itself. A worktree moves on within minutes of a rework, and a review against a contract the
+    /// commit never saw is a review of the wrong thing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_review_packet_carries_the_contract_as_it_stood_at_the_reviewed_commit() {
+        let root = reclaim_test_dir("review-contract");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Goal\n\nShip the thing.\n\n## Acceptance\n\n- [ ] it ships\n\n## Notes\n\nnot the contract\n",
+        )
+        .expect("write story");
+        guarded_git(&root, &["add", "."]).expect("add");
+        guarded_git(&root, &["commit", "-m", "contract"]).expect("commit");
+        let commit = git_output(&root, &["rev-parse", "HEAD"]).expect("commit sha");
+
+        // The worktree moves on, exactly as a rework would move it.
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Acceptance\n\n- [ ] something else entirely\n",
+        )
+        .expect("rewrite story");
+
+        let contract =
+            story_contract_at(&root, &commit, "flux/C-1").expect("the contract is in the commit");
+
+        assert_eq!(contract["path"], json!("docs/stories/C-1-first.md"));
+        assert_eq!(contract["goal"], json!("Ship the thing."));
+        assert_eq!(contract["acceptance"], json!("- [ ] it ships"));
+        assert!(
+            !contract["acceptance"]
+                .as_str()
+                .unwrap()
+                .contains("not the contract"),
+            "a section stops at the next heading: {contract}"
+        );
+        assert!(
+            story_contract_at(&root, &commit, "flux/C-404").is_none(),
+            "an absent contract is absent, never an empty one that reads as satisfied"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A diff that cannot be shown to a model is not a diff the model reviewed.
+    ///
+    /// `redact` is blunt by design: one credential pattern anywhere collapses the WHOLE string to
+    /// `[redacted]`. Judging the packet on the raw diff would therefore mark a packet whole whose
+    /// `diff` field is ten characters long — and a reviewer handed nothing could return PASS over a
+    /// change no one saw. Found by reading this diff back, not by a failing gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_diff_that_cannot_be_shown_is_an_incomplete_packet_not_a_silent_pass() {
+        let root = reclaim_test_dir("review-redaction");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Acceptance\n\n- [ ] it ships\n",
+        )
+        .expect("write story");
+        fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+
+        // Ordinary work first: the packet is whole and would be dispatched.
+        fs::write(root.join("clean.rs"), "// nothing sensitive\n").expect("write clean");
+        guarded_git(&root, &["add", "."]).expect("add clean");
+        guarded_git(&root, &["commit", "-m", "clean"]).expect("commit clean");
+        let clean_commit = git_output(&root, &["rev-parse", "HEAD"]).expect("clean sha");
+        let mut candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: root.clone(),
+            base: base.clone(),
+            commit: clean_commit,
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let clean = review_packet(&candidate);
+        assert_eq!(clean["complete"], json!(true), "{clean}");
+        assert!(
+            clean["diff"].as_str().unwrap().contains("clean.rs"),
+            "{clean}"
+        );
+        assert!(
+            review_refused_before_dispatch(true, &candidate, &clean, 1).is_none(),
+            "an ordinary candidate is dispatched"
+        );
+
+        // Now a line that trips the redactor.
+        fs::write(root.join("config.rs"), "let api_key = read_env();\n").expect("write secretish");
+        guarded_git(&root, &["add", "."]).expect("add secretish");
+        guarded_git(&root, &["commit", "-m", "config"]).expect("commit secretish");
+        candidate.commit = git_output(&root, &["rev-parse", "HEAD"]).expect("secretish sha");
+
+        let packet = review_packet(&candidate);
+
+        assert_eq!(
+            packet["diff"],
+            json!("[redacted]"),
+            "the redactor is expected to collapse this whole diff"
+        );
+        assert_eq!(
+            packet["complete"],
+            json!(false),
+            "a packet whose diff is one redaction marker is not complete: {packet}"
+        );
+        assert!(
+            packet["incomplete_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("credential pattern")),
+            "{packet}"
+        );
+        // The candidate's identity still comes from the real range, not from the redaction.
+        assert_ne!(packet["diff_digest"], clean["diff_digest"]);
+
+        let outcome = review_refused_before_dispatch(true, &candidate, &packet, 1)
+            .expect("an unshowable diff is never dispatched as if it were whole");
+        assert_eq!(outcome.verdict, "REWORK");
+        assert!(!outcome.examined, "no model saw this candidate");
+        assert_eq!(outcome.findings[0]["source"], json!("host"));
+        assert!(
+            outcome.findings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("credential pattern")),
+            "{:?}",
+            outcome.findings
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// C-730: a turn that cited no targeted test must SAY so, not carry an empty argv that reads
+    /// like an absent field.
+    ///
+    /// The old record wrote `test_argv: []`, `failing_before: null`, `passing_after: null` and a
+    /// `provisional: true` flag, which is indistinguishable from a handoff whose evidence was simply
+    /// never written down. `flux fleet handoff` already models the honest form for a change that
+    /// legitimately has no failing test — `--no-failing-test-reason` — and an automatic handoff owes
+    /// the same explicitness.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_cited_no_test_records_the_reason_rather_than_an_empty_claim() {
+        let (worktree, branch, base, _) = story_worktree_with_a_commit("handoff-no-evidence");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+        // A real turn that read and wrote, and never ran a targeted test.
+        state.agents.get_mut("wave-1-worker-1").expect("worker")["last_turn"] = json!({
+            "events": [
+                {"type": "tool_call", "name": "read", "input": {"path": "src/lib.rs"}},
+                {"type": "tool_call", "name": "git_commit", "input": {"message": "deliver"}},
+                {"type": "turn_end", "outcome": "ok"},
+            ],
+        });
+
+        let reports = record_turn_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
+        assert_eq!(reports[0]["verified"], json!(false), "{reports:?}");
+        let handoff =
+            &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0]["handoff"];
+        assert_eq!(handoff["verified"], json!(false), "{handoff:?}");
+        assert_eq!(handoff["test_argv"], json!([]), "{handoff:?}");
+        assert!(
+            handoff["no_failing_test_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no targeted test")),
+            "the handoff must name why it has no evidence: {handoff:?}"
+        );
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// C-730: where the worker DID run a targeted test, that argv is the handoff's evidence — and it
+    /// is re-run rather than believed.
+    ///
+    /// The scratch worktree is not a Cargo workspace, so the cited argv fails at both ends. That is
+    /// the point: the recorded evidence is a real run with a real exit code, the refusal is the
+    /// handoff's recorded reason, and nothing is invented to fill the gap. A wave is never failed by
+    /// this — integration's full gate is what decides — so the story still advances.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_hands_off_the_validation_argv_it_ran_and_records_the_real_result() {
+        let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-evidence");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+        // The pinned base checkout the pre-state is measured in. Without one there is nothing to
+        // measure against, and the handoff says exactly that instead — a different honest answer,
+        // but not the one this test is about.
+        let verify = reclaim_test_dir("handoff-evidence-base");
+        state.waves.get_mut("wave-1").expect("wave")["topology"]["repositories"][0]["verify"] =
+            json!({"worktree": verify.display().to_string()});
+        state.agents.get_mut("wave-1-worker-1").expect("worker")["last_turn"] = json!({
+            "events": [
+                // An untargeted sweep is not targeted evidence, and re-running the whole workspace
+                // twice per story would cost more than the gate it is standing in for.
+                {"type": "tool_call", "name": "cargo_test", "input": {}},
+                {"type": "tool_call", "name": "cargo_test",
+                 "input": {"package": "flux-cli", "filter": "a_named_failing_first_test"}},
+                {"type": "turn_end", "outcome": "ok"},
+            ],
+        });
+
+        let reports = record_turn_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
+        let handoff =
+            &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0]["handoff"];
+        assert_eq!(handoff["commit"], json!(commit));
+        assert_eq!(
+            handoff["test_argv"],
+            json!([
+                "cargo",
+                "test",
+                "-p",
+                "flux-cli",
+                "--",
+                "a_named_failing_first_test"
+            ]),
+            "the targeted call the worker made is the argv: {handoff:?}"
+        );
+        // A real run, not a placeholder: the pre-state was measured and it carries its own argv.
+        assert_eq!(
+            handoff["failing_before"]["argv"], handoff["test_argv"],
+            "{handoff:?}"
+        );
+        assert_eq!(handoff["failing_before"]["success"], json!(false));
+        assert_eq!(handoff["verified"], json!(false), "{handoff:?}");
+        assert!(
+            handoff["unverified_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("passing-after")),
+            "the refusal itself must be the recorded reason: {handoff:?}"
+        );
+        // Never fatal: the wave still moves, and the gate is what blesses it.
+        let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
+        assert_eq!(story["status"], json!("handoff-accepted"));
+        std::fs::remove_dir_all(&worktree).ok();
+        std::fs::remove_dir_all(&verify).ok();
+    }
+
+    /// C-730: `handoffs-ready` was a terminus under drive alone.
+    ///
+    /// `.flux/fleet.toml` declares an `integrator` role and an `integration` loop profile, and the
+    /// string `integrator` appeared nowhere in `flux-cli`: the role and `wave-integration.flux` were
+    /// dead configuration no tick ever dispatched, so every wave whose writers finished sat at
+    /// `handoffs-ready` waiting for a human to type `flux fleet integrate`.
+    #[test]
+    fn drive_dispatches_an_integrator_for_a_wave_whose_stories_all_handed_off() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "handoffs-ready",
+                "items": ["flux/C-1"],
+                "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+            }),
+        );
+
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&[]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+
+        assert_eq!(plan.integrate, vec!["wave-1".to_string()]);
+    }
+
+    /// One integrator per wave. Integration is the longest operation in the pipeline and it resets
+    /// the integration worktree it works in, so a second one dispatched over a live first is not a
+    /// duplicate report — it is two processes cherry-picking into the same checkout.
+    #[test]
+    fn drive_does_not_dispatch_a_second_integrator_over_a_live_one() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "handoffs-ready",
+                "items": ["flux/C-1"],
+                "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+            }),
+        );
+        state.agents.insert(
+            "wave-1-integrator".into(),
+            json!({
+                "id": "wave-1-integrator",
+                "role": "integrator",
+                "task_kind": "integration",
+                "status": "working",
+                "supervisor_pid": std::process::id(),
+                "assignment": {"wave": "wave-1"},
+            }),
+        );
+
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&[]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+
+        assert!(plan.integrate.is_empty(), "{:?}", plan.integrate);
+    }
+
+    /// A wave that spent its attempts stops being dispatched at — and SAYS so.
+    ///
+    /// A successful integration moves the wave off `handoffs-ready`, which normally ends this. A
+    /// turn that completes without ever calling `fleet.integrate` does not, and an unbounded
+    /// retry would then spend one model turn per tick forever on a wave that is not moving.
+    /// Silently skipping it would be worse than the loop: a wave nothing dispatches at reads
+    /// exactly like a wave nobody ever looked at.
+    #[test]
+    fn drive_stops_paying_for_integrator_turns_and_reports_the_wave_it_gave_up_on() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "handoffs-ready",
+                "items": ["flux/C-1"],
+                "integrator_attempts": MAX_INTEGRATOR_ATTEMPTS_PER_WAVE,
+                "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+            }),
+        );
+
+        assert!(drive_integration_targets(&state).is_empty());
+        let exhausted = drive_integration_exhausted(&state);
+        assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+        assert_eq!(exhausted[0]["wave"], json!("wave-1"));
+        assert!(
+            exhausted[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("fleet integrate wave-1")),
+            "the report must name the verb that finishes it: {exhausted:?}"
+        );
+
+        // One attempt short of the cap is still dispatched: the second try is a retry, not a loop.
+        state.waves.get_mut("wave-1").expect("wave")["integrator_attempts"] =
+            json!(MAX_INTEGRATOR_ATTEMPTS_PER_WAVE - 1);
+        assert_eq!(
+            drive_integration_targets(&state),
+            vec!["wave-1".to_string()]
+        );
+        assert!(drive_integration_exhausted(&state).is_empty());
+    }
+
+    /// C-732: the tick owes a promotion exactly when a wave is `awaiting-delivery`, and never
+    /// otherwise.
+    ///
+    /// That status is not a guess about what might be landable — it is the record C-721 has `apply`
+    /// write when it accepted a candidate whose canonical ref does not contain it. So it is the one
+    /// piece of evidence that the last mile is owed. `applied` means the work already landed and
+    /// asking again would spend a config read and a git probe per member for nothing; the statuses
+    /// on either side of delivery mean the wave has not earned the question yet.
+    #[test]
+    fn a_wave_awaiting_delivery_is_what_makes_a_tick_promote() {
+        let mut state = drive_fixture_state();
+        state
+            .waves
+            .insert("wave-1".into(), json!({"status": WAVE_AWAITING_DELIVERY}));
+        state
+            .waves
+            .insert("wave-2".into(), json!({"status": "applied"}));
+        state
+            .waves
+            .insert("wave-3".into(), json!({"status": "handoffs-ready"}));
+
+        assert_eq!(
+            drive_promotion_ready(&state),
+            vec!["wave-1".to_string()],
+            "only the wave whose candidate is accepted and undelivered owes a promotion"
+        );
+
+        // Once it lands, the tick must stop asking. A promotion that keeps being attempted against
+        // an already-delivered wave is the shape that makes an idle loop look busy.
+        state.waves.get_mut("wave-1").expect("wave")["status"] = json!("applied");
+        assert!(
+            drive_promotion_ready(&state).is_empty(),
+            "a delivered wave owes nothing"
+        );
     }
 
     /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not
@@ -21891,6 +25316,125 @@ mod tests {
             assert!(skill.len() < 4096);
             assert!(skill.contains("schema --output json"));
         }
+    }
+
+    /// C-600: the coordinator's durable transcript is an operator artifact with a lifecycle of its
+    /// own. The model never reads it back (`current_turn: true` resets the conversation every turn)
+    /// and compaction is structurally unreachable for an authored loop, so nothing bounded it. A
+    /// segment that has reached the rollover ceiling is retired at the next resume instead of being
+    /// projected again — `flux tui --fleet` attach time must not scale with total coordinator
+    /// history — and the retired segment stays readable in the same store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_coordinator_transcript_rolls_over_at_the_next_attach() {
+        let root = fleet_tui_fixture("rollover").canonicalize().unwrap();
+        let store = agent_store_path(&root, "main").unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let events = flux_events::EventStore::open(store.join("events.db")).unwrap();
+        let full = events.create_session("mock").unwrap();
+        events
+            .append_batch(
+                &full,
+                (0..COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS)
+                    .map(|turn| {
+                        flux_events::NewEvent::message(flux_core::Message::user_text(format!(
+                            "intake {turn}"
+                        )))
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let mut state = FleetState::default();
+        state.main_agent.session = Some(full.clone());
+        write_fleet_state(&root, &state).unwrap();
+
+        let launch = prepare_fleet_tui(&root).unwrap();
+        assert_eq!(
+            launch.session, None,
+            "a full segment must not be resumed: the attach mints a fresh one"
+        );
+
+        let source = FleetTuiSource { root: root.clone() };
+        source.attach_session("s_fresh").unwrap();
+        let rolled = read_fleet_state(&root).unwrap();
+        assert_eq!(rolled.main_agent.session.as_deref(), Some("s_fresh"));
+        assert_eq!(
+            rolled.main_agent.session_history,
+            vec![full.clone()],
+            "the retired segment stays indexed, not forgotten"
+        );
+
+        // Nothing is deleted to make the current transcript small: the retired segment is still a
+        // complete, readable session in the very same store.
+        assert_eq!(
+            events.load_stream(&full, None).unwrap().len(),
+            COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS as usize + 1,
+            "the retired transcript must survive the roll intact"
+        );
+
+        // A segment under the ceiling keeps the durable identity Fleet deliberately resumes, and any
+        // other id offered against it is still the conflict it always was.
+        let short = events.create_session("mock").unwrap();
+        let mut resumed = read_fleet_state(&root).unwrap();
+        resumed.main_agent.session = Some(short.clone());
+        resumed.revision += 1;
+        write_fleet_state(&root, &resumed).unwrap();
+        assert_eq!(
+            prepare_fleet_tui(&root).unwrap().session.as_deref(),
+            Some(short.as_str())
+        );
+        let refused = source.attach_session("s_other").unwrap_err().to_string();
+        assert!(refused.contains("refusing to attach"), "{refused}");
+
+        // The headless driving path applies the same ceiling — it is the path that grew one session
+        // to 8.2 MB with nobody attached to it.
+        let mut driving = read_fleet_state(&root).unwrap();
+        driving.main_agent.session = Some(full.clone());
+        assert_eq!(
+            main_turn_spec(&root, &driving, "ingest".into())
+                .unwrap()
+                .resume_session,
+            None
+        );
+        driving.main_agent.session = Some(short.clone());
+        assert_eq!(
+            main_turn_spec(&root, &driving, "ingest".into())
+                .unwrap()
+                .resume_session
+                .as_deref(),
+            Some(short.as_str())
+        );
+    }
+
+    /// C-600: replacing the coordinator's recorded segment never loses the id it replaced, and the
+    /// index that keeps them findable is itself bounded.
+    #[test]
+    fn a_replaced_coordinator_segment_is_retained_not_forgotten() {
+        let mut main = MainAgentState::default();
+        main.record_session(Some("s_1".into()));
+        assert!(main.session_history.is_empty());
+        main.record_session(Some("s_1".into()));
+        assert!(
+            main.session_history.is_empty(),
+            "resuming the same segment is not a roll"
+        );
+
+        main.record_session(Some("s_2".into()));
+        assert_eq!(main.session_history, vec!["s_1".to_string()]);
+
+        for segment in 0..COORDINATOR_TRANSCRIPT_HISTORY + 5 {
+            main.record_session(Some(format!("s_roll_{segment}")));
+        }
+        assert_eq!(
+            main.session_history.len(),
+            COORDINATOR_TRANSCRIPT_HISTORY,
+            "the state-file index is bounded; the store keeps the transcripts"
+        );
+        assert_eq!(
+            main.session_history.last().map(String::as_str),
+            Some("s_roll_53")
+        );
+        assert_eq!(main.session.as_deref(), Some("s_roll_54"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

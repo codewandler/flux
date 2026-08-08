@@ -24,6 +24,7 @@ mod codex;
 mod message;
 mod opencode;
 mod scan;
+mod usage;
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -38,6 +39,10 @@ pub use scan::{
     JsonlLine, JsonlLines, JsonlScan, ScanBudget, SkipReason, MAX_JSONL_FILES,
     MAX_JSONL_FILE_BYTES, MAX_JSONL_LINE_BYTES, MAX_MESSAGES, MAX_MESSAGE_BYTES,
     MAX_MESSAGE_TOTAL_BYTES,
+};
+pub use usage::{
+    claude_usage, codex_usage, flux_usage, harness_usage, opencode_usage, HarnessSession,
+    NoProgress, ScanObserver, UsageScan, UsageWindow,
 };
 
 /// A coding harness whose local state flux can read.

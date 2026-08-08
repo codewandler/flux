@@ -2,7 +2,7 @@
 id: C-587
 title: "Every Fleet candidate produces independent review and structured reflection before handoff"
 pillar: Improve
-status: backlog
+status: in-progress
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-flow, flux-runtime, flux-orchestrate, flux-events, flux-cli]
@@ -59,6 +59,34 @@ handoff, and collect structured friction centrally for self-improvement.
 ## Progress
 
 - 2026-08-05 — contracted from operator feedback after the explicit workhorse/reviewer loop plan.
+- 2026-08-08 — **the review half is implemented; the reflection half is not.** No box is ticked,
+  because every Acceptance item above is a compound "review *and* reflection" claim and only one
+  side of each is true. What now exists, in `crates/flux-cli/src/board_fleet_cmd.rs`:
+  - `flux fleet review WAVE [--item ITEM] [--from FILE]` admits a **fresh read-only agent that is
+    not the writer** (`admit_candidate_reviewer`) whose workspace is a per-candidate sandbox holding
+    only its packet — no repository checkout, no fleet state, no writer conversation, no session
+    inherited from the writer, and a `read-only` admission so it cannot edit what it judges.
+  - The packet (`review_packet`, `flux.fleet-review-packet/v1`) is host-derived: story Goal and
+    Acceptance read **at the reviewed commit**, the exact normalized diff, the observed write set,
+    candidate/base identities and a diff digest.
+  - Findings are structured and evidence-bound — closed `category`/`severity`/`confidence`
+    vocabularies, `component`, and exactly one of `{path,line}` / `{command}` / `{invariant}` — with
+    `source` separating a reviewer's assessment from a host-derived fact.
+  - The verdict gates: `integrate_wave` refuses any candidate without a PASS at its exact handoff
+    commit (`candidate_review_refusal`), and REWORK routes through the existing `fleet_rework`
+    budget, so the third round still parks.
+  - It fails closed. Receipts carry `examined` beside `verdict`, so a clean review and a review that
+    never ran are different rows; a stopped fleet, a missing contract, a packet that does not fit, a
+    failed turn and an exhausted retry run each record a distinct state and none of them passes.
+  - `drive_one_tick` reviews every ready candidate, so an unattended fleet needs no operator call.
+  - Receipts are keyed by wave, BoardRef, repository, attempt, reviewer id/session, loop and model,
+    candidate digest and the writer's identity, appended to the story's `review_receipts`.
+- Not implemented, and deliberately left: `AgentReflection/v1`, the bounded worker-transcript packet,
+  the central improvement projection and `flux fleet insights` (Acceptance 3, 5, 7 and the reflection
+  halves of 1, 2, 4, 6, 8, 9). The dedicated `review` loop profile and its authored strict-review
+  protocol, the reviewer's `PARK` vocabulary, and the `candidate_ready` → `handoff_ready` two-receipt
+  naming stay with C-572; this uses the configured `loop_policy["review"]` binding as it stands, and
+  keeps `PARK` host-derived from the rework budget.
 
 ## Notes
 

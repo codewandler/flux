@@ -55,6 +55,13 @@ structure, and the choice takes effect on the next start. A session that has alr
 admitted its loop: the selector then refuses and names the new-session/re-admission path instead of
 switching a running agent.
 
+Describing a loop authors one: `/loop <what it should do>` generates the `*.flux` file under
+`.flux/loops`, and the selector reopens with the new loop under the cursor, ready to select. The
+generated program passes the same load-time validation a hand-written loop passes before it is
+offered — an invalid generation is refused with its error rather than saved, and an existing loop
+file is never overwritten. Authoring is not an admission: it does not change the loop a running
+agent already runs, and it does not authorize the profile for a Fleet task kind.
+
 ## Board and Fleet operations
 
 Ordinary `flux tui` remains a standalone chat and says so in the header. Fleet attachment is always
@@ -213,6 +220,7 @@ These are the TUI's built-ins. A command file discovered from `.flux/commands`, 
 | `/model [spec]` | Show the active model, or switch mid-session (`/model opus`) |
 | `/effort [low\|medium\|high\|xhigh\|max\|off]` | Show or set reasoning effort; takes effect from the next turn |
 | `/theme [name]` | List the palettes and the current one, or switch (see [Themes](#themes)) |
+| `/loop [description]` | Open the loop selector, or author a new `*.flux` loop from a description and offer it immediately |
 | `/tools` | List the operations registered for this session |
 | `/shell` | Toggle the optional `bash` op group from the next turn |
 | `/evidence` | Show the session's durable evidence trail |
@@ -262,6 +270,20 @@ too small to draw it.
 - **Idle, composer empty** — *arm* quit. The footer shows `Ctrl-C again to quit`; a second
   `Ctrl-C` within two seconds exits. Any other key disarms it, so a single reflexive press
   never drops you out of the session.
+
+### How long cancelling takes
+
+Cancellation is cooperative, so it is acknowledged immediately but is not instantaneous. Any
+sub-agent the turn had in flight switches to a `cancelling` row in the fleet pane the moment the
+request lands — a state of its own, neither `running` nor a finished outcome — so you can tell the
+request was received rather than watching a spinner.
+
+The wait has a ceiling: **the provider call already open, plus a 10-second cleanup grace.** A model
+request cannot be interrupted mid-flight, so a child that is waiting on a large-context answer keeps
+that request open until the provider replies; only then does the grace window start, and a child that
+still has not stopped by the end of it is reported as failing to stop. Independently, a sub-agent
+carries a **10-minute wall-clock deadline by default**, which fires the same cancellation path, so a
+child can never run unbounded even if the cancel never reaches it.
 
 `Ctrl-D` exits directly, but only from an idle session with an empty composer. `/quit` and
 `/exit` have one meaning in every state: clear queued follow-ups, cancel a running turn, and leave

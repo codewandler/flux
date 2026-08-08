@@ -154,7 +154,14 @@ Three different histories exist:
   intentionally resumed by `flux tui --fleet`.
 
 Restarting the process changes the PID but does not mint a new Fleet-main session, so the transcript
-returning is expected. Never delete or edit runtime state to make a test look fresh. Use the typed
+returning is expected. The one exception is a **rollover** (C-600): a transcript segment that has
+reached its event ceiling is retired instead of resumed, so the attach opens a fresh segment and the
+retired one is indexed in `state.json`'s `main_agent.session_history`. Nothing is deleted — every
+segment lives in the same store, so `flux sessions --store <git-dir>/flux-fleet/sessions/main` and
+the TUI picker still list the older transcripts. A short transcript after a restart therefore means
+a roll, not a lost history; see
+[the design record](../../../docs/designs/coordinator-transcript-rollover.md). Never delete or edit
+runtime state to make a test look fresh. Use the typed
 Fleet/session command designed for that transition, or test the next current turn while explicitly
 accounting for resumed history.
 

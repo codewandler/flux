@@ -38,7 +38,7 @@ vision · roadmap · decisions · designs
        handoff → review/rework → integrate → final gate
                      │
                      ▼
-       local candidate → explicit apply
+       local candidate → explicit apply → promote onto local main
 ```
 
 There are two deliberately separate forms of truth:
@@ -100,8 +100,10 @@ the same session, integrates accepted commits, and runs one final repository gat
 
 It does **not** silently publish. A green wave leaves a local `fleet/<wave>` candidate, and
 `flux fleet apply <wave>` accepts it by pinning that exact commit with an annotated tag — it does not
-merge, and writing the canonical branch stays a separate step with its own gate. Neither `run` nor
-`apply` pushes, opens a pull request, releases, deploys, or removes a worktree.
+merge. Writing the canonical branch is `flux fleet promote`, which accumulates each member's accepted
+candidates, re-gates them in a throwaway worktree, and advances that member's **local** branch in the
+order its dependency graph declares. No Fleet operation pushes, opens a pull request, releases or
+deploys.
 
 Read [Fleet and sub-agents](./fleet.md) for configuration, dispatch, acknowledgements, recovery,
 inspection, and the publication boundary.
@@ -129,8 +131,9 @@ flux fleet run api/C-41 web/C-12 --idempotency-key wave-aug-05 --output json
 flux fleet status --output json
 flux fleet inspect activity --limit 100 --output json
 
-# Apply only a recorded green local candidate.
+# Apply only a recorded green local candidate, then land the accumulation on local main.
 flux fleet apply wave-7 --if-revision 18 --idempotency-key apply-wave-7 --output json
+flux fleet promote --output json
 ```
 
 The board's story Goal and Acceptance remain the definition of done. A worker saying “done” is not

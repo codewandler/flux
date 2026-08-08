@@ -95,10 +95,20 @@ pub type ProviderFactory = Arc<dyn Fn() -> Result<Box<dyn Provider>> + Send + Sy
 /// so a session id alone cannot distinguish concurrent storeless spawns of the same role.
 static NEXT_SPAWN_ACTIVITY_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Per-sub-agent resource limits. Defaults preserve the historical behaviour: 30 iterations (a
-/// planner that grounds a task in files or a worker that reads/edits/then runs the dev-gate needs
-/// more than a handful of tool turns), the spawner's configured token budget, and no wall-clock
-/// deadline.
+/// The wall-clock ceiling every sub-agent carries unless its spawner narrows or widens it (C-601).
+///
+/// Before this, `SpawnLimits::new` defaulted to `None` and only the SDK's client builders filled a
+/// deadline in, so a `task`/research child spawned by the CLI or the TUI was bounded by the
+/// iteration cap and the token budget alone — nothing wall-clock. Ten minutes is the value those
+/// builders already applied, so no surface gets a *shorter* bound than it had; it is a runaway
+/// backstop, not a scheduling ceiling. On expiry the child's cancel token fires, exactly as parent
+/// cancellation does, and the child is then bounded-awaited through
+/// [`SPAWN_CLEANUP_GRACE`](flux_runtime::SPAWN_CLEANUP_GRACE).
+pub const DEFAULT_SPAWN_WALL_CLOCK: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Per-sub-agent resource limits. Defaults are 30 iterations (a planner that grounds a task in files
+/// or a worker that reads/edits/then runs the dev-gate needs more than a handful of tool turns), the
+/// spawner's configured token budget, and the [`DEFAULT_SPAWN_WALL_CLOCK`] deadline.
 #[derive(Clone)]
 pub struct SpawnLimits {
     /// Per-turn tool-iteration cap.
@@ -114,12 +124,14 @@ pub struct SpawnLimits {
 }
 
 impl SpawnLimits {
-    /// Default limits for a given per-turn token budget (30 iterations, no wall-clock deadline).
+    /// Default limits for a given per-turn token budget (30 iterations and the
+    /// [`DEFAULT_SPAWN_WALL_CLOCK`] deadline). Set `wall_clock` to `None` explicitly for a child
+    /// that must only ever be bounded by its iteration cap.
     pub fn new(max_tokens: u32) -> Self {
         Self {
             max_iterations: 30,
             max_tokens,
-            wall_clock: None,
+            wall_clock: Some(DEFAULT_SPAWN_WALL_CLOCK),
         }
     }
 }
@@ -661,6 +673,27 @@ impl Spawner for LocalSpawner {
             Finished(Result<()>),
             Stopped(StopTrigger),
         }
+        // C-601: the child future owns `&mut sink` for the whole race, so the *cancelling* signal —
+        // the one event that has to reach the surface while the child is still winding down — is
+        // emitted through its own handle on the same activity sink.
+        let announce_cancelling = {
+            let activity = request.activity.clone();
+            let role = role_name.to_string();
+            let child_session_id = session_id.clone();
+            let parent_session = request.parent_session.clone();
+            move || {
+                if let Some(activity) = &activity {
+                    activity.emit(SpawnActivity {
+                        spawn_id,
+                        role: role.clone(),
+                        child_session_id: child_session_id.clone(),
+                        parent_session: parent_session.clone(),
+                        depth: child_depth,
+                        event: SpawnActivityEvent::Cancelling,
+                    });
+                }
+            }
+        };
         let (run_result, stop) = {
             let run = engine.run_turn_cancellable(&session_id, task, &mut sink, &run_cancel);
             tokio::pin!(run);
@@ -680,6 +713,9 @@ impl Spawner for LocalSpawner {
             match race {
                 RunRace::Finished(result) => (result, None),
                 RunRace::Stopped(trigger) => {
+                    // Announced BEFORE the grace starts: this is the whole window in which the
+                    // operator otherwise sees a spinning card and no acknowledgement.
+                    announce_cancelling();
                     run_cancel.cancel();
                     let cleanup = tokio::time::timeout(SPAWN_CLEANUP_GRACE, &mut run)
                         .await
@@ -1088,6 +1124,21 @@ impl AgentSink for TextCollector {
             }
             return;
         }
+        // C-570: a child-authored progress report crosses this boundary as itself rather than as
+        // opaque observation data, so a parent can project it while the terminal result is still
+        // being awaited. It is relayed only for the session that authored it and only when it is
+        // admissible; anything else is elided with a bounded diagnostic naming the refusal.
+        if let Some(mut report) = flux_runtime::agent_report_from_observation(observation) {
+            report.redact_with(&|text| self.redactor.redact(text));
+            let relayed = match report.admit_from_session(&self.child_session_id) {
+                Ok(()) => flux_runtime::agent_report_observation(&report),
+                Err(rejection) => flux_runtime::agent_report_refusal_observation(&rejection),
+            };
+            self.emit(SpawnActivityEvent::Observation {
+                observation: relayed,
+            });
+            return;
+        }
         if observation.kind == "turn.cancelled" {
             self.cancelled = true;
         }
@@ -1445,6 +1496,195 @@ mod tests {
         try_parse_role(content, name_fallback).unwrap()
     }
 
+    /// C-570: a child-authored report reaches the parent through the correlated child boundary
+    /// while the parent is still awaiting the terminal result — and only for the child that owns
+    /// the session it claims.
+    #[test]
+    fn a_child_progress_report_crosses_the_correlated_boundary_redacted() {
+        use flux_core::{
+            AgentLoopBindingMetadata, AgentLoopRunnerKind, AgentReport, AgentReportIdentity,
+            AgentReportState,
+        };
+
+        struct Capture(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for Capture {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
+        let identity = |session: &str| AgentReportIdentity {
+            agent_id: "writer-1".into(),
+            session_id: session.into(),
+            parent_session: Some("s_parent".into()),
+            assignment: "flux/C-570".into(),
+            loop_binding: AgentLoopBindingMetadata {
+                schema: AgentLoopBindingMetadata::SCHEMA.into(),
+                profile: "implementation".into(),
+                revision: "1".into(),
+                runner: AgentLoopRunnerKind::NativeFlux,
+                source_ref: "profile:implementation@1".into(),
+                source_sha256: "a".repeat(64),
+                entry_point: "work".into(),
+                required_operations: vec!["read".into()],
+                required_runtime_features: vec![],
+            },
+        };
+
+        let sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let redactor = flux_secret::Redactor::new();
+        redactor.add_secret("canary boundary value");
+        let mut collector = TextCollector::new(
+            Some(sink.clone() as Arc<dyn SpawnActivitySink>),
+            7,
+            "writer".to_string(),
+            "s_child".to_string(),
+            Some("s_parent".to_string()),
+            1,
+            redactor,
+        );
+
+        collector.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_1",
+            1,
+            identity("s_child"),
+            "establish-evidence",
+            AgentReportState::Active,
+            "red test established using canary boundary value",
+        )));
+        // A record claiming another agent's session is not this child's to relay.
+        collector.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_2",
+            2,
+            identity("s_somebody_else"),
+            "implement",
+            AgentReportState::Active,
+            "not mine to report",
+        )));
+        // Neither is an inadmissible one.
+        collector.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_3",
+            3,
+            identity("s_child"),
+            "implement",
+            AgentReportState::HandoffReady,
+            "I am done",
+        )));
+
+        let relayed: Vec<AgentReport> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|activity| match &activity.event {
+                SpawnActivityEvent::Observation { observation } => {
+                    assert_eq!(activity.child_session_id, "s_child");
+                    assert_eq!(activity.depth, 1);
+                    assert_eq!(activity.spawn_id, 7);
+                    flux_runtime::agent_report_from_observation(observation)
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(relayed.len(), 1, "{relayed:?}");
+        assert_eq!(relayed[0].report_id, "r_1");
+        assert_eq!(relayed[0].identity.assignment, "flux/C-570");
+        assert!(
+            !relayed[0].summary.contains("canary boundary value"),
+            "{:?}",
+            relayed[0].summary
+        );
+    }
+    /// C-570: a report authored two levels down reaches the root with the *inner* child's
+    /// identity, depth and spawn id intact — an intermediate collector relays it, it does not
+    /// re-sign it as its own.
+    #[test]
+    fn a_nested_child_report_reaches_the_root_with_its_own_identity() {
+        use flux_core::{
+            AgentLoopBindingMetadata, AgentLoopRunnerKind, AgentReport, AgentReportIdentity,
+            AgentReportState,
+        };
+
+        struct Capture(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for Capture {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
+        let grandchild = AgentReportIdentity {
+            agent_id: "writer-1".into(),
+            session_id: "s_grandchild".into(),
+            parent_session: Some("s_child".into()),
+            assignment: "flux/C-570".into(),
+            loop_binding: AgentLoopBindingMetadata {
+                schema: AgentLoopBindingMetadata::SCHEMA.into(),
+                profile: "implementation".into(),
+                revision: "1".into(),
+                runner: AgentLoopRunnerKind::NativeFlux,
+                source_ref: "profile:implementation@1".into(),
+                source_sha256: "a".repeat(64),
+                entry_point: "work".into(),
+                required_operations: vec!["read".into()],
+                required_runtime_features: vec![],
+            },
+        };
+
+        // The innermost collector admits and relays its own child's report...
+        let inner_sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let mut inner = TextCollector::new(
+            Some(inner_sink.clone() as Arc<dyn SpawnActivitySink>),
+            9,
+            "writer".to_string(),
+            "s_grandchild".to_string(),
+            Some("s_child".to_string()),
+            2,
+            flux_secret::Redactor::new(),
+        );
+        inner.observation(&flux_runtime::agent_report_observation(&AgentReport::new(
+            "r_1",
+            1,
+            grandchild,
+            "implement",
+            AgentReportState::CandidateReady,
+            "candidate frozen two levels down",
+        )));
+
+        // ...and the intermediate collector passes that activity through unchanged.
+        let root_sink = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let mut middle = TextCollector::new(
+            Some(root_sink.clone() as Arc<dyn SpawnActivitySink>),
+            3,
+            "coordinator".to_string(),
+            "s_child".to_string(),
+            Some("s_parent".to_string()),
+            1,
+            flux_secret::Redactor::new(),
+        );
+        for activity in inner_sink.0.lock().unwrap().iter() {
+            middle.observation(&activity.to_observation());
+        }
+
+        let relayed = root_sink.0.lock().unwrap();
+        let reports: Vec<(&SpawnActivity, AgentReport)> = relayed
+            .iter()
+            .filter_map(|activity| match &activity.event {
+                SpawnActivityEvent::Observation { observation } => {
+                    flux_runtime::agent_report_from_observation(observation)
+                        .map(|report| (activity, report))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reports.len(), 1, "{relayed:?}");
+        let (activity, report) = &reports[0];
+        assert_eq!(activity.child_session_id, "s_grandchild");
+        assert_eq!(activity.depth, 2);
+        assert_eq!(activity.spawn_id, 9);
+        assert_eq!(report.identity.session_id, "s_grandchild");
+        assert_eq!(report.state, AgentReportState::CandidateReady);
+    }
     fn request_has_tool(request: &Request, name: &str) -> bool {
         request.tools.iter().any(|tool| tool.name == name)
     }
@@ -4184,6 +4424,134 @@ mod tests {
             terminals,
             vec![true],
             "a timeout must emit exactly one failure terminal"
+        );
+    }
+
+    /// C-601 (failing first): a `task`/research child must carry a wall-clock deadline **by
+    /// default**. Only the SDK's client builders filled one in, so a child spawned by the CLI or
+    /// the TUI was bounded by the iteration cap and the token budget alone — nothing wall-clock.
+    #[test]
+    fn default_sub_agent_limits_carry_a_wall_clock_deadline() {
+        let limits = SpawnLimits::new(1024);
+        assert!(
+            limits.wall_clock.is_some(),
+            "a task/research child must be wall-clock bounded by default, not by its iteration \
+             cap alone"
+        );
+        assert_eq!(limits.wall_clock, Some(DEFAULT_SPAWN_WALL_CLOCK));
+
+        // And the bundle every surface actually spawns through inherits it.
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(MockProvider))),
+            Arc::new(RoleRegistry::default()),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+        assert_eq!(spawner.limits.wall_clock, Some(DEFAULT_SPAWN_WALL_CLOCK));
+        assert_eq!(
+            SubAgents::new(
+                RoleRegistry::default(),
+                ToolRegistry::new(),
+                Arc::new(|| Ok(Box::new(MockProvider))),
+                "mock",
+                1024,
+            )
+            .limits
+            .wall_clock,
+            Some(DEFAULT_SPAWN_WALL_CLOCK)
+        );
+    }
+
+    /// C-601 (failing first): cancelling a turn whose child is inside an uninterruptible provider
+    /// call must **announce** the cancellation as a distinct, non-terminal event — the one thing a
+    /// surface can repaint between the keypress and the terminal, without which a working system
+    /// reads as hung — and must then reach a terminal within the advertised bound: that in-flight
+    /// call plus [`SPAWN_CLEANUP_GRACE`].
+    #[tokio::test]
+    async fn cancelling_a_child_in_flight_is_announced_and_terminal_within_the_bound() {
+        /// The in-flight model request the story is about: the child cannot observe its cancel
+        /// token until the provider answers.
+        const IN_FLIGHT: std::time::Duration = std::time::Duration::from_millis(250);
+
+        struct SlowProvider;
+        #[async_trait]
+        impl Provider for SlowProvider {
+            fn name(&self) -> &str {
+                "mock"
+            }
+            async fn stream(&self, _r: Request) -> Result<ChunkStream> {
+                tokio::time::sleep(IN_FLIGHT).await;
+                Ok(Box::pin(futures::stream::iter(
+                    prose_chunks("answered after the cancel")
+                        .into_iter()
+                        .map(Ok),
+                )))
+            }
+        }
+
+        #[derive(Default)]
+        struct Capture(std::sync::Mutex<Vec<SpawnActivity>>);
+        impl SpawnActivitySink for Capture {
+            fn emit(&self, activity: SpawnActivity) {
+                self.0.lock().unwrap().push(activity);
+            }
+        }
+
+        let mut roles = RoleRegistry::default();
+        roles.insert(parse_role("---\ntools: []\n---\nYou stall.", "sloth"));
+        let spawner = LocalSpawner::new(
+            Arc::new(|| Ok(Box::new(SlowProvider))),
+            Arc::new(roles),
+            ToolRegistry::new(),
+            temp_system(),
+            "mock",
+            1024,
+        );
+
+        let activity = Arc::new(Capture::default());
+        let mut request = SpawnRequest::new("sloth", "wait for cancellation");
+        request.activity = Some(activity.clone());
+
+        // The operator's Ctrl-C, while the child is mid-request.
+        let cancel = CancellationToken::new();
+        let operator = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            operator.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let out = spawner.spawn(request, &cancel).await;
+        let elapsed = started.elapsed();
+
+        let err = out.expect_err("a cancelled child must not report success");
+        assert!(
+            err.to_string().contains("cancelled"),
+            "expected a cancellation error, got: {err}"
+        );
+        assert!(
+            elapsed < IN_FLIGHT + SPAWN_CLEANUP_GRACE,
+            "a cancelled turn with a child in flight must reach a terminal within its open \
+             provider call plus the {SPAWN_CLEANUP_GRACE:?} grace, took {elapsed:?}"
+        );
+
+        let events = activity.0.lock().unwrap();
+        let cancelling = events
+            .iter()
+            .position(|a| matches!(a.event, SpawnActivityEvent::Cancelling))
+            .expect(
+                "cancellation must be announced while the child is still winding down, so a \
+                 surface has a `cancelling` state to show",
+            );
+        let terminal = events
+            .iter()
+            .position(|a| matches!(a.event, SpawnActivityEvent::Finished { .. }))
+            .expect("the child must still emit exactly one terminal");
+        assert!(
+            cancelling < terminal,
+            "the cancelling signal is non-terminal and must precede the terminal: {events:?}"
         );
     }
 

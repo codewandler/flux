@@ -69,8 +69,10 @@ widths the rail disappears so chat keeps the available columns; the persistent a
 keeps connection, revision and the `F2` affordance visible, and `F2` opens the full operations overlay.
 `/fleet` opens overview, `/board` opens Board work, and the overlay tabs are Overview, Board,
 Workers, Decisions and Stats. Arrow keys move, Tab/Shift-Tab change tabs, Enter opens detail or begins
-an explicitly labelled decision confirmation, `r` refreshes and Esc returns to chat. Mouse wheel
-scrolls the active list; no mouse click can confirm a mutation.
+an explicitly labelled decision confirmation — on the Board it expands the selected box and collapses
+it again — `r` refreshes and Esc returns to chat. Mouse wheel scrolls the active list and a left click
+expands or collapses the Board box under the pointer, which is the same toggle the keyboard reaches;
+no mouse click can confirm a mutation.
 
 Worker detail correlates only durable identifiers: assignment, wave, session, worktree, handoff,
 review/rework, bounded activity and failure. It does not display secret-bearing prompts or arbitrary

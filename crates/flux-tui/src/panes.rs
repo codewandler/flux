@@ -776,6 +776,12 @@ fn fleet_lines(state: &ChatState, theme: &Theme, cols: usize) -> Vec<Line<'stati
         // The mark, the tint and the frame are all chosen here from the typed status — never from
         // anything a worker or the model wrote.
         let (mark, style) = match (&row.status, row.stalled) {
+            // C-601: cancellation wins over every other appearance, stall included. It loses the
+            // spinner — a cancelling worker is not making progress, it is winding down — and takes
+            // a mark of its own so the operator can see the request landed. Under `Theme::MONO`
+            // every colour role is `Color::Reset`, so the mark and the `cancelling` word on line 2
+            // are what carry it, not the tint.
+            (WorkerStatus::Cancelling, _) => ("⊘", theme.warn_style()),
             // A quiet worker is the one an operator has to notice, so it loses its animation: a
             // frozen mark plus a warn tint, rather than a spinner that suggests progress.
             (_, true) => ("◌", theme.warn_style()),
@@ -1913,6 +1919,64 @@ mod tests {
         assert!(
             screen.contains("idle"),
             "the finished-its-call child is shown idle:\n{screen}"
+        );
+    }
+
+    /// C-601's named failing-first surface test: the cancelling state has to be *seen*, not merely
+    /// projected. The operator's question after Ctrl-C is "was that received?", and before this the
+    /// worker card kept animating `running · read` for as long as the child's provider call stayed
+    /// open — a working system that looks hung.
+    #[test]
+    fn a_cancelled_turns_worker_card_shows_cancelling_instead_of_running() {
+        use flux_runtime::SpawnActivityEvent;
+
+        let mut state = ChatState::new("mock".into());
+        let t0 = std::time::Instant::now();
+        feed(
+            &mut state,
+            &child_event(
+                1,
+                "researcher",
+                SpawnActivityEvent::ToolCall {
+                    call_id: 1,
+                    name: "read".into(),
+                    input: serde_json::json!({}),
+                },
+            ),
+            t0,
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(TRUST_W, TRUST_H)).unwrap();
+        let draw = |terminal: &mut Terminal<TestBackend>, state: &ChatState| -> String {
+            terminal.draw(|f| crate::render(f, state)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect()
+        };
+
+        let before = draw(&mut terminal, &state);
+        assert!(
+            before.contains("running · read"),
+            "the worker is running before the cancel:\n{before}"
+        );
+
+        feed(
+            &mut state,
+            &child_event(1, "researcher", SpawnActivityEvent::Cancelling),
+            t0,
+        );
+        let after = draw(&mut terminal, &state);
+        assert!(
+            after.contains("cancelling"),
+            "the operator must be able to see the cancel was received:\n{after}"
+        );
+        assert!(
+            !after.contains("running · read"),
+            "a cancelling worker must not still read as running:\n{after}"
         );
     }
 
