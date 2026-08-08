@@ -358,6 +358,6 @@ pub fn sqlite_column_exists(conn: &Connection, table: &str, column: &str) -> Res
 
 /// Map a rusqlite error onto the shared error type, preserving its rendering verbatim so a surface
 /// note reads exactly as it did when the driver error surfaced directly.
-fn sqlite_err(e: rusqlite::Error) -> Error {
+pub(crate) fn sqlite_err(e: rusqlite::Error) -> Error {
     Error::Other(e.to_string())
 }
