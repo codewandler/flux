@@ -640,15 +640,37 @@ async fn a_far_side_version_mismatch_surfaces_the_protocols_own_refusal() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let refused = admit_ssh_substrate(
-        &fixture.local,
-        &fixture.bootstrap,
-        TOKEN.to_string(),
-        &loopback_grant(),
-        SshStartPolicy::AttachOnly,
-    )
-    .await
-    .expect_err("a mixed version pair must refuse to pair at all");
+    // What this test asks is what the *protocol* says about a mixed pair. Failing to reach the
+    // fixture sshd at all is not an answer to that question, and treating it as one made this the
+    // single largest source of red CI in the repository — four of the last five `ci` failures, one
+    // of which aborted a release after the identical suite had already passed on the pull request.
+    // The daemon accepts the fixture's startup probe and can still refuse a later connection under
+    // the parallel load of ten sibling tests each running their own sshd.
+    //
+    // So retry while the failure is transport, and only ever assert on an answer that came from the
+    // protocol. The assertion below is unchanged and no weaker: a run that never gets past the
+    // transport still fails, naming what it actually saw.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let refused = loop {
+        let error = admit_ssh_substrate(
+            &fixture.local,
+            &fixture.bootstrap,
+            TOKEN.to_string(),
+            &loopback_grant(),
+            SshStartPolicy::AttachOnly,
+        )
+        .await
+        .expect_err("a mixed version pair must refuse to pair at all");
+        if matches!(error, SshAdmissionError::Handshake(_)) {
+            break error;
+        }
+        let said = error.to_string();
+        assert!(
+            said.contains("could not reach") && Instant::now() < deadline,
+            "expected the protocol's own refusal, got {error}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     match &refused {
         SshAdmissionError::Handshake(error) => {
             let said = error.to_string();
