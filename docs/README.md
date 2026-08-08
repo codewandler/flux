@@ -30,6 +30,7 @@ Everything else (providers, tools, skills, orchestration, plugins) is machinery 
 | Why flux exists; the principles | [vision.md](vision.md) |
 | The design — layers, safety envelope, loop, **crate map** | [architecture.md](architecture.md) |
 | Status + what's next | [roadmap.md](roadmap.md) |
+| **How a release happens**, and the states it gets stuck in | [releasing.md](releasing.md) — the `release`-branch trigger, the two-job authority split, failure recovery |
 | **What to work on right now** | [stories/README.md](stories/README.md) — the backlog/status board |
 | Latest repository architecture review | [designs/architecture-review-2026-07-14/review.md](designs/architecture-review-2026-07-14/review.md) — ranked findings, evidence, and linked remediation stories |
 | Security / readiness reviews and their triage state | [reviews/README.md](reviews/README.md) — `single/` passes, `aggregate/` claim ledgers, `archive/` handled passes |
