@@ -14681,7 +14681,7 @@ struct DrivePlan {
     /// C-723: reasons that claimed an item but could not prove it, each with the evidence that
     /// failed. A released item goes on to dispatch; recording it is what makes a wrong withhold
     /// visible in the tick output instead of inferred from a shrinking dispatch count.
-    released: Vec<Value>,
+    overridden: Vec<Value>,
     /// Why the dispatch phase sent nothing at all, when that is a property of the fleet.
     blocked: Option<String>,
     /// Free worker slots at the configured width.
@@ -15239,7 +15239,7 @@ fn drive_tick_plan(
                     plan.withheld.push(record);
                     continue;
                 }
-                plan.released.push(record);
+                plan.overridden.push(record);
             }
             if plan.dispatch.len() >= plan.width {
                 plan.withheld.push(json!({
@@ -15427,7 +15427,7 @@ fn drive_one_tick(
         "reconstruct": plan.reconstruct,
         "dispatch": plan.dispatch,
         "withheld": plan.withheld,
-        "released": plan.released,
+        "released": plan.overridden,
         "blocked": plan.blocked,
     });
     let withheld = plan.withheld.clone();
@@ -15479,7 +15479,7 @@ fn drive_one_tick(
         "width": plan.width,
         "items": plan.dispatch,
         "withheld": plan.withheld,
-        "released": plan.released,
+        "released": plan.overridden,
         "blocked": plan.blocked,
     });
     if !plan.dispatch.is_empty() && !command.dry_run {
@@ -21743,7 +21743,7 @@ mod tests {
             "a withheld item reports what justified withholding it: {:?}",
             plan.withheld[0]
         );
-        assert!(plan.released.is_empty(), "{:?}", plan.released);
+        assert!(plan.overridden.is_empty(), "{:?}", plan.overridden);
         assert!(plan.blocked.is_none());
     }
 
@@ -21833,21 +21833,21 @@ mod tests {
 
         assert_eq!(plan.dispatch, vec!["flux/C-570".to_string()]);
         assert!(plan.withheld.is_empty(), "{:?}", plan.withheld);
-        assert_eq!(plan.released.len(), 1, "{:?}", plan.released);
-        assert_eq!(plan.released[0]["item"], "flux/C-570");
-        assert_eq!(plan.released[0]["reason"], "already-built");
+        assert_eq!(plan.overridden.len(), 1, "{:?}", plan.overridden);
+        assert_eq!(plan.overridden[0]["item"], "flux/C-570");
+        assert_eq!(plan.overridden[0]["reason"], "already-built");
         assert_eq!(
-            plan.released[0]["evidence"],
+            plan.overridden[0]["evidence"],
             json!([{"artifact": "AgentReport", "present": false}]),
             "the concrete evidence travels with the release: {:?}",
-            plan.released[0]
+            plan.overridden[0]
         );
         assert!(
-            plan.released[0]["detail"]
+            plan.overridden[0]["detail"]
                 .as_str()
                 .is_some_and(|detail| detail.contains("AgentReport")),
             "{:?}",
-            plan.released[0]
+            plan.overridden[0]
         );
     }
 
@@ -21982,14 +21982,14 @@ mod tests {
             vec!["C-570".to_string()],
             "a story whose named symbols are absent dispatches: {:?} / {:?}",
             plan.withheld,
-            plan.released
+            plan.overridden
         );
         assert!(plan.withheld.is_empty(), "{:?}", plan.withheld);
-        assert_eq!(plan.released.len(), 1, "{:?}", plan.released);
+        assert_eq!(plan.overridden.len(), 1, "{:?}", plan.overridden);
 
-        let detail = plan.released[0]["detail"].as_str().expect("a detail");
+        let detail = plan.overridden[0]["detail"].as_str().expect("a detail");
         assert!(detail.contains("AgentReport"), "{detail}");
-        let evidence = plan.released[0]["evidence"]
+        let evidence = plan.overridden[0]["evidence"]
             .as_array()
             .expect("per-artifact evidence")
             .clone();
@@ -22044,7 +22044,7 @@ mod tests {
         let plan = drive_tick_plan(&drive_fixture_state(), &schedule, Some(&verified), 8);
 
         assert!(plan.dispatch.is_empty(), "{:?}", plan.dispatch);
-        assert!(plan.released.is_empty(), "{:?}", plan.released);
+        assert!(plan.overridden.is_empty(), "{:?}", plan.overridden);
         assert_eq!(plan.withheld.len(), 1, "{:?}", plan.withheld);
         assert_eq!(plan.withheld[0]["reason"], "already-built");
         let detail = plan.withheld[0]["detail"].as_str().expect("a detail");
