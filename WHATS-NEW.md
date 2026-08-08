@@ -15,6 +15,8 @@
 
 ## [Unreleased]
 
+## [0.59.1] - 2026-08-08
+
 ### New
 
 - **Say which machine an endpoint is reachable from.** A service that only answers inside your
