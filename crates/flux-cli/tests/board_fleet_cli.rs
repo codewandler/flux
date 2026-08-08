@@ -624,10 +624,17 @@ fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
             "story",
             "--title",
             "Authored then committed",
-            // C-736: `ready` is where a contract becomes mandatory, and `create` writes the
-            // placeholder. This test is about the commit verb, so it drafts at backlog.
             "--status",
-            "backlog",
+            // C-736 made `ready` the point where a contract becomes mandatory, and C-738 gave
+            // `create` the flags to author one. So this test is back on the `ready` path it always
+            // meant to exercise, with a real contract rather than the placeholder.
+            "ready",
+            "--priority",
+            "7",
+            "--goal",
+            "Authoring defers, and exactly one verb commits.",
+            "--criterion",
+            "Creation authors the document.",
             "--output",
             "json",
         ],
@@ -673,9 +680,10 @@ fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
 
     // The meaningful edit — the one that used to arrive after the commit — lands first.
     let story = root.join(&file);
-    let authored = fs::read_to_string(&story)
-        .unwrap()
-        .replace("- [ ] Define acceptance.", "- [ ] The verb commits.");
+    let authored = fs::read_to_string(&story).unwrap().replace(
+        "- [ ] Creation authors the document.",
+        "- [ ] The verb commits.",
+    );
     fs::write(&story, authored).unwrap();
 
     let committed = board_json(
@@ -3985,6 +3993,337 @@ fn two_stories_sharing_one_file_integrate_when_their_commits_combine() {
     fs::remove_dir_all(root).ok();
 }
 
+/// Scaffold a repository whose stories carry a Goal and whose changelog has an empty `[Unreleased]`.
+///
+/// The empty section is the whole point: it is exactly the state `cut-release.sh` rolls into a
+/// version heading, so a fixture that starts with one reproduces how v0.59.2 came to be cut with a
+/// three-line release section over 5977 insertions.
+fn changelog_wave_fixture(name: &str, stories: &[(&str, &str, &str)]) -> PathBuf {
+    let root = fixture(name);
+    install_test_fleet_loops(&root);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    for (index, (id, title, goal)) in stories.iter().enumerate() {
+        fs::write(
+            root.join(format!("docs/stories/{id}-story.md")),
+            format!(
+                "---\nid: {id}\ntitle: {title}\nstatus: ready\npriority: {}\n---\n\n# {title}\n\n## Goal\n\n{goal}\n\n## Acceptance\n\n- [ ] ship\n",
+                index + 1
+            ),
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.join("CHANGELOG.md"),
+        "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- The first release.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    root
+}
+
+/// The `[Unreleased]` section body, which is what a release cut actually rolls into its heading.
+fn unreleased_section(changelog: &str) -> &str {
+    let start = changelog
+        .find("## [Unreleased]")
+        .expect("fixture changelog has an [Unreleased] heading")
+        + "## [Unreleased]".len();
+    let rest = &changelog[start..];
+    match rest.find("\n## ") {
+        Some(offset) => &rest[..offset],
+        None => rest,
+    }
+}
+
+/// C-743 (failing first): the whole gap in one test.
+///
+/// `.flux/fleet.toml` fences story workers out of `CHANGELOG.md` — correctly, since `wave-346`
+/// became unintegrable when two stories each appended an entry — with the note that assembling a
+/// wave-level changelog is the integrator's job. Nothing in the integrator did it, which is the same
+/// shape as the integrator role itself: configured, and dispatched by nothing until C-730. So
+/// v0.59.2 was tagged with an empty `## [0.59.2]` section and published with empty release notes,
+/// because `cut-release.sh` rolls `## [Unreleased]` into the version heading and an empty section
+/// rolls to an empty section.
+#[test]
+fn integration_composes_one_unreleased_entry_naming_every_user_visible_story() {
+    let root = changelog_wave_fixture(
+        "changelog-composed",
+        &[
+            (
+                "C-1",
+                "An endpoint records the host it is reachable through",
+                "A ClusterIP endpoint looked identical to a public one, and the record could not tell the two apart.",
+            ),
+            (
+                "C-2",
+                "A tag build that publishes nothing is red",
+                "The release workflow reported success while creating no Release at all.",
+            ),
+        ],
+    );
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "repo/C-2",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let stories = dispatched["data"]["topology"]["repositories"][0]["stories"]
+        .as_array()
+        .unwrap()
+        .clone();
+    for (index, marker) in ["endpoint host", "publishing tag"].iter().enumerate() {
+        let worktree = PathBuf::from(stories[index]["worktree"].as_str().unwrap());
+        let source = format!("src/change-{}.txt", index + 1);
+        fs::create_dir_all(worktree.join("src")).unwrap();
+        fs::write(worktree.join(&source), format!("{marker}\n")).unwrap();
+        assert!(git(&worktree, &["add", &source]).status.success());
+        assert!(git(&worktree, &["commit", "-qm", marker]).status.success());
+        let commit = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let item = format!("repo/C-{}", index + 1);
+        let handoff = flux(
+            &root,
+            &[
+                "fleet",
+                "handoff",
+                "wave-2",
+                &item,
+                "--commit",
+                &commit,
+                "--write-set",
+                &source,
+                "--test-arg",
+                "grep",
+                "--test-arg",
+                "-q",
+                "--test-arg",
+                marker,
+                "--test-arg",
+                &source,
+                "--failing-before",
+                "--passing-after",
+                "--summary",
+                "shipped a user-visible change",
+                "--output",
+                "json",
+            ],
+        );
+        assert!(
+            handoff.status.success(),
+            "{}",
+            String::from_utf8_lossy(&handoff.stdout)
+        );
+        record_passing_review(&root, "wave-2", &item, &commit);
+    }
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let repository = &integrated["data"]["topology"]["repositories"][0];
+    assert_eq!(
+        repository["changelog"]["composed"], true,
+        "integration must report composing the wave's entry: {repository}"
+    );
+
+    let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
+    let on_disk = fs::read_to_string(integration.join("CHANGELOG.md")).unwrap();
+    let section = unreleased_section(&on_disk);
+    // One entry, not one per story: a wave-level entry is the unit no single story could have
+    // written, which is the whole reason the integrator owns it.
+    assert_eq!(
+        section
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .count(),
+        1,
+        "the wave contributes exactly one [Unreleased] entry: {section}"
+    );
+    // The entry is wrapped like every other entry in the file, so match against the unwrapped prose
+    // rather than against one physical line.
+    let prose = section.split_whitespace().collect::<Vec<_>>().join(" ");
+    for expected in [
+        "(C-1, C-2)",
+        "An endpoint records the host it is reachable through (C-1)",
+        "A tag build that publishes nothing is red (C-2)",
+        "A ClusterIP endpoint looked identical to a public one, and the record could not tell the two apart.",
+        "The release workflow reported success while creating no Release at all.",
+    ] {
+        assert!(
+            prose.contains(expected),
+            "the entry must name {expected}: {section}"
+        );
+    }
+    // Wrapped, not one 400-column line that announces itself as machine-written.
+    assert!(
+        section.lines().all(|line| line.chars().count() <= 100),
+        "the composed entry must be wrapped like the rest of the file: {section}"
+    );
+    // Already-released sections are not the integrator's to touch.
+    assert!(on_disk.contains("- The first release."), "{on_disk}");
+
+    // Reported and real are different claims. The entry has to be in the candidate's TREE, which is
+    // what the gate ran against and what an accepted tag would pin — not merely on disk.
+    let in_tree = String::from_utf8(git(&integration, &["show", "HEAD:CHANGELOG.md"]).stdout)
+        .expect("the candidate carries a CHANGELOG.md");
+    assert_eq!(
+        unreleased_section(&in_tree),
+        section,
+        "the composed entry must be committed into the candidate, not left uncommitted"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-743: an entry padded to prove the step ran is worse than no entry.
+///
+/// A story that wrote only its own story document changed nothing a reader of the changelog can
+/// observe, so it contributes no line — and integration says which story it dropped and why, rather
+/// than silently producing an empty section that looks the same as the defect.
+#[test]
+fn a_wave_whose_stories_are_all_internal_composes_no_changelog_entry() {
+    let root = changelog_wave_fixture(
+        "changelog-internal",
+        &[("C-1", "Record the plan", "Write down where this stands.")],
+    );
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dispatched.stdout)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let worktree = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    let story_file = "docs/stories/C-1-story.md";
+    let existing = fs::read_to_string(worktree.join(story_file)).unwrap();
+    fs::write(
+        worktree.join(story_file),
+        format!("{existing}\n## Progress\n\n- Recorded the plan.\n"),
+    )
+    .unwrap();
+    assert!(git(&worktree, &["add", story_file]).status.success());
+    assert!(git(&worktree, &["commit", "-qm", "record the plan"])
+        .status
+        .success());
+    let commit = String::from_utf8(git(&worktree, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            story_file,
+            "--test-arg",
+            "grep",
+            "--test-arg",
+            "-q",
+            "--test-arg",
+            "Recorded the plan",
+            "--test-arg",
+            story_file,
+            "--failing-before",
+            "--passing-after",
+            "--summary",
+            "recorded the plan on the story",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&handoff.stdout)
+    );
+    record_passing_review(&root, "wave-2", "repo/C-1", &commit);
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    let repository = &integrated["data"]["topology"]["repositories"][0];
+    assert_eq!(
+        repository["changelog"]["composed"], false,
+        "an internal-only wave composes nothing: {repository}"
+    );
+    // "Says so" is the acceptance, not just "writes nothing": a silent skip is indistinguishable
+    // from the defect this story exists to close.
+    let dropped = repository["changelog"]["stories"][0]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        dropped.contains(story_file),
+        "integration must name what it dropped and why: {repository}"
+    );
+
+    let integration = PathBuf::from(repository["integration"]["worktree"].as_str().unwrap());
+    let on_disk = fs::read_to_string(integration.join("CHANGELOG.md")).unwrap();
+    assert_eq!(
+        unreleased_section(&on_disk).trim(),
+        "",
+        "no filler line: {on_disk}"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
 #[test]
 fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
     let (root, story) = one_story_wave("rework-budget");
@@ -5237,4 +5576,538 @@ fn a_qualified_acceptance_heading_is_still_the_acceptance_section() {
     );
 
     fs::remove_dir_all(&root).ok();
+}
+
+/// A wave over one story whose Acceptance criteria are addressable and carry their own handles.
+///
+/// Deliberately a separate fixture from `one_story_wave` rather than a parameter on it: every other
+/// test in this file asserts against the anonymous-bullet story that predates C-739, and that shape
+/// has to keep passing untouched.
+fn criteria_story_wave(name: &str) -> (PathBuf, PathBuf) {
+    let root = fixture(name);
+    fs::write(root.join(".gitignore"), ".flux/fleet/\n").unwrap();
+    fs::write(
+        root.join("docs/stories/C-1-story.md"),
+        "---\nid: C-1\ntitle: First story\nstatus: ready\npriority: 1\n---\n\n# First story\n\n\
+         ## Acceptance\n\n\
+         - [ ] `AC-1` The result lands in the tree.\n      verify: `test -f result.txt`\n\
+         - [ ] `AC-2` The result says what it was supposed to say.\n      verify: `grep -q shipped result.txt`\n\
+         - [ ] `AC-3` Nobody claims this one.\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".flux")).unwrap();
+    install_test_fleet_loops(&root);
+    fs::write(
+        root.join(".flux/fleet.toml"),
+        format!("schema = \"flux.fleet/v1\"\nworktree_root = \".flux/fleet/worktrees\"\n{TEST_FLEET_LOOP_POLICY}\n[[repositories]]\nid = \"repo\"\nroot = \".\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\ngate = [\"git\", \"status\", \"--short\"]\n"),
+    )
+    .unwrap();
+    assert!(git(&root, &["init", "-q"]).status.success());
+    assert!(git(&root, &["config", "user.email", "fleet@example.test"])
+        .status
+        .success());
+    assert!(git(&root, &["config", "user.name", "Flux Fleet Test"])
+        .status
+        .success());
+    assert!(git(&root, &["add", "."]).status.success());
+    assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    assert!(flux(&root, &["fleet", "start"]).status.success());
+    let dispatched = flux(
+        &root,
+        &[
+            "fleet",
+            "run",
+            "repo/C-1",
+            "--prepare-only",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        dispatched.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&dispatched.stdout),
+        String::from_utf8_lossy(&dispatched.stderr)
+    );
+    let dispatched: serde_json::Value = serde_json::from_slice(&dispatched.stdout).unwrap();
+    let story = PathBuf::from(
+        dispatched["data"]["topology"]["repositories"][0]["stories"][0]["worktree"]
+            .as_str()
+            .unwrap(),
+    );
+    (root, story)
+}
+
+/// C-739, failing first: a worker cites the criterion it claims, and a declared verification that
+/// did not run is reported as unproven rather than counted as satisfied.
+///
+/// The whole point of a per-criterion handle is that "I did it" stops being the evidence. This
+/// handoff runs `test -f result.txt` — exactly `AC-1`'s declared handle and nothing else — while
+/// claiming both `AC-1` and `AC-2`. `AC-2` names a different command, so its claim is recorded and
+/// its status is `unproven`: the fleet holds a claim for it and no proof, which is a state the
+/// anonymous-bullet contract could not represent at all. `AC-3` is nobody's claim.
+///
+/// A citation of an id the story does not declare is refused rather than recorded, because a
+/// citation that silently resolves to nothing is how a renumber would erase evidence.
+#[test]
+fn a_handoff_cites_a_criterion_and_an_undischarged_handle_is_reported_unproven() {
+    let (root, story) = criteria_story_wave("criterion-coverage");
+    let commit = commit_result(&story, "shipped");
+
+    let unknown = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--criterion",
+            "AC-9",
+            "--summary",
+            "Claims a criterion the story never declared",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !unknown.status.success(),
+        "an unresolvable citation was accepted: {}",
+        String::from_utf8_lossy(&unknown.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&unknown.stdout).contains("AC-9")
+            || String::from_utf8_lossy(&unknown.stderr).contains("AC-9"),
+        "the refusal has to name the criterion: stdout={} stderr={}",
+        String::from_utf8_lossy(&unknown.stdout),
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    let handoff = flux(
+        &root,
+        &[
+            "fleet",
+            "handoff",
+            "wave-2",
+            "repo/C-1",
+            "--commit",
+            &commit,
+            "--write-set",
+            "result.txt",
+            "--test-arg",
+            "test",
+            "--test-arg",
+            "-f",
+            "--test-arg",
+            "result.txt",
+            "--failing-before",
+            "--passing-after",
+            "--criterion",
+            "AC-1",
+            "--criterion",
+            "AC-2",
+            "--summary",
+            "Implemented the reviewed contract",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        handoff.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value = serde_json::from_slice(&handoff.stdout).unwrap();
+    let claims = handoff["data"]["criteria"]
+        .as_array()
+        .expect("the handoff records what it claimed")
+        .clone();
+    assert_eq!(claims.len(), 2, "{handoff}");
+    assert_eq!(claims[0]["id"], "AC-1");
+    assert_eq!(claims[0]["proven"], true, "{handoff}");
+    assert_eq!(claims[1]["id"], "AC-2");
+    assert_eq!(
+        claims[1]["proven"], false,
+        "a handle that never ran cannot prove anything: {handoff}"
+    );
+
+    let coverage = flux(
+        &root,
+        &["fleet", "coverage", "repo/C-1", "--output", "json"],
+    );
+    assert!(
+        coverage.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&coverage.stdout),
+        String::from_utf8_lossy(&coverage.stderr)
+    );
+    let coverage: serde_json::Value = serde_json::from_slice(&coverage.stdout).unwrap();
+    let criteria = coverage["data"]["criteria"]
+        .as_array()
+        .expect("coverage is per criterion")
+        .clone();
+    assert_eq!(criteria.len(), 3, "{coverage}");
+    assert_eq!(criteria[0]["id"], "AC-1");
+    assert_eq!(criteria[0]["status"], "proven");
+    assert_eq!(criteria[0]["claims"][0]["commit"], commit);
+    assert_eq!(criteria[1]["id"], "AC-2");
+    assert_eq!(
+        criteria[1]["status"], "unproven",
+        "a claimed criterion whose handle never ran is not satisfied: {coverage}"
+    );
+    assert_eq!(criteria[1]["claims"][0]["commit"], commit);
+    assert_eq!(criteria[2]["id"], "AC-3");
+    assert_eq!(criteria[2]["status"], "unclaimed");
+    assert_eq!(coverage["data"]["summary"]["proven"], 1, "{coverage}");
+    assert_eq!(coverage["data"]["summary"]["unproven"], 1, "{coverage}");
+    assert_eq!(coverage["data"]["summary"]["unclaimed"], 1, "{coverage}");
+
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-739: the additive half, at the surface a reader actually consults.
+///
+/// 1,260 stories on this board declare no criterion ids, and `one_story_wave`'s `- [ ] ship` is
+/// exactly their shape. Coverage answers for them rather than refusing: every criterion is
+/// `unaddressable` — nothing can cite it, which is a description of the story, not a defect in it —
+/// and a warning says so instead of an error. Nothing else about the item changes.
+#[test]
+fn coverage_answers_for_a_story_whose_criteria_carry_no_ids() {
+    let (root, _story) = one_story_wave("criterion-coverage-anonymous");
+
+    let coverage = flux(
+        &root,
+        &["fleet", "coverage", "repo/C-1", "--output", "json"],
+    );
+    assert!(
+        coverage.status.success(),
+        "a story that predates ids is not an error: stdout={} stderr={}",
+        String::from_utf8_lossy(&coverage.stdout),
+        String::from_utf8_lossy(&coverage.stderr)
+    );
+    let coverage: serde_json::Value = serde_json::from_slice(&coverage.stdout).unwrap();
+    assert_eq!(coverage["data"]["summary"]["total"], 1, "{coverage}");
+    assert_eq!(
+        coverage["data"]["summary"]["unaddressable"], 1,
+        "{coverage}"
+    );
+    assert_eq!(
+        coverage["data"]["criteria"][0]["id"],
+        serde_json::Value::Null
+    );
+    assert_eq!(coverage["data"]["criteria"][0]["status"], "unaddressable");
+    assert!(
+        coverage["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("declares no criterion ids")),
+        "{coverage}"
+    );
+}
+
+/// C-742: an epic is one entity — a resolvable document with its own contract and a derived
+/// completion.
+///
+/// Three claims in one fixture, because they are one defect. `epic:` was free text with only an
+/// emptiness filter on it, so a slug pointing at nothing was silently accepted while `design:` — the
+/// field beside it — has always been resolved and errored on. An epic therefore had no id, no
+/// status and no criteria anywhere, and "is this epic finished" was a question no board read could
+/// answer.
+#[test]
+fn board_check_resolves_epic_slugs_and_derives_epic_completion_from_its_members() {
+    let root = fixture("epic-entity");
+    fs::create_dir_all(root.join("docs/epics")).unwrap();
+    fs::write(
+        root.join("docs/epics/verified-delivery.md"),
+        "---\nid: E-1\ntitle: Delivery is verified\n---\n\n# Delivery is verified\n\n## Success criteria\n\n- [x] A dispatched wave reports the sha it landed.\n- [ ] The reviewer refuses a claim with no artifact.\n\n## Exit criteria\n\n- [ ] Every story carrying `epic: verified-delivery` is `done`.\n",
+    )
+    .unwrap();
+    for (id, status, epic) in [
+        ("C-1", "done", "verified-delivery"),
+        ("C-2", "ready", "verified-delivery"),
+    ] {
+        fs::write(
+            root.join(format!("docs/stories/{id}-member.md")),
+            format!(
+                // C-736: a `ready` or `done` story needs a Goal and a criterion, so the fixture
+                // carries both. The epic entity is what this test is about; the contract is not
+                // incidental scaffolding it may skip.
+                "---\nid: {id}\ntitle: Member {id}\nstatus: {status}\npriority: 1\nepic: {epic}\n---\n\n# Member {id}\n\n## Goal\n\nMember {id} of the verified-delivery epic, so the epic has something to derive completion from.\n\n## Acceptance\n\n- [ ] done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    // A named epic that exists is not an error, and its completion is computed rather than declared:
+    // the document above states no status at all.
+    let checked = board_json(&root, &["board", "check", "--output", "json"]);
+    assert_eq!(checked["data"]["valid"], true, "{checked}");
+    let epics = board_json(&root, &["board", "epics", "--output", "json"]);
+    let epic = &epics["data"]["epics"][0];
+    assert_eq!(epic["id"], "E-1", "{epics}");
+    assert_eq!(epic["slug"], "verified-delivery", "{epics}");
+    assert_eq!(epic["stories"]["done"], 1, "{epics}");
+    assert_eq!(epic["stories"]["total"], 2, "{epics}");
+    assert_eq!(epic["status"], "in-progress", "{epics}");
+    assert_eq!(epic["criteria"]["done"], 1, "{epics}");
+    assert_eq!(epic["criteria"]["total"], 3, "{epics}");
+
+    // Tick the last member and the epic is done — derived from its members, never asserted.
+    fs::write(
+        root.join("docs/stories/C-2-member.md"),
+        "---\nid: C-2\ntitle: Member C-2\nstatus: done\npriority: 1\nepic: verified-delivery\n---\n\n# Member C-2\n\n## Goal\n\nMember C-2 of the verified-delivery epic, so the epic has something to derive completion from.\n\n## Acceptance\n\n- [x] done\n",
+    )
+    .unwrap();
+    let epics = board_json(&root, &["board", "epics", "--output", "json"]);
+    assert_eq!(epics["data"]["epics"][0]["status"], "done", "{epics}");
+
+    // A slug that resolves to no document is an error, the way a missing design already is.
+    fs::write(
+        root.join("docs/stories/C-3-orphan.md"),
+        "---\nid: C-3\ntitle: Orphan\nstatus: backlog\nepic: no-such-epic\n---\n\n# Orphan\n\n## Acceptance\n\n- [ ] done\n",
+    )
+    .unwrap();
+    let output = flux(&root, &["board", "check", "--output", "json"]);
+    assert!(
+        !output.status.success(),
+        "a story naming a nonexistent epic passed check: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("C-3") && combined.contains("no-such-epic"),
+        "the failure did not name the story and its dangling epic: {combined}"
+    );
+    fs::remove_file(root.join("docs/stories/C-3-orphan.md")).unwrap();
+
+    // And an epic does not get to declare that it is finished. The trackers this replaces sat at
+    // `status: backlog` with every member done, which is why a declared status is refused rather
+    // than ignored — an ignored field drifts silently, exactly as that one did.
+    fs::write(
+        root.join("docs/epics/verified-delivery.md"),
+        "---\nid: E-1\ntitle: Delivery is verified\nstatus: backlog\n---\n\n# Delivery is verified\n\n## Success criteria\n\n- [x] A dispatched wave reports the sha it landed.\n\n## Exit criteria\n\n- [ ] Every story carrying `epic: verified-delivery` is `done`.\n",
+    )
+    .unwrap();
+    let output = flux(&root, &["board", "check", "--output", "json"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success() && combined.contains("derived from its members"),
+        "an epic asserted its own status and check accepted it: {combined}"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// The repository's own story template, as the binary embeds it. Reading the same bytes here is what
+/// makes the assertions below a drift check rather than a restatement of the generator.
+const REPO_STORY_TEMPLATE: &str = include_str!("../../../docs/stories/_TEMPLATE.md");
+
+/// Every `## ` section heading, in order — a document's shape with its prose removed.
+fn section_headings(document: &str) -> Vec<String> {
+    document
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .map(str::to_string)
+        .collect()
+}
+
+/// C-738, failing first: creation generates the template, and a story is not born dispatchable and
+/// empty.
+///
+/// `create` used to write a hardcoded body — an empty `## Goal`, `- [ ] Define acceptance.` and
+/// nothing else — while `docs/stories/_TEMPLATE.md` sat unread beside it. Two definitions of a
+/// story's shape had already drifted: the template has `## Progress` and `## Notes`, the generated
+/// body had neither. Worse, `--status ready` made that body dispatchable, so a story could reach a
+/// worker whose definition of done read "Define acceptance."
+#[test]
+fn creation_generates_the_template_and_refuses_a_ready_story_with_no_contract() {
+    let root = fixture("create-from-template");
+    // The board carries the template; the binary must follow it rather than a second shape of its
+    // own.
+    fs::write(root.join("docs/stories/_TEMPLATE.md"), REPO_STORY_TEMPLATE).unwrap();
+
+    // Drafting stays possible: a backlog story is generated with the template's shape and may carry
+    // the template's placeholders.
+    let drafted = board_json(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Draft it first",
+            "--output",
+            "json",
+        ],
+    );
+    let drafted_file = PathBuf::from(drafted["data"]["file"].as_str().unwrap());
+    let drafted_body = fs::read_to_string(&drafted_file).unwrap();
+    assert_eq!(
+        section_headings(&drafted_body),
+        section_headings(REPO_STORY_TEMPLATE),
+        "the generated body must have the template's shape: {drafted_body}"
+    );
+    assert!(
+        drafted_body.contains("\n# Draft it first\n"),
+        "the generated body carries the real title: {drafted_body}"
+    );
+    assert!(
+        drafted_body.contains("\nstatus: backlog\n"),
+        "the generated frontmatter is the requested one, not the template's: {drafted_body}"
+    );
+    assert!(
+        !drafted_body.contains("id: X-NN"),
+        "the template's frontmatter placeholders must not survive generation: {drafted_body}"
+    );
+    assert!(
+        !drafted_body.contains("- [ ] Define acceptance."),
+        "the drifted second shape is gone: {drafted_body}"
+    );
+
+    // A story cannot be born dispatchable and empty.
+    let refused = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Born ready",
+            "--status",
+            "ready",
+            "--priority",
+            "1",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a ready story with no contract must be refused: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(refused["error"]["class"], "input/schema", "{refused}");
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Goal") && message.contains("Acceptance"),
+        "the refusal must name what is missing: {refused}"
+    );
+    assert!(
+        !root.join("docs/stories/C-2-born-ready.md").exists(),
+        "a refused creation must not leave the document behind"
+    );
+
+    // An authored contract is the last thing that should vanish quietly, so an empty one is refused
+    // rather than written as an empty section.
+    let empty = flux(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Empty contract",
+            "--goal",
+            "   ",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !empty.status.success(),
+        "an empty --goal must be refused: {}",
+        String::from_utf8_lossy(&empty.stdout)
+    );
+
+    // …but a ready story born with a contract is allowed, because the rule is about the contract
+    // rather than about the status.
+    let born = board_json(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Born ready",
+            "--status",
+            "ready",
+            "--priority",
+            "1",
+            "--goal",
+            "Creation refuses a contract nobody could implement against.",
+            "--criterion",
+            "`board create --status ready` with no criteria exits 2.",
+            "--output",
+            "json",
+        ],
+    );
+    let born_body =
+        fs::read_to_string(PathBuf::from(born["data"]["file"].as_str().unwrap())).unwrap();
+    assert_eq!(
+        section_headings(&born_body),
+        section_headings(REPO_STORY_TEMPLATE),
+        "a contract fills the template's sections rather than replacing its shape: {born_body}"
+    );
+    assert!(
+        born_body.contains("Creation refuses a contract nobody could implement against.")
+            && born_body.contains("- [ ] `board create --status ready` with no criteria exits 2."),
+        "the authored contract is what the document carries: {born_body}"
+    );
+
+    // And the template is the *one* definition: a section added to it appears in the next story
+    // without touching the binary.
+    fs::write(
+        root.join("docs/stories/_TEMPLATE.md"),
+        format!("{REPO_STORY_TEMPLATE}\n## Risks\n- (what to watch if this breaks)\n"),
+    )
+    .unwrap();
+    let extended = board_json(
+        &root,
+        &[
+            "board",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Follows the template",
+            "--output",
+            "json",
+        ],
+    );
+    let extended_body =
+        fs::read_to_string(PathBuf::from(extended["data"]["file"].as_str().unwrap())).unwrap();
+    assert!(
+        extended_body.contains("\n## Risks\n"),
+        "generation follows the template, so a template edit needs no code change: {extended_body}"
+    );
+    fs::remove_dir_all(root).ok();
 }

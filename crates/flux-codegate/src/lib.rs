@@ -2903,7 +2903,7 @@ pub fn push_protection_shapes(src: &str) -> Vec<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
+    use cargo_metadata::{DependencyKind, Metadata, MetadataCommand, TargetKind};
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
 
@@ -3328,6 +3328,487 @@ mod tests {
             unpublished.is_empty(),
             ".github/workflows/release-plugins.yml publishes the plugin-pack half of the closure, \
              but never mentions: {unpublished:?}"
+        );
+    }
+
+    /// Where the workspace test gate is written down. `task test` and `task install` both expand to
+    /// the Taskfile's `cargo test --workspace …`; `scripts/release-full-gate.sh` runs the unfiltered
+    /// workspace suite. Both files are read, so neither can drop a crate on its own.
+    const DECLARED_GATE_FILES: &[&str] = &["Taskfile.yaml", "scripts/release-full-gate.sh"];
+
+    /// Every target-selection flag `cargo test` understands. The singular forms take a target name
+    /// and select exactly one target, so they are recorded but never count as selecting a kind.
+    const CARGO_TEST_SELECTORS: &[&str] = &[
+        "--lib",
+        "--bins",
+        "--bin",
+        "--tests",
+        "--test",
+        "--benches",
+        "--bench",
+        "--examples",
+        "--example",
+        "--all-targets",
+        "--doc",
+    ];
+
+    /// One `cargo test` invocation as written in a gate file.
+    #[derive(Debug, PartialEq, Eq)]
+    struct CargoTestInvocation {
+        /// `--workspace` or its `--all` alias was passed.
+        workspace: bool,
+        /// The target-selection flags in written order. **Empty means every target**, which is
+        /// `cargo test`'s default and the only selection that cannot leave a crate behind.
+        selectors: Vec<String>,
+    }
+
+    impl CargoTestInvocation {
+        fn selects(&self, selector: &str) -> bool {
+            self.selectors.is_empty()
+                || self
+                    .selectors
+                    .iter()
+                    .any(|written| written == "--all-targets" || written == selector)
+        }
+    }
+
+    /// Read every `cargo test` invocation out of a gate file's text.
+    ///
+    /// Deliberately a token scan rather than a YAML or shell parse: the same command is written five
+    /// ways across the two gate files — POSIX and Windows, `task test` and `task install`, plus the
+    /// release script's `owned_cargo` wrapper — and a parser per dialect would be the thing that
+    /// silently stops finding one of them. Comment-only lines are skipped so prose *about* a command
+    /// is never mistaken for the command.
+    fn cargo_test_invocations(text: &str) -> Vec<CargoTestInvocation> {
+        let mut found = Vec::new();
+        for line in text.lines() {
+            if line.trim_start().starts_with('#') {
+                continue;
+            }
+            let tokens = line
+                .split_whitespace()
+                .map(|token| token.trim_matches(|c| matches!(c, '\'' | '"' | '`')))
+                .collect::<Vec<_>>();
+            let mut index = 0;
+            while index < tokens.len() {
+                let is_cargo = tokens[index]
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .is_some_and(|name| matches!(name, "cargo" | "owned-cargo" | "owned_cargo"));
+                if !is_cargo || tokens.get(index + 1) != Some(&"test") {
+                    index += 1;
+                    continue;
+                }
+                index += 2;
+                let mut invocation = CargoTestInvocation {
+                    workspace: false,
+                    selectors: Vec::new(),
+                };
+                while let Some(token) = tokens.get(index) {
+                    // `--` hands the rest to the test harness; the others end the command.
+                    if matches!(*token, "--" | "&&" | "||" | ";" | "|") {
+                        break;
+                    }
+                    if matches!(*token, "--workspace" | "--all") {
+                        invocation.workspace = true;
+                    }
+                    if CARGO_TEST_SELECTORS.contains(token) {
+                        invocation.selectors.push((*token).to_string());
+                    }
+                    index += 1;
+                }
+                found.push(invocation);
+            }
+        }
+        found
+    }
+
+    /// `(selector, target name, entry point)` for every target of `package` that a *default-feature*
+    /// unit-test gate can reach: its library and its binaries. Integration tests, examples, benches
+    /// and build scripts are not unit-test carriers, so they are excluded here — `tests/` is covered
+    /// by the unfiltered release gate instead.
+    ///
+    /// Targets behind `required-features` are excluded too, and not because they matter less: no
+    /// target-selection flag reaches them, so demanding one would be a false claim. `flux-lang`'s
+    /// `fluxlang` binary is exactly that shape — 11 tests behind the non-default `cli` feature,
+    /// unreachable by `--bins` and by an unfiltered `cargo test --workspace` alike. That class is
+    /// C-308's, and `scripts/check-feature-gated-tests.sh` owns it: its ledger runs
+    /// `codewandler-flux-lang/cli` and refuses any feature with no stated disposition.
+    fn unit_test_targets(
+        package: &cargo_metadata::Package,
+    ) -> Vec<(&'static str, String, PathBuf)> {
+        package
+            .targets
+            .iter()
+            .filter(|target| target.required_features.is_empty())
+            .filter_map(|target| {
+                let selector = if target.is_kind(TargetKind::Lib)
+                    || target.is_kind(TargetKind::RLib)
+                    || target.is_kind(TargetKind::ProcMacro)
+                    || target.is_kind(TargetKind::CDyLib)
+                    || target.is_kind(TargetKind::DyLib)
+                    || target.is_kind(TargetKind::StaticLib)
+                {
+                    "--lib"
+                } else if target.is_kind(TargetKind::Bin) {
+                    "--bins"
+                } else {
+                    return None;
+                };
+                Some((
+                    selector,
+                    target.name.clone(),
+                    target.src_path.as_std_path().to_path_buf(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Every `.rs` file a Cargo target compiles, resolved from its entry point by following `mod`
+    /// declarations the way rustc does — inline modules nest a directory level, `mod x;` resolves to
+    /// `x.rs` or `x/mod.rs`, and `#[path = "…"]` wins over both.
+    ///
+    /// "Every file under the target's directory" is *not* good enough here. `flux-lsp`'s `main.rs`
+    /// and `lib.rs` share one `src/`, and a directory census blames the eleven-line binary for the
+    /// library's 53 tests — reporting a gate hole that does not exist. `#[cfg(test)]` modules are
+    /// deliberately followed: they are where nearly all of this repo's unit tests live.
+    fn target_module_sources(entry: &Path) -> Vec<PathBuf> {
+        fn declared_path(attrs: &[syn::Attribute]) -> Option<String> {
+            attrs.iter().find_map(|attr| {
+                if !attr.path().is_ident("path") {
+                    return None;
+                }
+                let syn::Meta::NameValue(pair) = &attr.meta else {
+                    return None;
+                };
+                let syn::Expr::Lit(literal) = &pair.value else {
+                    return None;
+                };
+                match &literal.lit {
+                    syn::Lit::Str(text) => Some(text.value()),
+                    _ => None,
+                }
+            })
+        }
+
+        fn descend(items: &[syn::Item], module_dir: &Path, out: &mut Vec<PathBuf>) {
+            for item in items {
+                let syn::Item::Mod(module) = item else {
+                    continue;
+                };
+                let name = module.ident.to_string();
+                if let Some((_, inline)) = &module.content {
+                    descend(inline, &module_dir.join(&name), out);
+                    continue;
+                }
+                let file = match declared_path(&module.attrs) {
+                    Some(declared) => module_dir.join(declared),
+                    None => {
+                        let flat = module_dir.join(format!("{name}.rs"));
+                        if flat.is_file() {
+                            flat
+                        } else {
+                            module_dir.join(&name).join("mod.rs")
+                        }
+                    }
+                };
+                let child_dir = match file.file_stem().and_then(|stem| stem.to_str()) {
+                    // `x/mod.rs` owns `x/`; `x.rs` owns the sibling directory `x/`.
+                    Some("mod") => file.parent().map(Path::to_path_buf),
+                    Some(stem) => file.parent().map(|parent| parent.join(stem)),
+                    None => None,
+                };
+                if let Some(child_dir) = child_dir {
+                    walk(&file, &child_dir, out);
+                }
+            }
+        }
+
+        fn walk(file: &Path, module_dir: &Path, out: &mut Vec<PathBuf>) {
+            if out.iter().any(|seen| seen == file) || !file.is_file() {
+                return;
+            }
+            out.push(file.to_path_buf());
+            let source = std::fs::read_to_string(file).unwrap_or_else(|error| {
+                panic!("read {} for the gate census: {error}", file.display())
+            });
+            let parsed = syn::parse_file(&source).unwrap_or_else(|error| {
+                panic!("parse {} for the gate census: {error}", file.display())
+            });
+            descend(&parsed.items, module_dir, out);
+        }
+
+        let mut out = Vec::new();
+        if let Some(root_dir) = entry.parent() {
+            walk(entry, root_dir, &mut out);
+        }
+        out
+    }
+
+    /// The module walk's own pins: the resolution rules a directory census gets wrong. `orphan.rs`
+    /// and `lib.rs` sit in the same directory as the entry point and are reached by nothing, so a
+    /// walk that finds them is a walk that would misattribute `flux-lsp`'s library tests to its
+    /// binary.
+    #[test]
+    fn module_walk_follows_declarations_rather_than_the_directory() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "flux-codegate-modwalk-{}-{nonce}",
+            std::process::id()
+        ));
+        let src = root.join("src");
+        std::fs::create_dir_all(src.join("flat")).unwrap();
+        std::fs::create_dir_all(src.join("inline")).unwrap();
+        std::fs::create_dir_all(src.join("folder")).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "mod flat;\n\
+             mod folder;\n\
+             #[cfg(test)]\n\
+             mod harness;\n\
+             mod inline {\n    mod deep;\n}\n\
+             #[path = \"renamed.rs\"]\n\
+             mod aliased;\n\
+             fn main() {}\n",
+        )
+        .unwrap();
+        // `flat.rs` owns the sibling `flat/` directory.
+        std::fs::write(src.join("flat.rs"), "mod child;\n").unwrap();
+        std::fs::write(src.join("flat").join("child.rs"), "").unwrap();
+        // `folder/mod.rs` owns `folder/` itself, not `folder/folder/`.
+        std::fs::write(src.join("folder").join("mod.rs"), "mod leaf;\n").unwrap();
+        std::fs::write(src.join("folder").join("leaf.rs"), "").unwrap();
+        std::fs::write(src.join("harness.rs"), "#[test]\nfn t() {}\n").unwrap();
+        std::fs::write(src.join("inline").join("deep.rs"), "").unwrap();
+        std::fs::write(src.join("renamed.rs"), "").unwrap();
+        // Declared by nothing. A directory census would sweep both of these in.
+        std::fs::write(src.join("orphan.rs"), "#[test]\nfn never_compiled() {}\n").unwrap();
+        std::fs::write(src.join("lib.rs"), "#[test]\nfn a_sibling_target() {}\n").unwrap();
+
+        let mut reached = target_module_sources(&src.join("main.rs"))
+            .iter()
+            .map(|file| {
+                file.strip_prefix(&src)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        reached.sort();
+        std::fs::remove_dir_all(&root).ok();
+
+        assert_eq!(
+            reached,
+            [
+                "flat.rs",
+                "flat/child.rs",
+                "folder/leaf.rs",
+                "folder/mod.rs",
+                "harness.rs",
+                "inline/deep.rs",
+                "main.rs",
+                "renamed.rs",
+            ]
+        );
+    }
+
+    /// The scanner's own pins. Every dialect the two gate files actually use appears here, including
+    /// the two that are easiest to misread: a comment quoting the command, and a `-p`-scoped run.
+    #[test]
+    fn cargo_test_scanner_reads_every_dialect_the_gate_files_use() {
+        let text = concat!(
+            "# prose naming `cargo test --workspace --lib` is not a command\n",
+            "      - 'FLUX_PYTHON=\"{{.P}}\" scripts/run-python3.sh own.py shared",
+            " --workspace-root \"{{.D}}\" -- cargo test --workspace --lib'\n",
+            "        'cargo fetch --locked && cargo test --workspace --lib",
+            " && cargo install --path crates/flux-cli --force'\n",
+            "      - 'set \"P=1\" && scripts\\run-python3.cmd own.py shared",
+            " -- cargo test --workspace --lib'\n",
+            "gate owned_cargo test --workspace\n",
+            "gate owned_cargo test -p flux-codegate\n",
+            "run: cargo test --workspace --all-targets -- --nocapture\n",
+        );
+
+        let found = cargo_test_invocations(text);
+        let shape = found
+            .iter()
+            .map(|invocation| (invocation.workspace, invocation.selectors.join(" ")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            vec![
+                (true, "--lib".to_string()),
+                (true, "--lib".to_string()),
+                (true, "--lib".to_string()),
+                (true, String::new()),
+                (false, String::new()),
+                (true, "--all-targets".to_string()),
+            ],
+            "the comment must be skipped, `cargo fetch`/`cargo install` must not be read as tests, \
+             `--` must hand off to the harness, and `-p` must not look workspace-scoped"
+        );
+
+        // An unfiltered or `--all-targets` run reaches every kind; `--lib` reaches only libraries.
+        assert!(found[3].selects("--lib") && found[3].selects("--bins"));
+        assert!(found[5].selects("--lib") && found[5].selects("--bins"));
+        assert!(found[0].selects("--lib") && !found[0].selects("--bins"));
+    }
+
+    /// C-664. `cargo test --workspace --lib` runs **nothing at all** in a crate with no library
+    /// target. `--lib` is a filter, and at workspace scope a filter that matches no target in a
+    /// package is not an error: `cargo test -p flux-cli --lib` fails loudly with "no library targets
+    /// found in package `flux-cli`", while the same filter across the workspace simply skips it.
+    /// That is how `flux-cli` — the whole board and fleet implementation, and hundreds of its unit
+    /// tests — sat outside `task test` and `task install` without a single red line.
+    ///
+    /// So the invariant is stated the other way round from the command: for every workspace crate
+    /// whose own target sources carry test functions, the declared gate must select a target kind
+    /// that can run them. A future binary-only crate then fails here on the day it is added, instead
+    /// of being quietly untested until someone remembers `--bins`.
+    ///
+    /// Two kinds of target are deliberately out of scope, each because another gate owns it, and
+    /// each pinned so the handoff cannot rot:
+    ///
+    /// - **Integration tests** (`tests/`). The Taskfile gate is the fast one. `cargo test --workspace`
+    ///   in `scripts/release-full-gate.sh` runs them, and that invocation is read here and asserted
+    ///   to carry no target filter at all.
+    /// - **Targets behind `required-features`.** No target-selection flag reaches them, so requiring
+    ///   one would be a false claim; see [`unit_test_targets`] and C-308's
+    ///   `scripts/check-feature-gated-tests.sh`.
+    #[test]
+    fn declared_test_gate_reaches_every_workspace_crate_that_carries_tests() {
+        let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let repo_root = crates_dir.parent().unwrap();
+
+        let mut invocations: Vec<(&str, CargoTestInvocation)> = Vec::new();
+        for gate_file in DECLARED_GATE_FILES {
+            let text = std::fs::read_to_string(repo_root.join(gate_file))
+                .unwrap_or_else(|error| panic!("read declared gate file {gate_file}: {error}"));
+            invocations.extend(
+                cargo_test_invocations(&text)
+                    .into_iter()
+                    .filter(|invocation| invocation.workspace)
+                    .map(|invocation| (*gate_file, invocation)),
+            );
+        }
+
+        // Anti-vacuity, and a reformatting guard: this scanner is line-based, so a gate command
+        // folded across lines would parse as a selector-free invocation and pass while running
+        // nothing of the sort. Pin the count instead — four Taskfile declarations (POSIX and
+        // Windows, `task test` and `task install`) and one release-gate run.
+        let taskfile_gates = invocations
+            .iter()
+            .filter(|(file, _)| *file == "Taskfile.yaml")
+            .count();
+        assert_eq!(
+            taskfile_gates, 4,
+            "expected the Taskfile to declare the workspace test gate 4 times (POSIX/Windows × \
+             test/install), found {taskfile_gates} — if a task was added or the command was \
+             reformatted across lines, update this count in the same diff, because a scanner that \
+             stops finding the command makes everything below vacuous"
+        );
+        let release_gates = invocations
+            .iter()
+            .filter(|(file, _)| *file == "scripts/release-full-gate.sh")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            release_gates.len(),
+            1,
+            "expected exactly one workspace-wide `cargo test` in the release gate, found {}",
+            release_gates.len()
+        );
+        assert!(
+            release_gates[0].1.selectors.is_empty(),
+            "scripts/release-full-gate.sh must run the UNFILTERED workspace suite: integration-test \
+             targets are covered nowhere else, and the Taskfile's gate is deliberately narrower — \
+             found selectors {:?}",
+            release_gates[0].1.selectors
+        );
+
+        let metadata = MetadataCommand::new()
+            .manifest_path(repo_root.join("Cargo.toml"))
+            .other_options(vec!["--locked".into(), "--offline".into()])
+            .exec()
+            .expect("resolve root workspace metadata");
+
+        // Which crate/target actually needs which selector, counted over the target's own module
+        // tree so a binary is never credited with a sibling library's tests.
+        let mut requirements: Vec<(String, &'static str, String, String, usize)> = Vec::new();
+        for package in metadata.workspace_packages() {
+            for (selector, target_name, entry) in unit_test_targets(package) {
+                let tests: usize = target_module_sources(&entry)
+                    .iter()
+                    .map(|file| {
+                        let source = std::fs::read_to_string(file).unwrap();
+                        test_function_names(&source)
+                            .unwrap_or_else(|error| {
+                                panic!("parse {} for the gate census: {error}", file.display())
+                            })
+                            .len()
+                    })
+                    .sum();
+                if tests == 0 {
+                    continue;
+                }
+                let relative = entry
+                    .strip_prefix(repo_root)
+                    .unwrap_or(&entry)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                requirements.push((
+                    package.name.to_string(),
+                    selector,
+                    target_name,
+                    relative,
+                    tests,
+                ));
+            }
+        }
+
+        assert!(
+            requirements.len() > 20,
+            "the gate census found only {} test-carrying targets — the workspace scan is broken",
+            requirements.len()
+        );
+        assert!(
+            requirements
+                .iter()
+                .any(|(_, selector, ..)| *selector == "--bins"),
+            "no default-feature binary target in the workspace carries a unit test, which is the \
+             exact thing C-664 is about — `flux-cli`'s bin is the one that must be here, so either \
+             this census has stopped seeing it or the board and fleet tests moved out of the \
+             binary, and the gate command above should shrink back in the same diff"
+        );
+
+        let mut violations = Vec::new();
+        for (gate_file, invocation) in &invocations {
+            for (package, selector, target, root, tests) in &requirements {
+                if invocation.selects(selector) {
+                    continue;
+                }
+                let kind = if *selector == "--lib" {
+                    "library"
+                } else {
+                    "bin"
+                };
+                violations.push(format!(
+                    "{gate_file}: `cargo test --workspace {}` does not select `{selector}`, so the \
+                     {tests} test(s) in {package}'s {kind} target `{target}` ({root}) never run",
+                    invocation.selectors.join(" ")
+                ));
+            }
+        }
+        violations.sort();
+        violations.dedup();
+
+        assert!(
+            violations.is_empty(),
+            "the declared workspace test gate leaves test-carrying crates behind (C-664) — \
+             `--lib` matches nothing in a crate with no library target and reports no error:\n  {}",
+            violations.join("\n  ")
         );
     }
 
