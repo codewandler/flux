@@ -4,6 +4,10 @@ Start here to find anything inside the repository. These are **internal contribu
 records, story status, implementation notes, and crate references. The public user documentation lives
 in [`../website`](../website) and is deployed to `https://codewandler.github.io/flux/`.
 
+> **Board and Fleet are PAUSED as of 2026-08-08** and are moving to `~/projects/autodev`. The
+> story board, the epics and the fleet documents below still describe what shipped and are kept for
+> that reason — they are no longer a plan of record for this repository.
+
 **flux is a deterministic agent platform** built on one thesis —
 **the LLM is not the runtime**: typed model stages interpret intent and gather evidence, while an
 authored Flux-Lang loop freezes effects into an action batch and a deterministic Rust runtime executes

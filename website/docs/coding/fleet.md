@@ -14,6 +14,17 @@ Native `flux fleet` landed after v0.55.0. It is available in source installs fro
 packaged-release users need v0.56.0 or newer.
 :::
 
+:::warning PAUSED — moving to a separate project
+Board and Fleet are **paused as of 2026-08-08** and are not under active development in this
+repository. The work is moving to `~/projects/autodev`, where it will continue as its own project.
+
+What that means in practice: the commands documented here still exist and still work — nothing was
+removed and nothing was deprecated in place — but no new board or fleet capability will land in
+`flux`, open stories against them are not scheduled, and the known gaps recorded on the board stay
+open here rather than being fixed here. Treat this page as a description of what shipped, not as a
+roadmap.
+:::
+
 The fleet is local in V1. It does not require remote A2A workers, containers, automatic publication,
 or automatic worktree deletion.
 

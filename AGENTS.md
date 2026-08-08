@@ -4,6 +4,14 @@ This file applies to every coding agent and automation tool working in this repo
 only repository policy that must be known before acting. Product documentation starts at
 [README.md](README.md).
 
+> **Board and Fleet are PAUSED as of 2026-08-08.** They are not under active development in this
+> repository and are moving to `~/projects/autodev` to continue as their own project. The commands
+> still exist and still work — nothing was removed or deprecated in place — but do not start new
+> board or fleet work here, do not schedule the open stories against them, and do not treat the
+> gaps recorded on the board as this repository's to close. Everything below about the board as a
+> source of work is therefore historical: take direction from the user, not from
+> `docs/stories/README.md`.
+
 ## Work contract
 
 - Serve the newest user request first. Do not select backlog work unless the user explicitly asks;
