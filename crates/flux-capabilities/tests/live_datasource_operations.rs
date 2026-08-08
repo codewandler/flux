@@ -326,18 +326,12 @@ fn surface_all_override_exposes_generated_operations_without_the_signal() {
 #[test]
 fn access_is_snapshotted_into_honest_specs_and_exact_invocation_authority() {
     let backend = Arc::new(MockBackend::with_access(vec![
-        LiveAccess::Network {
-            subject: "https://tickets.example/api".into(),
-        },
-        LiveAccess::Connection {
-            subject: "tcp:tickets-db.example:5432".into(),
-        },
+        LiveAccess::network("https://tickets.example/api"),
+        LiveAccess::connection("tcp:tickets-db.example:5432"),
     ]));
     let mut registry = ToolRegistry::new();
     try_register_live_datasource(&mut registry, "tickets", backend.clone()).unwrap();
-    backend.set_access(vec![LiveAccess::Network {
-        subject: "https://changed.example".into(),
-    }]);
+    backend.set_access(vec![LiveAccess::network("https://changed.example")]);
 
     assert_eq!(backend.access_calls.load(Ordering::SeqCst), 1);
     let expected_requirements = vec![
@@ -414,9 +408,9 @@ fn access_is_snapshotted_into_honest_specs_and_exact_invocation_authority() {
 
 #[tokio::test]
 async fn dispatch_enforces_the_snapshotted_exact_backend_authority() {
-    let backend = Arc::new(MockBackend::with_access(vec![LiveAccess::Network {
-        subject: "https://tickets.example/api".into(),
-    }]));
+    let backend = Arc::new(MockBackend::with_access(vec![LiveAccess::network(
+        "https://tickets.example/api",
+    )]));
     let mut registry = ToolRegistry::new();
     try_register_live_datasource(&mut registry, "tickets", backend.clone()).unwrap();
 

@@ -57,8 +57,8 @@ mod embeddings;
 mod embeddings_local;
 
 pub use board::{
-    try_register_work_board, validate_board_contract, work_board_tools, BoardLedger, WorkBoard,
-    WorkBoardSurface,
+    board_connection_system, try_register_work_board, validate_board_contract, work_board_tools,
+    BoardLedger, WorkBoard, WorkBoardSurface,
 };
 pub use board_registry::{BoardBinding, BoardRegistry};
 pub use harness_history::{
@@ -71,8 +71,9 @@ pub use ingest::{
     chunk_text, freshness, ingest_markdown, ingest_openapi, ingest_text, reindex, ChunkOptions,
 };
 pub use live::{
-    live_datasource_tools, try_register_live_datasource, validate_live_contract, LiveAccess,
-    LiveDatasource, LiveDatasourceSurface,
+    admit_live_locality, declared_host, live_connection_system, live_datasource_tools,
+    try_register_live_datasource, validate_live_contract, LiveAccess, LiveDatasource,
+    LiveDatasourceSurface, LiveLocality,
 };
 pub use markdown_board::MarkdownBoard;
 pub use memory::MemoryBackend;

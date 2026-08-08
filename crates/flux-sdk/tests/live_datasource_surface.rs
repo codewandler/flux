@@ -81,12 +81,8 @@ impl LiveDatasource for MockLiveDatasource {
 
     fn access(&self) -> Vec<LiveAccess> {
         vec![
-            LiveAccess::Network {
-                subject: NETWORK_SUBJECT.into(),
-            },
-            LiveAccess::Connection {
-                subject: CONNECTION_SUBJECT.into(),
-            },
+            LiveAccess::network(NETWORK_SUBJECT),
+            LiveAccess::connection(CONNECTION_SUBJECT),
         ]
     }
 
