@@ -11649,9 +11649,12 @@ fn fleet_runtime_health(state: &FleetState) -> Value {
 /// unreadable, or the wave recorded no base. An unanswered question is never a licence to delete.
 fn branch_is_at_pinned_base(source: &Path, branch: &str, base: Option<&str>) -> Option<bool> {
     let base = base?;
-    let head = guarded_git(source, &["rev-parse", "--verify", &format!("refs/heads/{branch}")])
-        .ok()
-        .filter(|output| output.exit_code == 0)?;
+    let head = guarded_git(
+        source,
+        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
+    )
+    .ok()
+    .filter(|output| output.exit_code == 0)?;
     Some(head.stdout.trim() == base)
 }
 
@@ -11740,9 +11743,8 @@ fn reclaim_wave_storage_inner(wave: &Value, dry_run: bool) -> Value {
         if present {
             for name in RECLAIMABLE_BUILD_DIRS {
                 for found in build_dirs_under(&worktree, name) {
-                    if dry_run {
-                        freed_dirs.push(display_path(&found));
-                    } else if std::fs::remove_dir_all(&found).is_ok() {
+                    // Short-circuits, so a dry run never reaches the removal.
+                    if dry_run || std::fs::remove_dir_all(&found).is_ok() {
                         freed_dirs.push(display_path(&found));
                     }
                 }
@@ -11820,16 +11822,12 @@ fn reclaim_wave_storage_inner(wave: &Value, dry_run: bool) -> Value {
 /// which is precisely how a feature that had been inert for nineteen runs kept reporting success.
 fn reclaimed_effects(reclaimed: &Value) -> (usize, usize, usize) {
     let len = |key: &str| reclaimed[key].as_array().map_or(0, Vec::len);
-    let deleted = reclaimed["branches"]
-        .as_array()
-        .map_or(0, |entries| {
-            entries
-                .iter()
-                .filter(|entry| {
-                    entry["deleted"] == json!(true) || entry["would_delete"] == json!(true)
-                })
-                .count()
-        });
+    let deleted = reclaimed["branches"].as_array().map_or(0, |entries| {
+        entries
+            .iter()
+            .filter(|entry| entry["deleted"] == json!(true) || entry["would_delete"] == json!(true))
+            .count()
+    });
     (len("build_dirs_removed"), len("worktrees_removed"), deleted)
 }
 
@@ -18969,8 +18967,11 @@ mod tests {
             "the branch still at its pinned base is pruned; the one holding a commit is not"
         );
         assert!(
-            git_output(&root, &["rev-parse", "--verify", "refs/heads/fleet/wave-9/story"])
-                .is_none(),
+            git_output(
+                &root,
+                &["rev-parse", "--verify", "refs/heads/fleet/wave-9/story"]
+            )
+            .is_none(),
             "the ref must actually be gone, not merely reported gone"
         );
         assert!(
