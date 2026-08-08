@@ -12,7 +12,7 @@ use std::str::Chars;
 use std::sync::Arc;
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -295,6 +295,15 @@ impl OperationsTab {
         let next = (current as isize + delta).rem_euclid(Self::ALL.len() as isize) as usize;
         Self::ALL[next]
     }
+
+    /// The tab's own key help, shown beside the tab strip. Only the Board carries a binding the
+    /// overlay's shared header does not already name.
+    fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Board => Some("· Enter or click: expand/collapse"),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -319,6 +328,11 @@ pub(crate) struct OperationsState {
     /// Only the renderer knows the wrap width, so only it can know where the body ends; recording
     /// it here is what keeps keyboard scrolling from running past a bottom already on screen.
     pub body_scroll_max: Cell<usize>,
+    /// Where the last frame painted the Board list, so a click can be resolved to the box under
+    /// the pointer. Only the renderer knows the pane's geometry, so — like `body_scroll_max` — it
+    /// is the party that records it. `None` while another tab is focused, so a stale rectangle can
+    /// never hit-test a pane that is not on screen.
+    pub board_viewport: Cell<Option<Rect>>,
     pub decision_option: usize,
     pub confirm_decision: bool,
     pub refresh_error: Option<String>,
@@ -346,6 +360,7 @@ impl OperationsState {
             detail_open: false,
             body_scroll: 0,
             body_scroll_max: Cell::new(0),
+            board_viewport: Cell::new(None),
             decision_option: 0,
             confirm_decision: false,
             refresh_error: None,
@@ -371,10 +386,28 @@ impl OperationsState {
     }
 
     pub(crate) fn refresh(&mut self, snapshot: FleetBoardSnapshot) {
+        // C-622: the operator selected an *item*, not a row index. A periodic refresh that inserts
+        // or reorders work around it must leave the selection on the same item and leave an
+        // expanded box open, because the Fleet view updates while an operator is reading one.
+        let anchor = self.selected_board_ref().map(str::to_string);
         self.snapshot = snapshot;
         self.projection_status = ProjectionStatus::Ready;
         self.refresh_error = None;
-        self.selected = self.selected.min(self.rows_len().saturating_sub(1));
+        match anchor
+            .as_deref()
+            .and_then(|anchor| BoardPane::new(&self.snapshot.items).position_of(anchor))
+        {
+            Some(position) => self.selected = position,
+            None => {
+                if anchor.is_some() {
+                    // What the operator had open is no longer on the board, so there is nothing
+                    // left to keep open.
+                    self.detail_open = false;
+                    self.body_scroll = 0;
+                }
+                self.selected = self.selected.min(self.rows_len().saturating_sub(1));
+            }
+        }
     }
 
     pub(crate) fn refresh_failed(&mut self, error: String) {
@@ -429,6 +462,60 @@ impl OperationsState {
             body_scroll: self.body_scroll,
             bottom: &self.body_scroll_max,
         }
+    }
+
+    /// The Board item the selection points at, in board order rather than snapshot order.
+    pub(crate) fn selected_board_ref(&self) -> Option<&str> {
+        if self.tab != OperationsTab::Board {
+            return None;
+        }
+        BoardPane::new(&self.snapshot.items)
+            .item(self.selected)
+            .map(|item| item.board_ref.as_str())
+    }
+
+    /// Rows the ack/stale trailer claims below the list, which the Board pane pages within.
+    pub(crate) fn trailer_rows(&self) -> usize {
+        usize::from(self.last_ack.is_some()) * 2 + usize::from(self.refresh_error.is_some())
+    }
+
+    /// Expand the Board box at `position`, or collapse it when it is the one already expanded.
+    ///
+    /// C-622: the keyboard binding and a mouse click both land here, so they cannot produce two
+    /// different states — a click merely names the box under the pointer instead of the selected
+    /// one. Toggling always rewinds the body, so a box reopened after being scrolled does not come
+    /// back mid-paragraph, and collapse-then-expand returns to a known state either way.
+    pub(crate) fn toggle_board_expansion(&mut self, position: usize) {
+        if position >= self.rows_len() {
+            return;
+        }
+        let collapse = self.detail_open && self.selected == position;
+        self.selected = position;
+        self.detail_open = !collapse;
+        self.body_scroll = 0;
+    }
+
+    /// The Board box under a terminal cell, as the last painted frame placed the boxes. `None`
+    /// when the pane is not on screen, the cell falls outside it, or the cell is a group heading
+    /// or trailer row rather than a box.
+    pub(crate) fn board_position_at(&self, column: u16, row: u16) -> Option<usize> {
+        if self.tab != OperationsTab::Board {
+            return None;
+        }
+        let area = self.board_viewport.get()?;
+        let inside = column >= area.x
+            && column < area.x.saturating_add(area.width)
+            && row >= area.y
+            && row < area.y.saturating_add(area.height);
+        if !inside {
+            return None;
+        }
+        let height = usize::from(area.height).saturating_sub(self.trailer_rows());
+        BoardPane::new(&self.snapshot.items).position_at(
+            &self.board_focus(),
+            height,
+            usize::from(row - area.y),
+        )
     }
 
     pub(crate) fn selected_decision(&self) -> Option<&BoardDecisionView> {
@@ -514,6 +601,12 @@ impl OperationsState {
                     };
                 }
             }
+            // C-622: on the Board the binding is a toggle — the same interaction expands a
+            // collapsed box and collapses an expanded one — and it is exactly what a click does,
+            // because both route through `toggle_board_expansion`.
+            KeyCode::Enter if self.tab == OperationsTab::Board => {
+                self.toggle_board_expansion(self.selected);
+            }
             KeyCode::Enter => {
                 // Expanding always starts at the top of the body, so a box reopened after being
                 // scrolled does not come back mid-paragraph.
@@ -528,12 +621,18 @@ impl OperationsState {
         OperationsCommand::None
     }
 
-    /// Route one mouse event while the overlay is open. Scrolling moves the selection and nothing
-    /// else, so no mouse interaction on any tab can ask for a mutation.
-    pub(crate) fn handle_mouse(&mut self, kind: MouseEventKind) {
-        match kind {
+    /// Route one mouse event while the overlay is open. Scrolling moves the selection and a left
+    /// click toggles the Board box under the pointer — presentation only, so no mouse interaction
+    /// on any tab can ask for a mutation.
+    pub(crate) fn handle_mouse(&mut self, event: MouseEvent) {
+        match event.kind {
             MouseEventKind::ScrollUp => self.move_selection(-1),
             MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(position) = self.board_position_at(event.column, event.row) {
+                    self.toggle_board_expansion(position);
+                }
+            }
             _ => {}
         }
     }
@@ -645,9 +744,45 @@ impl<'a> BoardPane<'a> {
     }
 
     /// The item at `position` in board order, not in snapshot order.
-    #[cfg(test)]
     pub(crate) fn item(&self, position: usize) -> Option<&'a BoardItemView> {
         self.order.get(position).map(|index| &self.items[*index])
+    }
+
+    /// Where `board_ref` sits in board order, so a selection can be re-anchored to the item the
+    /// operator chose after a refresh reorders or inserts work around it.
+    pub(crate) fn position_of(&self, board_ref: &str) -> Option<usize> {
+        self.order
+            .iter()
+            .position(|index| self.items[*index].board_ref == board_ref)
+    }
+
+    /// The box painted at viewport row `row`, mirroring [`Self::window_lines`]'s row arithmetic so
+    /// a click lands on the box the operator actually sees. `None` for a group heading, or past
+    /// the last box.
+    pub(crate) fn position_at(
+        &self,
+        focus: &BoardFocus<'_>,
+        height: usize,
+        row: usize,
+    ) -> Option<usize> {
+        if height == 0 || row >= height {
+            return None;
+        }
+        let target = self.first_visible_row(focus, height) + row;
+        let mut cursor = 0usize;
+        for group in &self.groups {
+            if target == cursor {
+                return None;
+            }
+            cursor += 1;
+            for position in group.start..(group.start + group.len) {
+                cursor += self.box_rows(position, focus, height);
+                if target < cursor {
+                    return Some(position);
+                }
+            }
+        }
+        None
     }
 
     /// First terminal row of the box at `position`, counting the group headings above it.
@@ -1268,13 +1403,34 @@ pub(crate) fn render_overlay(frame: &mut Frame, state: &ChatState) {
         ops.snapshot.revision,
         ops.snapshot.main_session.as_deref().unwrap_or("—")
     );
+    // C-622: the focused pane's own key help sits beside the tab strip, so the expand/collapse
+    // binding is discoverable without a mouse — this TUI normally runs in tmux, where mouse
+    // capture is not always available or wanted.
+    let mut header = tabs;
+    if let Some(hint) = ops.tab.hint() {
+        let used: usize = header
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        let room = (chunks[0].width as usize).saturating_sub(used);
+        if room > 4 {
+            header.push(Span::styled(
+                truncate(hint, room),
+                state.theme.muted_style(),
+            ));
+        }
+    }
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from(tabs),
+            Line::from(header),
             Line::styled(status, state.theme.muted_style()),
         ]),
         chunks[0],
     );
+    // Only the renderer knows where the list landed, so it is what records the geometry a click
+    // is resolved against.
+    ops.board_viewport
+        .set((ops.tab == OperationsTab::Board).then_some(chunks[1]));
     let lines = overlay_lines(
         ops,
         &state.theme,
@@ -1327,8 +1483,7 @@ fn overlay_lines(
         .bg(theme.sel_bg)
         .add_modifier(Modifier::BOLD);
     // Rows the ack/stale trailer claims below the list, so the Board pane pages within what is left.
-    let trailer =
-        usize::from(ops.last_ack.is_some()) * 2 + usize::from(ops.refresh_error.is_some());
+    let trailer = ops.trailer_rows();
     let mut rows = match ops.tab {
         OperationsTab::Overview => overview_lines(ops, theme, width),
         OperationsTab::Board => BoardPane::new(&ops.snapshot.items).window_lines(
@@ -2087,15 +2242,59 @@ mod tests {
         value
     }
 
+    /// A Board pane drawn into a test terminal. Interactions are driven through the same routing
+    /// the event loop uses, and the pane is repainted between them, so a click is resolved against
+    /// geometry an operator could actually have clicked on.
+    struct DrawnPane {
+        state: ChatState,
+        terminal: Terminal<TestBackend>,
+    }
+
+    impl DrawnPane {
+        fn new(snapshot: FleetBoardSnapshot, width: u16, height: u16) -> Self {
+            let mut state = ChatState::new("mock".into());
+            let mut ops = OperationsState::new(snapshot);
+            ops.open = true;
+            ops.tab = OperationsTab::Board;
+            state.operations = Some(ops);
+            Self {
+                state,
+                terminal: Terminal::new(TestBackend::new(width, height)).unwrap(),
+            }
+        }
+
+        fn draw(&mut self) -> String {
+            let Self { state, terminal } = self;
+            terminal.draw(|frame| crate::render(frame, state)).unwrap();
+            screen(terminal)
+        }
+
+        fn ops(&mut self) -> &mut OperationsState {
+            self.state.operations.as_mut().unwrap()
+        }
+
+        /// The operator-visible expansion state: which box, open or not, and where its body sits.
+        fn expansion(&self) -> (usize, bool, usize) {
+            let ops = self.state.operations.as_ref().unwrap();
+            (ops.selected, ops.detail_open, ops.body_scroll)
+        }
+    }
+
+    /// The cell `needle` was painted at, as `(column, row)`. Every glyph the pane paints is one
+    /// column wide, so a character offset is a column.
+    fn cell_of(content: &str, needle: &str) -> (u16, u16) {
+        content
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find(needle)
+                    .map(|byte| (line[..byte].chars().count() as u16, row as u16))
+            })
+            .unwrap_or_else(|| panic!("{needle} missing from\n{content}"))
+    }
+
     fn board_pane_screen(snapshot: FleetBoardSnapshot, width: u16, height: u16) -> String {
-        let mut state = ChatState::new("mock".into());
-        let mut ops = OperationsState::new(snapshot);
-        ops.open = true;
-        ops.tab = OperationsTab::Board;
-        state.operations = Some(ops);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| crate::render(frame, &state)).unwrap();
-        screen(&terminal)
+        DrawnPane::new(snapshot, width, height).draw()
     }
 
     #[test]
@@ -2227,6 +2426,15 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
     /// Every key the Board pane can receive: its own bindings, the overlay bindings reachable while
     /// it is focused, and every printable character a future binding might claim.
     fn board_pane_keys() -> Vec<KeyEvent> {
@@ -2304,9 +2512,10 @@ mod tests {
             if state.tab != OperationsTab::Board {
                 state.select_tab(OperationsTab::Board);
             }
-            state.handle_mouse(MouseEventKind::ScrollDown);
-            state.handle_mouse(MouseEventKind::ScrollUp);
-            state.handle_mouse(MouseEventKind::Moved);
+            state.handle_mouse(mouse(MouseEventKind::ScrollDown, 0, 0));
+            state.handle_mouse(mouse(MouseEventKind::ScrollUp, 0, 0));
+            state.handle_mouse(mouse(MouseEventKind::Moved, 0, 0));
+            state.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
             assert_eq!(
                 state.snapshot, before,
                 "board pane interaction {event:?} changed planning state"
@@ -2548,5 +2757,122 @@ mod tests {
         state.move_selection(1);
         assert!(!state.detail_open);
         assert_eq!(state.body_scroll, 0);
+    }
+
+    /// C-622: expand and collapse are one behaviour with two spellings. Driving the keyboard
+    /// binding and a click on the same box must reach *identical* state, in both directions —
+    /// keyboard parity is a hard requirement because this TUI normally runs in tmux, where mouse
+    /// capture is not always available or wanted.
+    #[test]
+    fn expanding_a_board_box_by_key_and_by_click_reaches_the_same_state() {
+        // Board order puts the in-progress group first: C-42 is position 0, C-43 position 1.
+        let mut typed = DrawnPane::new(grouped_board_snapshot(), 96, 44);
+        let mut clicked = DrawnPane::new(grouped_board_snapshot(), 96, 44);
+        typed.draw();
+        let painted = clicked.draw();
+        let (column, row) = cell_of(&painted, "flux/C-43");
+
+        typed.ops().handle_key(key(KeyCode::Down));
+        typed.ops().handle_key(key(KeyCode::Enter));
+        clicked
+            .ops()
+            .handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
+
+        assert_eq!(
+            typed.expansion(),
+            (1, true, 0),
+            "Enter expands the selected box"
+        );
+        assert_eq!(
+            clicked.expansion(),
+            typed.expansion(),
+            "click and key disagree on expanding"
+        );
+        let expanded = clicked.draw();
+        assert!(
+            expanded.contains("this projection carries no story body"),
+            "the clicked box is expanded on screen\n{expanded}"
+        );
+
+        // Repaint, then the same interaction again: each collapses the box it opened.
+        typed.draw();
+        let painted = clicked.draw();
+        let (column, row) = cell_of(&painted, "flux/C-43");
+        typed.ops().handle_key(key(KeyCode::Enter));
+        clicked
+            .ops()
+            .handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
+
+        assert_eq!(
+            typed.expansion(),
+            (1, false, 0),
+            "Enter collapses the box it expanded"
+        );
+        assert_eq!(
+            clicked.expansion(),
+            typed.expansion(),
+            "click and key disagree on collapsing"
+        );
+    }
+
+    /// C-622: the binding is discoverable in the pane's own help, so expand/collapse is reachable
+    /// without ever discovering that the boxes are clickable.
+    #[test]
+    fn the_board_pane_help_names_the_expand_binding() {
+        let content = board_pane_screen(grouped_board_snapshot(), 96, 44);
+        assert!(content.contains("Enter or click"), "{content}");
+    }
+
+    /// C-622: a periodic refresh must not collapse what the operator opened or move the selection.
+    /// The selection belongs to an item, not to a row index, so work arriving above it must not
+    /// slide the operator onto a different story.
+    #[test]
+    fn a_board_refresh_keeps_the_selection_and_the_expansion_the_operator_opened() {
+        let mut state = OperationsState::new(grouped_board_snapshot());
+        state.open = true;
+        state.select_tab(OperationsTab::Board);
+        state.move_selection(1);
+        let position = state.selected;
+        state.toggle_board_expansion(position);
+        state.body_scroll_max.set(4);
+        state.scroll_board_body(2);
+        let selected_ref = |state: &OperationsState| {
+            BoardPane::new(&state.snapshot.items)
+                .item(state.selected)
+                .map(|item| item.board_ref.clone())
+        };
+        assert_eq!(selected_ref(&state).as_deref(), Some("flux/C-43"));
+
+        // The Fleet updates while the operator reads: higher-priority in-progress work arrives
+        // above the open item and pushes every board position below it down by one.
+        let mut next = grouped_board_snapshot();
+        next.items.push(BoardItemView {
+            board_ref: "flux/C-1".into(),
+            title: "new in-progress work".into(),
+            status: "in-progress".into(),
+            priority: Some(1),
+            dependencies: Vec::new(),
+            design: None,
+            epic: None,
+            body: None,
+        });
+        next.items_total = next.items.len();
+        next.revision = 10;
+        state.refresh(next);
+
+        assert_eq!(
+            selected_ref(&state).as_deref(),
+            Some("flux/C-43"),
+            "the refresh moved the selection to a different item"
+        );
+        assert_eq!(
+            state.selected, 2,
+            "the selection follows the item, not the row"
+        );
+        assert!(
+            state.detail_open,
+            "the refresh collapsed what the operator opened"
+        );
+        assert_eq!(state.body_scroll, 2, "the refresh rewound the body");
     }
 }
