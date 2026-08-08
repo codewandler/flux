@@ -347,13 +347,40 @@ merged. Anything held back is named with its reason rather than dropped:
     "width": 2,
     "items": ["api/C-41"],
     "withheld": [
-      {"item": "api/C-40", "reason": "already-built", "signals": ["commit-subject"]},
+      {"item": "api/C-40", "reason": "already-built", "signals": ["commit-subject"],
+       "detail": "6 of 6 Acceptance criteria ticked and every named artifact is present in this checkout (RequestEnvelope)",
+       "evidence": [{"acceptance_ticked": 6, "acceptance_total": 6, "reviewed_complete": true},
+                    {"artifact": "RequestEnvelope", "present": true}]},
       {"item": "web/C-12", "reason": "claimed", "detail": "wave-88 still holds an attempt at this item"},
       {"item": "db/C-7", "reason": "parked", "detail": "wave-91 is parked pending a decision: waiting on the API decision"}
+    ],
+    "released": [
+      {"item": "api/C-70", "reason": "already-built",
+       "detail": "the Acceptance names 1 artifact(s) this checkout does not have (AgentReport); the signal is a mention of the id, not its implementation",
+       "evidence": [{"acceptance_ticked": 1, "acceptance_total": 8, "reviewed_complete": false},
+                    {"artifact": "AgentReport", "present": false},
+                    {"artifact": "SpawnActivity", "present": true}]}
     ]
   }
 }
 ```
+
+`already-built` is the one reason the driver does not take on trust. Reconcile answers "does some
+commit name this id?", which fires on a docs commit, on a sibling story's commit, and on a doc
+comment forward-referencing the id — so a tick with eight free slots and nine ready items once
+dispatched one, and both stories it held back were unbuilt. Each finding is now verified against the
+story it names before it may withhold. A wholly unticked Acceptance settles it outright — the story
+saying, in its own words, that it still owes everything, outranks a commit that only mentions the id.
+Otherwise every symbol and path the story's own `## Acceptance` names must be present in that
+member's checkout, found outside Markdown and outside comments. One absent name releases the item:
+absence is conclusive, while presence is weak enough that it never withholds on its own.
+
+A signal that fails verification appears under `released` with the evidence that failed it, and the
+item dispatches. Withholding is the strongest and the only *silent* action a tick takes, so it fails
+closed toward dispatching: a redundant turn is recoverable, a silently skipped story is not. And
+because a withhold is invisible from the outside, `drive` records how long each one has run —
+`flux fleet doctor` reports any ready item withheld across five consecutive ticks as
+`item-withheld-persistently`, so a permanent withhold cannot masquerade as an empty queue.
 
 `--loop` runs under a durable single-instance guard, so a second driver refuses and names the pid
 holding it; a lock naming a process that is gone is not a lock and needs no hand cleanup. The loop
