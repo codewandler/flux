@@ -184,6 +184,9 @@ pub(super) fn unattended_sandbox_surface(cli: &Cli) -> Option<&'static str> {
         | Commands::Integration { .. }
         | Commands::Policy { .. }
         | Commands::Catalog { .. }
+        // Read-only: assembles the in-process registry and renders it. No provider, no plugin
+        // subprocess, no operation is ever dispatched — the explorer only ever *describes* ops.
+        | Commands::Ops { .. }
         | Commands::Skill { .. }
         | Commands::Changelog { .. }
         | Commands::Docs { .. }
@@ -852,6 +855,7 @@ pub(super) async fn async_main(cli: Cli) -> Result<()> {
             Some(Commands::Integration { action }) => run_integration_boundary(action),
             Some(Commands::Policy { action }) => run_policy(action),
             Some(Commands::Catalog { action }) => run_catalog(action),
+            Some(Commands::Ops { explore }) => crate::ops_cmd::run_ops(explore),
             Some(Commands::Skill {
                 type_,
                 install,

@@ -1,0 +1,320 @@
+{
+  "all": [
+    "language/ops",
+    "language/node-reference"
+  ],
+  "any": [
+    "language/ops",
+    "language/node-reference",
+    "language/types-and-effects"
+  ],
+  "append": [
+    "language/ops"
+  ],
+  "bash": [
+    "language/ops"
+  ],
+  "browser.act": [
+    "language/ops"
+  ],
+  "browser.close": [
+    "language/ops"
+  ],
+  "browser.goto": [
+    "language/ops"
+  ],
+  "browser.open": [
+    "language/ops"
+  ],
+  "browser.snapshot": [
+    "language/ops"
+  ],
+  "cargo_build": [
+    "language/ops"
+  ],
+  "cargo_check": [
+    "language/ops"
+  ],
+  "cargo_clippy": [
+    "language/ops"
+  ],
+  "cargo_fmt": [
+    "language/ops"
+  ],
+  "cargo_test": [
+    "language/ops"
+  ],
+  "cite": [
+    "language/ops"
+  ],
+  "coalesce": [
+    "language/ops"
+  ],
+  "command.invoke": [
+    "language/ops",
+    "agent/claude-compat",
+    "agent/cli",
+    "agent/skills-and-roles"
+  ],
+  "compare": [
+    "language/ops"
+  ],
+  "count_by": [
+    "language/ops"
+  ],
+  "cwd": [
+    "language/ops"
+  ],
+  "dedupe": [
+    "language/ops"
+  ],
+  "edit": [
+    "language/ops"
+  ],
+  "evidence": [
+    "language/ops"
+  ],
+  "file_stat": [
+    "language/ops"
+  ],
+  "filter": [
+    "language/ops",
+    "language/control-flow",
+    "language/flows-and-syntax",
+    "language/pure-data"
+  ],
+  "first": [
+    "language/ops",
+    "language/node-reference"
+  ],
+  "flatten": [
+    "language/ops"
+  ],
+  "fleet.isolate": [
+    "language/ops"
+  ],
+  "gaps": [
+    "language/ops",
+    "language/types-and-effects"
+  ],
+  "git_branch": [
+    "language/ops"
+  ],
+  "git_checkout": [
+    "language/ops",
+    "whats-new"
+  ],
+  "git_commit": [
+    "language/ops"
+  ],
+  "git_diff": [
+    "language/ops"
+  ],
+  "git_hunks": [
+    "language/ops"
+  ],
+  "git_log": [
+    "language/ops"
+  ],
+  "git_merge": [
+    "language/ops"
+  ],
+  "git_push": [
+    "language/ops"
+  ],
+  "git_revert": [
+    "language/ops",
+    "whats-new"
+  ],
+  "git_stage": [
+    "language/ops"
+  ],
+  "git_stage_hunks": [
+    "language/ops"
+  ],
+  "git_status": [
+    "language/ops"
+  ],
+  "git_unstage": [
+    "language/ops"
+  ],
+  "git_worktree_enter": [
+    "language/ops"
+  ],
+  "git_worktree_leave": [
+    "language/ops"
+  ],
+  "glob": [
+    "language/ops"
+  ],
+  "go_build": [
+    "language/ops"
+  ],
+  "go_test": [
+    "language/ops"
+  ],
+  "go_vet": [
+    "language/ops"
+  ],
+  "grep": [
+    "language/ops"
+  ],
+  "group_by": [
+    "language/ops"
+  ],
+  "has": [
+    "language/ops",
+    "language/node-reference"
+  ],
+  "home_dir": [
+    "language/ops"
+  ],
+  "html_to_markdown": [
+    "language/ops"
+  ],
+  "http.request": [
+    "language/ops",
+    "channels/overview",
+    "language/tooling",
+    "reference/config",
+    "security/credentials",
+    "whats-new"
+  ],
+  "join": [
+    "language/ops"
+  ],
+  "keys": [
+    "language/ops"
+  ],
+  "last": [
+    "language/ops",
+    "agent/time-machine",
+    "language/node-reference"
+  ],
+  "len": [
+    "language/ops"
+  ],
+  "make": [
+    "language/ops",
+    "coding/fleet"
+  ],
+  "map": [
+    "language/ops"
+  ],
+  "merge": [
+    "language/ops"
+  ],
+  "merge_obj": [
+    "language/ops"
+  ],
+  "metrics": [
+    "language/ops"
+  ],
+  "need": [
+    "language/ops",
+    "language/types-and-effects"
+  ],
+  "node_run": [
+    "language/ops"
+  ],
+  "now": [
+    "language/ops",
+    "language/editors",
+    "language/tour"
+  ],
+  "npm": [
+    "language/ops"
+  ],
+  "observe": [
+    "language/ops",
+    "agent/agent-loop",
+    "sdk/overview",
+    "sdk/sessions"
+  ],
+  "omit": [
+    "language/ops"
+  ],
+  "patch": [
+    "language/ops"
+  ],
+  "path_exists": [
+    "language/ops",
+    "language/examples"
+  ],
+  "pick": [
+    "language/ops"
+  ],
+  "proc.run": [
+    "language/ops",
+    "reference/config"
+  ],
+  "pytest": [
+    "language/ops"
+  ],
+  "python_run": [
+    "language/ops"
+  ],
+  "read": [
+    "language/ops"
+  ],
+  "read_many": [
+    "language/ops"
+  ],
+  "regex_extract": [
+    "language/ops"
+  ],
+  "regex_match": [
+    "language/ops"
+  ],
+  "review.aggregate": [
+    "language/ops",
+    "agent/improvement"
+  ],
+  "review.normalize": [
+    "language/ops"
+  ],
+  "skill.load": [
+    "language/ops",
+    "agent/claude-compat",
+    "reference/config"
+  ],
+  "skip": [
+    "language/ops"
+  ],
+  "sort": [
+    "language/ops"
+  ],
+  "split": [
+    "language/ops"
+  ],
+  "sqlite_query": [
+    "language/ops"
+  ],
+  "sum": [
+    "language/ops",
+    "language/node-reference"
+  ],
+  "sys_info": [
+    "language/ops"
+  ],
+  "top": [
+    "language/ops"
+  ],
+  "values": [
+    "language/ops"
+  ],
+  "web.crawl": [
+    "language/ops",
+    "whats-new"
+  ],
+  "web.fetch": [
+    "language/ops",
+    "agent/skills-and-roles",
+    "language/pure-data",
+    "reference/config",
+    "whats-new"
+  ],
+  "write": [
+    "language/ops"
+  ]
+}

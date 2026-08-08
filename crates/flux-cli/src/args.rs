@@ -762,6 +762,13 @@ pub(super) enum Commands {
         #[command(subcommand)]
         action: CatalogAction,
     },
+    /// Browse the operation catalog. `--explore` opens a full-screen search-first explorer over
+    /// every registered operation — description, parameters, risk and documentation links.
+    Ops {
+        /// Open the full-screen explorer. Requires a real terminal on stdin and stdout.
+        #[arg(long)]
+        explore: bool,
+    },
     /// Render or install generated Claude-format Flux skills.
     Skill {
         /// Which section to render/install: cli | lang | plugin | ops. Omit for the root skill.

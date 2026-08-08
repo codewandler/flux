@@ -31,6 +31,7 @@ mod flow_cmd;
 mod insights_cmd;
 mod integration_projection;
 mod lab_cmd;
+mod ops_cmd;
 mod plugin_cmd;
 mod policy_cmd;
 mod rendering;

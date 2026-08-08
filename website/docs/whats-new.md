@@ -14,6 +14,12 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 
 ### New
 
+- **`flux ops --explore` browses every operation flux can run.** Operations are the things flux actually
+  does — read a file, commit, fetch a page, run a test. Until now there was no way to see the full list.
+  `flux ops --explore` opens a search box: start typing and you get a ranked list on the left and, on the
+  right, what the selected operation does, the parameters it takes, how risky it is, and links to its
+  documentation. Tab cycles a category filter, `Ctrl-Y` copies the doc link, and `Esc` steps back out.
+
 - **`/restart` reloads flux without losing your conversation.** After upgrading, type `/restart` in the
   terminal UI and it relaunches on the new version with the same options and the same session — no quitting,
   no retyping the command you started with.

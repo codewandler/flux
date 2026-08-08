@@ -7,12 +7,14 @@
 //! operations raise a y/a/N approval sheet. Headless layout behavior is pinned with `TestBackend`.
 
 mod controller;
+pub mod explorer;
 pub mod fleet;
 mod interaction;
 pub mod loopmock;
 mod observatory;
 pub mod operations;
 mod panes;
+mod pictogram;
 mod projection;
 mod rendering;
 pub mod spinners;
@@ -211,6 +213,14 @@ fn resolve_theme(name: Option<&str>) -> (String, Theme) {
         ),
     }
 }
+/// Resolve the theme for this terminal, honoring `NO_COLOR` and truecolor detection.
+///
+/// The public door onto [`resolve_theme`] for surfaces outside the chat TUI — the C-643 operations
+/// explorer is a separate entry point but must not grow a second idea of what `NO_COLOR` means.
+pub fn detect_theme(name: Option<&str>) -> Theme {
+    resolve_theme(name).1
+}
+
 /// Streaming cursor block appended to an in-progress assistant message.
 const CURSOR: &str = "▍";
 /// Max expanded-detail lines per tool card. Lifted entirely under verbose (`flux tui -v` /
