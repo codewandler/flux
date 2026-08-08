@@ -1979,6 +1979,115 @@ fn fleet_repair_rebuilds_missing_structure_without_discarding_work() {
     );
 }
 
+/// C-722, end to end through the binary: an interrupted worker's uncommitted work is reported, it
+/// survives the sweep, and the command `doctor` prints is the command that saves it.
+///
+/// wave-745 died overnight with a 531-line failing-first specification untracked in its story
+/// worktree, and every mechanism the fleet had agreed the work did not exist — the write set comes
+/// from `base..HEAD`, the branch was still at its pinned base, and the fix `doctor` prescribed was
+/// `reclaim`, which is documented to delete worktrees that provably hold no work. The only recovery
+/// was hand-running `git` inside a directory the fleet owns.
+///
+/// So the last step here runs the finding's OWN `fix` string verbatim rather than a command this
+/// test composed. If the prescription and the verb ever drift apart, the operator is back to
+/// improvising with `git` under time pressure, which is the defect and not a detail of it.
+#[test]
+fn fleet_reports_and_captures_work_a_story_worker_never_committed() {
+    let (root, story) = one_story_wave("wave-capture");
+    let specification = story.join("crates/flux-runtime/tests/resource_receipts.rs");
+    fs::create_dir_all(specification.parent().unwrap()).unwrap();
+    fs::write(
+        &specification,
+        "// the turn ended before this was committed\n",
+    )
+    .unwrap();
+    // Cancelled is the wave whose worktrees reclamation may actually remove, which is exactly the
+    // state an operator puts a dead wave into before sweeping it.
+    assert!(flux(&root, &["fleet", "cancel", "wave-2"]).status.success());
+
+    let doctored = flux(&root, &["fleet", "doctor", "--output", "json"]);
+    assert!(
+        doctored.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&doctored.stdout),
+        String::from_utf8_lossy(&doctored.stderr)
+    );
+    let doctored: serde_json::Value = serde_json::from_slice(&doctored.stdout).unwrap();
+    let findings = doctored["data"]["runtime"]["findings"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let dirty = findings
+        .iter()
+        .find(|finding| finding["check"] == "story-worktree-holds-uncommitted-work")
+        .unwrap_or_else(|| panic!("the uncommitted specification must be reported: {doctored}"));
+    assert_eq!(dirty["subject"], story.display().to_string());
+    let detail = dirty["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("wave-2")
+            && detail.contains("repo/C-1")
+            && detail.contains("1 uncommitted"),
+        "the finding names the wave, the story and the count: {detail}"
+    );
+    assert!(
+        findings.iter().all(|finding| !finding["fix"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("reclaim")),
+        "nothing may prescribe the sweep while the only copy of the work is here: {doctored}"
+    );
+
+    let reclaimed = flux(&root, &["fleet", "reclaim", "--output", "json"]);
+    assert!(reclaimed.status.success());
+    assert!(
+        specification.is_file(),
+        "the sweep must not remove the checkout holding the only copy: {}",
+        String::from_utf8_lossy(&reclaimed.stdout)
+    );
+
+    // The operator runs exactly what the finding told them to run.
+    let fix = dirty["fix"].as_str().unwrap().to_string();
+    let mut argv = fix.split_whitespace().collect::<Vec<_>>();
+    assert_eq!(argv.remove(0), "flux", "the fix is a flux command: {fix}");
+    argv.extend(["--output", "json"]);
+    let captured = flux(&root, &argv);
+    assert!(
+        captured.status.success(),
+        "the prescribed command must work: {fix}\nstdout={} stderr={}",
+        String::from_utf8_lossy(&captured.stdout),
+        String::from_utf8_lossy(&captured.stderr)
+    );
+    let captured: serde_json::Value = serde_json::from_slice(&captured.stdout).unwrap();
+    let capture = &captured["data"]["stories"][0]["capture"];
+    assert_eq!(capture["action"], "captured", "{captured}");
+    assert_eq!(capture["still_uncommitted"], 0, "verified, not assumed");
+
+    // On the story's OWN branch, so the work is reachable without the worktree.
+    let branch = String::from_utf8(git(&story, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(capture["branch"], branch);
+    let listed =
+        String::from_utf8(git(&root, &["ls-tree", "-r", "--name-only", &branch, "crates/"]).stdout)
+            .unwrap();
+    assert!(
+        listed.contains("crates/flux-runtime/tests/resource_receipts.rs"),
+        "the specification is committed on the story branch: {listed}"
+    );
+
+    let healthy = flux(&root, &["fleet", "doctor", "--output", "json"]);
+    let healthy: serde_json::Value = serde_json::from_slice(&healthy.stdout).unwrap();
+    assert!(
+        healthy["data"]["runtime"]["findings"]
+            .as_array()
+            .is_some_and(|findings| findings
+                .iter()
+                .all(|finding| finding["check"] != "story-worktree-holds-uncommitted-work")),
+        "once the work is on its branch there is nothing left to report: {healthy}"
+    );
+}
+
 #[test]
 fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     let root = fixture("wave-integration");
