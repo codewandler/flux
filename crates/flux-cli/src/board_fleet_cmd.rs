@@ -11341,14 +11341,175 @@ fn wave_worktrees_are_removable(status: &str) -> bool {
     matches!(status, "applied" | "cancelled")
 }
 
+/// C-724: the status of a wave whose claim was released because the process holding it is gone.
+///
+/// Deliberately NOT `cancelled`. Cancelling is an ending, and an ending makes the wave's disk
+/// disposable: `fleet cancel` reclaims storage on the spot and every sweep afterwards treats the
+/// checkouts as scaffolding. An interrupted wave has not ended — its story worktree may hold the only
+/// copy of a turn's work — so it needs a status that says exactly one thing: this no longer withholds
+/// its items from anybody.
+const WAVE_STATUS_ABANDONED: &str = "abandoned";
+
+/// Has this wave released its claim without its worktrees becoming removable?
+///
+/// The two halves of "finished" came apart the moment a supervisor died, and conflating them is what
+/// made the defect unfixable in place. `applied` and `cancelled` end a wave for good: the claim goes
+/// AND the checkouts become disposable. `abandoned` is the other half on its own — the claim goes and
+/// nothing on disk becomes anybody's to remove.
+fn wave_claim_is_released(status: &str) -> bool {
+    status == WAVE_STATUS_ABANDONED
+}
+
 /// Does this wave still hold a claim on the items it was dispatched for?
 ///
 /// A wave that finished for good — accepted and applied, or cancelled — has released them, and one of
 /// its items appearing in a newer wave is the system working. Anything else still holds its attempt,
 /// so the SAME item in two of them is one story being implemented twice. That happened: four separate
 /// waves each held an attempt at the same story, and noticing it took reading `state.json` by hand.
+///
+/// C-724 adds the third way a claim ends: the wave holding it was interrupted and will never advance.
 fn wave_still_claims_items(status: &str) -> bool {
-    !wave_worktrees_are_removable(status)
+    !wave_worktrees_are_removable(status) && !wave_claim_is_released(status)
+}
+
+/// Is this pid provably absent, as opposed to merely unsignalable?
+///
+/// `supervisor_process_is_live` answers `kill(pid, 0) == 0`, which folds two different failures
+/// together. `ESRCH` means no such process. `EPERM` means the process is THERE and owned by somebody
+/// this user may not signal — and reading that as death is the one way a claim could be released from
+/// under a supervisor that is still writing the story. So the errno is separated here and anything but
+/// `ESRCH` reads as life.
+///
+/// The remaining false positive is pid reuse, and it runs in the safe direction: a recycled pid reads
+/// as alive, so the failure mode is a claim held too long — the behaviour this replaces — never one
+/// released too early. On a platform without signals nothing is ever provably absent and no claim is
+/// ever released this way.
+#[cfg(unix)]
+fn supervisor_process_is_gone(pid: i64) -> bool {
+    // Range-check BEFORE narrowing, for the same reason `supervisor_process_is_live` does: `pid_t` is
+    // `i32`, and `u32::MAX` wraps to `-1`, which `kill` reads as every process this user may signal.
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    if pid <= 0 {
+        return true;
+    }
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+#[cfg(not(unix))]
+fn supervisor_process_is_gone(_pid: i64) -> bool {
+    false
+}
+
+/// Every worker record belonging to a wave.
+///
+/// Two ways to be a wave's worker and both are needed: the id the dispatcher mints
+/// (`<wave>-worker-<n>`, the association `fleet cancel <wave>` itself walks) and the wave the
+/// assignment names. A record can carry either alone.
+fn wave_worker_records<'a>(state: &'a FleetState, wave: &str) -> Vec<&'a Value> {
+    let prefix = format!("{wave}-worker-");
+    state
+        .agents
+        .iter()
+        .filter(|(id, agent)| {
+            id.starts_with(&prefix) || agent["assignment"]["wave"].as_str() == Some(wave)
+        })
+        .map(|(_, agent)| agent)
+        .collect()
+}
+
+/// Does this wave hold work a later step will still deliver?
+///
+/// A claim protects delivered work as much as running work. A wave with an accepted handoff has
+/// commits waiting for an integrator, and starting a second attempt at that story is exactly the
+/// double-write the claim exists to prevent — so delivery keeps the claim however dead the process
+/// that produced it is. This is what confines the release to INTERRUPTED waves rather than finished
+/// ones, and it is checked against the wave's own record, not against the pid.
+fn wave_holds_delivered_work(wave: &Value) -> bool {
+    if matches!(
+        wave["status"].as_str().unwrap_or_default(),
+        "handoffs-ready" | "integrating" | "green" | "conflict" | "red" | "applied"
+    ) {
+        return true;
+    }
+    drive_wave_stories(wave).iter().any(|story| {
+        story["status"].as_str() == Some("handoff-accepted") || story["handoff"].is_object()
+    })
+}
+
+/// The supervisor pid a wave's claim is held against, once that pid is provably gone.
+///
+/// `wave-745` claimed `C-575` and `C-519` for ten hours against pid 3513527, which died with the host.
+/// The two stories sat at the top of a ready board while 70 of the next 82 drive ticks reported an
+/// empty dispatch queue, and no operation released them: cancelling both workers left the wave
+/// claiming, and only cancelling the wave itself worked.
+///
+/// FAILS CLOSED, because the two errors do not cost the same. Releasing a live wave's claim would let
+/// two workers write one story; holding a dead wave's claim only costs scheduling, which is what
+/// already happens. So `Some` requires ALL of:
+///
+/// - the wave still claims, is not `parked` (a pause a human owns, and a dead driver does not answer
+///   it) and is not `integrating` (retryable by the verb `wave-wedged` already prescribes);
+/// - it holds no delivered work;
+/// - no integration supervisor is alive on it;
+/// - no worker of it is still `WorkerActivity::Active`, which folds in the receipt evidence a pid
+///   check cannot see;
+/// - EVERY worker of it recorded a supervisor pid and every one of those pids is provably gone. A
+///   worker with no recorded pid is judged live, exactly as `worker_activity` judges it — a record
+///   written before the field existed is not evidence of death, and an unanswered question is never a
+///   licence to take another wave's story.
+fn wave_supervisor_gone(state: &FleetState, wave_id: &str, wave: &Value) -> Option<i64> {
+    let status = wave["status"].as_str().unwrap_or("unknown");
+    if !wave_still_claims_items(status) || matches!(status, "parked" | "integrating") {
+        return None;
+    }
+    if wave_holds_delivered_work(wave) {
+        return None;
+    }
+    if wave["integration_supervisor_pid"]
+        .as_i64()
+        .is_some_and(|pid| !supervisor_process_is_gone(pid))
+    {
+        return None;
+    }
+    let workers = wave_worker_records(state, wave_id);
+    // A wave with no worker records has no supervisor to have lost. It may be mid-dispatch, or its
+    // records may never have been written at all — neither is evidence that a process died, and a
+    // wave that never got a worker is a different defect with a different fix.
+    if workers.is_empty() {
+        return None;
+    }
+    if workers
+        .iter()
+        .any(|agent| worker_activity(agent) == WorkerActivity::Active)
+    {
+        return None;
+    }
+    let mut gone = None;
+    for agent in workers {
+        match agent["supervisor_pid"].as_i64() {
+            Some(pid) if supervisor_process_is_gone(pid) => gone = gone.or(Some(pid)),
+            _ => return None,
+        }
+    }
+    gone
+}
+
+/// Every wave still claiming items with no live supervisor, and the dead pid that proves it.
+///
+/// Shared by the driver and `fleet doctor` deliberately, the way `wave_worktrees` is: a diagnostic
+/// that named a different set than the tick releases would report a claim the next tick had already
+/// freed, or stay silent about one it never will.
+fn abandoned_wave_claims(state: &FleetState) -> BTreeMap<String, i64> {
+    state
+        .waves
+        .iter()
+        .filter_map(|(id, wave)| wave_supervisor_gone(state, id, wave).map(|pid| (id.clone(), pid)))
+        .collect()
 }
 
 /// One worktree a wave's topology names, with everything needed to judge it.
@@ -11423,8 +11584,9 @@ fn wave_worktrees(wave: &Value) -> Vec<WaveWorktree> {
 }
 
 /// The runtime questions `fleet doctor` answers, in report order.
-const FLEET_RUNTIME_CHECKS: [&str; 5] = [
+const FLEET_RUNTIME_CHECKS: [&str; 6] = [
     "agent-supervisor-gone",
+    "claim-without-supervisor",
     "wave-wedged",
     "worktree-missing",
     "item-double-claimed",
@@ -11457,14 +11619,60 @@ fn dead_supervisor_findings(state: &FleetState) -> Vec<Value> {
             if supervisor_process_is_live(pid) {
                 return None;
             }
+            // C-724: prescribe the WAVE, not the worker. Cancelling both of wave-745's workers is
+            // exactly what an operator did on this finding's instruction, and it left the wave still
+            // claiming `C-575` and `C-519`; only `flux fleet cancel wave-745` released them, taking
+            // dispatch from one item to three. A prescription that leaves its own finding standing
+            // spends the operator's trust before it spends their time.
+            let wave = agent["assignment"]["wave"]
+                .as_str()
+                .or_else(|| agent["wave"].as_str());
+            let fix = match wave {
+                Some(wave) => format!(
+                    "flux fleet cancel {wave} (the next `flux fleet drive --tick` releases its claim \
+                     on its own; cancelling this worker alone would not)"
+                ),
+                None => format!("flux fleet cancel {id}"),
+            };
             Some(runtime_finding(
                 "agent-supervisor-gone",
                 id,
                 format!("recorded `{status}` by supervisor pid {pid}, which no longer exists"),
-                format!("flux fleet cancel {id}"),
+                fix,
             ))
         })
         .collect()
+}
+
+/// Claims held by a wave with no live supervisor.
+///
+/// The condition that removed two ready stories from the schedulable pool permanently. It was
+/// diagnosable only by reading `state.json` by hand and correlating a wave's `items` against a pid
+/// table — which is why nobody diagnosed it for ten hours while the driver reported an empty queue.
+/// Reported per ITEM, because the item is what an operator is looking for when they ask why the top
+/// of the ready board is not moving.
+fn abandoned_claim_findings(state: &FleetState) -> Vec<Value> {
+    let mut findings = Vec::new();
+    for (wave, pid) in abandoned_wave_claims(state) {
+        let items = state
+            .waves
+            .get(&wave)
+            .map(|record| value_strings(&record["items"]))
+            .unwrap_or_default();
+        for item in items {
+            findings.push(runtime_finding(
+                "claim-without-supervisor",
+                &item,
+                format!("wave {wave} claims it under supervisor pid {pid}, which no longer exists"),
+                format!(
+                    "none needed: the next `flux fleet drive --tick` releases it. \
+                     `flux fleet cancel {wave}` ends the wave now, but that also makes its \
+                     worktrees reclaimable"
+                ),
+            ));
+        }
+    }
+    findings
 }
 
 /// Waves wedged in a transient state.
@@ -11627,6 +11835,7 @@ fn stale_branch_findings(
 /// stops being able to poll. `healthy` is the machine-readable verdict for a caller that wants a gate.
 fn fleet_runtime_health(state: &FleetState) -> Value {
     let mut findings = dead_supervisor_findings(state);
+    findings.extend(abandoned_claim_findings(state));
     findings.extend(wedged_wave_findings(state));
     findings.extend(missing_worktree_findings(state));
     findings.extend(double_claimed_findings(state));
@@ -14613,6 +14822,8 @@ struct DrivePlan {
     advance: Vec<String>,
     /// Waves with outstanding stories whose finished turns can still be reconstructed into handoffs.
     reconstruct: Vec<String>,
+    /// C-724: claims this tick releases because the wave holding them has no live supervisor.
+    released: Vec<Value>,
     /// Items this tick will send workers at.
     dispatch: Vec<String>,
     /// Items this tick deliberately did not send, each with the reason it was held back.
@@ -14706,10 +14917,14 @@ struct ItemClaim {
 /// pause is a decision a human has yet to answer. The distinction is carried here so the driver can
 /// say *which* of the two withheld the item instead of reporting one as the other.
 fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, ItemClaim> {
+    // C-724: a claim held against a process that no longer exists is not a claim. Filtered HERE
+    // rather than out of the finished map, so an item two waves both claim keeps the live one's hold
+    // — dropping the entry afterwards would have released it on the abandoned wave's behalf.
+    let abandoned = abandoned_wave_claims(state);
     let mut claims: BTreeMap<String, ItemClaim> = BTreeMap::new();
     for (id, wave) in &state.waves {
         let status = wave["status"].as_str().unwrap_or("unknown");
-        if !wave_still_claims_items(status) {
+        if !wave_still_claims_items(status) || abandoned.contains_key(id) {
             continue;
         }
         let parked = (status == "parked").then(|| {
@@ -14728,6 +14943,92 @@ fn drive_claimed_items(state: &FleetState) -> BTreeMap<String, ItemClaim> {
     claims
 }
 
+/// The release each abandoned wave's claim needs, as one describable record.
+///
+/// Shared by the plan and the mutation so what a tick reports it will do and what it writes cannot
+/// drift apart.
+fn abandoned_claim_releases(state: &FleetState) -> Vec<Value> {
+    abandoned_wave_claims(state)
+        .into_iter()
+        .map(|(wave, pid)| {
+            let items = state
+                .waves
+                .get(&wave)
+                .map_or(Value::Null, |record| record["items"].clone());
+            json!({
+                "wave": wave,
+                "status": WAVE_STATUS_ABANDONED,
+                "supervisor_pid": pid,
+                "items": items,
+                "detail": format!(
+                    "supervisor pid {pid} no longer exists, so the claim it held was released"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Write those releases, and return only what was actually written.
+///
+/// State-only by construction, and that IS the safety argument: it sets a status and records why —
+/// no branch, no worktree, no file is touched — and the status it writes is one no sweep treats as
+/// disposable. wave-745's interrupted worker held a 531-line uncommitted test; a release that reached
+/// for `cancelled` instead would have handed that checkout straight to the reclaimer, because
+/// `fleet cancel` reclaims a wave's storage on the spot.
+///
+/// Re-derived from the state it is handed rather than from a plan computed earlier, so what the tick
+/// reports having released is what a compare-and-set actually persisted.
+fn release_abandoned_claims(state: &mut FleetState) -> Vec<Value> {
+    let mut written = Vec::new();
+    for release in abandoned_claim_releases(state) {
+        let Some(id) = release["wave"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let Some(wave) = state.waves.get_mut(&id) else {
+            continue;
+        };
+        wave["status"] = json!(WAVE_STATUS_ABANDONED);
+        wave["abandoned"] = json!({
+            "supervisor_pid": release["supervisor_pid"],
+            "detail": release["detail"],
+        });
+        written.push(release);
+    }
+    written
+}
+
+/// The planned dispatch set, re-checked against the state a tick actually wrote.
+///
+/// The plan proposes items on the strength of claims it expects to be released. Between the plan and
+/// the dispatch the tick runs its own mutations, and one of them can reinstate a claim: reconstructing
+/// a handoff from an interrupted worker's committed worktree turns a wave with no live supervisor into
+/// a wave holding delivered work, which keeps its items. Sending a worker at one of those would be the
+/// double-write the claim exists to prevent, so the set is verified rather than trusted — and it can
+/// only ever shrink.
+fn drive_dispatch_after_release(
+    state: &FleetState,
+    planned: &[String],
+) -> (Vec<String>, Vec<Value>) {
+    let claimed = drive_claimed_items(state);
+    let mut items = Vec::new();
+    let mut withheld = Vec::new();
+    for item in planned {
+        match claimed.get(item) {
+            Some(claim) => withheld.push(json!({
+                "item": item,
+                "reason": "claimed",
+                "detail": format!(
+                    "wave {} holds a claim on this item again after the tick's own mutations, so \
+                     it was not dispatched",
+                    claim.wave
+                ),
+            })),
+            None => items.push(item.clone()),
+        }
+    }
+    (items, withheld)
+}
+
 /// Compute one tick's decisions. Pure: every input is already-read durable state.
 ///
 /// `reconcile` is `None` when `board reconcile` could not be read, and that case **fails closed**:
@@ -14744,6 +15045,9 @@ fn drive_tick_plan(
         fingerprint: drive_fingerprint(state),
         ..DrivePlan::default()
     };
+    // Before anything reads a claim. Computed unconditionally — a stopped fleet and an unreadable
+    // reconcile both return early below, and neither changes the fact that a supervisor is gone.
+    plan.released = abandoned_claim_releases(state);
     for (id, wave) in &state.waves {
         // A parked wave is one a human is deliberating over. Advancing it would be re-deciding it,
         // which is the behaviour parking exists to stop.
@@ -14989,16 +15293,19 @@ fn drive_one_tick(
     let idle = previous.fingerprint.as_deref() == Some(plan.fingerprint.as_str())
         && plan.dispatch.is_empty()
         && plan.advance.is_empty()
-        && plan.reconstruct.is_empty();
+        && plan.reconstruct.is_empty()
+        && plan.released.is_empty();
 
     let reconstruct = plan.reconstruct.clone();
     let fingerprint = plan.fingerprint.clone();
     let mut advanced = Vec::new();
     let mut reconstructed = Vec::new();
+    let mut released = Vec::new();
     let event = json!({
         "fingerprint": fingerprint,
         "advance": plan.advance,
         "reconstruct": plan.reconstruct,
+        "release": plan.released,
         "dispatch": plan.dispatch,
         "withheld": plan.withheld,
         "blocked": plan.blocked,
@@ -15014,6 +15321,7 @@ fn drive_one_tick(
             // previous attempt observed.
             advanced.clear();
             reconstructed.clear();
+            released.clear();
             for wave in &reconstruct {
                 let reports = record_provisional_handoffs(state, wave);
                 let recorded = reports
@@ -15033,6 +15341,10 @@ fn drive_one_tick(
                     wave["status"] = json!(next);
                 }
             }
+            // C-724, and last for a reason: the two phases above are the ones that can turn an
+            // interrupted wave into one holding delivered work. Releasing before them would free a
+            // claim over commits this same tick was about to record a handoff for.
+            released = release_abandoned_claims(state);
             let record = state.drive.get_or_insert_with(DriveRecord::default);
             record.ticks += 1;
             record.fingerprint = Some(fingerprint.clone());
@@ -15044,6 +15356,14 @@ fn drive_one_tick(
 
     // Dispatch last, and never from the plan's stale view: the phases above moved the very waves
     // whose claims decide what is dispatchable.
+    let (items, reclaimed_by_wave) = drive_dispatch_after_release(&state, &plan.dispatch);
+    let mut withheld = plan.withheld.clone();
+    withheld.extend(reclaimed_by_wave);
+    let plan = DrivePlan {
+        dispatch: items,
+        withheld,
+        ..plan
+    };
     let mut dispatch = json!({
         "width": plan.width,
         "items": plan.dispatch,
@@ -15097,13 +15417,17 @@ fn drive_one_tick(
         },
         "advanced": advanced,
         "reconstructed": reconstructed,
+        // What was written, not what was proposed: `plan.released` is the candidate set and this is
+        // the set that survived the compare-and-set.
+        "released": released,
         "dispatch": dispatch,
     });
     Ok((
         format!(
-            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), dispatched {} item(s), withheld {}",
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}",
             advanced.len(),
             reconstructed.len(),
+            released.len(),
             dispatch["items"].as_array().map_or(0, Vec::len),
             dispatch["withheld"].as_array().map_or(0, Vec::len),
         ),
@@ -21358,6 +21682,306 @@ mod tests {
         assert_eq!(
             released.dispatch,
             vec!["flux/C-1".to_string(), "flux/C-2".to_string()]
+        );
+    }
+
+    /// A pid that is certainly dead: run a child to completion and reap it.
+    ///
+    /// Never a nonsense value instead — `u32::MAX` narrows to `-1`, which `kill` reads as "every
+    /// process this user may signal", so it reports success and every assertion built on it inverts.
+    fn reaped_supervisor_pid() -> u32 {
+        let child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a trivial child");
+        let pid = child.id();
+        let mut child = child;
+        child.wait().expect("reap it");
+        pid
+    }
+
+    /// The `wave-745` record as the fleet actually held it.
+    ///
+    /// Two stories claimed, no handoff recorded against either, and both workers left `working` by one
+    /// supervisor pid. `pid` is what makes the fixture a fixture: pass this process to describe a wave
+    /// that is genuinely running, pass a reaped one to describe the overnight crash.
+    fn wave_745_fixture(pid: u32) -> FleetState {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-745".into(),
+            json!({
+                "id": "wave-745",
+                "status": "awaiting-handoffs",
+                "items": ["flux/C-575", "flux/C-519"],
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "stories": [
+                        {"board_ref": "flux/C-575", "handoff": Value::Null},
+                        {"board_ref": "flux/C-519", "handoff": Value::Null},
+                    ],
+                }]},
+            }),
+        );
+        for (id, board_ref) in [
+            ("wave-745-worker-1", "flux/C-575"),
+            ("wave-745-worker-2", "flux/C-519"),
+        ] {
+            state.agents.insert(
+                id.into(),
+                json!({
+                    "id": id,
+                    "status": "working",
+                    "supervisor_pid": pid,
+                    "assignment": {"wave": "wave-745", "board_ref": board_ref},
+                }),
+            );
+        }
+        state
+    }
+
+    /// C-724 (failing first): a claim must not outlive the process that holds it.
+    ///
+    /// `wave-745`'s supervisor — pid 3513527 — died overnight and the wave went on claiming `C-575`
+    /// and `C-519` against a process that no longer existed. Those two stories sat at the TOP of a
+    /// ready board while 70 of the next 82 drive ticks reported an empty dispatch queue. Nothing
+    /// reclaimed the claim, so a driver crash removed its in-flight items from the schedulable pool
+    /// permanently — the opposite of what an unattended machine should do with an interrupted turn.
+    ///
+    /// The release is the TICK's, not an operator's: this asserts the plan a tick computes from
+    /// durable state alone, with no command typed in between.
+    #[test]
+    fn a_wave_whose_supervisor_is_gone_releases_its_claim_on_the_next_tick() {
+        let dead_pid = reaped_supervisor_pid();
+        let schedule = drive_fixture_schedule(&["flux/C-575", "flux/C-519", "flux/C-1"]);
+        let reconcile = json!({"findings": []});
+
+        // The control, and the whole reason a claim exists: a wave whose supervisor is running holds
+        // its two stories against every other wave, and only the unclaimed item dispatches.
+        let live = wave_745_fixture(std::process::id());
+        let held = drive_tick_plan(&live, &schedule, Some(&reconcile), 8);
+        assert_eq!(
+            held.dispatch,
+            vec!["flux/C-1".to_string()],
+            "a live wave's claim is not the driver's to take"
+        );
+        assert!(held.released.is_empty(), "{:?}", held.released);
+
+        // The defect: the same record, one dead pid.
+        let state = wave_745_fixture(dead_pid);
+        let plan = drive_tick_plan(&state, &schedule, Some(&reconcile), 8);
+
+        assert_eq!(
+            plan.dispatch,
+            vec![
+                "flux/C-575".to_string(),
+                "flux/C-519".to_string(),
+                "flux/C-1".to_string()
+            ],
+            "wave-745 claims C-575 and C-519 against pid {dead_pid}, which no longer exists, so \
+             both are schedulable again; withheld was {:?}",
+            plan.withheld
+        );
+        assert!(
+            !plan
+                .withheld
+                .iter()
+                .any(|withheld| withheld["reason"] == "claimed"),
+            "nothing is withheld as claimed once the claim is released: {:?}",
+            plan.withheld
+        );
+        // The release is reported as its own verified effect, naming the pid that proves it.
+        assert_eq!(plan.released.len(), 1, "{:?}", plan.released);
+        assert_eq!(plan.released[0]["wave"], json!("wave-745"));
+        assert_eq!(plan.released[0]["supervisor_pid"], json!(dead_pid));
+        assert_eq!(
+            plan.released[0]["items"],
+            json!(["flux/C-575", "flux/C-519"])
+        );
+
+        // Delivered work keeps its claim however dead the supervisor is. A wave holding an accepted
+        // handoff has commits waiting for an integrator, and starting a second attempt at that story
+        // is precisely the double-write the claim exists to prevent.
+        let mut delivered = wave_745_fixture(dead_pid);
+        delivered.waves.get_mut("wave-745").unwrap()["topology"]["repositories"][0]["stories"][0]
+            ["status"] = json!("handoff-accepted");
+        let plan = drive_tick_plan(&delivered, &schedule, Some(&reconcile), 8);
+        assert!(plan.released.is_empty(), "{:?}", plan.released);
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+
+        // A park is a decision a human owns, and a dead driver does not answer it.
+        let mut parked = wave_745_fixture(dead_pid);
+        parked.waves.get_mut("wave-745").unwrap()["status"] = json!("parked");
+        let plan = drive_tick_plan(&parked, &schedule, Some(&reconcile), 8);
+        assert!(plan.released.is_empty(), "{:?}", plan.released);
+        assert_eq!(plan.withheld[0]["reason"], "parked");
+
+        // A record written before the pid field existed is judged as live, never released: an
+        // unanswered question is not a licence to take another wave's story.
+        let mut legacy = wave_745_fixture(dead_pid);
+        legacy.agents.get_mut("wave-745-worker-2").unwrap()["supervisor_pid"] = Value::Null;
+        let plan = drive_tick_plan(&legacy, &schedule, Some(&reconcile), 8);
+        assert!(plan.released.is_empty(), "{:?}", plan.released);
+        assert_eq!(plan.dispatch, vec!["flux/C-1".to_string()]);
+    }
+
+    /// C-724 (failing first): releasing a claim must never cost work.
+    ///
+    /// `wave-745` is exactly the case that makes this non-negotiable — its interrupted worker held a
+    /// 531-line failing-first test that was never committed. The claim has to go so the story can be
+    /// scheduled again; the branch, the checkout and every uncommitted byte in it have to stay. The
+    /// two are separate questions and this pins them apart: the released status must free the claim
+    /// and must NOT make the wave's disk disposable to any sweep.
+    ///
+    /// On a runtime because the reclaimer resolves refs through the guarded process boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn releasing_an_abandoned_claim_leaves_the_story_worktree_and_its_uncommitted_work_alone()
+    {
+        let (repository, branch, base, commit) =
+            story_worktree_with_a_commit("c724-release-safety");
+        // The interrupted turn's specification: real work, never committed, invisible to every
+        // mechanism that reads `base..HEAD`.
+        let uncommitted = repository.join("failing_first_test.rs");
+        std::fs::write(
+            &uncommitted,
+            "// a specification the turn never committed\n",
+        )
+        .expect("leave uncommitted work behind");
+
+        let dead_pid = reaped_supervisor_pid();
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-745".into(),
+            json!({
+                "id": "wave-745",
+                "status": "awaiting-handoffs",
+                "items": ["flux/C-575"],
+                "topology": {"repositories": [{
+                    "id": "flux",
+                    "source_root": display_path(&repository),
+                    "canonical_ref": "main",
+                    "base_commit": base,
+                    "stories": [{
+                        "board_ref": "flux/C-575",
+                        "branch": branch,
+                        "base_commit": base,
+                        "worktree": display_path(&repository),
+                        "handoff": Value::Null,
+                    }],
+                }]},
+            }),
+        );
+        state.agents.insert(
+            "wave-745-worker-1".into(),
+            json!({
+                "id": "wave-745-worker-1",
+                "status": "working",
+                "supervisor_pid": dead_pid,
+                "assignment": {"wave": "wave-745", "board_ref": "flux/C-575"},
+            }),
+        );
+
+        // Half one: the claim is gone, so the story is schedulable again.
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&["flux/C-575"]),
+            Some(&json!({"findings": []})),
+            4,
+        );
+        assert_eq!(
+            plan.dispatch,
+            vec!["flux/C-575".to_string()],
+            "the claim is held against pid {dead_pid}, which no longer exists: {:?}",
+            plan.withheld
+        );
+
+        // Half two: the status that release writes must not make the wave's disk disposable. Both
+        // sweeps are asked directly, because it was `cancelled` — the only status that released a
+        // claim before this — that took wave-745's checkout with it.
+        let released_status = plan.released[0]["status"]
+            .as_str()
+            .expect("the release names the status it wrote")
+            .to_string();
+        assert!(
+            !wave_worktrees_are_removable(&released_status),
+            "`{released_status}` must not make a story worktree removable"
+        );
+        assert!(
+            !wave_is_reclaimable(&released_status),
+            "`{released_status}` must not admit an unattended reclaim sweep"
+        );
+
+        let mut wave = state.waves["wave-745"].clone();
+        wave["status"] = json!(released_status);
+        let reclaimed = reclaim_wave_storage(&wave);
+        assert_eq!(
+            reclaimed["worktrees_removed"],
+            json!([]),
+            "a released claim must cost no checkout: {reclaimed}"
+        );
+        assert_eq!(
+            reclaimed["branches"],
+            json!([]),
+            "a released claim must cost no branch: {reclaimed}"
+        );
+        assert!(
+            uncommitted.is_file(),
+            "the interrupted turn's uncommitted specification must survive the release"
+        );
+        assert_eq!(
+            git_output(&repository, &["rev-parse", &branch]).as_deref(),
+            Some(commit.as_str()),
+            "the story branch must still hold the commit it held before"
+        );
+
+        std::fs::remove_dir_all(&repository).ok();
+    }
+
+    /// C-724 (failing first): `doctor` detected the condition and prescribed a remedy that did not fix
+    /// it.
+    ///
+    /// It reported `agent-supervisor-gone` for both of wave-745's workers and prescribed cancelling
+    /// them. Cancelling both did NOT release the wave's claim; only `flux fleet cancel wave-745` did,
+    /// and dispatch went from one item to three. A prescription that leaves its own finding standing
+    /// is worse than none, because it spends the operator's trust before it spends their time.
+    ///
+    /// On a runtime because the branch check resolves refs through the guarded process boundary.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn doctor_reports_a_claim_held_by_a_wave_whose_supervisor_is_gone() {
+        let dead_pid = reaped_supervisor_pid();
+        let state = wave_745_fixture(dead_pid);
+
+        let health = fleet_runtime_health(&state);
+        let findings = health["findings"]
+            .as_array()
+            .expect("doctor reports runtime findings as an array");
+
+        // The claim itself is a finding, naming wave, item and the dead pid.
+        for item in ["flux/C-575", "flux/C-519"] {
+            let claim = findings
+                .iter()
+                .find(|finding| {
+                    finding["check"] == "claim-without-supervisor" && finding["subject"] == item
+                })
+                .unwrap_or_else(|| panic!("{item} is claimed by a wave with no live supervisor, and doctor must say so: {findings:#?}"));
+            let detail = claim["detail"].as_str().unwrap_or_default();
+            assert!(detail.contains("wave-745"), "{detail}");
+            assert!(detail.contains(&dead_pid.to_string()), "{detail}");
+        }
+
+        // And the older finding's prescription names the WAVE. Cancelling the worker is what an
+        // operator did, twice, to no effect.
+        let agent = findings
+            .iter()
+            .find(|finding| finding["check"] == "agent-supervisor-gone")
+            .expect("the worker finding still stands");
+        let fix = agent["fix"].as_str().unwrap_or_default();
+        assert!(
+            fix.starts_with("flux fleet cancel wave-745 "),
+            "the prescription must name the wave whose claim is the problem, not the worker whose \
+             cancellation leaves it standing: {fix}"
+        );
+        assert!(
+            !fix.contains("cancel wave-745-worker"),
+            "cancelling the worker is the remedy that was tried, twice, to no effect: {fix}"
         );
     }
 
