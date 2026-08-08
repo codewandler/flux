@@ -917,9 +917,9 @@ pub(super) enum FleetAction {
     ///
     /// Beyond `validate`'s configuration checks, reports agents recorded active whose supervisor is
     /// gone, waves wedged mid-integration, worktrees a topology names that disk lacks, items claimed by
-    /// more than one live wave, and branches left at their pinned base holding nothing unique. Each
-    /// finding carries its own next action; runtime findings do not fail the run, so `data.runtime` is
-    /// the machine-readable verdict.
+    /// more than one live wave, story worktrees holding work no commit has, and branches left at their
+    /// pinned base holding nothing unique. Each finding carries its own next action; runtime findings do
+    /// not fail the run, so `data.runtime` is the machine-readable verdict.
     Doctor,
     Refresh,
     /// Reclaim a finished wave's build output, and its worktrees if they provably hold no work.
@@ -939,6 +939,23 @@ pub(super) enum FleetAction {
     Repair {
         /// Wave whose recorded structure should be rebuilt.
         wave: String,
+    },
+    /// Commit the work a story worker left uncommitted onto that story's own branch.
+    ///
+    /// The recovery half of a story worktree. An interrupted turn leaves its work uncommitted —
+    /// that is the normal state, not a failure — and until now saving it took hand-running `git add`
+    /// and `git commit` inside a directory the fleet owns, which the operating rules forbid and no
+    /// operator should have to improvise under time pressure. Every input is already recorded: the
+    /// checkout, the branch it is on, and the story it belongs to.
+    Capture {
+        /// Wave whose story worktrees should be captured.
+        wave: String,
+        /// Capture only this story. Omit to capture every story worktree of the wave that holds work.
+        #[arg(long, value_name = "BOARD/ITEM")]
+        item: Option<String>,
+        /// Commit subject. A default naming the wave and the story is used when omitted.
+        #[arg(long)]
+        message: Option<String>,
     },
     Validate,
     Start,
@@ -4986,6 +5003,18 @@ worktree_root = ".flux/fleet/worktrees"
             reclaim_finished_waves(command, root, state, target.as_deref())
         }
         FleetAction::Repair { wave } => repair_wave_structure(command, root, state, wave),
+        FleetAction::Capture {
+            wave,
+            item,
+            message,
+        } => capture_story_work(
+            command,
+            root,
+            state,
+            wave,
+            item.as_deref(),
+            message.as_deref(),
+        ),
         FleetAction::Start => {
             state.running = true;
             state.main_agent.status = "running".into();
@@ -6112,6 +6141,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Note { .. }
             | FleetAction::Reclaim { .. }
             | FleetAction::Repair { .. }
+            | FleetAction::Capture { .. }
             | FleetAction::Drive { .. }
     ) || matches!(action, FleetAction::Call { operation } if !matches!(operation.as_str(), "status" | "schedule" | "schema"))
 }
@@ -6260,6 +6290,8 @@ fn fleet_operations() -> &'static [&'static str] {
         // side.
         "reclaim",
         "repair",
+        // Capture MUTATES: it commits a worker's uncommitted work onto the story's own branch.
+        "capture",
         "validate",
         "start",
         "stop",
@@ -11266,6 +11298,50 @@ fn worker_dirt(porcelain: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The path a `git status --porcelain` entry refers to.
+///
+/// A rename entry names both sides (`R  old -> new`); the new path is the one on disk, and the one a
+/// report about *what is here now* has to name.
+fn porcelain_path(entry: &str) -> &str {
+    let path = entry.get(3..).unwrap_or("").trim();
+    path.rsplit(" -> ").next().unwrap_or(path)
+}
+
+/// Every uncommitted file a checkout is holding — tracked modifications and untracked files alike.
+///
+/// `-uall` deliberately. The default collapses an untracked directory into a single `?? dir/` entry,
+/// so a report built on it cannot tell one stray file from a day's work, and the count is most of
+/// what makes the finding actionable. `.gitignore` is still honoured, so regenerable output never
+/// counts as work; `worker_dirt` removes Fleet's own loop-binding snapshot for the same reason.
+///
+/// `None` when the checkout is present and git could not be asked. Every caller treats that as "may
+/// hold work", the same asymmetry `orphan_holds_no_work` and `worktree_holds_work` keep: the cost of
+/// retaining a dead checkout is disk, and the cost of the other mistake is somebody's uncommitted
+/// afternoon.
+fn uncommitted_files(worktree: &Path) -> Option<Vec<String>> {
+    let output = guarded_git(worktree, &["status", "--porcelain", "-uall"]).ok()?;
+    if output.exit_code != 0 {
+        return None;
+    }
+    // Deliberately not `git_output`: it trims the whole buffer, which eats the leading space of a
+    // ` M path` entry and shifts every column of the first line by one.
+    Some(
+        worker_dirt(&output.stdout)
+            .into_iter()
+            .map(|entry| porcelain_path(entry).to_string())
+            .collect(),
+    )
+}
+
+/// Is this the checkout a story worker was given, rather than structure the fleet derives for itself?
+///
+/// The distinction is the whole reason the uncommitted-work check exists. An integration or verify
+/// checkout is an assembly the fleet can rebuild from the story branches; a story worktree is the
+/// only place an interrupted worker's unfinished work exists.
+fn is_story_worktree_role(role: &str) -> bool {
+    !matches!(role, "integration" | "verify")
+}
+
 /// Regenerable build output that must never outlive the wave that produced it.
 const RECLAIMABLE_BUILD_DIRS: [&str; 2] = ["target", "node_modules"];
 
@@ -11423,11 +11499,14 @@ fn wave_worktrees(wave: &Value) -> Vec<WaveWorktree> {
 }
 
 /// The runtime questions `fleet doctor` answers, in report order.
-const FLEET_RUNTIME_CHECKS: [&str; 5] = [
+const FLEET_RUNTIME_CHECKS: [&str; 6] = [
     "agent-supervisor-gone",
     "wave-wedged",
     "worktree-missing",
     "item-double-claimed",
+    // Deliberately ahead of the branch check: it answers the same situation with the opposite
+    // prescription, and only one of the two may reach the operator.
+    "story-worktree-holds-uncommitted-work",
     "branch-without-unique-work",
 ];
 
@@ -11619,6 +11698,137 @@ fn stale_branch_findings(
     findings
 }
 
+/// One story worktree a wave still names, and the uncommitted work it is sitting on.
+struct StoryWorktreeWork {
+    wave: String,
+    /// The story's BoardRef, which is also what `flux fleet capture --item` takes.
+    story: String,
+    branch: Option<String>,
+    worktree: PathBuf,
+    /// The uncommitted paths, or `None` when the checkout is present and git could not be asked.
+    files: Option<Vec<String>>,
+}
+
+/// Every story worktree on disk holding something no commit has.
+///
+/// **Deliberately not filtered by wave status or worker liveness**, and the temptation to do so is
+/// the defect wearing a different hat. Suppressing it while a turn is in flight sounds like noise
+/// control and is exactly wrong: mid-turn IS the window in which the host dies, and wave-745 died in
+/// it — workers still recorded working, no `turn_end`, `last_turn: null`. A check that stayed quiet
+/// until the turn ended would have said nothing about the one wave it exists for. The other end is
+/// no better: reclamation only reaches its removal decision for a wave that has *finished*, so a
+/// finished wave's dirty story checkout is the one about to be deleted.
+///
+/// The cost is one `git status` per story checkout that is actually on disk — bounded by the live
+/// waves' width, since a reclaimed wave has no checkouts left, and this is not a question that can
+/// be batched into a single call the way branch heads can.
+///
+/// The inspector is injected so the walk is testable without a checkout, the same way
+/// [`stale_branch_findings`] injects its head resolver. A worktree the topology names and disk lacks
+/// is skipped here; `missing_worktree_findings` already owns that question.
+fn story_worktrees_holding_work(
+    state: &FleetState,
+    inspect: impl Fn(&Path) -> Option<Vec<String>>,
+) -> Vec<StoryWorktreeWork> {
+    let mut holding = Vec::new();
+    for (id, wave) in &state.waves {
+        for named in wave_worktrees(wave) {
+            if !is_story_worktree_role(&named.role) || !named.worktree.is_dir() {
+                continue;
+            }
+            let files = inspect(&named.worktree);
+            if files.as_ref().is_some_and(Vec::is_empty) {
+                continue;
+            }
+            holding.push(StoryWorktreeWork {
+                wave: id.clone(),
+                story: named.role.clone(),
+                branch: named.branch.clone(),
+                worktree: named.worktree.clone(),
+                files,
+            });
+        }
+    }
+    holding
+}
+
+/// A story worktree holding work that no commit, and therefore no other mechanism, can see.
+///
+/// wave-745 died with a 531-line failing-first specification sitting untracked in one of these, and
+/// every part of the fleet agreed it did not exist: `handoff --from-worktree` derives the write set
+/// from `base..HEAD`, the branch was still at its pinned base, and the fix `doctor` prescribed was
+/// the command documented to delete worktrees that provably hold no work. Uncommitted is the normal
+/// state of a worker that was interrupted; treating it as absence is what turns an interrupted turn
+/// into lost work.
+///
+/// The count is part of the finding rather than a follow-up `git status`, because "there is
+/// something here" and "there are forty files here" are different operator decisions.
+fn uncommitted_work_findings(holding: &[StoryWorktreeWork]) -> Vec<Value> {
+    holding
+        .iter()
+        .map(|held| {
+            let detail = match &held.files {
+                Some(files) => format!(
+                    "wave {} left {} uncommitted file(s) in the story worktree for {}, which no \
+                     commit and no branch can see: {}",
+                    held.wave,
+                    files.len(),
+                    held.story,
+                    named_sample(files)
+                ),
+                None => format!(
+                    "wave {} names this story worktree for {} and git could not be asked what it \
+                     holds, so it may be the only copy of an interrupted turn's work",
+                    held.wave, held.story
+                ),
+            };
+            runtime_finding(
+                "story-worktree-holds-uncommitted-work",
+                &display_path(&held.worktree),
+                detail,
+                format!("flux fleet capture {} --item {}", held.wave, held.story),
+            )
+        })
+        .collect()
+}
+
+/// A few names plus a count, so a finding stays one readable line however much the worker wrote.
+fn named_sample(files: &[String]) -> String {
+    const SHOWN: usize = 3;
+    let head = files.iter().take(SHOWN).cloned().collect::<Vec<_>>();
+    match files.len().checked_sub(SHOWN) {
+        Some(rest) if rest > 0 => format!("{} and {rest} more", head.join(", ")),
+        _ => head.join(", "),
+    }
+}
+
+/// Drop the "holds no commit of its own" findings that a dirty story worktree already answers.
+///
+/// Both checks fire on exactly the situation wave-745 was in — a branch sitting at its pinned base
+/// with a worktree full of uncommitted work — and they prescribe opposite actions: capture the work,
+/// or run the sweep that removes it. The emptiness is true of the *branch* and false of the
+/// *worktree*, so the branch finding is the misleading half and it is the half that goes.
+///
+/// Only for branches that are still checked out somewhere holding work. A wave's other empty
+/// branches are ordinary scaffolding and keep reporting as such.
+fn without_branches_holding_uncommitted_work(
+    stale: Vec<Value>,
+    holding: &[StoryWorktreeWork],
+) -> Vec<Value> {
+    let dirty = holding
+        .iter()
+        .filter_map(|held| held.branch.as_deref())
+        .collect::<BTreeSet<_>>();
+    stale
+        .into_iter()
+        .filter(|finding| {
+            !finding["subject"]
+                .as_str()
+                .is_some_and(|branch| dirty.contains(branch))
+        })
+        .collect()
+}
+
 /// The runtime half of `fleet doctor`: everything the fleet already records and offered no way to ask.
 ///
 /// Read-only by construction — every check reads recorded state, the filesystem, or a `for-each-ref`
@@ -11626,11 +11836,16 @@ fn stale_branch_findings(
 /// (cancel this, retry that), and a diagnostic that exits non-zero on a wedged wave is one a driver
 /// stops being able to poll. `healthy` is the machine-readable verdict for a caller that wants a gate.
 fn fleet_runtime_health(state: &FleetState) -> Value {
+    let holding = story_worktrees_holding_work(state, uncommitted_files);
     let mut findings = dead_supervisor_findings(state);
     findings.extend(wedged_wave_findings(state));
     findings.extend(missing_worktree_findings(state));
     findings.extend(double_claimed_findings(state));
-    findings.extend(stale_branch_findings(state, git_fleet_branch_heads));
+    findings.extend(uncommitted_work_findings(&holding));
+    findings.extend(without_branches_holding_uncommitted_work(
+        stale_branch_findings(state, git_fleet_branch_heads),
+        &holding,
+    ));
     json!({
         "healthy": findings.is_empty(),
         "checks": FLEET_RUNTIME_CHECKS,
@@ -11697,6 +11912,30 @@ fn prune_wave_branch(source: &Path, branch: &str, base: Option<&str>, dry_run: b
             "deleted": false,
             "reason": "its head could not be resolved, so nothing can be concluded about its contents",
         }),
+    }
+}
+
+/// Why reclamation is leaving a worktree where it is, in terms an operator can act on.
+///
+/// "Holds uncommitted changes or commits absent from the canonical ref" was true and unusable: it
+/// named two possibilities, neither a count nor a next command, so the only way to find out which
+/// one applied — and whether anything was at risk — was to run `git status` by hand in a directory
+/// the fleet owns. The retained worktrees are few, so the extra inspection is cheap; being unable to
+/// tell a stale checkout from an interrupted worker's afternoon is not.
+fn retention_reason(uncommitted: Option<&[String]>) -> String {
+    match uncommitted {
+        Some([]) => {
+            "holds commits that are reachable from no branch, tag or canonical ref".to_string()
+        }
+        Some(files) => format!(
+            "holds {} uncommitted file(s) that exist nowhere else; capture them with `flux fleet \
+             capture` before reclaiming ({})",
+            files.len(),
+            named_sample(files)
+        ),
+        None => {
+            "could not be inspected, so nothing can be concluded about what it holds".to_string()
+        }
     }
 }
 
@@ -11781,7 +12020,7 @@ fn reclaim_wave_storage_inner(wave: &Value, dry_run: bool) -> Value {
                 }
                 Ok(true) => retained.push(json!({
                     "worktree": display_path(&worktree),
-                    "reason": "holds uncommitted changes or commits absent from the canonical ref",
+                    "reason": retention_reason(uncommitted_files(&worktree).as_deref()),
                 })),
                 Err(error) => retained.push(json!({
                     "worktree": display_path(&worktree),
@@ -12156,6 +12395,279 @@ fn repair_wave_structure(
     let data = json!({"wave": wave_id, "dry_run": command.dry_run, "worktrees": outcomes});
     persist_fleet_mutation(command, root, &state, "wave.repaired", data.clone())?;
     Ok((summary, data, vec![], state.revision))
+}
+
+/// Everything `capture` needs to be true before it commits, or the reason it refuses.
+///
+/// Kept apart from the git that carries it out for the same reason [`plan_worktree_repair`] is: the
+/// risk lives entirely in the decision, and a commit landing somewhere other than the story's own
+/// branch is a failure that looks exactly like a success in the report.
+enum CapturePlan<'a> {
+    /// Commit these paths onto `branch`.
+    Commit {
+        branch: &'a str,
+        files: Vec<String>,
+    },
+    /// Nothing to do — a checkout with no uncommitted work is the state capture is trying to reach.
+    Clean,
+    Refused(String),
+}
+
+/// Decide whether one story worktree may be captured, from what disk and git can be asked.
+///
+/// The refusals are the contract. A detached checkout, or one that has been moved onto some other
+/// branch, would take the commit somewhere the story does not name — and a commit on a detached HEAD
+/// is reachable only from the reflog, which is exactly the invisibility this story exists to end.
+fn plan_story_capture<'a>(worktree: &Path, branch: Option<&'a str>) -> CapturePlan<'a> {
+    if !worktree.is_dir() {
+        return CapturePlan::Refused(
+            "the wave names this checkout and disk does not have it; `flux fleet repair` rebuilds \
+             recorded structure"
+                .to_string(),
+        );
+    }
+    let Some(branch) = branch else {
+        return CapturePlan::Refused(
+            "the wave recorded no branch for this story, so there is nowhere to commit".to_string(),
+        );
+    };
+    match git_output(worktree, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
+        Some(checked_out) if checked_out == branch => {}
+        Some(checked_out) => {
+            return CapturePlan::Refused(format!(
+                "the checkout is on {checked_out}, not the story's own branch {branch}"
+            ));
+        }
+        None => {
+            return CapturePlan::Refused(
+                "the checkout has a detached HEAD, so a commit here would be reachable from \
+                 nothing; `flux fleet repair` puts a checkout back on its branch"
+                    .to_string(),
+            );
+        }
+    }
+    match uncommitted_files(worktree) {
+        Some(files) if files.is_empty() => CapturePlan::Clean,
+        Some(files) => CapturePlan::Commit { branch, files },
+        None => CapturePlan::Refused(
+            "the checkout could not be inspected, so what it holds is unknown and nothing may be \
+             staged from it"
+                .to_string(),
+        ),
+    }
+}
+
+/// The message a captured commit carries when the operator supplies none.
+///
+/// It says what happened and what produced it, because the reader of this commit is somebody
+/// reconstructing an interrupted wave months later, working from `git log` alone.
+fn capture_commit_message(wave: &str, story: &str, files: usize, message: Option<&str>) -> String {
+    let subject = message
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("wip({story}): capture uncommitted work from {wave}"));
+    let item = story.rsplit('/').next().unwrap_or(story);
+    format!(
+        "{subject}\n\n- {files} file(s) the worker left uncommitted in its story worktree\n- \
+         captured by flux fleet capture, which commits on the story's own branch so an interrupted \
+         turn's work survives without hand-running git\n\nRefs: {item}\n"
+    )
+}
+
+/// Capture one story worktree, and report a VERIFIED effect rather than a git exit code.
+///
+/// `git commit` exiting 0 is not proof a commit was made — a fully ignored working tree, a hook that
+/// unstages, an `--allow-empty`-shaped edge — so the head is read before and after and the outcome
+/// is the difference between them. That is the whole discipline this epic exists for: reclamation
+/// reported "reclaimed 39 wave(s)" over zero effects for nineteen runs because it counted intent.
+fn capture_story_worktree(
+    wave: &str,
+    named: &WaveWorktree,
+    message: Option<&str>,
+    dry_run: bool,
+) -> Value {
+    let outcome = match plan_story_capture(&named.worktree, named.branch.as_deref()) {
+        CapturePlan::Clean => json!({"action": "clean"}),
+        CapturePlan::Refused(reason) => json!({"action": "refused", "reason": reason}),
+        CapturePlan::Commit { branch, files } if dry_run => {
+            json!({"action": "would_capture", "branch": branch, "files": files})
+        }
+        CapturePlan::Commit { branch, files } => {
+            let before = git_output(&named.worktree, &["rev-parse", "HEAD"]);
+            // Stage everything except Fleet's own loop-binding snapshot, by pathspec rather than by
+            // the listed paths: a pathspec cannot be defeated by a filename git had to quote, and
+            // `--all` honours `.gitignore` exactly as the listing that produced `files` did.
+            let staged = guarded_git(
+                &named.worktree,
+                &["add", "--all", "--", ".", ":(exclude).flux"],
+            );
+            match staged {
+                Ok(output) if output.exit_code == 0 => {}
+                Ok(output) => {
+                    return capture_entry(
+                        wave,
+                        named,
+                        json!({
+                            "action": "failed",
+                            "reason": format!("git could not stage the work: {}", clipped_redacted(output.stderr.as_bytes())),
+                        }),
+                    );
+                }
+                Err(error) => {
+                    return capture_entry(
+                        wave,
+                        named,
+                        json!({"action": "failed", "reason": format!("could not stage the work: {error:#}")}),
+                    );
+                }
+            }
+            let body = capture_commit_message(wave, &named.role, files.len(), message);
+            // `--no-verify` on purpose. This runs on a checkout whose work is by definition
+            // unfinished, and a repository hook that rejects work in progress is precisely what
+            // would leave the operator back at hand-running git — which is the defect, not the fix.
+            let committed = guarded_git(
+                &named.worktree,
+                &["commit", "--no-verify", "-m", body.as_str()],
+            );
+            let after = git_output(&named.worktree, &["rev-parse", "HEAD"]);
+            match (committed, after) {
+                (Ok(output), Some(head))
+                    if output.exit_code == 0 && Some(&head) != before.as_ref() =>
+                {
+                    json!({
+                        "action": "captured",
+                        "branch": branch,
+                        "commit": head,
+                        "files": files,
+                        // Proof rather than assumption: what the checkout still holds afterwards.
+                        "still_uncommitted": uncommitted_files(&named.worktree).map(|rest| rest.len()),
+                    })
+                }
+                (Ok(output), _) => json!({
+                    "action": "failed",
+                    "reason": format!(
+                        "git left the branch at {}: {}",
+                        before.as_deref().unwrap_or("its previous head"),
+                        clipped_redacted(output.stderr.as_bytes())
+                    ),
+                }),
+                (Err(error), _) => {
+                    json!({"action": "failed", "reason": format!("could not commit: {error:#}")})
+                }
+            }
+        }
+    };
+    capture_entry(wave, named, outcome)
+}
+
+/// One capture outcome, addressed the way an operator would name it again.
+fn capture_entry(wave: &str, named: &WaveWorktree, capture: Value) -> Value {
+    json!({
+        "wave": wave,
+        "repository": named.repository,
+        "story": named.role,
+        "worktree": display_path(&named.worktree),
+        "branch": named.branch,
+        "capture": capture,
+    })
+}
+
+/// Commit what a wave's interrupted story workers left uncommitted, onto their own branches.
+///
+/// The verb wave-745 did not have. It died overnight with a 531-line failing-first specification
+/// untracked in a story worktree, and the fleet's every mechanism read that as a worker that had
+/// done nothing: the write set comes from `base..HEAD`, the branch was still at its pinned base, and
+/// `doctor` prescribed the sweep that deletes empty checkouts. Reporting the work (see
+/// `uncommitted_work_findings`) is only half a fix — without somewhere to send the operator, the
+/// finding's honest next action would have been "run git by hand in a directory the fleet owns".
+///
+/// Story worktrees only. An integration or verify checkout is an assembly the fleet rebuilds from
+/// the story branches, so its uncommitted state is not a deliverable and committing it would invent
+/// history nothing asked for.
+fn capture_story_work(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    wave_id: &str,
+    item: Option<&str>,
+    message: Option<&str>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let record = state
+        .waves
+        .get(wave_id)
+        .cloned()
+        .with_context(|| format!("not-found: wave {wave_id}"))?;
+    if !record["topology"].is_object() {
+        bail!("not-found: wave {wave_id} has no recorded topology, so it names no story worktree")
+    }
+    let stories = wave_worktrees(&record)
+        .into_iter()
+        .filter(|named| is_story_worktree_role(&named.role))
+        .filter(|named| item.is_none_or(|wanted| wanted == named.role))
+        .collect::<Vec<_>>();
+    if stories.is_empty() {
+        match item {
+            Some(wanted) => {
+                bail!("not-found: wave {wave_id} names no story worktree for {wanted}")
+            }
+            None => bail!("not-found: wave {wave_id} names no story worktree"),
+        }
+    }
+    let outcomes = stories
+        .iter()
+        .map(|named| capture_story_worktree(wave_id, named, message, command.dry_run))
+        .collect::<Vec<_>>();
+    let counted = |action: &str| {
+        outcomes
+            .iter()
+            .filter(|outcome| outcome["capture"]["action"] == action)
+            .count()
+    };
+    let captured = counted(if command.dry_run {
+        "would_capture"
+    } else {
+        "captured"
+    });
+    let files: usize = outcomes
+        .iter()
+        .filter_map(|outcome| outcome["capture"]["files"].as_array().map(Vec::len))
+        .sum();
+    let verb = if command.dry_run {
+        "would capture"
+    } else {
+        "captured"
+    };
+    let summary = format!(
+        "wave {wave_id}: {verb} {captured} story worktree(s) holding {files} file(s); {} already \
+         clean, {} refused, {} failed",
+        counted("clean"),
+        counted("refused"),
+        counted("failed"),
+    );
+    let data = json!({"wave": wave_id, "dry_run": command.dry_run, "stories": outcomes});
+    // Journalled only when something was actually committed, for the reason reclamation learned the
+    // hard way: a no-op that bumps the revision and writes an event is indistinguishable from
+    // progress in the record an operator reads afterwards.
+    if captured > 0 && !command.dry_run {
+        state.revision += 1;
+        persist_fleet_mutation(command, root, &state, "wave.captured", data.clone())?;
+    }
+    let warnings = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome["capture"]["action"].as_str(),
+                Some("refused" | "failed")
+            )
+        })
+        .map(|outcome| {
+            format!(
+                "{}: {}",
+                outcome["story"].as_str().unwrap_or_default(),
+                outcome["capture"]["reason"].as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    Ok((summary, data, warnings, state.revision))
 }
 
 /// Per repository, the operations `binding` requires that the repository will not surface.
@@ -18987,6 +19499,344 @@ mod tests {
             (0, 0, 1),
             "the reported count is derived from verified effects, never from candidates"
         );
+    }
+
+    /// The wave-745 fixture, built for real: a story worktree sitting exactly at its pinned base
+    /// whose only content is one untracked file.
+    ///
+    /// Returns the fleet root, the source checkout, the story worktree, and the wave record. The
+    /// source repository lives beside the worktree root rather than above it, so the checkout under
+    /// inspection contains nothing but what the fixture put there.
+    fn interrupted_worker_fixture(label: &str) -> (PathBuf, PathBuf, PathBuf, Value) {
+        let root = reclaim_test_dir(label);
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("src");
+        std::fs::create_dir_all(source.join(".flux/fleet")).expect("scratch dirs");
+        std::fs::create_dir_all(root.join(".flux/fleet")).expect("fleet root");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&source, &argv).expect("git setup");
+        }
+        std::fs::write(source.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&source, &["add", "."]).expect("add base");
+        guarded_git(&source, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&source, &["rev-parse", "HEAD"]).expect("base sha");
+
+        let branch = "fleet/wave-745/flux/story/C-575";
+        let worktree = root.join("worktrees/wave-745/flux/stories/C-575");
+        let path = worktree.display().to_string();
+        guarded_git(
+            &source,
+            &["worktree", "add", "-b", branch, path.as_str(), &base],
+        )
+        .expect("story worktree at the pinned base");
+        // The whole fixture: 531 lines of failing-first specification that no commit has.
+        std::fs::create_dir_all(worktree.join("crates/flux-runtime/tests")).expect("test dir");
+        std::fs::write(
+            worktree.join("crates/flux-runtime/tests/resource_receipts.rs"),
+            "// the specification wave-745 never committed\n".repeat(531),
+        )
+        .expect("write the untracked specification");
+
+        let wave = json!({
+            "id": "wave-745",
+            // Finished for good, so reclamation reaches its removal decision rather than stopping
+            // at "the wave is not finished". This is the wave whose worktrees it may delete.
+            "status": "cancelled",
+            "items": ["flux/C-575"],
+            "topology": {"repositories": [{
+                "id": "flux",
+                "source_root": source.display().to_string(),
+                "canonical_ref": "main",
+                "base_commit": base,
+                "stories": [{
+                    "board_ref": "flux/C-575",
+                    "branch": branch,
+                    "worktree": path,
+                }],
+            }]},
+        });
+        (root, source, worktree, wave)
+    }
+
+    /// C-722: a worker that does real work and never commits it must not read as a worker that did
+    /// nothing.
+    ///
+    /// wave-745 died with a 531-line failing-first specification sitting untracked in its story
+    /// worktree, and three independent mechanisms agreed the work did not exist: the write set comes
+    /// from `base..HEAD`, `doctor` reported the branch as `branch-without-unique-work`, and the fix
+    /// it prescribed was `reclaim` — the command documented to delete worktrees that provably hold
+    /// no work. Uncommitted is the normal state of an interrupted worker, so all three had to change
+    /// together: report it, refuse to sweep it, and offer a verb that captures it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_interrupted_workers_untracked_file_is_reported_and_survives_every_sweep() {
+        let (root, source, worktree, wave) = interrupted_worker_fixture("uncommitted-story");
+        let specification = worktree.join("crates/flux-runtime/tests/resource_receipts.rs");
+        let branch = "fleet/wave-745/flux/story/C-575";
+
+        let mut state = FleetState::default();
+        state.waves.insert("wave-745".into(), wave.clone());
+
+        // 1. Doctor names the worktree, the wave, the story and the file count.
+        let runtime = fleet_runtime_health(&state);
+        let findings = runtime["findings"].as_array().expect("findings array");
+        let dirty = findings
+            .iter()
+            .find(|finding| finding["check"] == "story-worktree-holds-uncommitted-work")
+            .unwrap_or_else(|| panic!("the uncommitted specification must be reported: {runtime}"));
+        assert_eq!(dirty["subject"], json!(display_path(&worktree)));
+        let detail = dirty["detail"].as_str().unwrap_or_default();
+        for expected in ["wave-745", "flux/C-575", "1 uncommitted file"] {
+            assert!(
+                detail.contains(expected),
+                "detail names {expected}: {detail}"
+            );
+        }
+        assert_eq!(
+            runtime["healthy"],
+            json!(false),
+            "a fleet holding uncommitted work is not healthy: {runtime}"
+        );
+
+        // 2. The dirty finding takes precedence: the branch IS at its pinned base, so the empty
+        //    finding is true of the branch and false of the work — and it prescribes `reclaim`.
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding["check"] != "branch-without-unique-work"),
+            "the empty-branch finding must not also fire on a worktree holding work: {runtime}"
+        );
+        assert!(
+            findings.iter().all(|finding| !finding["fix"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("reclaim")),
+            "nothing here may prescribe the command that deletes it: {runtime}"
+        );
+
+        // 3. Reclamation refuses the worktree and says why, in terms that name the next command.
+        let reclaimed = reclaim_wave_storage(&wave);
+        assert_eq!(
+            reclaimed["worktrees_removed"].as_array().map(Vec::len),
+            Some(0),
+            "the checkout holding the only copy of the work is never removed: {reclaimed}"
+        );
+        let retained = reclaimed["worktrees_retained"]
+            .as_array()
+            .and_then(|entries| entries.first())
+            .cloned()
+            .unwrap_or_default();
+        let reason = retained["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("1 uncommitted file") && reason.contains("flux fleet capture"),
+            "the refusal names what it found and how to save it: {reclaimed}"
+        );
+        assert!(
+            git_output(
+                &source,
+                &["rev-parse", "--verify", &format!("refs/heads/{branch}")]
+            )
+            .is_some(),
+            "the branch holding the worktree must survive too"
+        );
+        assert!(
+            specification.is_file(),
+            "the file itself must still be there"
+        );
+
+        // 4. And it is recoverable THROUGH THE CLI — the exact command the finding prescribed.
+        let action = FleetAction::Capture {
+            wave: "wave-745".to_string(),
+            item: Some("flux/C-575".to_string()),
+            message: None,
+        };
+        let (human, data, _, revision) =
+            run_fleet_action(&fleet_command(&root, action), &root, state.clone(), None)
+                .expect("capture runs against the recorded topology");
+        assert_eq!(
+            revision, 1,
+            "a capture that committed is a recorded mutation"
+        );
+        let capture = &data["stories"][0]["capture"];
+        assert_eq!(
+            capture["action"],
+            json!("captured"),
+            "the work is committed, not merely described: {data}"
+        );
+        assert_eq!(
+            capture["files"],
+            json!(["crates/flux-runtime/tests/resource_receipts.rs"]),
+            "the captured file is named: {data}"
+        );
+        assert_eq!(
+            capture["still_uncommitted"],
+            json!(0),
+            "the effect is verified against the worktree, not assumed: {data}"
+        );
+        assert!(
+            human.contains("captured 1 story worktree(s) holding 1 file(s)"),
+            "the human line reports the effect: {human}"
+        );
+
+        // The commit landed on the STORY'S OWN branch, and the file is now in its tree.
+        let head = git_output(&source, &["rev-parse", &format!("refs/heads/{branch}")])
+            .expect("the story branch still resolves");
+        assert_eq!(
+            capture["commit"],
+            json!(head),
+            "the reported commit is the branch's new head: {data}"
+        );
+        assert!(
+            git_output(
+                &source,
+                &[
+                    "cat-file",
+                    "-e",
+                    &format!("{head}:crates/flux-runtime/tests/resource_receipts.rs")
+                ]
+            )
+            .is_some(),
+            "the specification is in the branch's tree, reachable without the worktree"
+        );
+
+        // Which is what finally makes the branch honest: it now holds a commit of its own, so the
+        // three mechanisms that could not see the work all can.
+        let recovered = fleet_runtime_health(&state);
+        assert!(
+            recovered["findings"]
+                .as_array()
+                .is_some_and(|findings| findings.is_empty()),
+            "nothing is left to report once the work is on its branch: {recovered}"
+        );
+
+        // Capturing again is a no-op that says so rather than inventing an empty commit.
+        let (_, again, _, unchanged) = run_fleet_action(
+            &fleet_command(
+                &root,
+                FleetAction::Capture {
+                    wave: "wave-745".to_string(),
+                    item: None,
+                    message: None,
+                },
+            ),
+            &root,
+            state,
+            None,
+        )
+        .expect("a second capture is allowed");
+        assert_eq!(again["stories"][0]["capture"]["action"], json!("clean"));
+        assert_eq!(
+            unchanged, 0,
+            "a capture that changed nothing is not a revision"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Capture must never take a commit somewhere the story does not name.
+    ///
+    /// A detached checkout is the dangerous one: `git commit` succeeds, reports a sha, and the
+    /// result is reachable only from the reflog — the same invisibility this story exists to end,
+    /// reached by the verb meant to fix it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capture_refuses_any_checkout_that_is_not_on_the_storys_own_branch() {
+        let (root, _, worktree, _) = interrupted_worker_fixture("capture-detached");
+        let branch = "fleet/wave-745/flux/story/C-575";
+        guarded_git(&worktree, &["checkout", "--detach"]).expect("detach the checkout");
+
+        match plan_story_capture(&worktree, Some(branch)) {
+            CapturePlan::Refused(reason) => assert!(
+                reason.contains("detached"),
+                "the refusal names the reason: {reason}"
+            ),
+            _ => panic!("a detached checkout must never be committed to"),
+        }
+        assert!(
+            matches!(plan_story_capture(&worktree, None), CapturePlan::Refused(_)),
+            "a story with no recorded branch has nowhere to commit"
+        );
+        assert!(
+            matches!(
+                plan_story_capture(&root.join("nowhere"), Some(branch)),
+                CapturePlan::Refused(_)
+            ),
+            "an absent checkout is repair's problem, not capture's"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The precedence rule, isolated from any checkout: only the branch of a worktree that is
+    /// actually holding work loses its `branch-without-unique-work` finding.
+    #[test]
+    fn only_a_dirty_worktrees_own_branch_stops_reporting_as_empty() {
+        let holding = [StoryWorktreeWork {
+            wave: "wave-745".into(),
+            story: "flux/C-575".into(),
+            branch: Some("fleet/wave-745/flux/story/C-575".into()),
+            worktree: PathBuf::from("/w/C-575"),
+            files: Some(vec!["spec.rs".into()]),
+        }];
+        let stale = vec![
+            runtime_finding(
+                "branch-without-unique-work",
+                "fleet/wave-745/flux/story/C-575",
+                "at its pinned base".into(),
+                "flux fleet reclaim wave-745".into(),
+            ),
+            runtime_finding(
+                "branch-without-unique-work",
+                "fleet/wave-745/flux/integration",
+                "at its pinned base".into(),
+                "flux fleet reclaim wave-745".into(),
+            ),
+        ];
+
+        let kept = without_branches_holding_uncommitted_work(stale, &holding);
+        assert_eq!(
+            kept.iter()
+                .map(|finding| finding["subject"].as_str().unwrap_or_default())
+                .collect::<Vec<_>>(),
+            vec!["fleet/wave-745/flux/integration"],
+            "an ordinary empty branch is still ordinary scaffolding"
+        );
+    }
+
+    /// `-uall` is load-bearing: the default collapses an untracked directory to one entry, so a
+    /// worker's whole afternoon and a single stray file are indistinguishable — and the count is
+    /// most of what makes the finding worth reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn uncommitted_work_is_counted_per_file_and_excludes_fleets_own_snapshot() {
+        let (root, _, worktree, _) = interrupted_worker_fixture("uncommitted-count");
+        std::fs::write(
+            worktree.join("crates/flux-runtime/tests/second.rs"),
+            "// a second file in the same untracked directory\n",
+        )
+        .expect("second file");
+        std::fs::create_dir_all(worktree.join(".flux/fleet")).expect("fleet snapshot dir");
+        std::fs::write(
+            worktree.join(".flux/fleet/agent-loop.flux"),
+            "flow worker -> string\n  return \"snapshot\"\n",
+        )
+        .expect("fleet snapshot");
+        std::fs::write(worktree.join("base.txt"), "modified\n").expect("modify a tracked file");
+
+        let mut found = uncommitted_files(&worktree).expect("a readable checkout answers");
+        found.sort();
+        assert_eq!(
+            found,
+            vec![
+                "base.txt".to_string(),
+                "crates/flux-runtime/tests/resource_receipts.rs".to_string(),
+                "crates/flux-runtime/tests/second.rs".to_string(),
+            ],
+            "tracked modifications and every untracked file, minus Fleet's own snapshot"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn repair_facts<'a>(

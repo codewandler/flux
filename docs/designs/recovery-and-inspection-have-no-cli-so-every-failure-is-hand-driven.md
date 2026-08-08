@@ -56,6 +56,12 @@ Nothing here changes state; each replaces a `jq` expression an operator currentl
 
 - **`fleet repair <wave>`** recreates structure the topology names and disk lacks — a removed worktree, one
   left off its pinned base — and refuses anything that would discard work.
+- **`fleet capture <wave> [--item]`** commits what an interrupted story worker left uncommitted onto that
+  story's own branch. Uncommitted is the normal state of a turn that was cut short, and it was the one
+  state with no verb: `wave-745` died with a 531-line failing-first specification untracked in a story
+  worktree, and saving it meant hand-running `git add` and `git commit` in a directory the fleet owns.
+  Story checkouts only — a derived assembly is rebuilt, never committed — and never onto a detached or
+  reassigned HEAD, where the commit would be as invisible as the file was.
 - **`fleet park <wave> --reason` / `unpark`** make parking a lifecycle state with a recorded reason. Today
   it is a line in a driver-owned file, invisible to `fleet status`, which is why a parked wave could be
   re-decided every minute and why unparking meant editing text.
@@ -84,6 +90,8 @@ because a specific failure had no answer, and each should be deletable if that f
 - `fleet inspect gate` prints a repository gate's own output for a wave, tail first.
 - `board reconcile` reports stories whose work is already present while their status says otherwise.
 - `fleet repair` rebuilds structure a topology names and disk lacks, refusing anything that discards work.
+- `fleet doctor` reports a story worktree holding uncommitted work, and `fleet capture` commits it onto the
+  story's own branch — so an interrupted turn's work is never mistaken for a turn that did nothing.
 - `fleet park`/`unpark` make parking a recorded lifecycle state with a reason.
 - `fleet land` merges accepted candidates into the canonical branch and re-gates against it.
 - `fleet handoff --from-worktree` derives the write set and the owning worker.
