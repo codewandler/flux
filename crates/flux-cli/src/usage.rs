@@ -9,7 +9,7 @@
 //! datasource (C-213). What stays here is the token-shaped projection: this command's answer to its
 //! own question.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -17,13 +17,12 @@ use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Days, Duration, Local, NaiveDate, TimeZone};
 use clap::{Args, ValueEnum};
 use flux_capabilities::harness::{
-    self, HarnessEnv, HarnessKind, HarnessLocation, JsonlLine, ScanBudget,
+    claude_usage, codex_usage, flux_usage, opencode_usage, HarnessEnv, HarnessKind,
+    HarnessLocation, HarnessSession, ScanObserver, UsageScan, UsageWindow,
 };
-use flux_capabilities::usage_observatory::{
-    CostCell, CostSourceCell, CostStatus, ProviderAttribution, TimePrecision, UsageFact,
-};
-use flux_core::{CostSource, PricingTable, Usage};
-use flux_events::{EventKind, EventStore, StoredEvent};
+use flux_capabilities::usage_observatory::{CostCell, CostSourceCell, CostStatus, UsageFact};
+use flux_core::{PricingTable, Usage};
+use flux_events::EventStore;
 use serde::Serialize;
 use serde_json::{json, Value};
 
@@ -168,48 +167,9 @@ struct UsageSection {
 
 type UsageRecord = UsageFact;
 
-#[derive(Clone, Debug)]
-struct SessionRecord {
-    harness: HarnessKind,
-    session_id: String,
-    started_at_ms: Option<i64>,
-    ended_at_ms: Option<i64>,
-    cwd: Option<String>,
-    messages: u64,
-}
-
-#[derive(Default)]
-struct SessionBuild {
-    started_at_ms: Option<i64>,
-    ended_at_ms: Option<i64>,
-    cwd: Option<String>,
-    messages: u64,
-}
-
-impl SessionBuild {
-    fn observe(&mut self, ts_ms: Option<i64>) {
-        if let Some(ts) = ts_ms {
-            self.started_at_ms = Some(self.started_at_ms.map_or(ts, |old| old.min(ts)));
-            self.ended_at_ms = Some(self.ended_at_ms.map_or(ts, |old| old.max(ts)));
-        }
-    }
-
-    fn observe_range(&mut self, started_at_ms: Option<i64>, ended_at_ms: Option<i64>) {
-        self.observe(started_at_ms);
-        self.observe(ended_at_ms);
-    }
-
-    fn into_record(self, harness: HarnessKind, session_id: String) -> SessionRecord {
-        SessionRecord {
-            harness,
-            session_id,
-            started_at_ms: self.started_at_ms,
-            ended_at_ms: self.ended_at_ms,
-            cwd: self.cwd,
-            messages: self.messages,
-        }
-    }
-}
+/// The session-shaped half of the same shared scan. Aliased locally because this command's
+/// rendering vocabulary is records and sessions.
+type SessionRecord = HarnessSession;
 
 #[derive(Clone, Debug, PartialEq)]
 struct UsageRow {
@@ -474,23 +434,6 @@ impl ProgressRenderer {
         }
     }
 
-    fn begin(&mut self, label: &str, total: usize) {
-        self.draw(label, 0, total, 0);
-    }
-
-    fn tick(&mut self, label: &str, current: usize, total: usize, skipped: usize) {
-        self.draw(label, current, total, skipped);
-    }
-
-    fn finish(&mut self, label: &str, current: usize, total: usize, skipped: usize) {
-        if !self.active {
-            return;
-        }
-        self.draw(label, current, total, skipped);
-        eprintln!();
-        self.last_len = 0;
-    }
-
     fn draw(&mut self, label: &str, current: usize, total: usize, skipped: usize) {
         if !self.active {
             return;
@@ -514,6 +457,27 @@ impl ProgressRenderer {
         eprint!("\r{line:<width$}");
         let _ = std::io::stderr().flush();
         self.last_len = width;
+    }
+}
+
+/// The progress bar is this surface's rendering of the shared scan's callbacks; acquisition itself
+/// decides nothing about whether anything is drawn.
+impl ScanObserver for ProgressRenderer {
+    fn begin(&mut self, harness: HarnessKind, total: usize) {
+        self.draw(harness.label(), 0, total, 0);
+    }
+
+    fn tick(&mut self, harness: HarnessKind, current: usize, total: usize, skipped: usize) {
+        self.draw(harness.label(), current, total, skipped);
+    }
+
+    fn finish(&mut self, harness: HarnessKind, current: usize, total: usize, skipped: usize) {
+        if !self.active {
+            return;
+        }
+        self.draw(harness.label(), current, total, skipped);
+        eprintln!();
+        self.last_len = 0;
     }
 }
 
@@ -652,106 +616,15 @@ fn flux_dataset_from_store_with_progress(
         None => None,
     };
     let all_efficiency = store.efficiency_all()?.as_ref().map(format_efficiency);
-    let streams = store.all_streams()?;
-    let mut loaded = Vec::new();
-    progress.begin(HarnessKind::Flux.label(), streams.len());
-    for (idx, stream) in streams.iter().enumerate() {
-        let events = store.load_stream(stream, None)?;
-        let correlation_id = events
-            .first()
-            .and_then(|e| e.context.correlation_id.clone());
-        loaded.push((stream.clone(), events, correlation_id));
-        progress.tick(HarnessKind::Flux.label(), idx + 1, streams.len(), 0);
-    }
-    progress.finish(HarnessKind::Flux.label(), streams.len(), streams.len(), 0);
-
-    let ids: HashSet<String> = loaded.iter().map(|(id, _, _)| id.clone()).collect();
-    let mut records = Vec::new();
-    let mut sessions = Vec::new();
-    for (stream, events, correlation_id) in loaded {
-        if correlation_id
-            .as_ref()
-            .is_some_and(|parent| ids.contains(parent))
-        {
-            continue;
-        }
-        let mut stream_records = flux_records_from_events(&stream, &events, pricing);
-        let session = flux_session_from_events(&stream, &events);
-        records.append(&mut stream_records);
-        sessions.push(session);
-    }
-
+    // The token-shaped walk is the shared extraction (C-519). What stays here is the flux-only
+    // efficiency projection, which needs the store rather than the records.
+    let scan = flux_usage(store, pricing, UsageWindow::UNBOUNDED, progress)?;
     Ok(HarnessDataset {
-        kind: HarnessKind::Flux,
-        source,
-        note: None,
         latest_session,
-        records,
-        sessions,
         latest_efficiency,
         all_efficiency,
-        scanned: streams.len(),
-        skipped: 0,
+        ..dataset_from_scan(HarnessKind::Flux, source, scan)
     })
-}
-
-fn flux_session_from_events(stream: &str, events: &[StoredEvent]) -> SessionRecord {
-    let mut build = SessionBuild::default();
-    for event in events {
-        build.observe(Some(event.ts_ms));
-    }
-    build.messages = flux_events::turns(events).len() as u64;
-    build.into_record(HarnessKind::Flux, stream.to_string())
-}
-
-fn flux_records_from_events(
-    stream: &str,
-    events: &[StoredEvent],
-    pricing: &PricingTable,
-) -> Vec<UsageRecord> {
-    let mut records = Vec::new();
-    let mut covered_turns = HashSet::new();
-    for event in events {
-        if let EventKind::CallUsage { model, usage } = &event.kind {
-            if let Some(turn_id) = event.turn_id {
-                covered_turns.insert(turn_id);
-            }
-            if usage_is_empty(usage) {
-                continue;
-            }
-            records.push(usage_record(
-                HarnessKind::Flux,
-                stream.to_string(),
-                model.clone(),
-                Some(event.ts_ms),
-                Some(event.ts_ms),
-                usage.clone(),
-                pricing,
-            ));
-        }
-    }
-
-    for turn in flux_events::turns(events) {
-        if covered_turns.contains(&turn.turn_id) {
-            continue;
-        }
-        if let Some(usage) = turn.usage {
-            if usage_is_empty(&usage) {
-                continue;
-            }
-            let ts = turn.ended_at_ms.or(Some(turn.started_at_ms));
-            records.push(usage_record(
-                HarnessKind::Flux,
-                stream.to_string(),
-                turn.model,
-                ts,
-                ts,
-                usage,
-                pricing,
-            ));
-        }
-    }
-    records
 }
 
 fn collect_codex(
@@ -759,21 +632,7 @@ fn collect_codex(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> HarnessDataset {
-    let sessions = match harness_source(HarnessKind::Codex, env) {
-        HarnessSource::Scan(path) => path,
-        HarnessSource::Note(dataset) => return dataset,
-    };
-    match parse_codex_sessions(&sessions, pricing, progress) {
-        Ok((records, session_records, scanned, skipped)) => external_dataset(
-            HarnessKind::Codex,
-            sessions,
-            records,
-            session_records,
-            scanned,
-            skipped,
-        ),
-        Err(e) => HarnessDataset::warning(HarnessKind::Codex, Some(sessions), e.to_string()),
-    }
+    collect_external(HarnessKind::Codex, env, pricing, progress, codex_usage)
 }
 
 fn collect_claude(
@@ -781,21 +640,7 @@ fn collect_claude(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> HarnessDataset {
-    let projects = match harness_source(HarnessKind::Claude, env) {
-        HarnessSource::Scan(path) => path,
-        HarnessSource::Note(dataset) => return dataset,
-    };
-    match parse_claude_projects(&projects, pricing, progress) {
-        Ok((records, session_records, scanned, skipped)) => external_dataset(
-            HarnessKind::Claude,
-            projects,
-            records,
-            session_records,
-            scanned,
-            skipped,
-        ),
-        Err(e) => HarnessDataset::warning(HarnessKind::Claude, Some(projects), e.to_string()),
-    }
+    collect_external(HarnessKind::Claude, env, pricing, progress, claude_usage)
 }
 
 fn collect_opencode(
@@ -803,440 +648,58 @@ fn collect_opencode(
     pricing: &PricingTable,
     progress: &mut ProgressRenderer,
 ) -> HarnessDataset {
-    let db = match harness_source(HarnessKind::Opencode, env) {
+    collect_external(
+        HarnessKind::Opencode,
+        env,
+        pricing,
+        progress,
+        opencode_usage,
+    )
+}
+
+/// Acquisition for a harness whose state is another tool's files: locate it, hand the path to the
+/// shared extraction, and turn a failure into this command's note instead of aborting the run.
+fn collect_external(
+    kind: HarnessKind,
+    env: &HarnessEnv,
+    pricing: &PricingTable,
+    progress: &mut ProgressRenderer,
+    extract: fn(
+        &Path,
+        &PricingTable,
+        UsageWindow,
+        &mut dyn ScanObserver,
+    ) -> flux_core::Result<UsageScan>,
+) -> HarnessDataset {
+    let path = match harness_source(kind, env) {
         HarnessSource::Scan(path) => path,
         HarnessSource::Note(dataset) => return dataset,
     };
-    match parse_opencode_db(&db, pricing, progress) {
-        Ok((records, session_records, scanned, skipped)) => external_dataset(
-            HarnessKind::Opencode,
-            db,
-            records,
-            session_records,
-            scanned,
-            skipped,
-        ),
-        Err(e) => HarnessDataset::warning(HarnessKind::Opencode, Some(db), e.to_string()),
+    match extract(&path, pricing, UsageWindow::UNBOUNDED, progress) {
+        Ok(scan) => dataset_from_scan(kind, Some(path), scan),
+        Err(e) => HarnessDataset::warning(kind, Some(path), e.to_string()),
     }
 }
 
-fn external_dataset(
+/// One shared scan, projected onto this command's dataset. The flux-only efficiency lines are
+/// filled in by the caller that has the store.
+fn dataset_from_scan(
     kind: HarnessKind,
-    source: PathBuf,
-    records: Vec<UsageRecord>,
-    sessions: Vec<SessionRecord>,
-    scanned: usize,
-    skipped: usize,
+    source: Option<PathBuf>,
+    scan: UsageScan,
 ) -> HarnessDataset {
     HarnessDataset {
         kind,
-        source: Some(source),
+        source,
         note: None,
         latest_session: None,
-        records,
-        sessions,
+        records: scan.facts,
+        sessions: scan.sessions,
         latest_efficiency: None,
         all_efficiency: None,
-        scanned,
-        skipped,
+        scanned: scan.scanned,
+        skipped: scan.skipped,
     }
-}
-
-fn parse_claude_projects(
-    projects: &Path,
-    pricing: &PricingTable,
-    progress: &mut ProgressRenderer,
-) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let scan = jsonl_scan(projects)?;
-    let files = scan.files();
-    let mut skipped = scan.skipped();
-    let mut seen = HashSet::new();
-    let mut records = Vec::new();
-    let mut sessions = BTreeMap::<String, SessionBuild>::new();
-
-    progress.begin(HarnessKind::Claude.label(), files.len());
-    for (idx, file) in files.iter().enumerate() {
-        // An over-budget or unreadable file must not abort the scan: skip it like a bad line and
-        // keep the rest.
-        let Ok(lines) = harness::open_jsonl(file, ScanBudget::default()) else {
-            skipped += 1;
-            progress.tick(HarnessKind::Claude.label(), idx + 1, files.len(), skipped);
-            continue;
-        };
-        let fallback_session = file_stem(file);
-        for line in lines {
-            let JsonlLine::Text(line) = line else {
-                skipped += 1;
-                continue;
-            };
-            if !line.contains("\"type\"") {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                skipped += 1;
-                continue;
-            };
-            let typ = v.get("type").and_then(Value::as_str);
-            let sid = v
-                .get("sessionId")
-                .or_else(|| v.get("session_id"))
-                .and_then(Value::as_str)
-                .unwrap_or(&fallback_session)
-                .to_string();
-            let ts = json_timestamp_ms(&v);
-            let build = sessions.entry(sid.clone()).or_default();
-            build.observe(ts);
-            if matches!(typ, Some("user" | "assistant")) {
-                build.messages += 1;
-            }
-            if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
-                build.cwd.get_or_insert_with(|| cwd.to_string());
-            }
-
-            if typ != Some("assistant") {
-                continue;
-            }
-            let Some(message) = v.get("message") else {
-                continue;
-            };
-            let Some(usage_value) = message.get("usage") else {
-                continue;
-            };
-            let Some(model) = message.get("model").and_then(Value::as_str) else {
-                continue;
-            };
-            let dedupe_key = message
-                .get("id")
-                .and_then(Value::as_str)
-                .or_else(|| v.get("requestId").and_then(Value::as_str))
-                .or_else(|| v.get("uuid").and_then(Value::as_str));
-            if let Some(key) = dedupe_key {
-                if !seen.insert(format!("{sid}:{key}")) {
-                    continue;
-                }
-            }
-            let model = prefixed_model("claude", model);
-            let usage = usage_from_anthropic(usage_value);
-            if usage_is_empty(&usage) {
-                continue;
-            }
-            records.push(usage_record(
-                HarnessKind::Claude,
-                sid,
-                model,
-                ts,
-                ts,
-                usage,
-                pricing,
-            ));
-        }
-        progress.tick(HarnessKind::Claude.label(), idx + 1, files.len(), skipped);
-    }
-    progress.finish(
-        HarnessKind::Claude.label(),
-        files.len(),
-        files.len(),
-        skipped,
-    );
-
-    Ok((
-        records,
-        sessions
-            .into_iter()
-            .map(|(id, build)| build.into_record(HarnessKind::Claude, id))
-            .collect(),
-        files.len(),
-        skipped,
-    ))
-}
-
-fn parse_codex_sessions(
-    sessions_root: &Path,
-    pricing: &PricingTable,
-    progress: &mut ProgressRenderer,
-) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let scan = jsonl_scan(sessions_root)?;
-    let files = scan.files();
-    let mut skipped = scan.skipped();
-    let mut records = Vec::new();
-    let mut session_records = Vec::new();
-
-    progress.begin(HarnessKind::Codex.label(), files.len());
-    for (idx, file) in files.iter().enumerate() {
-        // An over-budget or unreadable file must not abort the scan: skip it like a bad line and
-        // keep the rest.
-        let Ok(lines) = harness::open_jsonl(file, ScanBudget::default()) else {
-            skipped += 1;
-            progress.tick(HarnessKind::Codex.label(), idx + 1, files.len(), skipped);
-            continue;
-        };
-        let mut session_id = file_stem(file);
-        let mut build = SessionBuild::default();
-        let mut model = "codex/gpt-5.5".to_string();
-        let mut token_count_records = Vec::<UsageRecord>::new();
-        let mut fallback_records = Vec::<UsageRecord>::new();
-        let mut seen_fallback = HashSet::new();
-
-        for line in lines {
-            let JsonlLine::Text(line) = line else {
-                skipped += 1;
-                continue;
-            };
-            let interesting = line.contains("\"session_meta\"")
-                || line.contains("\"turn_context\"")
-                || line.contains("\"token_count\"")
-                || line.contains("\"user_message\"")
-                || line.contains("\"agent_message\"")
-                || (line.contains("\"response_item\"") && line.contains("\"usage\""));
-            if !interesting {
-                continue;
-            }
-            let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                skipped += 1;
-                continue;
-            };
-            let ts = json_timestamp_ms(&v);
-            build.observe(ts);
-            match v.get("type").and_then(Value::as_str) {
-                Some("session_meta") => {
-                    if let Some(id) = v.pointer("/payload/id").and_then(Value::as_str) {
-                        session_id = id.to_string();
-                    }
-                    if let Some(cwd) = v.pointer("/payload/cwd").and_then(Value::as_str) {
-                        build.cwd.get_or_insert_with(|| cwd.to_string());
-                    }
-                    if let Some(started) = v.pointer("/payload/timestamp").and_then(json_value_ms) {
-                        build.observe(Some(started));
-                    }
-                    continue;
-                }
-                Some("turn_context") => {
-                    if let Some(m) = v
-                        .pointer("/payload/model")
-                        .and_then(Value::as_str)
-                        .filter(|m| !m.is_empty())
-                    {
-                        model = prefixed_model("codex", m);
-                    }
-                    continue;
-                }
-                Some("event_msg")
-                    if v.pointer("/payload/type").and_then(Value::as_str)
-                        == Some("token_count") =>
-                {
-                    if let Some(info) = v.pointer("/payload/info/last_token_usage") {
-                        let usage = usage_from_codex_token_count(info);
-                        if !usage_is_empty(&usage) {
-                            token_count_records.push(usage_record(
-                                HarnessKind::Codex,
-                                session_id.clone(),
-                                model.clone(),
-                                ts,
-                                ts,
-                                usage,
-                                pricing,
-                            ));
-                        }
-                    }
-                    continue;
-                }
-                Some("event_msg") => {
-                    if matches!(
-                        v.pointer("/payload/type").and_then(Value::as_str),
-                        Some("user_message" | "agent_message")
-                    ) {
-                        build.messages += 1;
-                    }
-                }
-                Some("response_item") => {
-                    let Some(message) = v.pointer("/payload/message") else {
-                        continue;
-                    };
-                    let Some(usage_value) = message.get("usage") else {
-                        continue;
-                    };
-                    let request_key = message
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .or_else(|| v.get("requestId").and_then(Value::as_str));
-                    if let Some(key) = request_key {
-                        if !seen_fallback.insert(key.to_string()) {
-                            continue;
-                        }
-                    }
-                    let fallback_model = message
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(|m| prefixed_model("codex", m))
-                        .unwrap_or_else(|| model.clone());
-                    let usage = usage_from_anthropic(usage_value);
-                    if !usage_is_empty(&usage) {
-                        fallback_records.push(usage_record(
-                            HarnessKind::Codex,
-                            session_id.clone(),
-                            fallback_model,
-                            ts,
-                            ts,
-                            usage,
-                            pricing,
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if token_count_records.is_empty() {
-            records.extend(fallback_records);
-        } else {
-            records.extend(token_count_records);
-        }
-        session_records.push(build.into_record(HarnessKind::Codex, session_id));
-        progress.tick(HarnessKind::Codex.label(), idx + 1, files.len(), skipped);
-    }
-    progress.finish(
-        HarnessKind::Codex.label(),
-        files.len(),
-        files.len(),
-        skipped,
-    );
-
-    Ok((records, session_records, files.len(), skipped))
-}
-
-fn parse_opencode_db(
-    db: &Path,
-    pricing: &PricingTable,
-    progress: &mut ProgressRenderer,
-) -> Result<(Vec<UsageRecord>, Vec<SessionRecord>, usize, usize)> {
-    let conn =
-        harness::open_sqlite_read_only(db).with_context(|| format!("open {}", db.display()))?;
-    let has_session_table = harness::sqlite_table_exists(&conn, "session")?;
-    let message_has_session_id = harness::sqlite_column_exists(&conn, "message", "session_id")?;
-    let message_has_time_created = harness::sqlite_column_exists(&conn, "message", "time_created")?;
-    let message_has_time_updated = harness::sqlite_column_exists(&conn, "message", "time_updated")?;
-
-    let mut sessions = BTreeMap::<String, SessionBuild>::new();
-    if has_session_table {
-        let mut stmt = conn.prepare(
-            "select id, time_created, time_updated, directory from session order by time_created",
-        )?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let started: Option<i64> = row.get::<_, Option<i64>>(1)?.map(normalize_epoch_ms);
-            let ended: Option<i64> = row.get::<_, Option<i64>>(2)?.map(normalize_epoch_ms);
-            let cwd: Option<String> = row.get(3)?;
-            let build = sessions.entry(id).or_default();
-            build.observe_range(started, ended);
-            build.cwd = build.cwd.take().or(cwd);
-        }
-    }
-
-    let total = sqlite_count_assistant_token_messages(&conn).unwrap_or(0);
-    progress.begin(HarnessKind::Opencode.label(), total);
-    let sql = match (
-        message_has_session_id,
-        message_has_time_created,
-        message_has_time_updated,
-    ) {
-        (true, true, true) => {
-            "select id, session_id, time_created, time_updated, data from message \
-             where json_extract(data, '$.role') = 'assistant' \
-               and json_type(data, '$.tokens') is not null \
-             order by time_created, id"
-        }
-        _ => {
-            "select id, null, null, null, data from message \
-             where json_extract(data, '$.role') = 'assistant' \
-               and json_type(data, '$.tokens') is not null \
-             order by id"
-        }
-    };
-    let mut stmt = conn.prepare(sql)?;
-    let mut query = stmt.query([])?;
-    let mut records = Vec::new();
-    let mut scanned = 0usize;
-    let mut skipped = 0usize;
-    while let Some(row) = query.next()? {
-        scanned += 1;
-        let id: String = row.get(0)?;
-        let row_session: Option<String> = row.get(1)?;
-        let created: Option<i64> = row.get::<_, Option<i64>>(2)?.map(normalize_epoch_ms);
-        let updated: Option<i64> = row.get::<_, Option<i64>>(3)?.map(normalize_epoch_ms);
-        let data: String = row.get(4)?;
-        let v: Value = match serde_json::from_str(&data) {
-            Ok(v) => v,
-            Err(_) => {
-                skipped += 1;
-                progress.tick(HarnessKind::Opencode.label(), scanned, total, skipped);
-                continue;
-            }
-        };
-        let provider = v
-            .get("providerID")
-            .and_then(Value::as_str)
-            .unwrap_or("opencode");
-        let Some(model_id) = v.get("modelID").and_then(Value::as_str) else {
-            skipped += 1;
-            progress.tick(HarnessKind::Opencode.label(), scanned, total, skipped);
-            continue;
-        };
-        let session_id = row_session
-            .or_else(|| {
-                v.get("sessionID")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .or_else(|| {
-                v.get("session_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| id.clone());
-        let started = created.or_else(|| json_nested_timestamp_ms(&v, &["time", "created"]));
-        let ended = updated
-            .or_else(|| json_nested_timestamp_ms(&v, &["time", "completed"]))
-            .or(started);
-        let usage = Usage {
-            input_tokens: u64_path(&v, &["tokens", "input"]),
-            output_tokens: u64_path(&v, &["tokens", "output"]),
-            cache_read_input_tokens: u64_path(&v, &["tokens", "cache", "read"]),
-            cache_creation_input_tokens: u64_path(&v, &["tokens", "cache", "write"]),
-            reasoning_tokens: u64_path(&v, &["tokens", "reasoning"]),
-            reported_cost_usd: f64_path(&v, &["cost"]),
-            ..Default::default()
-        };
-        if usage_is_empty(&usage) {
-            skipped += 1;
-            progress.tick(HarnessKind::Opencode.label(), scanned, total, skipped);
-            continue;
-        }
-        let build = sessions.entry(session_id.clone()).or_default();
-        build.observe_range(started, ended);
-        build.messages += 1;
-        records.push(usage_record(
-            HarnessKind::Opencode,
-            session_id,
-            prefixed_model(provider, model_id),
-            started,
-            ended,
-            usage,
-            pricing,
-        ));
-        progress.tick(HarnessKind::Opencode.label(), scanned, total, skipped);
-    }
-    progress.finish(HarnessKind::Opencode.label(), scanned, total, skipped);
-
-    Ok((
-        records,
-        sessions
-            .into_iter()
-            .map(|(id, build)| build.into_record(HarnessKind::Opencode, id))
-            .collect(),
-        scanned,
-        skipped,
-    ))
 }
 
 fn report_from_dataset(dataset: HarnessDataset, filter: &TimeFilter) -> HarnessReport {
@@ -1803,98 +1266,6 @@ impl From<CostCell> for CostJson {
     }
 }
 
-fn usage_record(
-    harness: HarnessKind,
-    session_id: String,
-    model: String,
-    started_at_ms: Option<i64>,
-    ended_at_ms: Option<i64>,
-    usage: Usage,
-    pricing: &PricingTable,
-) -> UsageRecord {
-    let (cost, cost_status) = price_usage(&usage, &model, pricing);
-    UsageRecord {
-        harness,
-        session_id,
-        raw_model: model.clone(),
-        canonical_model: flux_core::canonical_model_parts(&model).1.to_string(),
-        provider: ProviderAttribution::Unknown,
-        model,
-        started_at_ms,
-        ended_at_ms,
-        precision: if started_at_ms == ended_at_ms {
-            TimePrecision::Call
-        } else {
-            TimePrecision::Bucket
-        },
-        usage,
-        calls: 1,
-        cost,
-        cost_status,
-    }
-}
-
-fn price_usage(
-    usage: &Usage,
-    model: &str,
-    pricing: &PricingTable,
-) -> (Option<CostCell>, CostStatus) {
-    if usage_is_empty(usage) {
-        return (None, CostStatus::UnpricedMissingUsage);
-    }
-    match pricing.cost(usage, model) {
-        Some(money) => {
-            let source = match money.source {
-                CostSource::Reported => CostSourceCell::Reported,
-                CostSource::Estimated => CostSourceCell::Estimated,
-            };
-            let status = match money.source {
-                CostSource::Reported => CostStatus::Reported,
-                CostSource::Estimated if money.subscription => CostStatus::SubscriptionEquivalent,
-                CostSource::Estimated => CostStatus::EstimatedTable,
-            };
-            (
-                Some(CostCell {
-                    usd: money.usd,
-                    subscription: money.subscription,
-                    source,
-                    status,
-                    basis: if source == CostSourceCell::Reported {
-                        "provider_reported"
-                    } else {
-                        "pricing_table"
-                    },
-                }),
-                status,
-            )
-        }
-        None => (None, CostStatus::UnpricedUnknownModel),
-    }
-}
-
-fn usage_from_anthropic(v: &Value) -> Usage {
-    Usage {
-        input_tokens: u64_path(v, &["input_tokens"]),
-        output_tokens: u64_path(v, &["output_tokens"]),
-        cache_creation_input_tokens: u64_path(v, &["cache_creation_input_tokens"]),
-        cache_read_input_tokens: u64_path(v, &["cache_read_input_tokens"]),
-        reasoning_tokens: u64_path(v, &["reasoning_tokens"]),
-        ..Default::default()
-    }
-}
-
-fn usage_from_codex_token_count(v: &Value) -> Usage {
-    let input = u64_path(v, &["input_tokens"]);
-    let cached = u64_path(v, &["cached_input_tokens"]);
-    Usage {
-        input_tokens: input.saturating_sub(cached),
-        output_tokens: u64_path(v, &["output_tokens"]),
-        cache_read_input_tokens: cached,
-        reasoning_tokens: u64_path(v, &["reasoning_output_tokens"]),
-        ..Default::default()
-    }
-}
-
 fn format_efficiency(e: &flux_events::EfficiencySummary) -> String {
     let phases = if e.has_phase_rounds() {
         format!(
@@ -1929,60 +1300,6 @@ fn sum_usage(acc: &mut Usage, usage: &Usage) {
     acc.audio_output_tokens += usage.audio_output_tokens;
     if let Some(cost) = usage.reported_cost_usd {
         *acc.reported_cost_usd.get_or_insert(0.0) += cost;
-    }
-}
-
-fn usage_is_empty(usage: &Usage) -> bool {
-    usage.total() == 0 && usage.reasoning_tokens == 0 && usage.reported_cost_usd.is_none()
-}
-
-fn u64_path(v: &Value, path: &[&str]) -> u64 {
-    let mut cur = v;
-    for key in path {
-        let Some(next) = cur.get(*key) else {
-            return 0;
-        };
-        cur = next;
-    }
-    cur.as_u64()
-        .or_else(|| cur.as_i64().and_then(|n| u64::try_from(n).ok()))
-        .unwrap_or(0)
-}
-
-fn f64_path(v: &Value, path: &[&str]) -> Option<f64> {
-    let mut cur = v;
-    for key in path {
-        cur = cur.get(*key)?;
-    }
-    cur.as_f64()
-}
-
-fn json_timestamp_ms(v: &Value) -> Option<i64> {
-    v.get("timestamp")
-        .and_then(json_value_ms)
-        .or_else(|| json_nested_timestamp_ms(v, &["message", "timestamp"]))
-}
-
-fn json_nested_timestamp_ms(v: &Value, path: &[&str]) -> Option<i64> {
-    let mut cur = v;
-    for key in path {
-        cur = cur.get(*key)?;
-    }
-    json_value_ms(cur)
-}
-
-fn json_value_ms(v: &Value) -> Option<i64> {
-    if let Some(s) = v.as_str() {
-        return parse_rfc3339_ms(s).ok();
-    }
-    v.as_i64().map(normalize_epoch_ms)
-}
-
-fn normalize_epoch_ms(n: i64) -> i64 {
-    if n.abs() < 10_000_000_000 {
-        n.saturating_mul(1000)
-    } else {
-        n
     }
 }
 
@@ -2188,22 +1505,6 @@ fn progress_bar(current: usize, total: usize) -> String {
     format!("[{}{}]", "#".repeat(filled), "-".repeat(width - filled))
 }
 
-fn prefixed_model(provider: &str, model: &str) -> String {
-    if model.starts_with(&format!("{provider}/")) {
-        model.to_string()
-    } else {
-        format!("{provider}/{model}")
-    }
-}
-
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
 fn clamp_range_to_filter(
     started_at_ms: Option<i64>,
     ended_at_ms: Option<i64>,
@@ -2246,27 +1547,11 @@ fn plural(n: u64) -> &'static str {
     }
 }
 
-/// The `.jsonl` files under a harness root at the standard scan budget. Only an unreadable root
-/// propagates as an error — it becomes the harness note, with the same wording it always had.
-fn jsonl_scan(root: &Path) -> Result<harness::JsonlScan> {
-    harness::jsonl_files(root, ScanBudget::default())
-        .with_context(|| format!("read {}", root.display()))
-}
-
-fn sqlite_count_assistant_token_messages(conn: &rusqlite::Connection) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "select count(*) from message \
-         where json_extract(data, '$.role') = 'assistant' \
-           and json_type(data, '$.tokens') is not null",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(count.max(0) as usize)
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File};
+    use std::fs;
+
+    use flux_capabilities::usage_observatory::ProviderAttribution;
 
     use super::*;
 
@@ -2320,12 +1605,12 @@ mod tests {
             )
             .unwrap();
 
-        let stored = events.load_stream(&session, None).unwrap();
-        let records = flux_records_from_events(&session, &stored, &PricingTable::builtin());
+        let dataset = flux_dataset_from_store(&events, &PricingTable::builtin(), None).unwrap();
 
-        assert_eq!(records.len(), 2);
+        assert_eq!(dataset.records.len(), 2);
         assert_eq!(
-            records
+            dataset
+                .records
                 .iter()
                 .map(|record| record.usage.input_tokens)
                 .sum::<u64>(),
@@ -2360,10 +1645,11 @@ mod tests {
     #[test]
     fn renderer_outputs_metrics_and_aligned_usage_table() {
         crate::style::init(crate::style::ColorChoice::Never);
-        let record = usage_record(
+        let record = UsageFact::priced_span(
             HarnessKind::Claude,
-            "s".to_string(),
-            "claude/claude-opus-4-8".to_string(),
+            "s",
+            "claude/claude-opus-4-8",
+            ProviderAttribution::Unknown,
             Some(1_772_000_000_000),
             Some(1_772_000_060_000),
             Usage {
@@ -2375,20 +1661,22 @@ mod tests {
             },
             &PricingTable::builtin(),
         );
-        let dataset = external_dataset(
+        let dataset = dataset_from_scan(
             HarnessKind::Claude,
-            PathBuf::from("/tmp/claude/projects"),
-            vec![record],
-            vec![SessionRecord {
-                harness: HarnessKind::Claude,
-                session_id: "s".to_string(),
-                started_at_ms: Some(1_772_000_000_000),
-                ended_at_ms: Some(1_772_000_060_000),
-                cwd: None,
-                messages: 2,
-            }],
-            1,
-            0,
+            Some(PathBuf::from("/tmp/claude/projects")),
+            UsageScan {
+                facts: vec![record],
+                sessions: vec![SessionRecord {
+                    harness: HarnessKind::Claude,
+                    session_id: "s".to_string(),
+                    started_at_ms: Some(1_772_000_000_000),
+                    ended_at_ms: Some(1_772_000_060_000),
+                    cwd: None,
+                    messages: 2,
+                }],
+                scanned: 1,
+                skipped: 0,
+            },
         );
         let filter = TimeFilter {
             since_ms: None,
@@ -2670,148 +1958,97 @@ mod tests {
         assert_eq!(all.efficiency, None, "efficiency is hidden under a filter");
     }
 
+    /// The parity contract for C-519: `flux usage` now folds records produced by the shared
+    /// cross-harness extraction, and its filtering, per-model rows, call counts, totals,
+    /// discovery limits and empty/error behavior are exactly what they were before the private
+    /// parsers moved down.
     #[test]
-    fn claude_jsonl_dedupes_split_assistant_messages() {
-        let root = test_path("claude");
-        let project = root.join("projects").join("p");
+    fn shared_timeline_preserves_flux_usage_output() {
+        crate::style::init(crate::style::ColorChoice::Never);
+        let root = test_path("parity");
+        let project = root.join(".claude").join("projects").join("p");
         fs::create_dir_all(&project).unwrap();
-        let file = project.join("s.jsonl");
-        let line = r#"{"type":"assistant","timestamp":"2026-07-08T12:00:00Z","message":{"id":"msg_1","model":"claude-opus-4-8","usage":{"input_tokens":10,"cache_read_input_tokens":5,"cache_creation_input_tokens":2,"output_tokens":3}},"sessionId":"s"}"#;
-        fs::write(&file, format!("{line}\n{line}\n")).unwrap();
-
-        let mut progress = quiet_progress();
-        let (records, sessions, scanned, skipped) = parse_claude_projects(
-            &root.join("projects"),
-            &PricingTable::builtin(),
-            &mut progress,
-        )
-        .unwrap();
-        assert_eq!(scanned, 1);
-        assert_eq!(skipped, 0);
-        assert_eq!(records.len(), 1);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(records[0].model, "claude/claude-opus-4-8");
-        assert_eq!(records[0].usage.input_tokens, 10);
-        assert_eq!(records[0].cost_status, CostStatus::SubscriptionEquivalent);
-        assert!(records[0].started_at_ms.is_some());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn claude_scan_skips_unreadable_files_and_dirs_and_keeps_the_rest() {
-        use std::os::unix::fs::PermissionsExt;
-
-        // A permission-denied file or subdirectory must be counted as skipped like a bad line, not
-        // abort the scan and blank out every record already parsed from readable files.
-        let root = test_path("claude-unreadable");
-        let project = root.join("projects").join("p");
-        fs::create_dir_all(&project).unwrap();
-        let line = r#"{"type":"assistant","timestamp":"2026-07-08T12:00:00Z","message":{"id":"msg_1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":3}},"sessionId":"s"}"#;
-        fs::write(project.join("good.jsonl"), format!("{line}\n")).unwrap();
-        let bad = project.join("locked.jsonl");
-        fs::write(&bad, format!("{line}\n")).unwrap();
-        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
-        let locked_dir = project.join("locked-dir");
-        fs::create_dir_all(&locked_dir).unwrap();
-        fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o000)).unwrap();
-        if File::open(&bad).is_ok() {
-            // Running as root: permission bits cannot make paths unreadable, so the scenario is
-            // untestable here.
-            let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
-            let _ = fs::remove_dir_all(root);
-            return;
-        }
-
-        let mut progress = quiet_progress();
-        let (records, sessions, scanned, skipped) = parse_claude_projects(
-            &root.join("projects"),
-            &PricingTable::builtin(),
-            &mut progress,
-        )
-        .unwrap();
-        assert_eq!(scanned, 2, "both jsonl files are listed");
-        assert_eq!(skipped, 2, "the unreadable file and directory are skipped");
-        assert_eq!(
-            records.len(),
-            1,
-            "the readable file still yields its record"
-        );
-        assert_eq!(sessions.len(), 1);
-
-        let _ = fs::set_permissions(&locked_dir, fs::Permissions::from_mode(0o755));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_jsonl_uses_incremental_token_count_rows() {
-        let root = test_path("codex");
-        let sessions = root.join("sessions").join("2026").join("07").join("08");
-        fs::create_dir_all(&sessions).unwrap();
+        let record = |ts: &str, id: &str, model: &str, input: u64| {
+            format!(
+                r#"{{"type":"assistant","timestamp":"{ts}","sessionId":"s","cwd":"/w","message":{{"id":"{id}","model":"{model}","usage":{{"input_tokens":{input},"output_tokens":2}}}}}}"#
+            )
+        };
         fs::write(
-            sessions.join("rollout.jsonl"),
-            r#"{"timestamp":"2026-07-08T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.5"}}"#.to_string()
-                + "\n"
-                + r#"{"timestamp":"2026-07-08T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":12,"reasoning_output_tokens":3}}}}"#
-                + "\n",
-        )
-        .unwrap();
-
-        let mut progress = quiet_progress();
-        let (records, sessions, scanned, skipped) = parse_codex_sessions(
-            &root.join("sessions"),
-            &PricingTable::builtin(),
-            &mut progress,
-        )
-        .unwrap();
-        assert_eq!(scanned, 1);
-        assert_eq!(skipped, 0);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].model, "codex/gpt-5.5");
-        assert_eq!(records[0].usage.input_tokens, 60);
-        assert_eq!(records[0].usage.cache_read_input_tokens, 40);
-        assert_eq!(records[0].usage.output_tokens, 12);
-        assert_eq!(records[0].usage.reasoning_tokens, 3);
-        assert!(records[0].started_at_ms.is_some());
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn opencode_sqlite_reads_message_tokens_and_reported_cost() {
-        let root = test_path("opencode");
-        fs::create_dir_all(&root).unwrap();
-        let db = root.join("opencode.db");
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute(
-            "create table message (id text primary key, data text not null)",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "insert into message (id, data) values (?1, ?2)",
-            (
-                "m1",
-                r#"{"role":"assistant","providerID":"openrouter","modelID":"z-ai/glm","tokens":{"input":7,"output":2,"reasoning":1,"cache":{"read":5,"write":3}},"cost":0.0042}"#,
+            project.join("s.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                record("2026-07-08T12:00:00Z", "a", "claude-opus-4-8", 10),
+                record("2026-07-09T12:00:00Z", "b", "claude-opus-4-8", 20),
+                record("2026-07-09T12:00:01Z", "c", "claude-sonnet-4-8", 30),
             ),
         )
         .unwrap();
-        drop(conn);
 
-        let mut progress = quiet_progress();
-        let (records, sessions, scanned, skipped) =
-            parse_opencode_db(&db, &PricingTable::builtin(), &mut progress).unwrap();
-        assert_eq!(scanned, 1);
-        assert_eq!(skipped, 0);
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].model, "openrouter/z-ai/glm");
-        assert_eq!(records[0].usage.cache_read_input_tokens, 5);
-        assert_eq!(records[0].cost.unwrap().source, CostSourceCell::Reported);
-        assert_eq!(records[0].cost_status, CostStatus::Reported);
-        assert!((records[0].cost.unwrap().usd - 0.0042).abs() < 1e-9);
+        let env = HarnessEnv::empty().with("HOME", &root);
+        let pricing = PricingTable::builtin();
+        let dataset = collect_claude(&env, &pricing, &mut quiet_progress());
+        // Read-only discovery limits stay visible: one file listed, nothing skipped, no note.
+        assert_eq!(dataset.records.len(), 3);
+        assert_eq!(dataset.scanned, 1);
+        assert_eq!(dataset.skipped, 0);
+        assert_eq!(dataset.note, None);
+
+        let all_time = TimeFilter {
+            since_ms: None,
+            until_ms: None,
+            label: "all time".to_string(),
+        };
+        let report = report_from_dataset(dataset.clone(), &all_time);
+        let section = report
+            .sections
+            .iter()
+            .find(|s| s.include_in_combined)
+            .unwrap();
+        assert_eq!(section.rows.len(), 2, "one row per model");
+        let opus = section
+            .rows
+            .iter()
+            .find(|row| row.model == "claude/claude-opus-4-8")
+            .unwrap();
+        assert_eq!(opus.calls, 2);
+        assert_eq!(opus.usage.input_tokens, 30);
+        assert_eq!(section.metrics.calls, 3);
+        assert_eq!(section.metrics.sessions, 1);
+        assert_eq!(section.metrics.usage.input_tokens, 60);
+        assert_eq!(section.metrics.usage.output_tokens, 6);
+
+        // Filtering: a `--since` bound drops the older call from the rows, the totals and the
+        // call count together. 2026-07-08T12:00:00Z is 1_783_512_000_000.
+        let since = TimeFilter {
+            since_ms: Some(1_783_550_000_000),
+            until_ms: None,
+            label: "since".to_string(),
+        };
+        let filtered = report_from_dataset(dataset.clone(), &since);
+        let filtered_section = filtered
+            .sections
+            .iter()
+            .find(|s| s.include_in_combined)
+            .unwrap();
+        assert_eq!(filtered_section.metrics.calls, 2);
+        assert_eq!(filtered_section.metrics.usage.input_tokens, 50);
+
+        let out = render_human(&[report], &all_time);
+        assert!(out.contains("Claude Code"));
+        assert!(out.contains("claude/claude-opus-4-8"));
+        assert!(out.contains("3 calls"));
+
+        let value = report_json(&[report_from_dataset(dataset, &all_time)], &all_time);
+        assert_eq!(value["harnesses"][0]["scanned"], 1);
+        assert_eq!(value["summary"]["total"]["calls"], 3);
+
+        // Empty/error behavior: a harness with no state keeps its note and renders no rows.
+        let missing = collect_codex(&env, &pricing, &mut quiet_progress());
+        assert_eq!(missing.note.as_deref(), Some("not found"));
+        assert!(missing.records.is_empty());
+        let empty = report_from_dataset(missing, &all_time);
+        assert!(!empty.has_rows());
+        assert!(render_human(&[empty], &all_time).contains("(no usage recorded)"));
 
         let _ = fs::remove_dir_all(root);
     }

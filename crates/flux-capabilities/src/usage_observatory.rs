@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use flux_core::{canonical_model_parts, CostSource, PricingTable, Usage};
+use flux_events::receipt::{Dimension, MeasuredValue, MeasurementFamily, ResourceReceipt};
 use flux_events::{EventKind, StoredEvent};
 
 use crate::harness::HarnessKind;
@@ -93,6 +94,62 @@ pub struct CostCell {
     pub basis: &'static str,
 }
 
+/// A Flux-native fact's link to the causal resource receipt that billed the same work (C-575).
+///
+/// Only Flux records one: a foreign harness exposes token history and nothing else, so attaching
+/// physical-resource ownership to one of its calls would be an invention rather than a measurement.
+/// Every field here is copied from a recorded [`ResourceReceipt`]; none is derived or guessed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResourceLink {
+    /// The receipt id, derived by C-575 from (root, span) — never minted here.
+    pub receipt_id: String,
+    /// The request/result the span belongs to.
+    pub root_id: String,
+    /// The session the work ran in, when the causal binding proved one.
+    pub session: Option<String>,
+    /// The board item the work was admitted against, when the causal binding proved one.
+    pub board_ref: Option<String>,
+    /// Physical dimensions the receipt actually *observed*, by wire name — CPU, network, bytes,
+    /// capacity. Empty means the receipt proves model facts only, which is a different statement
+    /// from proving that nothing physical happened.
+    pub physical_dimensions: Vec<String>,
+}
+
+impl ResourceLink {
+    /// Link a recorded receipt, keeping only what it measured.
+    pub fn from_receipt(receipt: &ResourceReceipt) -> Self {
+        Self {
+            receipt_id: receipt.receipt_id.clone(),
+            root_id: receipt.root_id.clone(),
+            session: receipt.binding.session.clone(),
+            board_ref: receipt.binding.board_ref.clone(),
+            physical_dimensions: receipt
+                .measurements
+                .iter()
+                .filter(|measurement| matches!(measurement.value, MeasuredValue::Observed(_)))
+                .filter(|measurement| is_physical(measurement.dimension))
+                .map(|measurement| measurement.dimension.as_str().to_string())
+                .collect(),
+        }
+    }
+
+    /// Whether this receipt proves physical resource use at all.
+    pub fn covers_physical_resources(&self) -> bool {
+        !self.physical_dimensions.is_empty()
+    }
+}
+
+/// Whether a dimension measures a physical resource rather than tokens or host counters.
+fn is_physical(dimension: Dimension) -> bool {
+    matches!(
+        dimension.family(),
+        MeasurementFamily::Process
+            | MeasurementFamily::Network
+            | MeasurementFamily::Filesystem
+            | MeasurementFamily::Capacity
+    )
+}
+
 /// One usage-bearing call, or one explicitly coarse legacy fallback.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UsageFact {
@@ -110,6 +167,10 @@ pub struct UsageFact {
     pub calls: u64,
     pub cost: Option<CostCell>,
     pub cost_status: CostStatus,
+    /// The causal resource receipt this call is part of (C-575), when the source is Flux and a
+    /// receipt was recorded for this call's own session. `None` on every foreign-harness fact, and
+    /// on native facts whose work predates the ledger — a partial record, not a zero.
+    pub receipt: Option<ResourceLink>,
 }
 
 impl UsageFact {
@@ -134,6 +195,29 @@ impl UsageFact {
         usage: Usage,
         pricing: &PricingTable,
     ) -> Self {
+        Self {
+            precision,
+            ..Self::priced_span(
+                harness, session_id, raw_model, provider, at_ms, at_ms, usage, pricing,
+            )
+        }
+    }
+
+    /// One priced call whose source proves a span rather than an instant.
+    ///
+    /// A start that differs from its end is a bucket, not a call time, and the precision says so
+    /// instead of pretending the work happened at one of the two ends.
+    #[allow(clippy::too_many_arguments)]
+    pub fn priced_span(
+        harness: HarnessKind,
+        session_id: impl Into<String>,
+        raw_model: impl Into<String>,
+        provider: ProviderAttribution,
+        started_at_ms: Option<i64>,
+        ended_at_ms: Option<i64>,
+        usage: Usage,
+        pricing: &PricingTable,
+    ) -> Self {
         let raw_model = raw_model.into();
         let (_, canonical) = canonical_model_parts(&raw_model);
         let canonical_model = canonical.to_string();
@@ -145,14 +229,39 @@ impl UsageFact {
             model: raw_model,
             canonical_model,
             provider,
-            started_at_ms: at_ms,
-            ended_at_ms: at_ms,
-            precision,
+            started_at_ms,
+            ended_at_ms,
+            precision: if started_at_ms == ended_at_ms {
+                TimePrecision::Call
+            } else {
+                TimePrecision::Bucket
+            },
             usage,
             calls: 1,
             cost,
             cost_status,
+            receipt: None,
         }
+    }
+
+    /// Attach a native causal resource receipt (C-575).
+    ///
+    /// Two identities have to agree before a measured bill becomes this call's. A foreign-harness
+    /// fact is returned unchanged: its harness reported tokens and nothing else, so it stays a
+    /// valid partial record rather than acquiring CPU/network ownership it never proved. A receipt
+    /// whose causal binding names a *different* session is refused on the same ground — the ledger
+    /// says which session's work it measured, and moving it here would attribute real CPU, network
+    /// and byte use to a call that did none of it. A receipt whose binding proved no session is
+    /// still linkable: an unproven session is absence, not a contradiction.
+    pub fn with_receipt(mut self, link: ResourceLink) -> Self {
+        let session_agrees = link
+            .session
+            .as_ref()
+            .is_none_or(|session| *session == self.session_id);
+        if self.harness == HarnessKind::Flux && session_agrees {
+            self.receipt = Some(link);
+        }
+        self
     }
 }
 
@@ -702,7 +811,6 @@ pub fn replay_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flux_events::NewEvent;
 
     fn fact(harness: HarnessKind, session: &str, model: &str, at: i64, tokens: u64) -> UsageFact {
         UsageFact::priced(
@@ -735,15 +843,29 @@ mod tests {
     }
 
     #[test]
-    fn shared_timeline_covers_every_discovered_harness() {
+    fn shared_timeline_groups_every_discovered_harness_into_one_series() {
+        // Cross-harness *acquisition* is proven end-to-end in
+        // `tests/usage_timeline.rs::shared_timeline_covers_every_discovered_harness`; this pins the
+        // downstream fold, that one series carries every discovered harness without merging them.
         let facts = HarnessKind::ALL
             .into_iter()
             .enumerate()
             .map(|(i, harness)| fact(harness, "s", "gpt-5", i as i64, 1))
             .collect::<Vec<_>>();
+        let rows = groups(
+            &facts,
+            UsageRange::new(0, 10).unwrap(),
+            &UsageFilter::default(),
+            GroupBy::Harness,
+        );
         assert_eq!(
-            facts.iter().map(|f| f.harness).collect::<BTreeSet<_>>(),
-            HarnessKind::ALL.into_iter().collect()
+            rows.iter()
+                .map(|row| row.key.clone())
+                .collect::<BTreeSet<_>>(),
+            HarnessKind::ALL
+                .into_iter()
+                .map(|k| k.label().to_string())
+                .collect()
         );
     }
 
@@ -944,13 +1066,66 @@ mod tests {
     }
 
     #[test]
-    fn usage_timeline_reads_metadata_only() {
-        // The public fact type has no text/transcript field; extraction observes only typed usage
-        // event variants even when secret sentinels exist in neighbouring turn payloads.
-        let event = NewEvent::new(EventKind::Message(flux_core::Message::user_text(
-            "DO_NOT_LOAD",
-        )));
-        assert!(matches!(event.kind, EventKind::Message(_)));
-        assert!(std::mem::size_of::<UsageFact>() > 0);
+    fn a_foreign_fact_never_acquires_native_resource_ownership() {
+        // C-575 receipts are native evidence. A Codex record carries token history and nothing
+        // else, so asking to link one leaves it partial instead of inventing CPU/network ownership.
+        let link = ResourceLink {
+            receipt_id: "receipt:root#span".into(),
+            root_id: "root".into(),
+            session: Some("s".into()),
+            board_ref: Some("flux/C-519".into()),
+            physical_dimensions: vec!["process.user_cpu_time_ms".into()],
+        };
+        assert!(link.covers_physical_resources());
+        assert_eq!(
+            fact(HarnessKind::Codex, "s", "gpt-5", 1, 1)
+                .with_receipt(link.clone())
+                .receipt,
+            None
+        );
+        assert_eq!(
+            fact(HarnessKind::Flux, "s", "gpt-5", 1, 1)
+                .with_receipt(link.clone())
+                .receipt,
+            Some(link)
+        );
+    }
+
+    #[test]
+    fn a_receipt_bound_to_another_session_is_not_attached() {
+        // The receipt names the session whose work it measured. Handing it to a different session's
+        // call would move real CPU/network ownership onto a call that never did it — an invention
+        // the harness check alone does not catch, because both facts are native.
+        let link = ResourceLink {
+            receipt_id: "receipt:root#span".into(),
+            root_id: "root".into(),
+            session: Some("s_1".into()),
+            board_ref: Some("flux/C-519".into()),
+            physical_dimensions: vec!["process.user_cpu_time_ms".into()],
+        };
+        assert_eq!(
+            fact(HarnessKind::Flux, "s_2", "gpt-5", 1, 1)
+                .with_receipt(link.clone())
+                .receipt,
+            None
+        );
+        assert_eq!(
+            fact(HarnessKind::Flux, "s_1", "gpt-5", 1, 1)
+                .with_receipt(link.clone())
+                .receipt,
+            Some(link.clone())
+        );
+        // A receipt whose binding proved no session at all is absence, not a contradiction: it
+        // stays linkable rather than being refused for a disagreement nobody stated.
+        let unbound = ResourceLink {
+            session: None,
+            ..link
+        };
+        assert_eq!(
+            fact(HarnessKind::Flux, "s_2", "gpt-5", 1, 1)
+                .with_receipt(unbound.clone())
+                .receipt,
+            Some(unbound)
+        );
     }
 }

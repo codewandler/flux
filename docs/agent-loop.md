@@ -203,6 +203,12 @@ Custom loops are ordinary validated Flux-Lang. They may combine deterministic op
 `detect_intent`, `explore`, `approve_batch`, `execute_batch`, `present_results`, `ai_segment`,
 `observe`, and `await`. Unknown operations fail validation before a turn starts.
 
+A loop can also be authored by describing it. In the TUI, `/loop <what it should do>` generates the
+`*.flux` file under `.flux/loops` from that description, validates it exactly as a hand-written loop
+is validated, and offers it in the `F3` selector immediately. An invalid generation is refused with
+its error and never saved, an existing loop file is never overwritten, and authoring changes neither
+the loop a running agent already runs nor any Fleet task-kind policy.
+
 The current selector is resolved at each agent-start boundary. The planned C-568 contract records a
 versioned binding even when an ordinary omitted selector resolves to the adaptive preset. Sub-agents
 and Fleet workers do not implicitly inherit a parent's loop or conversation: a role/task resolves its

@@ -1406,6 +1406,18 @@ struct MainAgentState {
     /// the wrong conclusion about which agent was confined. `default` keeps older state files loadable.
     #[serde(default)]
     capability_set: Option<Value>,
+    /// C-600: the transcript segments this coordinator has retired, oldest first.
+    ///
+    /// The coordinator's durable session is an *operator* artifact, and it had no lifecycle: the
+    /// model never reads it back and compaction is structurally unreachable for an authored loop, so
+    /// one recorded session reached 8.2 MB after ~75 intake items and kept growing. Rolling over is
+    /// the bound; this index is how a retired segment stays findable afterwards. The transcripts
+    /// themselves are never deleted — every segment is minted in the SAME store, so
+    /// `flux sessions --store <git-dir>/flux-fleet/sessions/main` and the TUI session picker still
+    /// list all of them. The index is bounded because a list that only grows is how one state file
+    /// reached 12.9MB; the store, not this field, is the durable record.
+    #[serde(default)]
+    session_history: Vec<String>,
 }
 
 impl Default for MainAgentState {
@@ -1420,7 +1432,30 @@ impl Default for MainAgentState {
             last_turn: None,
             last_error: None,
             capability_set: None,
+            session_history: Vec::new(),
         }
+    }
+}
+
+impl MainAgentState {
+    /// Record the coordinator's current transcript segment, retaining the one it replaces.
+    ///
+    /// C-600: a rollover must never lose operator history, so the id being replaced is pushed onto
+    /// the index rather than overwritten. Recording the same id again is a resume, not a roll.
+    fn record_session(&mut self, session: Option<String>) {
+        let replaced = self
+            .session
+            .take()
+            .filter(|previous| session.as_deref() != Some(previous.as_str()));
+        if let Some(previous) = replaced {
+            self.session_history.push(previous);
+            let overflow = self
+                .session_history
+                .len()
+                .saturating_sub(COORDINATOR_TRANSCRIPT_HISTORY);
+            self.session_history.drain(..overflow);
+        }
+        self.session = session;
     }
 }
 
@@ -2416,7 +2451,11 @@ pub(super) fn prepare_fleet_tui(root: &Path) -> Result<FleetTuiLaunch> {
     configured_main_research_loop_with(&root, &config)?;
     let state = read_fleet_state(&root)?;
     let store = agent_store_path(&root, "main")?;
-    let session = state.main_agent.session.clone();
+    // C-600: decide the transcript segment BEFORE the surface projects it. A segment that reached
+    // the rollover ceiling is not resumed — the attach mints a fresh one in the same store, and
+    // `attach_session` records the roll — so attach time is bounded by one segment rather than by
+    // the coordinator's total history.
+    let session = coordinator_resume_session(&store, state.main_agent.session.as_deref());
     let initial_snapshot = fleet_tui_initial_snapshot(&root, &state, &config);
     Ok(FleetTuiLaunch {
         root: root.clone(),
@@ -3258,17 +3297,25 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
             });
         }
         if let Some(existing) = state.main_agent.session.as_deref() {
-            bail!(
-                "conflict/precondition: Fleet main records session {existing}, refusing to attach {session}"
-            )
+            // C-600: a segment that reached the rollover ceiling rolls over instead of pinning the
+            // coordinator to one transcript forever. `prepare_fleet_tui` has already declined to
+            // resume it, so the surface arrives holding a freshly minted id; every other mismatch is
+            // still the conflict it was.
+            let store = agent_store_path(&self.root, "main")?;
+            if !coordinator_transcript_is_full(&store, existing) {
+                bail!(
+                    "conflict/precondition: Fleet main records session {existing}, refusing to attach {session}"
+                )
+            }
         }
         self.mutate("fleet.tui.attached", |state| {
             state.revision += 1;
-            state.main_agent.session = Some(session.to_string());
+            let rolled_from = state.main_agent.session.clone();
+            state.main_agent.record_session(Some(session.to_string()));
             Ok((
                 "main".into(),
                 "attached".into(),
-                json!({"agent":"main","session":session,"status":state.main_agent.status}),
+                json!({"agent":"main","session":session,"status":state.main_agent.status,"rolled_from":rolled_from}),
             ))
         })
     }
@@ -3396,7 +3443,7 @@ impl flux_tui::operations::FleetBoardSource for FleetTuiSource {
                 if let Some(error) = error {
                     intake["error"] = json!(redact(error));
                 }
-                state.main_agent.session = Some(session.to_string());
+                state.main_agent.record_session(Some(session.to_string()));
                 state.main_agent.status = if succeeded {
                     if state.running { "running" } else { "stopped" }
                 } else {
@@ -13619,7 +13666,11 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         Some(path) => read_configured_instructions(root, path, "main coordinator instructions")?,
         None => "You are the fleet's only main coordinator. Ingest requirements and agent follow-ups, keep planning authority on the board, schedule only dependency-satisfied work, and never push, publish, deploy, or delete worktrees.".into(),
     };
-    let resume_session = state.main_agent.session.clone();
+    let store = agent_store_path(root, "main")?;
+    // C-600: the headless driving path applies the same ceiling the TUI attach does — it is where
+    // ~75 intake turns grew a single session to 8.2 MB, so bounding only the attach would leave the
+    // artifact unbounded for a coordinator nobody is watching.
+    let resume_session = coordinator_resume_session(&store, state.main_agent.session.as_deref());
     let context_origin = agent_context_origin(
         "main",
         &instructions,
@@ -13633,7 +13684,7 @@ fn main_turn_spec(root: &Path, state: &FleetState, request: String) -> Result<Ag
         id: "main".into(),
         worktree: root.to_path_buf(),
         read_roots,
-        store: agent_store_path(root, "main")?,
+        store,
         model: config.main.model,
         agent_loop: Some(agent_loop),
         agent_loop_binding: None,
@@ -13843,6 +13894,62 @@ fn agent_store_path(worktree: &Path, id: &str) -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     Ok(worktree.join(".flux/fleet/sessions").join(segment))
+}
+
+/// C-600: how many durable events one coordinator transcript segment may hold before the next
+/// resume starts a new one.
+///
+/// **Why the coordinator is exempt from `compaction_attempt`, deliberately.** The growth is a
+/// *transcript* problem, not a context problem. `FlowEngine::compaction_attempt` runs only for
+/// `TurnProgram::Adaptive`, and an authored coordinator loop is `TurnProgram::Authored`, so it can
+/// never fire here — and it should not: `.flux/fleet/loops/main-coordinator.flux` sets
+/// `current_turn: true`, so every coordinator turn is instructions plus the current request plus the
+/// typed Board/Fleet catalogue. Turn 75 never sees turn 1. Compaction would therefore rewrite the
+/// operator's only readable record to relieve a context pressure the model does not experience.
+/// Rolling the segment over bounds the artifact and leaves every prior transcript intact instead.
+///
+/// The ceiling is counted in events because events are what an attach pays for: `flux tui --fleet`
+/// rebuilds the transcript through `ChatState::project_session`, whose cost is the segment's event
+/// count, not the store's total history. See
+/// [docs/designs/coordinator-transcript-rollover.md](../../../docs/designs/coordinator-transcript-rollover.md).
+const COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS: i64 = 1_000;
+
+/// How many retired segment ids `state.json` indexes before the oldest drops out of the index.
+///
+/// Only the *pointer* is bounded: every retired transcript remains a complete session in the
+/// coordinator's store, which is what `flux sessions --store` and the TUI picker enumerate.
+const COORDINATOR_TRANSCRIPT_HISTORY: usize = 50;
+
+/// The transcript segment a coordinator resume attaches to, applying C-600's rollover ceiling.
+///
+/// `None` means "mint a fresh one" — either nothing is recorded, or the recorded segment is full.
+fn coordinator_resume_session(store: &Path, recorded: Option<&str>) -> Option<String> {
+    let recorded = recorded?;
+    (!coordinator_transcript_is_full(store, recorded)).then(|| recorded.to_string())
+}
+
+/// Whether a recorded segment has reached [`COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS`].
+///
+/// Fails *open*: an absent or unreadable store keeps the recorded identity rather than silently
+/// starting a second transcript. Fleet deliberately resumes the recorded main session, so a
+/// transient IO failure must never be able to fork that identity.
+fn coordinator_transcript_is_full(store: &Path, session: &str) -> bool {
+    coordinator_transcript_events(store, session)
+        .is_some_and(|events| events >= COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS)
+}
+
+/// Events recorded in one segment, or `None` when the store cannot answer.
+///
+/// Reads the stream head from the session registry, never the events themselves — the check that
+/// keeps attach cheap must not itself be proportional to the history it bounds.
+fn coordinator_transcript_events(store: &Path, session: &str) -> Option<i64> {
+    let database = store.join("events.db");
+    if !database.is_file() {
+        return None;
+    }
+    let events = flux_events::EventStore::open(&database).ok()?;
+    let head = events.head_seq(session).ok()?;
+    (head >= 0).then_some(head + 1)
 }
 
 fn scoped_goals(state: &FleetState) -> String {
@@ -14371,7 +14478,7 @@ fn execute_and_record_agent_turn(
                 } else {
                     "stopped".into()
                 };
-                state.main_agent.session = session;
+                state.main_agent.record_session(session);
                 state.main_agent.last_turn = Some(receipt.clone());
                 state.main_agent.last_error = None;
             } else if let Some(agent) = state.agents.get_mut(&spec.id) {
@@ -23363,6 +23470,125 @@ mod tests {
             assert!(skill.len() < 4096);
             assert!(skill.contains("schema --output json"));
         }
+    }
+
+    /// C-600: the coordinator's durable transcript is an operator artifact with a lifecycle of its
+    /// own. The model never reads it back (`current_turn: true` resets the conversation every turn)
+    /// and compaction is structurally unreachable for an authored loop, so nothing bounded it. A
+    /// segment that has reached the rollover ceiling is retired at the next resume instead of being
+    /// projected again — `flux tui --fleet` attach time must not scale with total coordinator
+    /// history — and the retired segment stays readable in the same store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_coordinator_transcript_rolls_over_at_the_next_attach() {
+        let root = fleet_tui_fixture("rollover").canonicalize().unwrap();
+        let store = agent_store_path(&root, "main").unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let events = flux_events::EventStore::open(store.join("events.db")).unwrap();
+        let full = events.create_session("mock").unwrap();
+        events
+            .append_batch(
+                &full,
+                (0..COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS)
+                    .map(|turn| {
+                        flux_events::NewEvent::message(flux_core::Message::user_text(format!(
+                            "intake {turn}"
+                        )))
+                    })
+                    .collect(),
+            )
+            .unwrap();
+
+        let mut state = FleetState::default();
+        state.main_agent.session = Some(full.clone());
+        write_fleet_state(&root, &state).unwrap();
+
+        let launch = prepare_fleet_tui(&root).unwrap();
+        assert_eq!(
+            launch.session, None,
+            "a full segment must not be resumed: the attach mints a fresh one"
+        );
+
+        let source = FleetTuiSource { root: root.clone() };
+        source.attach_session("s_fresh").unwrap();
+        let rolled = read_fleet_state(&root).unwrap();
+        assert_eq!(rolled.main_agent.session.as_deref(), Some("s_fresh"));
+        assert_eq!(
+            rolled.main_agent.session_history,
+            vec![full.clone()],
+            "the retired segment stays indexed, not forgotten"
+        );
+
+        // Nothing is deleted to make the current transcript small: the retired segment is still a
+        // complete, readable session in the very same store.
+        assert_eq!(
+            events.load_stream(&full, None).unwrap().len(),
+            COORDINATOR_TRANSCRIPT_ROLLOVER_EVENTS as usize + 1,
+            "the retired transcript must survive the roll intact"
+        );
+
+        // A segment under the ceiling keeps the durable identity Fleet deliberately resumes, and any
+        // other id offered against it is still the conflict it always was.
+        let short = events.create_session("mock").unwrap();
+        let mut resumed = read_fleet_state(&root).unwrap();
+        resumed.main_agent.session = Some(short.clone());
+        resumed.revision += 1;
+        write_fleet_state(&root, &resumed).unwrap();
+        assert_eq!(
+            prepare_fleet_tui(&root).unwrap().session.as_deref(),
+            Some(short.as_str())
+        );
+        let refused = source.attach_session("s_other").unwrap_err().to_string();
+        assert!(refused.contains("refusing to attach"), "{refused}");
+
+        // The headless driving path applies the same ceiling — it is the path that grew one session
+        // to 8.2 MB with nobody attached to it.
+        let mut driving = read_fleet_state(&root).unwrap();
+        driving.main_agent.session = Some(full.clone());
+        assert_eq!(
+            main_turn_spec(&root, &driving, "ingest".into())
+                .unwrap()
+                .resume_session,
+            None
+        );
+        driving.main_agent.session = Some(short.clone());
+        assert_eq!(
+            main_turn_spec(&root, &driving, "ingest".into())
+                .unwrap()
+                .resume_session
+                .as_deref(),
+            Some(short.as_str())
+        );
+    }
+
+    /// C-600: replacing the coordinator's recorded segment never loses the id it replaced, and the
+    /// index that keeps them findable is itself bounded.
+    #[test]
+    fn a_replaced_coordinator_segment_is_retained_not_forgotten() {
+        let mut main = MainAgentState::default();
+        main.record_session(Some("s_1".into()));
+        assert!(main.session_history.is_empty());
+        main.record_session(Some("s_1".into()));
+        assert!(
+            main.session_history.is_empty(),
+            "resuming the same segment is not a roll"
+        );
+
+        main.record_session(Some("s_2".into()));
+        assert_eq!(main.session_history, vec!["s_1".to_string()]);
+
+        for segment in 0..COORDINATOR_TRANSCRIPT_HISTORY + 5 {
+            main.record_session(Some(format!("s_roll_{segment}")));
+        }
+        assert_eq!(
+            main.session_history.len(),
+            COORDINATOR_TRANSCRIPT_HISTORY,
+            "the state-file index is bounded; the store keeps the transcripts"
+        );
+        assert_eq!(
+            main.session_history.last().map(String::as_str),
+            Some("s_roll_53")
+        );
+        assert_eq!(main.session.as_deref(), Some("s_roll_54"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
