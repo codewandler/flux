@@ -7,6 +7,7 @@ areas: [flux-cli]
 depends_on: [C-736]
 design: docs/designs/story-contracts-are-validated.md
 note: "C-320 sat at `status: active` — not a parseable value — and was dropped by every board read while `check` exited 0. Invisible is worse than invalid."
+priority: 3
 ---
 
 # A story the board cannot parse is a failure, not a silent skip

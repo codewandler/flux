@@ -13,10 +13,36 @@ note: "connectors and exchange declare canonical_ref = origin/main, a remote-tra
 
 ## Goal
 
+`connectors` and `exchange` declare `canonical_ref = "origin/main"` — a remote-tracking ref that no
+fleet operation can write. `apply` cannot reach it, `promote` refuses it by name, and C-721's check
+reports both members' waves as *applied-without-delivery*.
+
+Decision [0021](../../../flux-roadmap/decisions/0021-delivery-publication-and-release-are-three-events.md)
+§2 says board validation must **refuse** the combination rather than accept it and silently
+under-deliver. Today the misconfiguration is accepted at load and only discovered at the moment work
+fails to land.
+
+The config change alone is not safe — see Progress. The order is: reconcile each member's local
+`main`, then repoint, then add the validation that stops it coming back.
 
 ## Acceptance
 
-- [ ] Define acceptance.
+- [ ] Board validation refuses a `canonical_ref` that is a remote-tracking ref, at load, naming the
+      member and what to declare instead. A refusal at configuration time is the whole point: the
+      current failure surfaces only after a wave has been built and gated.
+- [ ] The refusal message distinguishes "this ref does not exist" from "this ref exists and cannot be
+      written", because they need different fixes.
+- [ ] `connectors` and `exchange` are repointed at a local branch **after** their local `main` is
+      reconciled with its remote. Reconciliation is a precondition of the repoint, not a follow-up —
+      repointing first makes every dispatched worker branch from stale code.
+- [ ] The unpushed `connectors` commit is preserved and its disposition recorded. It is not
+      discarded to make the reconcile easy.
+- [ ] The website's example fleet configuration carries the same mistake and is corrected, so the
+      documented starting point does not reproduce the defect.
+- [ ] `flux fleet doctor` reports zero `applied-without-delivery` findings afterwards, which is the
+      observable proof the two historical waves were the symptom of this and not of something else.
+- [ ] Regression test: a fixture config declaring `origin/main` is refused with the message above.
+- [ ] Full gate green: `scripts/release-full-gate.sh`.
 
 ## Progress
 

@@ -2,8 +2,7 @@
 id: C-737
 title: "A missing or suffixed Acceptance heading cannot pass for a satisfied contract"
 pillar: "Core"
-status: backlog
-priority: 1
+status: done
 epic: delivery-is-verified
 areas: [flux-cli]
 ---
@@ -24,12 +23,29 @@ And `checkbox_counts` matches the heading exactly, so `## Acceptance (for the ep
 
 ## Acceptance
 
-- [ ] `board done` refuses a story with zero acceptance criteria. Absence and satisfaction must not
+- [x] `board done` refuses a story with zero acceptance criteria. Absence and satisfaction must not
       produce the same verdict. `--override-reason` remains the recorded escape.
-- [ ] `checkbox_counts` recognises `## Acceptance` followed by anything, so a suffixed heading is
+- [x] `checkbox_counts` recognises `## Acceptance` followed by anything, so a suffixed heading is
       read rather than silently reporting zero.
-- [ ] Every consumer of that parser sees the recovered criteria — `board done`, `board reconcile`'s
+- [x] Every consumer of that parser sees the recovered criteria — `board done`, `board reconcile`'s
       `acceptance-complete`, `board stats`, and C-723's `verify_already_built`.
-- [ ] Regression test: a fixture story with `## Acceptance (for the epic)` and one unticked box is
+- [x] Regression test: a fixture story with `## Acceptance (for the epic)` and one unticked box is
       refused by `board done`, and the same story with zero criteria is refused for the other reason.
-- [ ] The ten affected stories are re-counted after the fix and their criteria are visible.
+- [x] The ten affected stories are re-counted after the fix and their criteria are visible.
+
+## Progress
+
+- 2026-08-08 — landed on `main` in `fdb59a47`, gate green.
+- `heading_opens_section` accepts a heading that *opens* the section rather than one that equals it,
+  so `## Acceptance (for the epic)` and `## Acceptance — stage 1, post-hoc transcript` are read as
+  the Acceptance section. It still refuses `## Acceptances`: the character after the heading must be
+  non-alphanumeric, so a longer word is not a qualified heading.
+- **Measured recovery, same tree, two binaries.** `board stats` before the fix reported
+  `criteria.total = 6781`; after, `6834`. **53 acceptance criteria existed on disk that no tool could
+  see** — and since `stats` resolves items at a git ref, both runs read identical input, so the
+  entire difference is the parser. That is also the evidence for the "every consumer" criterion:
+  `stats` shares `checkbox_counts` with `board done`, `board reconcile`'s `acceptance-complete` and
+  C-587's reviewer, so recovering it once recovers it everywhere.
+- The `board done` hole is closed in the same change: `total == 0` now refuses rather than passing
+  as "nothing remaining", with `--override-reason` still the recorded escape. Absence and
+  satisfaction are no longer the same value.
