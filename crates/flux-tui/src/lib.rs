@@ -4289,7 +4289,7 @@ where
                     .is_some_and(|operations| operations.open)
                 {
                     if let Some(operations) = state.operations.as_mut() {
-                        operations.handle_mouse(m.kind);
+                        operations.handle_mouse(m);
                     }
                     continue;
                 }
