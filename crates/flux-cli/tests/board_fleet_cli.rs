@@ -2623,6 +2623,12 @@ fn promote_deliver(
         String::from_utf8_lossy(&handoff.stdout),
         String::from_utf8_lossy(&handoff.stderr)
     );
+    // C-587 landed alongside this story and gates integration on a review by an agent that is not
+    // the writer, so a delivered candidate is no longer integrable on its author's word alone.
+    // These fixtures exist to exercise promotion, not to re-test the review refusal, so they record
+    // the PASS a dispatched reviewer would have written — through the same parser and the same
+    // closed vocabularies.
+    record_passing_review(root, wave, item, &commit);
 }
 
 /// Gate the wave and accept every green candidate, leaving one annotated tag per member.
