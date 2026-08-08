@@ -2,7 +2,7 @@
 id: C-681
 title: "fleet promote accumulates, gates and merges every member in dependency order"
 pillar: "Core"
-status: in-progress
+status: done
 epic: fleet-harness-throughput
 areas: [flux-cli]
 note: "decision 0017 point 6; the bash driver's snapshot_and_merge is flux-only and carries one machine's absolute paths"

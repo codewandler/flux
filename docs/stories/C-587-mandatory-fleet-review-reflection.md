@@ -2,7 +2,7 @@
 id: C-587
 title: "Every Fleet candidate produces independent review and structured reflection before handoff"
 pillar: Improve
-status: backlog
+status: in-progress
 epic: agent-loop-harnesses
 design: docs/designs/agent-loop-harnesses.md
 areas: [flux-flow, flux-runtime, flux-orchestrate, flux-events, flux-cli]
