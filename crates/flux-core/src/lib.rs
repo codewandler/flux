@@ -6,6 +6,7 @@
 //! and the surfaces all build on these types.
 
 mod agent_loop;
+mod agent_report;
 mod audio;
 pub mod budget;
 mod content;
@@ -23,6 +24,10 @@ mod timing;
 mod urlencode;
 
 pub use agent_loop::{AgentLoopBindingMetadata, AgentLoopRunnerKind};
+pub use agent_report::{
+    AgentAttentionRequest, AgentReport, AgentReportAck, AgentReportIdentity, AgentReportLedger,
+    AgentReportRejection, AgentReportState, AgentReportUnits, AgentYieldCursor, AgentYieldOutcome,
+};
 pub use audio::{AudioEncoding, AudioFormat};
 pub use budget::{
     BudgetAttribution, BudgetBreach, BudgetCharge, BudgetDimension, BudgetEnvelope, BudgetLedger,
