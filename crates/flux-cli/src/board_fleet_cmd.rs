@@ -1059,8 +1059,19 @@ pub(super) enum FleetAction {
         passing_after: bool,
         #[arg(long)]
         no_failing_test_reason: Option<String>,
+        /// Cite the Acceptance criterion this handoff claims, by its `AC-n` id. Repeat for more.
+        ///
+        /// C-739. Optional, and a story whose criteria carry no ids has none to cite. An id the
+        /// story does not declare at the handed-off commit is refused rather than recorded.
+        #[arg(long = "criterion", value_name = "AC-N")]
+        criteria: Vec<String>,
         #[arg(long)]
         summary: String,
+    },
+    /// Report which Acceptance criteria are claimed, by which commit, and on what evidence.
+    Coverage {
+        #[arg(value_name = "BOARD/ITEM")]
+        item: String,
     },
     /// Have an agent that is not the writer examine each candidate, and record its typed verdict.
     ///
@@ -5958,6 +5969,7 @@ worktree_root = ".flux/fleet/worktrees"
             failing_before,
             passing_after,
             no_failing_test_reason,
+            criteria,
             summary,
         } => fleet_handoff(
             command,
@@ -5975,9 +5987,11 @@ worktree_root = ".flux/fleet/worktrees"
                 failing_before: *failing_before,
                 passing_after: *passing_after,
                 no_failing_test_reason: no_failing_test_reason.as_deref(),
+                criteria,
                 summary,
             },
         ),
+        FleetAction::Coverage { item } => fleet_coverage(root, &state, item),
         FleetAction::Review { wave, item, from } => fleet_review(
             command,
             root,
@@ -6535,6 +6549,9 @@ fn fleet_operations() -> &'static [&'static str] {
         "spawn",
         "run",
         "handoff",
+        // Coverage READS: it joins a story's criteria to the handoffs that cite them and writes
+        // nothing at all.
+        "coverage",
         // Review DISPATCHES: it admits a fresh read-only agent and runs its turn.
         "review",
         "rework",
@@ -6587,6 +6604,7 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
             "agents",
             "worktrees",
             "inspect",
+            "coverage",
             "dashboard",
             "schema",
             "skill",
@@ -6648,7 +6666,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, or deploys. `apply` accepts a green candidate and pins it with a tag; `promote` is the only operation that writes a member's local canonical branch.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet review WAVE --output json\nflux fleet apply WAVE --if-revision REV --output json\nflux fleet promote --dry-run --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet promote` is the last mile: per member, in the order `depends_on` declares, it accumulates the accepted candidates its canonical ref lacks, merges and gates them in a throwaway worktree, and advances the local branch by a compare-and-swap ref update — a conflicting candidate is left out and named, a red gate anywhere leaves every member's branch untouched, and a member whose `canonical_ref` is remote-tracking is refused because only a push could move it. `[promote] threshold` in `.flux/fleet.toml` sets how many accepted candidates a member accumulates first; it defaults to `1`. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Every candidate is examined by a fresh read-only agent that is not its writer before it may be integrated: `flux fleet review WAVE` records a typed PASS/REWORK verdict with structured findings over the exact handoff commit, and a review that could not run records `examined: false` rather than a pass. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, or deploys. `apply` accepts a green candidate and pins it with a tag; `promote` is the only operation that writes a member's local canonical branch.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet review WAVE --output json\nflux fleet apply WAVE --if-revision REV --output json\nflux fleet promote --dry-run --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet promote` is the last mile: per member, in the order `depends_on` declares, it accumulates the accepted candidates its canonical ref lacks, merges and gates them in a throwaway worktree, and advances the local branch by a compare-and-swap ref update — a conflicting candidate is left out and named, a red gate anywhere leaves every member's branch untouched, and a member whose `canonical_ref` is remote-tracking is refused because only a push could move it. `[promote] threshold` in `.flux/fleet.toml` sets how many accepted candidates a member accumulates first; it defaults to `1`. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Every candidate is examined by a fresh read-only agent that is not its writer before it may be integrated: `flux fleet review WAVE` records a typed PASS/REWORK verdict with structured findings over the exact handoff commit, and a review that could not run records `examined: false` rather than a pass. A story's Acceptance criteria may carry `AC-n` ids and a `verify:` handle naming what proves each one; `flux fleet handoff --criterion AC-1` cites one, resolved against the story at the handed-off commit, and records whether that handle actually ran. `flux fleet coverage BOARD/ITEM` reports per criterion — proven, unproven, claimed, unclaimed — with the commit behind each claim; a criterion whose declared verification never ran is unproven, never satisfied. Criteria without ids are reported `unaddressable` and are otherwise unaffected. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -7723,24 +7741,213 @@ fn has_heading(text: &str, heading: &str) -> bool {
         .any(|line| line.trim().eq_ignore_ascii_case(&format!("## {heading}")))
 }
 
-fn checkbox_counts(text: &str, heading: &str) -> (usize, usize, usize) {
+/// One `## Acceptance` checkbox, and whatever it declares about itself.
+///
+/// C-739. A criterion used to be an anonymous bullet, so nothing could reference one: evidence could
+/// only ever be reported for a whole story, and "partially satisfied" had no representation at all —
+/// the states were "every box ticked" and "not done". An `AC-n` id makes a criterion addressable, so
+/// a handoff, a review finding and a coverage report can all name the same one. A `verify:` handle
+/// names the exact command, test or artifact that proves it, so evidence is checked against what the
+/// story asked for rather than against whatever its prose happened to backtick.
+///
+/// ```markdown
+/// - [ ] `AC-1` A reclaimed wave's worktrees are provably gone.
+///       verify: `cargo test -p flux-cli reclaim_removes_the_worktrees_it_reports`
+/// ```
+///
+/// Both fields are optional and neither is retrofitted. Every story written before this carries
+/// neither and parses exactly as it always did — one criterion per checkbox, `id: None`,
+/// `verify: None` — because a story is not invalid for predating the scheme.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AcceptanceCriterion {
+    /// `AC-3`, when the bullet opens with one.
+    id: Option<String>,
+    ticked: bool,
+    /// The bullet's prose, with the id token removed.
+    text: String,
+    /// The exact command, test name or artifact the bullet says proves it.
+    verify: Option<String>,
+}
+
+/// A section's checkboxes, plus what is malformed about the way they were written.
+///
+/// Defects are collected rather than raised. This parser is on the read path of `board done`,
+/// `board stats`, `board reconcile` and the driver's already-built verification, none of which may
+/// start refusing a story over how it phrased a bullet. `board check` is the one caller that turns a
+/// defect into an error.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct AcceptanceContract {
+    criteria: Vec<AcceptanceCriterion>,
+    defects: Vec<String>,
+}
+
+/// The criterion id prefix. Deliberately distinct from every board id prefix in use (`C-`, `X-`,
+/// `D-`, `E-`), so a bullet that opens by naming a story is citing that story rather than defining a
+/// criterion.
+const CRITERION_ID_PREFIX: &str = "AC-";
+
+/// Is this backticked span a criterion id — `AC-` and a positive decimal with no leading zero?
+///
+/// Ids are allocated once and never renumbered, so the written form has to be exact: `AC-01` and
+/// `AC-1` would otherwise be two spellings of one citation target.
+fn is_criterion_id(span: &str) -> bool {
+    span.strip_prefix(CRITERION_ID_PREFIX)
+        .is_some_and(|number| {
+            !number.is_empty()
+                && !number.starts_with('0')
+                && number.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// The backticked span a bullet opens with, and the prose after it.
+fn leading_backtick_span(body: &str) -> Option<(&str, &str)> {
+    body.strip_prefix('`')?.split_once('`')
+}
+
+/// A `verify:` continuation line's handle, unwrapped from the backticks it is conventionally written
+/// in.
+///
+/// Only a whole span is unwrapped. A handle holding a second backtick is left exactly as written
+/// rather than silently reshaped — a verification handle that is not what the author typed is worth
+/// less than no handle at all.
+fn verify_handle(trimmed: &str) -> Option<&str> {
+    let rest = trimmed
+        .get(..7)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("verify:"))
+        .and_then(|_| trimmed.get(7..))?;
+    let handle = rest.trim();
+    Some(
+        handle
+            .strip_prefix('`')
+            .and_then(|inner| inner.strip_suffix('`'))
+            .filter(|inner| !inner.contains('`'))
+            .unwrap_or(handle)
+            .trim(),
+    )
+}
+
+/// Fold one line of an Acceptance section into the contract being parsed.
+///
+/// The checkbox predicate is the one the counts have always used — `- [` with `]` at byte 4 —
+/// because every consumer of a count now reads through here, and a parser that disagreed with the
+/// counter would be a second, quieter answer to the same question.
+fn push_contract_line(contract: &mut AcceptanceContract, line: &str) {
+    let trimmed = line.trim();
+    if trimmed.starts_with("- [") && trimmed.as_bytes().get(4) == Some(&b']') {
+        let ticked = matches!(trimmed.as_bytes().get(3), Some(b'x' | b'X'));
+        let body = trimmed.get(5..).unwrap_or_default().trim();
+        let (id, text) = match leading_backtick_span(body) {
+            Some((span, rest)) if is_criterion_id(span) => {
+                (Some(span.to_string()), rest.trim_start())
+            }
+            Some((span, _)) if span.starts_with(CRITERION_ID_PREFIX) => {
+                contract.defects.push(format!(
+                    "malformed criterion id `{span}` (expected `AC-<n>`, n >= 1)"
+                ));
+                (None, body)
+            }
+            _ => (None, body),
+        };
+        if let Some(id) = id.as_deref() {
+            if contract
+                .criteria
+                .iter()
+                .any(|held| held.id.as_deref() == Some(id))
+            {
+                contract
+                    .defects
+                    .push(format!("criterion id {id} is declared twice"));
+            }
+        }
+        contract.criteria.push(AcceptanceCriterion {
+            id,
+            ticked,
+            text: text.to_string(),
+            verify: None,
+        });
+        return;
+    }
+    // A continuation line belongs to the bullet above it, and indentation is what says so. An
+    // unindented `verify:` is a line of the section, not part of any criterion.
+    if !line.starts_with(char::is_whitespace) {
+        return;
+    }
+    let Some(handle) = verify_handle(trimmed) else {
+        return;
+    };
+    let Some(index) = contract.criteria.len().checked_sub(1) else {
+        contract
+            .defects
+            .push("a `verify:` handle sits under no criterion".to_string());
+        return;
+    };
+    let named = contract.criteria[index]
+        .id
+        .clone()
+        .unwrap_or_else(|| "an unaddressed criterion".to_string());
+    if handle.is_empty() {
+        contract
+            .defects
+            .push(format!("{named} declares an empty `verify:` handle"));
+        return;
+    }
+    if contract.criteria[index].verify.is_some() {
+        // The first handle stands. Two handles is one criterion with two definitions of proof, and
+        // silently taking the later one would mean the evidence is checked against whichever was
+        // typed last.
+        contract
+            .defects
+            .push(format!("{named} declares more than one `verify:` handle"));
+        return;
+    }
+    contract.criteria[index].verify = Some(handle.to_string());
+}
+
+/// Every checkbox under `## <heading>`, in reading order, and every defect in how they were written.
+fn section_contract(text: &str, heading: &str) -> AcceptanceContract {
+    let mut contract = AcceptanceContract::default();
     let mut in_section = false;
-    let mut done = 0;
-    let mut total = 0;
     for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(found) = trimmed.strip_prefix("## ") {
+        if let Some(found) = line.trim().strip_prefix("## ") {
             in_section = found.trim().eq_ignore_ascii_case(heading);
             continue;
         }
-        if in_section && trimmed.starts_with("- [") && trimmed.as_bytes().get(4) == Some(&b']') {
-            total += 1;
-            if matches!(trimmed.as_bytes().get(3), Some(b'x' | b'X')) {
-                done += 1;
-            }
+        if in_section {
+            push_contract_line(&mut contract, line);
         }
     }
-    (done, total - done, total)
+    contract
+}
+
+/// The same parse over a section body already cut out of its document — what `story_contract_at`
+/// hands back for the story as it stood at one commit.
+fn section_body_contract(body: &str) -> AcceptanceContract {
+    let mut contract = AcceptanceContract::default();
+    for line in body.lines() {
+        push_contract_line(&mut contract, line);
+    }
+    contract
+}
+
+/// C-739: what `board check` refuses about a story's criterion ids — and only ever about ids that
+/// are actually there.
+///
+/// Over a thousand stories predate the scheme and not one of them is invalid for it, so a story
+/// declaring no ids produces nothing here. What is not optional is that an id, once written, means
+/// exactly one thing: a duplicate makes every citation of it ambiguous, which is the failure the ids
+/// exist to prevent.
+fn criterion_contract_errors(story: &Story) -> Vec<String> {
+    section_contract(&story.body, "Acceptance")
+        .defects
+        .into_iter()
+        .map(|defect| format!("{}: {defect}", story.id))
+        .collect()
+}
+
+fn checkbox_counts(text: &str, heading: &str) -> (usize, usize, usize) {
+    let criteria = section_contract(text, heading).criteria;
+    let done = criteria.iter().filter(|criterion| criterion.ticked).count();
+    (done, criteria.len() - done, criteria.len())
 }
 
 fn document_counts(command: &BoardCommand, root: &Path) -> Value {
@@ -8793,6 +9000,9 @@ fn check_board_with_known_dependencies(
                 errors.push(format!("{} links missing design {design}", story.id));
             }
         }
+        // C-739. Additive by construction: a story that declares no criterion ids contributes
+        // nothing here, which is every story written before the scheme existed.
+        errors.extend(criterion_contract_errors(story));
     }
     let decisions = decision_records(&root.join("docs/decisions"))?;
     let mut decision_ids = BTreeSet::new();
@@ -16660,8 +16870,83 @@ fn is_checkable_artifact(span: &str) -> bool {
     span.contains('_') || rest.any(|c| c.is_ascii_uppercase())
 }
 
-/// The symbols and paths a story's `## Acceptance` names, deduplicated in reading order.
-fn acceptance_artifacts(body: &str) -> Vec<String> {
+/// Where the artifacts behind an `already-built` verdict came from.
+///
+/// C-723 had one source: backticked spans scraped out of Acceptance prose and filtered by what
+/// *looks* like a symbol or a path. That is a guess about what the story meant. A criterion that
+/// declares `verify:` states it (C-739), so a declared handle wins — and which of the two was used
+/// is itself evidence, because a verdict resting on a guess and a verdict resting on a declaration
+/// are not the same verdict and must not read the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcceptanceHandleSource {
+    /// At least one criterion named what proves it, and that is what was checked.
+    Declared,
+    /// No criterion declared a handle a tree can be asked about; the backtick scrape is the
+    /// fallback, exactly as before.
+    Scraped,
+}
+
+impl AcceptanceHandleSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Declared => "declared",
+            Self::Scraped => "scraped",
+        }
+    }
+}
+
+/// The artifacts an `already-built` verdict may be checked against, and where they came from.
+struct AcceptanceEvidence {
+    source: AcceptanceHandleSource,
+    artifacts: Vec<String>,
+}
+
+/// The checkable names inside one declared handle.
+///
+/// A handle is a command (`cargo test -p flux-cli reclaim_removes_x`), a bare test name, or a path.
+/// Only the parts a tree can be asked about survive: `cargo`, `test` and `-p` name no artifact, the
+/// test name and the path do.
+fn handle_artifacts(handle: &str) -> Vec<&str> {
+    handle
+        .split_whitespace()
+        .filter(|token| is_checkable_artifact(token))
+        .collect()
+}
+
+/// What the driver checks an `already-built` signal against, and which source it used.
+///
+/// Declared handles win when any of them names something checkable. When none do — a story whose
+/// only handle is `cargo build`, or the thousand-odd stories that declare none at all — the scrape
+/// is used rather than nothing, because an empty artifact list is not evidence of absence and
+/// absence is what releases a story back into the pool.
+fn acceptance_evidence(body: &str) -> AcceptanceEvidence {
+    let criteria = section_contract(body, "Acceptance").criteria;
+    let mut declared: Vec<String> = Vec::new();
+    for handle in criteria
+        .iter()
+        .filter_map(|criterion| criterion.verify.as_deref())
+    {
+        for artifact in handle_artifacts(handle) {
+            if !declared.iter().any(|held| held == artifact) {
+                declared.push(artifact.to_string());
+            }
+        }
+    }
+    if !declared.is_empty() {
+        declared.truncate(DRIVE_ACCEPTANCE_ARTIFACTS);
+        return AcceptanceEvidence {
+            source: AcceptanceHandleSource::Declared,
+            artifacts: declared,
+        };
+    }
+    AcceptanceEvidence {
+        source: AcceptanceHandleSource::Scraped,
+        artifacts: scraped_acceptance_artifacts(body),
+    }
+}
+
+/// The original scrape: every backticked span under `## Acceptance` that looks like an artifact.
+fn scraped_acceptance_artifacts(body: &str) -> Vec<String> {
     let mut artifacts: Vec<String> = Vec::new();
     let mut in_section = false;
     for line in body.lines() {
@@ -16771,10 +17056,15 @@ fn verify_already_built(finding: &Value, story_body: &str, root: &Path) -> Alrea
         .iter()
         .any(|signal| signal == "acceptance-complete");
     let (ticked, _, total) = checkbox_counts(story_body, "Acceptance");
+    // C-739: say which handle source this verdict rests on. A story that declares what proves each
+    // criterion is checked against that declaration; one that declares nothing is still checked
+    // against the backtick scrape, and a reader can now tell the two apart.
+    let checked = acceptance_evidence(story_body);
     let mut evidence = vec![json!({
         "acceptance_ticked": ticked,
         "acceptance_total": total,
         "reviewed_complete": reviewed,
+        "handle_source": checked.source.as_str(),
     })];
     if total > 0 && ticked == 0 {
         return AlreadyBuiltVerdict {
@@ -16788,7 +17078,7 @@ fn verify_already_built(finding: &Value, story_body: &str, root: &Path) -> Alrea
     }
 
     let (mut present, mut absent, mut unanswered) = (Vec::new(), Vec::new(), Vec::new());
-    for artifact in acceptance_artifacts(story_body) {
+    for artifact in checked.artifacts {
         let answer = artifact_present_in(root, &artifact);
         evidence.push(json!({"artifact": artifact, "present": answer}));
         match answer {
@@ -16805,9 +17095,10 @@ fn verify_already_built(finding: &Value, story_body: &str, root: &Path) -> Alrea
     };
     if !absent.is_empty() {
         return release(format!(
-            "the Acceptance names {} artifact(s) this checkout does not have ({}); the signal is a \
-             mention of the id, not its implementation",
+            "the Acceptance names {} {} artifact(s) this checkout does not have ({}); the signal is \
+             a mention of the id, not its implementation",
             absent.len(),
+            checked.source.as_str(),
             absent.join(", ")
         ));
     }
@@ -16821,16 +17112,17 @@ fn verify_already_built(finding: &Value, story_body: &str, root: &Path) -> Alrea
     }
     if !reviewed && present.is_empty() {
         return release(
-            "nothing behind this signal could be verified: the Acceptance names no symbol or path \
-             to check, and no reviewer ticked it complete"
+            "nothing behind this signal could be verified: the Acceptance declares no verification \
+             handle and names no symbol or path to check, and no reviewer ticked it complete"
                 .to_string(),
         );
     }
     AlreadyBuiltVerdict {
         withhold: true,
         detail: format!(
-            "{ticked} of {total} Acceptance criteria ticked and every named artifact is present in \
+            "{ticked} of {total} Acceptance criteria ticked and every {} artifact is present in \
              this checkout ({})",
+            checked.source.as_str(),
             if present.is_empty() {
                 "none named".to_string()
             } else {
@@ -18606,6 +18898,8 @@ struct HandoffInput<'a> {
     failing_before: bool,
     passing_after: bool,
     no_failing_test_reason: Option<&'a str>,
+    /// The `AC-n` ids this handoff claims. Empty for a story with no addressable criteria.
+    criteria: &'a [String],
     summary: &'a str,
 }
 
@@ -19180,6 +19474,21 @@ fn fleet_handoff(
     }) {
         bail!("permission: observed path {path:?} crosses ledger fence {fence:?}")
     }
+    // C-739: what this handoff claims, criterion by criterion. Empty for every worker that cites
+    // nothing — which is every worker of every story whose criteria carry no ids. Resolved here,
+    // before any validation runs, so an unresolvable citation costs a refusal rather than a test
+    // suite.
+    let criteria = if input.criteria.is_empty() {
+        Vec::new()
+    } else {
+        handoff_criterion_claims(
+            &worktree,
+            input.commit,
+            input.item,
+            input.criteria,
+            input.test_argv,
+        )?
+    };
     let documentation_only = input.no_failing_test_reason.is_some();
     if documentation_only {
         let reason = input.no_failing_test_reason.unwrap_or_default();
@@ -19292,6 +19601,7 @@ fn fleet_handoff(
         "passing_after": after,
         "documentation_only": documentation_only,
         "no_failing_test_reason": input.no_failing_test_reason,
+        "criteria": criteria,
         "summary": input.summary,
         "status": "accepted",
     });
@@ -19345,6 +19655,159 @@ fn fleet_handoff(
         format!("{} handoff accepted at {}", input.item, input.commit),
         handoff,
         vec![],
+        state.revision,
+    ))
+}
+
+/// Which Acceptance criteria of an item are claimed, by which commit, and on what evidence.
+///
+/// C-739. The board could only ever answer "how many boxes are ticked" — the writer's own word about
+/// their own work, aggregated into a percentage. This joins the story's criteria to the handoffs that
+/// cite them, so the question is asked per criterion and every answer carries a commit.
+///
+/// The criteria come from the repository's checkout, because the contract as it stands now is what a
+/// citation has to resolve against. The claims come from every wave that ever handed the item off. A
+/// claim naming an id the story no longer declares is reported as dangling rather than dropped: that
+/// is what a renumber looks like from here, and dropping it would hide the one thing ids exist to
+/// prevent.
+///
+/// Five states, and only one of them is satisfaction:
+///
+/// - `proven` — a citing handoff ran the criterion's own declared verification, and that validation
+///   passed.
+/// - `unproven` — cited, declares a handle, and no citing handoff discharged it. **Claimed is not
+///   satisfied**: the evidence exists and does not say what the criterion asked it to say.
+/// - `claimed` — cited by a handoff, but the criterion declares no handle, so nothing but the
+///   writer's word stands behind it.
+/// - `unclaimed` — no handoff cites it.
+/// - `unaddressable` — the criterion carries no id, so nothing can cite it. Every criterion of every
+///   story written before C-739 is this, and it is a description rather than a defect.
+fn fleet_coverage(
+    root: &Path,
+    state: &FleetState,
+    item: &str,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    validate_board_refs(&[item.to_string()])?;
+    let (namespace, id) = item
+        .split_once('/')
+        .context("input/schema: coverage takes a BOARD/ITEM reference")?;
+    let config = read_fleet_config(root)?;
+    let repository = config
+        .repositories
+        .iter()
+        .find(|candidate| candidate.id == namespace || candidate.board == namespace)
+        .with_context(|| format!("not-found: no fleet repository for board {namespace}"))?;
+    let checkout = repository_root(root, repository)?;
+    let story = read_stories(&checkout)?
+        .into_iter()
+        .find(|story| story.id == id)
+        .with_context(|| format!("not-found: {namespace} has no story {id}"))?;
+    let criteria = section_contract(&story.body, "Acceptance").criteria;
+
+    let mut claimed: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    for (wave_id, wave) in &state.waves {
+        for repository in wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            for record in repository["stories"].as_array().into_iter().flatten() {
+                if record["board_ref"].as_str() != Some(item) {
+                    continue;
+                }
+                for handoff in record["handoffs"].as_array().into_iter().flatten() {
+                    for claim in handoff["criteria"].as_array().into_iter().flatten() {
+                        let Some(cited) = claim["id"].as_str() else {
+                            continue;
+                        };
+                        // The handoff's own validation has to have passed. A discharged handle
+                        // inside a validation that failed proves nothing about the criterion.
+                        let validated = handoff["passing_after"]["success"].as_bool() == Some(true);
+                        claimed.entry(cited.to_string()).or_default().push(json!({
+                            "wave": wave_id,
+                            "worker": handoff["worker"],
+                            "commit": handoff["commit"],
+                            "test_argv": handoff["test_argv"],
+                            "validated": validated,
+                            "proven": claim["proven"].as_bool() == Some(true) && validated,
+                            "proof": claim["proof"],
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for criterion in &criteria {
+        let (status, claims) = match criterion.id.as_deref() {
+            None => ("unaddressable", Vec::new()),
+            Some(id) => {
+                let claims = claimed.remove(id).unwrap_or_default();
+                let status = if claims.iter().any(|claim| claim["proven"] == json!(true)) {
+                    "proven"
+                } else if claims.is_empty() {
+                    "unclaimed"
+                } else if criterion.verify.is_some() {
+                    "unproven"
+                } else {
+                    "claimed"
+                };
+                (status, claims)
+            }
+        };
+        *counts.entry(status).or_default() += 1;
+        rows.push(json!({
+            "id": criterion.id,
+            "text": criterion.text,
+            "ticked": criterion.ticked,
+            "verify": criterion.verify,
+            "status": status,
+            "claims": claims,
+        }));
+    }
+    let dangling = claimed
+        .into_iter()
+        .map(|(id, claims)| json!({"id": id, "claims": claims}))
+        .collect::<Vec<_>>();
+    let count = |status: &str| counts.get(status).copied().unwrap_or_default();
+    let summary = json!({
+        "total": criteria.len(),
+        "proven": count("proven"),
+        "unproven": count("unproven"),
+        "claimed": count("claimed"),
+        "unclaimed": count("unclaimed"),
+        "unaddressable": count("unaddressable"),
+        "dangling": dangling.len(),
+    });
+    let mut warnings = Vec::new();
+    for entry in &dangling {
+        warnings.push(format!(
+            "{item} holds a claim on criterion {} that the story no longer declares; a criterion id \
+             is allocated once and never renumbered",
+            entry["id"].as_str().unwrap_or_default()
+        ));
+    }
+    if count("unaddressable") == criteria.len() && !criteria.is_empty() {
+        warnings.push(format!(
+            "{item} declares no criterion ids, so nothing can cite one of its {} criteria",
+            criteria.len()
+        ));
+    }
+    Ok((
+        format!(
+            "{item}: {} of {} criteria proven ({} unproven, {} claimed without a handle, {} \
+             unclaimed, {} unaddressable)",
+            count("proven"),
+            criteria.len(),
+            count("unproven"),
+            count("claimed"),
+            count("unclaimed"),
+            count("unaddressable"),
+        ),
+        json!({"item": item, "story": story.id, "criteria": rows, "dangling": dangling, "summary": summary}),
+        warnings,
         state.revision,
     ))
 }
@@ -19720,6 +20183,125 @@ fn story_contract_at(source: &Path, commit: &str, item: &str) -> Option<Value> {
         "goal": markdown_section(prose, "Goal"),
         "acceptance": acceptance,
     }))
+}
+
+/// Did this handoff's own validation discharge what the criterion declared?
+///
+/// C-739. Three shapes of handle, one question each. A path is answered by the handed-off tree.
+/// Anything else is a command, and it is discharged only when every token it names appears in the
+/// argv this handoff actually ran — an argv that ran some *other* test proves some other criterion.
+/// A criterion that declares nothing is never proven: there is nothing to check but the writer's
+/// word, and telling that state apart from "satisfied" is the whole point of the handle.
+fn discharge_criterion_handle(
+    handle: Option<&str>,
+    source: &Path,
+    test_argv: &[String],
+) -> (bool, String) {
+    let Some(handle) = handle else {
+        return (
+            false,
+            "the criterion declares no verification handle, so nothing but the writer's word \
+             stands behind it"
+                .to_string(),
+        );
+    };
+    let tokens: Vec<&str> = handle.split_whitespace().collect();
+    let [only] = tokens.as_slice() else {
+        if tokens.is_empty() {
+            return (
+                false,
+                "the declared verification handle is empty".to_string(),
+            );
+        }
+        return command_handle_discharge(handle, &tokens, test_argv);
+    };
+    if only.contains('/') {
+        return if source.join(only).exists() {
+            (
+                true,
+                format!("the declared artifact {only} is present in the handed-off tree"),
+            )
+        } else {
+            (
+                false,
+                format!("the declared artifact {only} is absent from the handed-off tree"),
+            )
+        };
+    }
+    command_handle_discharge(handle, &tokens, test_argv)
+}
+
+/// The command case of `discharge_criterion_handle`: every token of the handle has to appear in the
+/// argv that ran.
+fn command_handle_discharge(handle: &str, tokens: &[&str], test_argv: &[String]) -> (bool, String) {
+    if tokens
+        .iter()
+        .all(|token| test_argv.iter().any(|argument| argument == token))
+    {
+        (
+            true,
+            format!("this handoff's targeted validation ran the declared verification ({handle})"),
+        )
+    } else {
+        (
+            false,
+            format!(
+                "the declared verification ({handle}) did not run; this handoff validated with \
+                 {test_argv:?}"
+            ),
+        )
+    }
+}
+
+/// Resolve every cited criterion against the story AS OF the handed-off commit, and record whether
+/// the handle it declares was discharged.
+///
+/// Fails closed on a citation that does not resolve. An id the story does not declare is a typo or
+/// a renumber, and a renumber is exactly what an id scheme exists to make loud: recording evidence
+/// against nothing is how a claim outlives the criterion it was about.
+///
+/// The contract is read out of the commit rather than off disk for the same reason the reviewer's
+/// is — the worktree moves on, and evidence about a criterion that candidate never saw is evidence
+/// about the wrong criterion.
+fn handoff_criterion_claims(
+    source: &Path,
+    commit: &str,
+    item: &str,
+    cited: &[String],
+    test_argv: &[String],
+) -> Result<Vec<Value>> {
+    let contract = story_contract_at(source, commit, item).with_context(|| {
+        format!("not-found: no story contract at {commit} to resolve a criterion citation against")
+    })?;
+    let criteria =
+        section_body_contract(contract["acceptance"].as_str().unwrap_or_default()).criteria;
+    let mut claims = Vec::new();
+    let mut seen = BTreeSet::new();
+    for id in cited {
+        let id = id.trim();
+        if !is_criterion_id(id) {
+            bail!("input/schema: {id:?} is not a criterion id (expected `AC-<n>`)")
+        }
+        if !seen.insert(id.to_string()) {
+            bail!("input/schema: criterion {id} is cited twice")
+        }
+        let criterion = criteria
+            .iter()
+            .find(|criterion| criterion.id.as_deref() == Some(id))
+            .with_context(|| {
+                format!("not-found: {item} declares no Acceptance criterion {id} at {commit}")
+            })?;
+        let (proven, proof) =
+            discharge_criterion_handle(criterion.verify.as_deref(), source, test_argv);
+        claims.push(json!({
+            "id": id,
+            "verify": criterion.verify,
+            "ticked": criterion.ticked,
+            "proven": proven,
+            "proof": proof,
+        }));
+    }
+    Ok(claims)
 }
 
 /// Build the only thing a dispatched reviewer is given.
@@ -28046,6 +28628,10 @@ mod tests {
                 "acceptance_ticked": 0,
                 "acceptance_total": 4,
                 "reviewed_complete": false,
+                // C-739: which source the artifacts would have come from. This story declares no
+                // `verify:` handle, so the answer is the backtick scrape — and saying so costs no
+                // IO, which is what keeps this gate the cheap one.
+                "handle_source": "scraped",
             })],
             "the record settles it before any checkout is read: {verdict:?}"
         );
@@ -28152,8 +28738,10 @@ mod tests {
     /// What an Acceptance names that a tree can be asked about — and what it does not.
     #[test]
     fn acceptance_artifacts_names_symbols_and_paths_but_never_prose_or_an_id() {
+        let scraped = acceptance_evidence(UNBUILT_STORY);
+        assert_eq!(scraped.source, AcceptanceHandleSource::Scraped);
         assert_eq!(
-            acceptance_artifacts(UNBUILT_STORY),
+            scraped.artifacts,
             vec![
                 "AgentReport".to_string(),
                 "candidate_ready".to_string(),
@@ -28163,17 +28751,188 @@ mod tests {
             "`task` is an English word and `TaskAgentBackend` is outside the Acceptance"
         );
         assert!(
-            acceptance_artifacts(
+            acceptance_evidence(
                 "## Acceptance\n- [ ] `flux fleet drive` writes a `*.flux` file for `C-544`.\n"
             )
+            .artifacts
             .is_empty(),
             "a command, a glob and a story id are not artifacts"
         );
         assert_eq!(
-            acceptance_artifacts(
+            acceptance_evidence(
                 "## Acceptance\n- [ ] `.agents/skills/flux-tui/SKILL.md` says so.\n"
-            ),
+            )
+            .artifacts,
             vec![".agents/skills/flux-tui/SKILL.md".to_string()]
+        );
+    }
+
+    /// C-739: a declared handle beats the scrape, and the verdict says which one it stood on.
+    ///
+    /// The scrape is a guess about what a story meant by its backticks — it reads `AgentReport` out
+    /// of the prose and hopes that is the artifact. A criterion that declares `verify:` states it
+    /// outright, so that is what gets checked, and `handle_source` records the difference for
+    /// whoever reads the withhold later. A handle naming nothing checkable (`cargo build`) falls
+    /// back to the scrape rather than to nothing: an empty artifact list is not evidence of absence,
+    /// and absence is what releases a story back into the pool.
+    #[test]
+    fn a_declared_verification_handle_outranks_the_backtick_scrape() {
+        let declared = "## Acceptance\n\
+                        - [x] `AC-1` The reclaimer reports what it removed.\n      \
+                        verify: `cargo test -p flux-cli reclaim_reports_removals`\n\
+                        - [x] `AC-2` The prose mentions `SomeSymbol` in passing.\n";
+        let evidence = acceptance_evidence(declared);
+        assert_eq!(evidence.source, AcceptanceHandleSource::Declared);
+        assert_eq!(
+            evidence.artifacts,
+            vec!["reclaim_reports_removals".to_string()],
+            "the declared handle is the artifact; the prose symbol is not consulted at all"
+        );
+
+        let unspecific = "## Acceptance\n\
+                          - [x] `AC-1` It builds.\n      verify: `cargo build`\n\
+                          - [x] `AC-2` `SomeSymbol` exists.\n";
+        let evidence = acceptance_evidence(unspecific);
+        assert_eq!(evidence.source, AcceptanceHandleSource::Scraped);
+        assert_eq!(evidence.artifacts, vec!["SomeSymbol".to_string()]);
+
+        let verdict = verify_already_built(
+            &json!({"signals": ["acceptance-complete"]}),
+            declared,
+            Path::new("/nonexistent-checkout-c739"),
+        );
+        assert_eq!(verdict.evidence[0]["handle_source"], "declared");
+    }
+
+    /// C-739: ids and handles are opt-in, and everything downstream of the parser is unmoved by a
+    /// story that declares neither.
+    ///
+    /// Over a thousand stories predate the scheme. `board done`, `board stats`, `board reconcile`
+    /// and the driver all read their acceptance through this one parser, so "additive" has to mean
+    /// the counts are byte-identical, not merely similar.
+    #[test]
+    fn a_story_without_criterion_ids_parses_and_counts_exactly_as_it_always_did() {
+        let anonymous = "## Acceptance\n\n- [x] It ships.\n- [ ] It is documented.\n\n## Notes\n- [x] not a criterion\n";
+        assert_eq!(checkbox_counts(anonymous, "Acceptance"), (1, 1, 2));
+        let contract = section_contract(anonymous, "Acceptance");
+        assert!(
+            contract.defects.is_empty(),
+            "a story is not invalid for predating ids: {:?}",
+            contract.defects
+        );
+        assert_eq!(contract.criteria.len(), 2);
+        assert!(contract
+            .criteria
+            .iter()
+            .all(|criterion| criterion.id.is_none()));
+        assert!(contract
+            .criteria
+            .iter()
+            .all(|criterion| criterion.verify.is_none()));
+        assert_eq!(contract.criteria[0].text, "It ships.");
+
+        let addressed = "## Acceptance\n\n\
+                         - [x] `AC-1` It ships.\n      verify: `cargo test -p flux-cli it_ships`\n\
+                         - [ ] `AC-4` It is documented.\n";
+        assert_eq!(
+            checkbox_counts(addressed, "Acceptance"),
+            (1, 1, 2),
+            "an id and a handle are not extra checkboxes"
+        );
+        let contract = section_contract(addressed, "Acceptance");
+        assert!(contract.defects.is_empty(), "{:?}", contract.defects);
+        assert_eq!(contract.criteria[0].id.as_deref(), Some("AC-1"));
+        assert_eq!(contract.criteria[0].text, "It ships.");
+        assert_eq!(
+            contract.criteria[0].verify.as_deref(),
+            Some("cargo test -p flux-cli it_ships")
+        );
+        // Ids are allocated once and never renumbered, so a gap is normal and never closed up.
+        assert_eq!(contract.criteria[1].id.as_deref(), Some("AC-4"));
+        assert_eq!(contract.criteria[1].verify, None);
+    }
+
+    /// C-739: `board check` refuses an id that cannot mean one thing — and nothing else.
+    #[test]
+    fn check_refuses_a_duplicate_criterion_id_and_ignores_a_story_that_declares_none() {
+        let story = |body: &str| Story {
+            id: "C-1".to_string(),
+            title: "Story".to_string(),
+            status: "ready".to_string(),
+            file: "C-1-story.md".to_string(),
+            pillar: None,
+            epic: None,
+            design: None,
+            areas: Vec::new(),
+            note: None,
+            priority: Some(1),
+            dependencies: Vec::new(),
+            body: body.to_string(),
+        };
+
+        assert!(
+            criterion_contract_errors(&story("## Acceptance\n- [ ] It ships.\n- [ ] It works.\n"))
+                .is_empty(),
+            "the 1,251 stories that predate ids stay valid"
+        );
+
+        let duplicated = criterion_contract_errors(&story(
+            "## Acceptance\n- [ ] `AC-1` It ships.\n- [ ] `AC-1` It works.\n",
+        ));
+        assert_eq!(duplicated.len(), 1, "{duplicated:?}");
+        assert!(duplicated[0].contains("C-1: criterion id AC-1 is declared twice"));
+
+        let malformed =
+            criterion_contract_errors(&story("## Acceptance\n- [ ] `AC-01` It ships.\n"));
+        assert_eq!(malformed.len(), 1, "{malformed:?}");
+        assert!(malformed[0].contains("malformed criterion id `AC-01`"));
+
+        let orphan = criterion_contract_errors(&story(
+            "## Acceptance\n  verify: `cargo test x`\n- [ ] `AC-1` It ships.\n      verify:\n",
+        ));
+        assert_eq!(orphan.len(), 2, "{orphan:?}");
+        assert!(orphan[0].contains("sits under no criterion"), "{orphan:?}");
+        assert!(orphan[1].contains("AC-1 declares an empty"), "{orphan:?}");
+    }
+
+    /// C-739: a handle is discharged by what actually ran, not by the claim that it did.
+    #[test]
+    fn a_declared_handle_is_discharged_only_by_the_validation_that_ran_it() {
+        let argv = ["cargo", "test", "-p", "flux-cli", "it_ships"].map(str::to_string);
+
+        let (proven, proof) = discharge_criterion_handle(
+            Some("cargo test -p flux-cli it_ships"),
+            Path::new("."),
+            &argv,
+        );
+        assert!(proven, "{proof}");
+
+        let (proven, proof) = discharge_criterion_handle(
+            Some("cargo test -p flux-cli it_is_documented"),
+            Path::new("."),
+            &argv,
+        );
+        assert!(
+            !proven,
+            "an argv that ran another test proves another criterion"
+        );
+        assert!(proof.contains("did not run"), "{proof}");
+
+        let (proven, proof) = discharge_criterion_handle(None, Path::new("."), &argv);
+        assert!(!proven, "a criterion with no handle is never proven");
+        assert!(proof.contains("writer's word"), "{proof}");
+
+        let (proven, _) = discharge_criterion_handle(
+            Some("crates/flux-cli/src/board_fleet_cmd.rs"),
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("workspace root"),
+            &argv,
+        );
+        assert!(
+            proven,
+            "an artifact handle is answered by the tree, not by the argv"
         );
     }
 

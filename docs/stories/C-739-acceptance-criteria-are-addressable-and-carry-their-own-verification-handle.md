@@ -23,14 +23,64 @@ command that proves it.
 
 ## Acceptance
 
-- [ ] Each criterion carries a stable id, allocated once and never renumbered, that a handoff, a
+- [x] Each criterion carries a stable id, allocated once and never renumbered, that a handoff, a
       review finding and a doctor report can all cite.
-- [ ] A criterion may declare its own verification handle — the exact command, test name or
+- [x] A criterion may declare its own verification handle — the exact command, test name or
       observable artifact that proves it — and that handle is what evidence is checked against.
-- [ ] Coverage is computable: which criteria are claimed, by which commit, with what evidence.
-- [ ] C-723's `acceptance_artifacts` prefers a declared handle over scraping backticks from prose,
+- [x] Coverage is computable: which criteria are claimed, by which commit, with what evidence.
+- [x] C-723's `acceptance_artifacts` prefers a declared handle over scraping backticks from prose,
       and says which it used.
-- [ ] Existing stories without ids keep working. This is additive; a story is not invalid for
+- [x] Existing stories without ids keep working. This is additive; a story is not invalid for
       predating it.
-- [ ] Regression test: a worker's handoff cites a criterion id, and a criterion whose declared
+- [x] Regression test: a worker's handoff cites a criterion id, and a criterion whose declared
       verification did not run is reported as unproven rather than counted as satisfied.
+
+## Syntax
+
+```markdown
+## Acceptance
+
+- [ ] `AC-1` A reclaimed wave's worktrees are provably gone.
+      verify: `cargo test -p flux-cli reclaim_removes_the_worktrees_it_reports`
+```
+
+The id is a backticked `AC-<n>` opening the bullet — written down rather than derived from
+position, which is what makes it survive an insertion, a deletion or a reorder. `AC-` collides with
+no board id prefix in use (`C-`, `X-`, `D-`, `E-`), so a bullet opening with a story id is citing
+that story rather than defining a criterion. The handle is an indented `verify:` continuation line
+holding a command, a test name or a path.
+
+Both are optional. Nothing is retrofitted: 1,260 stories declare neither, and every one of them
+parses, counts and validates exactly as before.
+
+## Progress
+
+- One parser. `checkbox_counts` — the counter shared by `board done`, `board reconcile`, `board
+  stats` and C-723's `verify_already_built` — is now derived from `section_contract`, so ids,
+  handles and counts can never be two answers to the same question.
+- Counting parity proved on the corpus rather than argued: the legacy algorithm and the new binary
+  both report `done=4032 total=6707` over the same 1,260 stories, and `flux board check` stays
+  green on all of them.
+- `board check` refuses only what makes an id meaningless — a duplicate, a malformed `AC-01`, a
+  `verify:` under no criterion, an empty or doubled handle. A story declaring no ids contributes no
+  findings by construction.
+- `flux fleet handoff --criterion AC-1` resolves each citation against the story *at the handed-off
+  commit* and refuses one that does not resolve, before any validation runs. A renumber therefore
+  breaks loudly, which is the only thing that makes "allocated once" enforceable.
+- `flux fleet coverage BOARD/ITEM` joins the story's criteria to every wave's handoffs: `proven`
+  needs the criterion's own declared handle discharged inside a validation that passed; `unproven`
+  is claimed-and-not-discharged; `claimed` has evidence but no declared handle; `unclaimed` and
+  `unaddressable` are the rest. A claim naming an id the story no longer declares is reported as
+  dangling, not dropped.
+- `acceptance_evidence` replaces the bare scrape and reports `handle_source: declared|scraped`.
+  Declared handles win when any names something checkable; a handle naming nothing checkable falls
+  back to the scrape rather than to an empty list, because absence is what releases a story and an
+  empty list is not evidence of absence.
+
+## Notes
+
+- Not in scope, deliberately: migrating existing stories to ids, and the story template. Both
+  belong with C-738.
+- `fleet rework` and `fleet doctor` resolve criterion ids through the same parser but take no
+  `--criterion` flag yet; the citation surface wired here is the handoff, which is where a worker's
+  claim actually lands.
