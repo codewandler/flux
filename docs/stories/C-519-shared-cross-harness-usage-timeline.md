@@ -5,6 +5,7 @@ pillar: Core
 status: ready
 epic: usage-observatory
 note: "Make flux usage and the future observatory consume one read-only timeline instead of copying CLI parsers into the TUI"
+priority: 12
 ---
 
 # Extract one shared cross-harness usage timeline

@@ -7,6 +7,7 @@ epic: resource-accounting
 design: docs/designs/resource-accounting.md
 areas: [flux-events, flux-runtime, flux-flow, flux-system]
 note: "one span tree for tokens/calls, wall/CPU, network time/bytes, process/tool/artifact resources and validation"
+priority: 11
 ---
 
 # Measure work once at the owning boundary
