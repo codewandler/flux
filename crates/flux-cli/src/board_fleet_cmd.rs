@@ -659,10 +659,6 @@ pub(super) enum BoardAction {
         design: Option<String>,
         #[arg(long)]
         note: Option<String>,
-        /// Leave the new document uncommitted. It will not be visible to any board read that resolves
-        /// items at a git ref, which is the default for a workspace member.
-        #[arg(long)]
-        no_commit: bool,
     },
     /// Update common planning metadata.
     Update {
@@ -698,6 +694,29 @@ pub(super) enum BoardAction {
     Comment { id: String, text: String },
     /// Append structured evidence to an item.
     Evidence { id: String, evidence: String },
+    /// Put planning documents on the branch. The only board verb that commits.
+    ///
+    /// Every other mutating op authors a file and stops. That is one rule with no exceptions to
+    /// remember, instead of nine ops of which exactly one used to commit — and what it committed was
+    /// the stub, so a story's committed form was the one whose Acceptance read "Define acceptance."
+    /// while a board read, which resolves items at a git ref, could already schedule it.
+    Commit {
+        /// Planning documents to commit, board-relative. Repeat for more than one.
+        #[arg(value_name = "PATH")]
+        paths: Vec<String>,
+        /// Commit the document of this planning item. Repeat for more than one.
+        #[arg(long = "item", value_name = "ID")]
+        items: Vec<String>,
+        /// Commit every uncommitted planning document under the board's own document roots.
+        ///
+        /// Never the whole checkout: a source edit, a manifest or a lockfile is out of reach by
+        /// construction, because another session's work is not this board's to commit.
+        #[arg(long)]
+        all: bool,
+        /// Commit subject. Defaults to a subject derived from the documents that are committed.
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
     /// Validate frontmatter, ids, priorities and planning-document links.
     Check,
     /// Report items whose work is already present while their status says it is outstanding.
@@ -4024,14 +4043,44 @@ fn require_canonical_member_checkout(workspace: &Path, selector: &str, root: &Pa
                 member.canonical_ref
             )
         }
-        if git_output(root, &["status", "--porcelain"]).is_some_and(|status| !status.is_empty()) {
-            bail!(
-                "conflict/precondition: workspace member {} checkout is dirty",
-                member.id
-            )
+        // C-735: a mutating op no longer commits what it writes, so the board's own uncommitted
+        // documents are the normal state between authoring and `flux board commit`. Refusing on them
+        // would make a `create` block the very next `update` — the git-amend loop this guard was
+        // never meant to cause. Dirt the board does not own still refuses, which is what it is for.
+        if let Some(status) = git_output(root, &["status", "--porcelain"]) {
+            if !status.is_empty()
+                && !member_dirt_outside_the_board(root)
+                    .unwrap_or(status)
+                    .is_empty()
+            {
+                bail!(
+                    "conflict/precondition: workspace member {} checkout is dirty outside its planning documents",
+                    member.id
+                )
+            }
         }
     }
     Ok(())
+}
+
+/// The member's dirty paths that are not the board's own documents.
+///
+/// Asked with `:(exclude)` pathspecs rather than by parsing porcelain, so rename records and quoted
+/// paths never have to be interpreted. `None` means the question could not be asked, and the caller
+/// falls back to refusing: a guard that fails open is not a guard.
+fn member_dirt_outside_the_board(root: &Path) -> Option<String> {
+    let mut args = vec![
+        "status".to_string(),
+        "--porcelain".to_string(),
+        "--".to_string(),
+        ".".to_string(),
+    ];
+    args.extend(
+        board_committable_roots()
+            .into_iter()
+            .map(|path| format!(":(exclude){path}")),
+    );
+    git_output(root, &args.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 fn run_session_board_checked(command: &BoardCommand, request: Option<Value>) -> Result<()> {
@@ -4460,9 +4509,10 @@ fn run_session_board_action(
             Ok((serde_json::to_string_pretty(&data)?, data, vec![], current))
         }
         // A session board keeps neither git history nor acceptance prose, so it has nothing
-        // reconcile could read. Refusing beats answering "nothing drifted" from a backend that
-        // could not have seen drift.
+        // reconcile could read, and no file for commit to put on a branch. Refusing beats answering
+        // "nothing drifted" from a backend that could not have seen drift.
         BoardAction::Call { .. }
+        | BoardAction::Commit { .. }
         | BoardAction::Reconcile
         | BoardAction::Render
         | BoardAction::Sync
@@ -4673,7 +4723,6 @@ fn run_board_action(
             areas,
             design,
             note,
-            no_commit,
         } => create_item(
             command,
             root,
@@ -4688,7 +4737,6 @@ fn run_board_action(
                 areas,
                 design: design.as_deref(),
                 note: note.as_deref(),
-                commit: !no_commit,
             },
         ),
         BoardAction::Update {
@@ -4736,6 +4784,12 @@ fn run_board_action(
         BoardAction::Evidence { id, evidence } => {
             append_story_section(command, root, id, "Evidence", evidence)
         }
+        BoardAction::Commit {
+            paths,
+            items,
+            all,
+            message,
+        } => board_commit(command, root, paths, items, *all, message.as_deref()),
         BoardAction::Check => {
             if command.scope() == BoardScopeArg::Workspace && command.board.is_none() {
                 check_workspace_board(root)
@@ -6187,6 +6241,7 @@ fn board_operations() -> &'static [&'static str] {
         "done",
         "comment",
         "evidence",
+        "commit",
         "check",
         "reconcile",
         "render",
@@ -6219,6 +6274,7 @@ fn board_action_mutates(action: &BoardAction) -> bool {
             | BoardAction::Done { .. }
             | BoardAction::Comment { .. }
             | BoardAction::Evidence { .. }
+            | BoardAction::Commit { .. }
             | BoardAction::Render
             | BoardAction::Sync
             | BoardAction::Import { .. }
@@ -6258,6 +6314,8 @@ fn board_action_requires_member(action: &BoardAction) -> bool {
             | BoardAction::Done { .. }
             | BoardAction::Comment { .. }
             | BoardAction::Evidence { .. }
+            // Commit moves a member's branch, so it must name the member whose branch that is.
+            | BoardAction::Commit { .. }
             | BoardAction::Render
             | BoardAction::Sync
             | BoardAction::Import { .. }
@@ -6586,7 +6644,7 @@ fn family_schema(family: &str, operations: &[&str]) -> Value {
 }
 
 fn board_skill() -> String {
-    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board next --limit 8 --independent --output json  # a wave-safe set, not a priority prefix\nflux board reconcile --output json  # items whose work is already in the tree\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\n```\n\nUse `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-board\ndescription: Inspect and safely mutate scoped Flux boards through the stable JSON CLI.\n---\n\n# Flux board\n\nUse this for session, repository, or workspace boards. Start with `flux board schema --output json`; JSON is the agent API. A default `.flux/board.toml` makes plain `flux board` select the independent cross-repository workspace and its active-milestone program. Before mutation, inspect `vision`, `roadmap`, applicable `decision` records, the story Goal/Acceptance, and its linked design.\n\n```sh\nflux board show --output json\nflux board next --limit 1 --output json\nflux board next --limit 8 --independent --output json  # a wave-safe set, not a priority prefix\nflux board reconcile --output json  # items whose work is already in the tree\nflux board get C-1 --output json\nflux board stats --history --output json\nflux board transition C-1 in-progress --if-revision REV --idempotency-key KEY --output json\nflux board commit --item C-1 --output json  # authoring writes files; this is the only verb that commits\n```\n\nEvery mutating op authors a document and commits nothing, so a board read — which resolves items at a git ref — cannot see the work until `flux board commit` lands it. Commit what you named (`--item ID`, or explicit paths) or `--all`, which reaches the board's own document roots and never the rest of the checkout. `flux board check` reports every planning document still off the branch. Use `--dry-run` first for compound changes. Never hand-edit the generated board marker region. Board scope, profile, and backend are independent; use an explicit `--board` when more than one matches. README and AGENTS prose are not schedule inputs. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn fleet_skill() -> String {
@@ -8167,7 +8225,6 @@ struct CreateItemInput<'a> {
     areas: &'a [String],
     design: Option<&'a str>,
     note: Option<&'a str>,
-    commit: bool,
 }
 
 fn create_item(
@@ -8186,7 +8243,6 @@ fn create_item(
         areas,
         design,
         note,
-        commit,
     } = input;
     let status = normalize_status(status);
     if !matches!(status.as_str(), "backlog" | "ready") {
@@ -8248,52 +8304,326 @@ fn create_item(
             .with_context(|| format!("conflict/precondition: {} already exists", file.display()))?;
         output.write_all(body.as_bytes())?;
     }
-    let recorded = if command.dry_run || !commit {
-        None
-    } else {
-        commit_new_planning_document(root, &file, &id, title)?
-    };
     Ok((
         format!(
-            "created {id}{}{}",
-            if command.dry_run { " (dry run)" } else { "" },
-            recorded
-                .as_deref()
-                .map(|sha| format!(" and committed as {}", &sha[..sha.len().min(8)]))
-                .unwrap_or_default()
+            "created {id}{}",
+            if command.dry_run { " (dry run)" } else { "" }
         ),
-        json!({"id": id, "slug": slug, "kind": format!("{kind:?}").to_ascii_lowercase(), "file": display_path(&file), "status": status, "pillar": pillar, "areas": areas, "commit": recorded, "dry_run": command.dry_run, "content": if command.dry_run { Some(body) } else { None }}),
+        // C-735: `commit` stays in the envelope and is always null. Creation authors a document and
+        // nothing else; `flux board commit` is the only verb that puts one on a branch.
+        json!({"id": id, "slug": slug, "kind": format!("{kind:?}").to_ascii_lowercase(), "file": display_path(&file), "status": status, "pillar": pillar, "areas": areas, "commit": Value::Null, "dry_run": command.dry_run, "content": if command.dry_run { Some(body) } else { None }}),
         vec![],
         changed_revision(root, command.dry_run)?,
     ))
 }
 
-/// Commit exactly the document just created, and nothing else.
+/// Put the named planning documents on the branch, and report what actually landed.
 ///
-/// Creating a planning item without committing it is a silent no-op wherever items are resolved at a
-/// git ref, which is the normal case: a workspace member's items are read with `ls-tree`/`show` at its
-/// `canonical_ref`, so an uncommitted story does not exist as far as the Board is concerned. Twenty-seven
-/// stories were filed, reported as created, and could not be scheduled — the command had succeeded and
-/// nothing had happened. Committing is what makes creation take effect, so it is the default.
-///
-/// Deliberately narrow:
-/// - The commit is path-scoped. It never sweeps in whatever else happens to be dirty in the checkout,
-///   which is the whole reason `git commit -a` is not used anywhere near this.
-/// - It commits to the current branch rather than a side branch. A side branch would reproduce exactly
-///   the invisibility being fixed. Item creation is also the one planning mutation that cannot conflict:
-///   it only ever adds a path that did not exist.
-/// - Outside a git repository it does nothing and reports nothing, because there is no ref for a read
-///   to resolve against.
-/// - Mid-merge or mid-rebase it refuses rather than committing into someone else's in-progress
-///   operation. The document is already on disk, so the path is named in the error and no work is lost.
-fn commit_new_planning_document(
+/// The verb never guesses at its own scope: without `--all`, `--item` or a path it refuses rather
+/// than defaulting to "commit whatever is lying around", because "whatever is lying around" in this
+/// repository routinely belongs to somebody else.
+fn board_commit(
+    command: &BoardCommand,
     root: &Path,
-    file: &Path,
-    id: &str,
-    title: &str,
-) -> Result<Option<String>> {
+    paths: &[String],
+    items: &[String],
+    all: bool,
+    message: Option<&str>,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    if !all && paths.is_empty() && items.is_empty() {
+        bail!("input/schema: board commit needs --all, --item ID, or an explicit planning-document path")
+    }
+    if message.is_some_and(|message| message.trim().is_empty()) {
+        bail!("input/schema: --message cannot be empty")
+    }
+    // Outside a checkout there is no branch to commit to. Reporting a no-op success here would be the
+    // exact failure this verb exists to remove, so it refuses instead.
+    if git_output(root, &["rev-parse", "--absolute-git-dir"]).is_none() {
+        bail!(
+            "not-found: {} is not a git checkout, so there is no branch for a planning document to land on",
+            display_path(root)
+        )
+    }
+
+    let mut requested = BTreeSet::new();
+    for id in items {
+        let path = story_path(root, id)?;
+        requested.insert(board_relative_document(root, &path.to_string_lossy())?);
+    }
+    for path in paths {
+        requested.insert(board_relative_document(root, path)?);
+    }
+
+    let mut pathspecs = requested.iter().cloned().collect::<Vec<_>>();
+    if all {
+        pathspecs.extend(BOARD_DOCUMENT_ROOTS.into_iter().map(str::to_string));
+    }
+    let pending = uncommitted_documents(root, &pathspecs).unwrap_or_default();
+    let selected = if all {
+        pending
+    } else {
+        pending
+            .into_iter()
+            .filter(|(path, _)| requested.contains(path))
+            .collect()
+    };
+    // A named document that is neither pending nor on disk was never a document here.
+    for path in &requested {
+        if !selected.contains_key(path) && !root.join(path).exists() {
+            bail!(
+                "not-found: {path} is not a planning document in {}",
+                display_path(root)
+            )
+        }
+    }
+    let already = requested
+        .iter()
+        .filter(|path| !selected.contains_key(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let documents = selected.keys().cloned().collect::<Vec<_>>();
+
+    if command.dry_run {
+        return Ok((
+            format!("would commit {} planning document(s)", documents.len()),
+            json!({"commit": Value::Null, "documents": documents, "already_committed": already, "dry_run": true}),
+            vec![],
+            changed_revision(root, true)?,
+        ));
+    }
+    if selected.is_empty() {
+        // Idempotent by construction: a document already on the branch is not pending, so a repeat
+        // invocation resolves to an empty set and says so rather than making an empty commit.
+        let human = if already.is_empty() {
+            "nothing to commit: no planning document differs from the branch".to_string()
+        } else {
+            format!(
+                "nothing to commit: {} planning document(s) are already on the branch",
+                already.len()
+            )
+        };
+        return Ok((
+            human,
+            json!({"commit": Value::Null, "documents": [], "already_committed": already, "dry_run": false}),
+            vec![],
+            changed_revision(root, false)?,
+        ));
+    }
+
+    let message = message
+        .map(str::to_string)
+        .unwrap_or_else(|| derived_commit_message(root, &selected));
+    let (sha, landed) = commit_planning_documents(root, &selected, &message)?;
+    Ok((
+        format!(
+            "committed {} planning document(s) as {}",
+            landed.len(),
+            &sha[..sha.len().min(8)]
+        ),
+        json!({"commit": sha, "documents": landed, "message": message, "already_committed": already, "dry_run": false}),
+        vec![],
+        changed_revision(root, false)?,
+    ))
+}
+
+/// Normalise one caller-named path to a board-relative planning document, or refuse it.
+///
+/// Absolute paths under the board root are accepted because that is the form every op reports back in
+/// `data.file`. Everything else is refused as `permission`: this verb stages the board's own
+/// documents, and widening it into a general-purpose `git add` would give a planning tool the power to
+/// commit source it never read.
+fn board_relative_document(root: &Path, supplied: &str) -> Result<String> {
+    let candidate = Path::new(supplied);
+    let relative = if candidate.is_absolute() {
+        candidate.strip_prefix(root).map_err(|_| {
+            anyhow::anyhow!(
+                "permission: {supplied} is outside the board root {}",
+                display_path(root)
+            )
+        })?
+    } else {
+        candidate
+    };
+    let mut parts = Vec::new();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(part.to_string_lossy().into_owned()),
+            std::path::Component::CurDir => {}
+            _ => bail!(
+                "permission: planning-document paths are board-relative and cannot escape the board root: {supplied}"
+            ),
+        }
+    }
+    let relative = parts.join("/");
+    if relative.is_empty() {
+        bail!("input/schema: a planning-document path cannot be empty")
+    }
+    if !under_any_root(&relative, &board_committable_roots()) {
+        bail!(
+            "permission: {relative} is not one of the board's own documents; `flux board commit` stages planning documents and never the rest of a checkout"
+        )
+    }
+    Ok(relative)
+}
+
+/// The subject a caller gets when they do not supply one.
+///
+/// A single document is named the way `create` used to name it, so the history reads the same; a set
+/// gets a counted subject and a body listing every path, because a subject that named one of five
+/// documents would misdescribe the commit.
+fn derived_commit_message(root: &Path, documents: &BTreeMap<String, &'static str>) -> String {
+    if let Some((path, state)) = documents.iter().next().filter(|_| documents.len() == 1) {
+        let verb = if *state == "untracked" {
+            "add"
+        } else {
+            "update"
+        };
+        return format!("board: {verb} {}", document_label(root, path));
+    }
+    format!(
+        "board: commit {} planning documents\n\n{}\n",
+        documents.len(),
+        documents
+            .keys()
+            .map(|path| format!("- {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    )
+}
+
+/// How one planning document names itself: its frontmatter identity, else its title, else its path.
+fn document_label(root: &Path, path: &str) -> String {
+    let Ok(body) = fs::read_to_string(root.join(path)) else {
+        return path.to_string();
+    };
+    let frontmatter = parse_frontmatter(&body);
+    match (frontmatter.get("id"), frontmatter.get("title")) {
+        (Some(id), Some(title)) => format!("{id} {title}"),
+        (Some(id), None) => id.clone(),
+        _ => markdown_title(&root.join(path)).unwrap_or_else(|| path.to_string()),
+    }
+}
+
+/// The board's own document roots, and therefore the exact reach of `board commit --all`.
+///
+/// `--all` cannot mean "every dirty file in the repository". Four writers routinely share a checkout
+/// here and the standing rule is to commit path-scoped and never sweep another session's work, so the
+/// fence is structural rather than a convention someone has to remember: a source edit, a manifest or
+/// a lockfile is out of reach by construction. This is also the set `board check` watches for a
+/// planning document that exists on disk and nowhere a board read can resolve it.
+///
+/// Both spellings of each singleton are listed because the board itself reads either.
+const BOARD_DOCUMENT_ROOTS: [&str; 10] = [
+    "ROADMAP.md",
+    "VISION.md",
+    "decisions",
+    "docs/ROADMAP.md",
+    "docs/VISION.md",
+    "docs/decisions",
+    "docs/designs",
+    "docs/roadmap.md",
+    "docs/stories",
+    "docs/vision.md",
+];
+
+/// Board-authored files that `--all` must never sweep, but that a caller may still name explicitly.
+///
+/// `board done --changelog` authors `CHANGELOG.md`, so refusing it outright would leave a
+/// board-authored edit no board verb could ever land. It is also the most contended shared ledger in
+/// a repository, which is exactly why committing it has to be a deliberate act rather than a side
+/// effect of `--all`.
+const BOARD_NAMED_ONLY_DOCUMENTS: [&str; 1] = ["CHANGELOG.md"];
+
+/// Every path `flux board commit` will stage when a caller names it.
+fn board_committable_roots() -> Vec<&'static str> {
+    BOARD_DOCUMENT_ROOTS
+        .into_iter()
+        .chain(BOARD_NAMED_ONLY_DOCUMENTS)
+        .collect()
+}
+
+/// Is `path` inside one of `roots`?
+fn under_any_root(path: &str, roots: &[&str]) -> bool {
+    roots
+        .iter()
+        .any(|root| path == *root || path.starts_with(&format!("{root}/")))
+}
+
+/// The board-relative planning documents whose on-disk form the branch does not hold.
+///
+/// Two plumbing reads rather than `status --porcelain`, because `ls-files --others` and
+/// `diff --name-only HEAD` answer precisely "not on the branch" and "not the same as the branch" —
+/// the actual question — without the porcelain format's rename records or its path quoting. `-z`
+/// removes the quoting entirely, so a document with an awkward name reads back exactly as git names
+/// it. `None` means "no branch to be absent from": outside a git repository nothing is uncommitted.
+fn uncommitted_documents(
+    root: &Path,
+    pathspecs: &[String],
+) -> Option<BTreeMap<String, &'static str>> {
+    git_output(root, &["rev-parse", "--absolute-git-dir"])?;
+    // git reports repository-relative paths; the board may sit in a subdirectory of the repository.
+    let prefix = git_output(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let mut documents = BTreeMap::new();
+    for (state, probe) in [
+        (
+            "untracked",
+            vec![
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--full-name",
+                "--",
+            ],
+        ),
+        // `diff HEAD` fails on an unborn branch, where nothing is committed anyway.
+        ("modified", vec!["diff", "-z", "--name-only", "HEAD", "--"]),
+    ] {
+        let mut args = probe;
+        args.extend(pathspecs.iter().map(String::as_str));
+        let Some(listed) = git_output(root, &args) else {
+            continue;
+        };
+        for path in listed.split('\0').filter(|path| !path.is_empty()) {
+            let Some(path) = path.strip_prefix(prefix.as_str()) else {
+                continue;
+            };
+            documents.insert(path.to_string(), state);
+        }
+    }
+    Some(documents)
+}
+
+/// The paths one commit actually contains, board-relative.
+fn committed_paths(root: &Path, sha: &str) -> Result<BTreeSet<String>> {
+    let prefix = git_output(root, &["rev-parse", "--show-prefix"]).unwrap_or_default();
+    let listed = git_output(
+        root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "-z",
+            "--root",
+            sha,
+        ],
+    )
+    .with_context(|| format!("validation/gate: commit {sha} could not be read back"))?;
+    Ok(listed
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter_map(|path| path.strip_prefix(prefix.as_str()).map(str::to_string))
+        .collect())
+}
+
+/// Refuse to write into an in-progress git operation, naming what stays on disk.
+///
+/// Committing here would hand a conflict resolution files nobody resolved. The documents are already
+/// written, so the refusal loses nothing — it only declines to put them on a branch mid-operation.
+fn refuse_mid_git_operation(root: &Path, documents: &[&String]) -> Result<()> {
     let Some(git_dir) = git_output(root, &["rev-parse", "--absolute-git-dir"]) else {
-        return Ok(None);
+        return Ok(());
     };
     let git_dir = PathBuf::from(git_dir);
     for marker in [
@@ -8306,32 +8636,82 @@ fn commit_new_planning_document(
             bail!(
                 "conflict/precondition: {} is mid-{marker}; {} was written but not committed",
                 root.display(),
-                file.display()
+                documents
+                    .iter()
+                    .map(|path| path.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }
     }
-    let relative = file
-        .strip_prefix(root)
-        .unwrap_or(file)
-        .to_string_lossy()
-        .replace('\\', "/");
-    let staged = guarded_git(root, &["add", "--", &relative])?;
+    Ok(())
+}
+
+/// Commit exactly these planning documents, and report only what the commit actually contains.
+///
+/// Deliberately narrow, and unchanged in mechanics from the creation-time commit it generalises:
+/// - The commit is path-scoped. It never sweeps in whatever else happens to be dirty in the checkout,
+///   which is the whole reason `git commit -a` is not used anywhere near this.
+/// - It commits to the current branch rather than a side branch. A side branch would reproduce the
+///   invisibility being fixed: a board read resolves items at a ref, and that ref is this one.
+/// - Mid-merge or mid-rebase it refuses rather than committing into someone else's in-progress
+///   operation. The documents are already on disk, so they are named in the error and nothing is lost.
+///
+/// The commit is then **read back**. git's exit code says a commit happened, not what is in it, and a
+/// verb that reported the paths it meant to write would be the same defect this epic exists to remove:
+/// a mismatch between the requested set and the committed set fails instead of reporting success.
+fn commit_planning_documents(
+    root: &Path,
+    documents: &BTreeMap<String, &'static str>,
+    message: &str,
+) -> Result<(String, Vec<String>)> {
+    let paths = documents.keys().collect::<Vec<_>>();
+    refuse_mid_git_operation(root, &paths)?;
+    let named = paths
+        .iter()
+        .map(|path| path.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut stage = vec!["add", "--"];
+    stage.extend(paths.iter().map(|path| path.as_str()));
+    let staged = guarded_git(root, &stage)?;
     if staged.exit_code != 0 {
         bail!(
-            "validation/gate: staging {relative} failed; the document was written but not committed: {}",
+            "validation/gate: staging {named} failed; the document(s) were written but not committed: {}",
             clipped_redacted(staged.stderr.as_bytes())
         )
     }
-    let message = format!("board: add {id} {title}");
-    // The pathspec makes this `--only`: exactly this document, whatever else is staged.
-    let committed = guarded_git(root, &["commit", "-m", &message, "--", &relative])?;
+    // The pathspec makes this `--only`: exactly these documents, whatever else is staged.
+    let mut commit = vec!["commit", "-m", message, "--"];
+    commit.extend(paths.iter().map(|path| path.as_str()));
+    let committed = guarded_git(root, &commit)?;
     if committed.exit_code != 0 {
         bail!(
-            "validation/gate: committing {relative} failed; the document was written but not committed: {}",
+            "validation/gate: committing {named} failed; the document(s) were written but not committed: {}",
             clipped_redacted(committed.stderr.as_bytes())
         )
     }
-    Ok(git_output(root, &["rev-parse", "HEAD"]))
+
+    let sha = git_output(root, &["rev-parse", "HEAD"])
+        .context("validation/gate: the commit could not be resolved after it was made")?;
+    let landed = committed_paths(root, &sha)?;
+    let requested = documents.keys().cloned().collect::<BTreeSet<_>>();
+    if landed != requested {
+        bail!(
+            "validation/gate: commit {sha} holds {} but {named} was requested",
+            landed.iter().cloned().collect::<Vec<_>>().join(", ")
+        )
+    }
+    let still_pending = uncommitted_documents(root, &documents.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !still_pending.is_empty() {
+        bail!(
+            "validation/gate: commit {sha} was made yet {} is still uncommitted",
+            still_pending.keys().cloned().collect::<Vec<_>>().join(", ")
+        )
+    }
+    Ok((sha, landed.into_iter().collect()))
 }
 
 fn allocate_id(root: &Path, prefix: &str) -> String {
@@ -8468,13 +8848,40 @@ fn check_board_with_known_dependencies(
     if !errors.is_empty() {
         bail!("validation/gate: {}", errors.join("; "));
     }
+    // C-735: no mutating op commits, so between authoring and `flux board commit` a planning document
+    // exists on disk and nowhere a board read can resolve it. That window is what makes deferral safe
+    // to have — but only once it is reported, so it is reported here.
+    //
+    // A warning rather than an error: `board sync` runs this check before rendering, and a fatal
+    // finding would make the board unrenderable for exactly as long as somebody is authoring.
+    let uncommitted = uncommitted_documents(
+        root,
+        &BOARD_DOCUMENT_ROOTS
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
+    for (path, state) in &uncommitted {
+        warnings.push(format!(
+            "{path} is {state}; no board read that resolves items at a git ref can see it — commit it with `flux board commit`"
+        ));
+    }
     Ok((
         format!(
-            "board valid: {} stories, {} warning(s)",
+            "board valid: {} stories, {} warning(s), {} uncommitted document(s)",
             stories.len(),
-            warnings.len()
+            warnings.len(),
+            uncommitted.len()
         ),
-        json!({"valid": true, "stories": stories.len()}),
+        json!({
+            "valid": true,
+            "stories": stories.len(),
+            "uncommitted": uncommitted
+                .iter()
+                .map(|(path, state)| json!({"path": path, "state": state}))
+                .collect::<Vec<_>>(),
+        }),
         warnings,
         None,
     ))
@@ -22588,6 +22995,50 @@ mod tests {
             target: "reconcile".into(),
             operation: None,
         }));
+    }
+
+    /// C-735: `commit` is the one verb that moves a branch, so it must be classed as a mutation and
+    /// must name the member whose branch it moves. Misclassified as a read it would skip the
+    /// canonical-checkout guard and commit into whatever member happened to be selected.
+    #[test]
+    fn board_commit_is_a_published_mutation_that_names_its_member() {
+        let commit = BoardAction::Commit {
+            paths: vec![],
+            items: vec!["C-1".into()],
+            all: false,
+            message: None,
+        };
+
+        assert!(board_operations().contains(&"commit"));
+        assert!(board_action_mutates(&commit));
+        assert!(board_action_requires_member(&commit));
+    }
+
+    /// The fence is structural: `--all` reaches the board's own documents and stops there.
+    ///
+    /// `CHANGELOG.md` is the deliberate asymmetry — `board done --changelog` authors it, so a caller
+    /// may name it, but sweeping the most contended ledger in a repository is exactly the accident
+    /// `--all` must be unable to have.
+    #[test]
+    fn the_commit_fence_reaches_planning_documents_and_nothing_else() {
+        let roots = BOARD_DOCUMENT_ROOTS.to_vec();
+
+        assert!(under_any_root("docs/stories/C-1-a.md", &roots));
+        assert!(under_any_root("docs/designs/whatever.md", &roots));
+        assert!(under_any_root("docs/ROADMAP.md", &roots));
+        for outside in [
+            "Cargo.lock",
+            "Cargo.toml",
+            "crates/flux-cli/src/board_fleet_cmd.rs",
+            "docs/architecture.md",
+            "CHANGELOG.md",
+        ] {
+            assert!(
+                !under_any_root(outside, &roots),
+                "{outside} is not `--all`'s"
+            );
+        }
+        assert!(under_any_root("CHANGELOG.md", &board_committable_roots()));
     }
 
     /// C-596: the integrator's authority ends at a green gate. Apply, push, Board mutation and

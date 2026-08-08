@@ -333,6 +333,24 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
         "---\nid: C-1\ntitle: Ready\nstatus: ready\npriority: 1\n---\n\n# Ready\n\n## Acceptance\n\n- [ ] ship\n",
     )
     .unwrap();
+    // C-735: the skill documents `board commit`, so its fixture needs a branch for a document to
+    // land on. The examples run in order, which means the transition example dirties C-1 and the
+    // commit example genuinely commits it.
+    assert!(git(&board_root, &["init", "-q"]).status.success());
+    assert!(
+        git(&board_root, &["config", "user.email", "board@example.test"])
+            .status
+            .success()
+    );
+    assert!(
+        git(&board_root, &["config", "user.name", "Flux Board Test"])
+            .status
+            .success()
+    );
+    assert!(git(&board_root, &["add", "."]).status.success());
+    assert!(git(&board_root, &["commit", "-qm", "fixture"])
+        .status
+        .success());
     let board_skill = flux(&board_root, &["board", "skill"]);
     assert!(board_skill.status.success());
     let board_skill = String::from_utf8(board_skill.stdout).unwrap();
@@ -531,17 +549,11 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
     fs::remove_dir_all(fleet_root).ok();
 }
 
-/// Failing first: creating a planning item commits it, path-scoped, and `--no-commit` opts out.
+/// A board fixture with one tracked file, a first commit, and a configured committer.
 ///
-/// Items are resolved at a git ref wherever a board is federated — a workspace member's stories are read
-/// with `ls-tree`/`show` at its `canonical_ref` — so an uncommitted document is invisible to every read
-/// that matters. Twenty-seven stories were filed, reported as created, and could not be scheduled: the
-/// command had succeeded and nothing had happened. Committing is therefore the default, and it must
-/// never sweep in unrelated dirt from the checkout it happens to run in.
-#[test]
-fn creating_a_planning_item_commits_exactly_that_document() {
-    let root = fixture("create-commits");
-    // git records no empty directory, so the fixture needs one tracked file to have a first commit.
+/// git records no empty directory, so a board needs one tracked file before it has a first commit.
+fn commit_fixture(name: &str) -> PathBuf {
+    let root = fixture(name);
     fs::write(root.join("docs/stories/README.md"), "# Board\n").unwrap();
     assert!(git(&root, &["init", "-q"]).status.success());
     assert!(git(&root, &["config", "user.email", "board@example.test"])
@@ -552,11 +564,58 @@ fn creating_a_planning_item_commits_exactly_that_document() {
         .success());
     assert!(git(&root, &["add", "."]).status.success());
     assert!(git(&root, &["commit", "-qm", "fixture"]).status.success());
+    root
+}
+
+fn board_json(root: &PathBuf, args: &[&str]) -> serde_json::Value {
+    let output = flux(root, args);
+    assert!(
+        output.status.success(),
+        "{args:?} failed: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn head(root: &PathBuf) -> String {
+    String::from_utf8(git(root, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn paths_in(root: &PathBuf, sha: &str) -> Vec<String> {
+    String::from_utf8(git(root, &["show", "--name-only", "--pretty=format:", sha]).stdout)
+        .unwrap()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Status with every untracked file named, rather than collapsed to its directory.
+fn porcelain(root: &PathBuf) -> String {
+    String::from_utf8(git(root, &["status", "--porcelain", "-uall"]).stdout).unwrap()
+}
+
+/// C-735, failing first: authoring never commits, and exactly one verb does.
+///
+/// `create` used to be the single mutating op that committed, and what it committed was the stub whose
+/// Acceptance reads `- [ ] Define acceptance.` — so a story's committed form was the one where its
+/// definition of done did not exist, while a board read resolves items at a git ref and could schedule
+/// it anyway. Deferring every commit is only safe if the resulting window is reported, so `board check`
+/// names the uncommitted document, and `board commit` commits exactly what it is told about.
+#[test]
+fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
+    let root = commit_fixture("commit-verb");
 
     // Unrelated uncommitted work that must survive untouched.
     fs::write(root.join("UNRELATED.md"), "someone else's work\n").unwrap();
 
-    let created = flux(
+    let before = head(&root);
+    let created = board_json(
         &root,
         &[
             "board",
@@ -564,7 +623,7 @@ fn creating_a_planning_item_commits_exactly_that_document() {
             "--kind",
             "story",
             "--title",
-            "Committed on creation",
+            "Authored then committed",
             "--status",
             "ready",
             "--priority",
@@ -574,34 +633,210 @@ fn creating_a_planning_item_commits_exactly_that_document() {
         ],
     );
     assert!(
-        created.status.success(),
-        "{}",
-        String::from_utf8_lossy(&created.stdout)
+        created["data"]["commit"].is_null(),
+        "creation authors a document and commits nothing: {created}"
     );
-    let created: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
-    let sha = created["data"]["commit"]
-        .as_str()
-        .expect("creation must report the commit it made")
-        .to_string();
-    let file = created["data"]["file"].as_str().unwrap().to_string();
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+    // `data.file` is the absolute authored path; git speaks board-relative paths.
+    let file = Path::new(created["data"]["file"].as_str().unwrap())
+        .strip_prefix(&root)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(before, head(&root), "creation moved HEAD");
+    assert!(
+        String::from_utf8(git(&root, &["ls-tree", "HEAD", "--", &file]).stdout)
+            .unwrap()
+            .trim()
+            .is_empty(),
+        "the stub must not be the committed form of {id}"
+    );
 
-    // The commit exists, and contains exactly the new document.
-    let named =
-        String::from_utf8(git(&root, &["show", "--name-only", "--pretty=format:", &sha]).stdout)
-            .unwrap();
-    let touched = named
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect::<Vec<_>>();
-    assert_eq!(touched.len(), 1, "path-scoped commit, got {touched:?}");
-    assert!(file.ends_with(touched[0]), "{file} vs {}", touched[0]);
+    // The window between authoring and committing is reported, not silent.
+    let checked = board_json(&root, &["board", "check", "--output", "json"]);
+    assert!(
+        checked["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap_or_default().contains(&file)),
+        "check must report the uncommitted document: {checked}"
+    );
+    assert!(
+        checked["data"]["uncommitted"]
+            .as_array()
+            .expect("check reports uncommitted documents as machine-readable data")
+            .iter()
+            .any(|entry| entry["path"].as_str() == Some(file.as_str())),
+        "check data must name the uncommitted document: {checked}"
+    );
+
+    // The meaningful edit — the one that used to arrive after the commit — lands first.
+    let story = root.join(&file);
+    let authored = fs::read_to_string(&story)
+        .unwrap()
+        .replace("- [ ] Define acceptance.", "- [ ] The verb commits.");
+    fs::write(&story, authored).unwrap();
+
+    let committed = board_json(
+        &root,
+        &["board", "commit", "--item", &id, "--output", "json"],
+    );
+    let sha = committed["data"]["commit"]
+        .as_str()
+        .expect("the verb reports the commit it made")
+        .to_string();
+    assert_eq!(
+        sha,
+        head(&root),
+        "the reported sha is the commit that landed"
+    );
+    assert_eq!(
+        paths_in(&root, &sha),
+        vec![file.clone()],
+        "path-scoped commit"
+    );
+    assert_eq!(
+        committed["data"]["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry.as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        vec![file.clone()],
+        "the verb reports the documents that actually landed: {committed}"
+    );
+    // The committed form now carries the authored Acceptance, not the stub.
+    let landed = String::from_utf8(git(&root, &["show", &format!("{sha}:{file}")]).stdout).unwrap();
+    assert!(
+        landed.contains("- [ ] The verb commits."),
+        "the committed form is the authored one: {landed}"
+    );
 
     // The unrelated file was neither committed nor staged.
-    let status = String::from_utf8(git(&root, &["status", "--porcelain"]).stdout).unwrap();
-    assert_eq!(status.trim(), "?? UNRELATED.md", "status was {status:?}");
+    assert_eq!(
+        porcelain(&root).trim(),
+        "?? UNRELATED.md",
+        "board commit never sweeps the checkout it runs in"
+    );
 
-    // `--no-commit` writes the document and leaves it untracked, which is the invisible state.
-    let uncommitted = flux(
+    // Idempotent: nothing left to commit, said plainly, exit 0, HEAD untouched.
+    let again = board_json(
+        &root,
+        &["board", "commit", "--item", &id, "--output", "json"],
+    );
+    assert!(
+        again["data"]["commit"].is_null(),
+        "a second commit of the same document makes no commit: {again}"
+    );
+    assert_eq!(sha, head(&root), "the idempotent call moved HEAD");
+    let spoken = flux(&root, &["board", "commit", "--item", &id]);
+    assert!(spoken.status.success());
+    let spoken = String::from_utf8(spoken.stdout).unwrap();
+    assert!(
+        spoken.contains("nothing to commit"),
+        "it must say plainly that there was nothing to commit: {spoken:?}"
+    );
+
+    // And the check finding clears once the document is on the branch.
+    let checked = board_json(&root, &["board", "check", "--output", "json"]);
+    assert!(
+        checked["data"]["uncommitted"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "the finding clears once the document is committed: {checked}"
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-735: `--all` means every planning document, never every dirty file.
+///
+/// Four concurrent writers share this repository. "Commit path-scoped, never sweep another session's
+/// work" is the hard rule, so the board's own document roots are the fence — a dirty manifest, a
+/// lockfile or a source file is out of scope by construction, and an explicit path outside those roots
+/// is refused rather than quietly committed.
+#[test]
+fn board_commit_all_is_scoped_to_the_boards_own_documents() {
+    let root = commit_fixture("commit-all-scope");
+    fs::create_dir_all(root.join("crates/thing/src")).unwrap();
+    fs::write(root.join("Cargo.lock"), "# another session\n").unwrap();
+    fs::write(root.join("crates/thing/src/lib.rs"), "fn other() {}\n").unwrap();
+
+    for title in ["First document", "Second document"] {
+        board_json(
+            &root,
+            &[
+                "board", "create", "--kind", "story", "--title", title, "--output", "json",
+            ],
+        );
+    }
+
+    let committed = board_json(&root, &["board", "commit", "--all", "--output", "json"]);
+    let sha = committed["data"]["commit"].as_str().unwrap().to_string();
+    let landed = paths_in(&root, &sha);
+    assert_eq!(
+        landed.len(),
+        2,
+        "exactly the two documents landed: {landed:?}"
+    );
+    assert!(
+        landed.iter().all(|path| path.starts_with("docs/stories/")),
+        "`--all` is scoped to planning documents: {landed:?}"
+    );
+
+    let status = porcelain(&root);
+    assert!(
+        status.contains("Cargo.lock") && status.contains("crates/thing/src/lib.rs"),
+        "another session's work is untouched: {status:?}"
+    );
+
+    // An explicit path outside the board's document roots is refused, not committed.
+    let refused = flux(
+        &root,
+        &[
+            "board",
+            "commit",
+            "crates/thing/src/lib.rs",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(5),
+        "an out-of-scope path is a permission refusal: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_eq!(sha, head(&root), "the refusal committed nothing");
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-735: mid-merge, the verb refuses and the documents stay on disk.
+///
+/// Committing into someone else's in-progress merge is how a conflict resolution acquires files nobody
+/// resolved. The document is already written, so the refusal names it and loses nothing.
+#[test]
+fn board_commit_refuses_mid_merge_and_keeps_the_document_on_disk() {
+    let root = commit_fixture("commit-mid-merge");
+    let trunk = String::from_utf8(git(&root, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(git(&root, &["checkout", "-q", "-b", "side"])
+        .status
+        .success());
+    fs::write(root.join("docs/stories/README.md"), "# Board (side)\n").unwrap();
+    assert!(git(&root, &["commit", "-qam", "side"]).status.success());
+    assert!(git(&root, &["checkout", "-q", &trunk]).status.success());
+    fs::write(root.join("docs/stories/README.md"), "# Board (trunk)\n").unwrap();
+    assert!(git(&root, &["commit", "-qam", "trunk"]).status.success());
+    assert!(
+        !git(&root, &["merge", "side"]).status.success(),
+        "the fixture needs a conflicted merge"
+    );
+
+    let created = board_json(
         &root,
         &[
             "board",
@@ -609,24 +844,186 @@ fn creating_a_planning_item_commits_exactly_that_document() {
             "--kind",
             "story",
             "--title",
-            "Left uncommitted",
-            "--no-commit",
+            "Written mid merge",
             "--output",
             "json",
         ],
     );
-    assert!(uncommitted.status.success());
-    let uncommitted: serde_json::Value = serde_json::from_slice(&uncommitted.stdout).unwrap();
-    assert!(
-        uncommitted["data"]["commit"].is_null(),
-        "--no-commit must report no commit"
+    let file = Path::new(created["data"]["file"].as_str().unwrap())
+        .strip_prefix(&root)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    let refused = flux(&root, &["board", "commit", "--all", "--output", "json"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(4),
+        "mid-merge is a conflict/precondition refusal: {}",
+        String::from_utf8_lossy(&refused.stdout)
     );
-    let status = String::from_utf8(git(&root, &["status", "--porcelain"]).stdout).unwrap();
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
     assert!(
-        status.contains("docs/stories/"),
-        "the opted-out document stays untracked: {status:?}"
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&file),
+        "the refusal names the document it did not commit: {refused}"
+    );
+    assert!(
+        root.join(&file).is_file(),
+        "the document stays on disk: {file}"
     );
     fs::remove_dir_all(root).ok();
+}
+
+/// C-735: `commit` joins the family without bending the envelope it joins.
+///
+/// The session backend's refusal is not exercised here: reaching it needs a recorded session, and no
+/// sibling file-backed operation (`reconcile`, `render`, `sync`, `import`, …) is covered that way
+/// either. `board_action_mutates`/`board_action_requires_member` carry the classification below.
+#[test]
+fn board_commit_is_a_published_mutation_that_never_widens_its_own_scope() {
+    let root = commit_fixture("commit-schema");
+    let schema = board_json(&root, &["board", "schema", "--output", "json"]);
+    let published = schema["data"]["operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|operation| operation["name"] == "commit")
+        .unwrap_or_else(|| panic!("commit must be a published board operation: {schema}"));
+    assert_eq!(published["mutation"], true);
+    assert_eq!(published["supports"]["dry_run"], true);
+    assert_eq!(published["supports"]["if_revision"], true);
+
+    // `board call` routes it like every other operation.
+    let request = root.join("commit-request.json");
+    fs::write(
+        &request,
+        r#"{"schema":"flux.cli/v1","request_id":"board-commit","args":["--all"]}"#,
+    )
+    .unwrap();
+    let called = board_json(
+        &root,
+        &[
+            "board",
+            "call",
+            "commit",
+            "--request",
+            request.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(called["request_id"], "board-commit");
+    assert!(
+        called["data"]["commit"].is_null(),
+        "a clean board has nothing to commit: {called}"
+    );
+    fs::remove_file(&request).ok();
+
+    // The verb refuses to guess its own scope.
+    let unscoped = flux(&root, &["board", "commit", "--output", "json"]);
+    assert_eq!(
+        unscoped.status.code(),
+        Some(2),
+        "commit without a scope is refused, never widened: {}",
+        String::from_utf8_lossy(&unscoped.stdout)
+    );
+    fs::remove_dir_all(root).ok();
+}
+
+/// C-735: a deferred `create` no longer refuses the next workspace mutation.
+///
+/// The clean-checkout guard exists so a board mutation cannot land on top of somebody else's
+/// in-progress work. Now that authoring commits nothing, the board's own uncommitted documents are the
+/// normal state between an op and `flux board commit`, and a `create` that blocked the following
+/// `update` would just reinstate the per-story git-amend loop. Dirt the board does not own still refuses.
+#[test]
+fn a_workspace_mutation_tolerates_the_boards_own_uncommitted_documents() {
+    let workspace = fixture("workspace-board-dirt");
+    let member = workspace.join("members/repo");
+    fs::create_dir_all(member.join("docs/stories")).unwrap();
+    fs::create_dir_all(workspace.join(".flux")).unwrap();
+    fs::write(
+        workspace.join(".flux/board.toml"),
+        "schema = \"flux.board-workspace/v1\"\nid = \"workspace\"\ndefault = true\nactive_milestone = \"current\"\n\n[[members]]\nid = \"repo\"\nroot = \"members/repo\"\nboard = \"repo\"\ncanonical_ref = \"HEAD\"\n",
+    )
+    .unwrap();
+    fs::write(member.join("docs/stories/README.md"), "# Board\n").unwrap();
+    assert!(git(&member, &["init", "-q"]).status.success());
+    assert!(
+        git(&member, &["config", "user.email", "board@example.test"])
+            .status
+            .success()
+    );
+    assert!(git(&member, &["config", "user.name", "Flux Board Test"])
+        .status
+        .success());
+    assert!(git(&member, &["add", "."]).status.success());
+    assert!(git(&member, &["commit", "-qm", "fixture"]).status.success());
+
+    let created = board_json(
+        &workspace,
+        &[
+            "board",
+            "--board",
+            "repo",
+            "create",
+            "--kind",
+            "story",
+            "--title",
+            "Authored in a member",
+            "--output",
+            "json",
+        ],
+    );
+    let id = created["data"]["id"].as_str().unwrap().to_string();
+
+    // The member checkout is now dirty with exactly the document the board just wrote.
+    let updated = flux(
+        &workspace,
+        &[
+            "board",
+            "--board",
+            "repo",
+            "update",
+            &id,
+            "--priority",
+            "4",
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        updated.status.success(),
+        "the board's own uncommitted document must not refuse the next mutation: {}",
+        String::from_utf8_lossy(&updated.stdout)
+    );
+
+    // Dirt the board does not own still refuses.
+    fs::write(member.join("Cargo.toml"), "# another session\n").unwrap();
+    let refused = flux(
+        &workspace,
+        &[
+            "board",
+            "--board",
+            "repo",
+            "update",
+            &id,
+            "--priority",
+            "5",
+            "--output",
+            "json",
+        ],
+    );
+    assert_eq!(
+        refused.status.code(),
+        Some(4),
+        "foreign dirt still refuses: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    fs::remove_dir_all(workspace).ok();
 }
 
 #[test]
