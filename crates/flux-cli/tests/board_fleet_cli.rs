@@ -680,12 +680,10 @@ fn authoring_defers_and_one_verb_commits_exactly_what_it_names() {
 
     // The meaningful edit — the one that used to arrive after the commit — lands first.
     let story = root.join(&file);
-    let authored = fs::read_to_string(&story)
-        .unwrap()
-        .replace(
-            "- [ ] Creation authors the document.",
-            "- [ ] The verb commits.",
-        );
+    let authored = fs::read_to_string(&story).unwrap().replace(
+        "- [ ] Creation authors the document.",
+        "- [ ] The verb commits.",
+    );
     fs::write(&story, authored).unwrap();
 
     let committed = board_json(
@@ -5821,7 +5819,6 @@ fn coverage_answers_for_a_story_whose_criteria_carry_no_ids() {
                 .contains("declares no criterion ids")),
         "{coverage}"
     );
-
 }
 
 /// C-742: an epic is one entity — a resolvable document with its own contract and a derived

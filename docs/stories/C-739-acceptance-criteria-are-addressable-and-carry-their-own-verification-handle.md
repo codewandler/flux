@@ -38,11 +38,17 @@ command that proves it.
 ## Syntax
 
 ```markdown
-## Acceptance
-
 - [ ] `AC-1` A reclaimed wave's worktrees are provably gone.
       verify: `cargo test -p flux-cli reclaim_removes_the_worktrees_it_reports`
 ```
+
+The example above deliberately omits its `## Acceptance` heading line, and that is not a
+typographical preference. `section_contract` decides which section it is in by scanning `## `
+headings with no awareness of fenced blocks, so a heading written *inside* a fence re-opens the
+section for the parser. The first draft of this story included the heading and thereby gave itself a
+seventh acceptance criterion — the example bullet — which could never be ticked and which made the
+story permanently unclosable by the very feature it was introducing. See
+[C-750](C-750-the-acceptance-parser-is-not-fence-aware-so-a-story-documenting-the-syntax-corrupts-its-own-contract.md).
 
 The id is a backticked `AC-<n>` opening the bullet — written down rather than derived from
 position, which is what makes it survive an insertion, a deletion or a reorder. `AC-` collides with
