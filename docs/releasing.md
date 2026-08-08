@@ -86,6 +86,17 @@ One of the eleven required checks is `every version tag has a Release and /relea
 newest` — the audit in `scripts/check-release-tags.sh`. A tag with no GitHub Release therefore
 blocks every future release until it is backfilled or removed.
 
+### The one thing standing between this and an unattended release
+
+Every step above is an API call, and `release` requires **zero** approving reviews — no person has
+to approve anything. The only manual act left is clicking merge once the checks are green, and
+`gh pr merge --auto --merge` exists exactly for that.
+
+It currently fails with `Auto merge is not allowed for this repository`. Enabling **Settings →
+General → Allow auto-merge** is the single toggle that closes the gap, and it weakens no protection:
+the eleven required checks, `enforce_admins` and the strict up-to-date rule all still gate the
+merge. Until it is on, a release needs one deliberate click or one `gh pr merge` call.
+
 ## When a release fails
 
 Cleanup of `release-cuts/*` and `release-candidates/*` runs only on the success path, but the entry

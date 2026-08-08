@@ -185,13 +185,16 @@ pub enum EventKind {
     /// parallel store. Every flux projection must still decide what `Custom` means for *it*
     /// (compile-forced by the exhaustive match) — the answer is almost always "skip".
     ///
-    /// **One reserved namespace** (A-107): `name`s beginning with `"memory."` are flux's own —
+    /// **Two reserved namespaces.** (A-107): `name`s beginning with `"memory."` are flux's own —
     /// cross-session memory rides `Custom` (rather than three new closed variants, which would
     /// break every downstream `match`) and *is* folded, by
     /// [`memory_entries`](crate::memory_entries), off the `memory:<scope-key>` streams. An embedder
     /// must namespace its app facts away from that prefix. A colliding, undecodable payload is
     /// skipped by the fold rather than erroring the read, so a collision degrades one entry instead
     /// of the whole memory read model — but it is still a collision, and the prefix is reserved.
+    /// `"resource."` (C-575) is the second, on the same terms: causal resource receipts ride
+    /// `Custom` on `resource:<root-id>` streams and are folded by
+    /// [`EventStore::resource_receipts`](crate::EventStore::resource_receipts).
     Custom {
         name: String,
         payload: serde_json::Value,
