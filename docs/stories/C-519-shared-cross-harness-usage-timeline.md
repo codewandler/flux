@@ -69,12 +69,13 @@ boundary the observatory can use without depending on `flux-cli` or inventing an
 - Nothing *produces* receipts yet (C-575's own Progress says so, and C-727 owns the instrumentation),
   so acquisition attaches no link on its own. The seam is proven consumer-side against the real
   ledger rather than against a hand-built value.
-- Re-dispatched later against a clean tree and re-verified rather than re-implemented: every clause
-  above is already carried by committed code, so this pass added no behavior. `cargo test -p
-  codewandler-flux-capabilities` (132 unit tests plus every integration binary) and `cargo test -p
-  flux-cli --bin flux usage::tests` are green, including the three named acceptance tests and
-  `a_flux_record_links_only_the_receipt_recorded_for_its_own_session`. A dispatch of this item is a
-  stale open board entry, not missing work.
+- Re-dispatched and found finished but *uncommitted*: the whole implementation sat in the story
+  worktree as unstaged edits to `harness/mod.rs`, `harness/scan.rs`, `usage_observatory.rs` and
+  `flux-cli/src/usage.rs`, plus two untracked files (`harness/usage.rs`, `tests/usage_timeline.rs`).
+  It is committed now. Verified before committing: `cargo test -p codewandler-flux-capabilities`
+  (132 unit tests plus every integration binary) and `cargo test -p flux-cli --bin flux usage::tests`
+  are green, including the three named acceptance tests and
+  `a_flux_record_links_only_the_receipt_recorded_for_its_own_session`.
 
 
 ## Notes
