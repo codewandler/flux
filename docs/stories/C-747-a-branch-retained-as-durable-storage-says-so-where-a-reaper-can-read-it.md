@@ -32,3 +32,21 @@ grepped every branch name against main's tree. Any reaper without that step dest
       quietly become false.
 - [ ] Regression test: a marked branch survives a reap that would otherwise take it, and the marker
       is reported when the branch is missing.
+- [ ] A retention declares where the branch is durable, and a retention backed only by this working
+      copy is reported as such. "Retained indefinitely" on a ref that exists on one disk is a claim
+      the repository cannot keep.
+
+## What raises the stakes
+
+A second audit on 2026-08-08 checked every local ref against its upstream: **16 of 18 local branches
+exist nowhere but this disk.** Only `impl/D-232` has a remote-tracking branch, and it is one of the
+branches main's own prose says is retained indefinitely.
+
+So "retained" currently means "nobody has run `git branch -D` yet, on this laptop". The audit also
+priced what is riding on that: `wave/flux-exchange-lifecycle-1` and `-2` hold roughly 5,100 lines
+implementing `C-510` (see [C-745](C-745-a-story-already-implemented-on-a-live-branch-is-not-re-dispatched.md)),
+`impl/D-232` holds 1,692, and `preserve/quiet-flow-pre-sync-20260805` holds a finished tested feature.
+None of it is anywhere else.
+
+A marker that stops a reaper is therefore necessary but not sufficient. A retention has to name a
+location that survives the machine, or admit that it does not.

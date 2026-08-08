@@ -33,3 +33,29 @@ error: dispatching work that demonstrably exists, because nothing looks at the b
       that main has already moved past.
 - [ ] Regression test: two waves dispatched for one story produce a report naming the first
       attempt's branch rather than two independent implementations.
+- [ ] `C-510` is the live fixture and must be reported, not dispatched, by a dry-run tick. It is
+      `ready` with 38 acceptance criteria, and its implementation already exists **twice** — see the
+      audit below.
+
+## The standing case: C-510
+
+A second branch audit on 2026-08-08 found the cost is not historical. `C-510` — *install and
+supervise a verified local Exchange release* — is `ready` on the board right now, and roughly **5,100
+lines implementing it** sit on two branches:
+
+| Branch | Unique commits | What it adds |
+|---|---|---|
+| `wave/flux-exchange-lifecycle-2` | 7 | `flux-cli/src/exchange_local_cmd.rs`, `flux-system/src/exchange_release_transport.rs` |
+| `wave/flux-exchange-lifecycle-1` | 5 | `flux-cli/src/exchange_local/`, `flux-system/src/verified_cache.rs` |
+
+They are **disjoint rival implementations, not a series**: their merge base is `087e93ba`, a docs-only
+merge, and `git cherry lifecycle-2 lifecycle-1` reports all five of branch-1's commits as `+`. So the
+fleet already paid for this story twice and landed neither.
+
+Main holds the contract and nothing else — `ExchangeLocalAction::{Start,Status,Stop}` in `args.rs`,
+`Command::ExchangeLocal*` in `dispatch.rs`, and `docs/designs/managed-exchange-lifecycle.md` — while
+`flux exchange local status` answers `refused [unsupported]`. That refusal is honest and deliberate;
+the point is that the code which would replace it has been written twice and is on this disk.
+
+Dispatching `C-510` today buys a third implementation. That is what this story has to stop, and it is
+why the check must run before dispatch rather than as a report afterwards.
