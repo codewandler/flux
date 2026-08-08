@@ -432,36 +432,78 @@ mistyped.
 
 ## Review and bounded rework
 
-A fresh read-only reviewer inspects the exact handoff commit. Findings are structured path/line,
-command-output, or invariant records with reviewer identity. A REWORK decision is delivered back to
-the same persistent worker session, preserving its context.
+`flux fleet review` admits a fresh read-only agent for each candidate and gives it one packet: the
+story's Goal and Acceptance as they stood **at the reviewed commit**, the exact normalized diff, the
+host-observed write set, and the candidate/base identities. That packet is its entire workspace — it
+holds no repository checkout, no fleet state, and no part of the writer's conversation, and its
+read-only admission means it cannot modify the change it is judging. Only the story's own writer
+applies a finding.
+
+```sh
+flux fleet review wave-7 --output json                      # every candidate still owed a review
+flux fleet review wave-7 --item api/C-41 --output json      # one candidate
+flux fleet review wave-7 --item api/C-41 --from review.json # an external reviewer's typed document
+```
+
+It returns one typed verdict, `PASS` or `REWORK`. It cannot park, cancel or accept work: the rework
+budget below is a host invariant, and a reviewer that could end work would not be bound by it.
 
 ```text
-assignment
-    │
-    ▼
-isolated writer session + story worktree
-    │
-    ▼
-failing-first evidence → implementation → targeted checks
-    │
-    ▼
 exact commit + typed handoff
     │
     ▼
-fresh read-only review
-    ├── ACCEPT ──→ dependency-order integration
+fresh read-only review over the exact commit
+    ├── PASS   ──→ dependency-order integration
     └── REWORK ──→ same writer session (at most two deliveries)
                          │
                          └── third failure ──→ parked
 ```
 
-The reviewer is not a second writer, and the original writer does not review itself. Review changes
-the next execution step; the host-observed commit, write set, commands, and evidence remain the
-facts.
+Integration refuses a candidate no independent review passed at that exact commit. A moved commit
+makes its review stale, and a review that could not run is not a pass — every record carries
+`examined` beside `verdict`, so "the reviewer looked and found nothing" and "nothing looked" are
+different rows rather than two readings of an empty `findings` list:
+
+| situation | `state` | `verdict` | `examined` |
+|---|---|---|---|
+| the reviewer examined it and found nothing | `reviewed` | `PASS` | `true` |
+| the reviewer examined it and found something | `reviewed` | `REWORK` | `true` |
+| no contract at that commit, or the fleet is stopped | `not-run` | `BLOCKED` | `false` |
+| the candidate does not fit a reviewable packet | `incomplete-context` | `REWORK` | `false` |
+| the turn failed, or returned no typed document | `failed` | `BLOCKED` | `false` |
+| the bounded retry run is spent | `attention` | `BLOCKED` | `false` |
+
+Findings are structured rather than prose, so they can be counted and routed. Each carries a
+`category` (`contract`, `correctness`, `safety`, `evidence`, `scope`, `regression`,
+`maintainability`), a `severity` (`blocker`, `major`, `minor`), a `confidence`, the affected
+component, and exactly one piece of evidence — a `path`/`line`, a command, or a named invariant.
+`source` separates a reviewer's assessment from a fact the host derived.
+
+```json
+{
+  "schema": "flux.fleet-review/v1",
+  "reviewer": "reviewer-2",
+  "reviewed_commit": "FULL_SHA",
+  "verdict": "REWORK",
+  "findings": [
+    {
+      "category": "contract", "severity": "blocker", "confidence": "high",
+      "component": "crates/api/src/lib.rs",
+      "evidence": {"path": "crates/api/src/lib.rs", "line": 91},
+      "detail": "Preserve the prior error class"
+    }
+  ]
+}
+```
+
+`--from` records a review produced outside the fleet — by a human, or by another harness — through
+the same parser and the same validation, and refuses a document naming the story's own writer as its
+reviewer. `flux fleet drive` reviews every ready candidate on its own, so an unattended fleet needs
+neither call.
 
 The host allows two rework deliveries. A third request parks the item with unresolved findings; a
-board transition, cancellation, restart, or new CLI call cannot reset the counter.
+board transition, cancellation, restart, or new CLI call cannot reset the counter. `flux fleet
+rework` delivers findings directly for the same effect:
 
 ```sh
 flux fleet rework wave-7 api/C-41 --reviewer reviewer-2 --reviewed-commit FULL_SHA \

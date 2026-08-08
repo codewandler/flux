@@ -1043,6 +1043,23 @@ pub(super) enum FleetAction {
         #[arg(long)]
         summary: String,
     },
+    /// Have an agent that is not the writer examine each candidate, and record its typed verdict.
+    ///
+    /// C-587. Nothing adversarial used to read a Fleet candidate: `rework` took a `--reviewer`
+    /// string, so "reviewer" named a field a finding could cite rather than an agent anyone
+    /// dispatched. The reviewer admitted here is fresh, read-only, and given one packet — the story
+    /// contract at the reviewed commit plus the exact normalized diff — and nothing else. Its
+    /// `PASS` at the exact handoff commit is what `integrate` now requires.
+    Review {
+        wave: String,
+        /// Review only this candidate. Omit to review every candidate of the wave still owed one.
+        #[arg(long, value_name = "BOARD/ITEM")]
+        item: Option<String>,
+        /// Record an external reviewer's typed `flux.fleet-review/v1` document instead of
+        /// dispatching one. Validated identically, and refused when it names the story's own writer.
+        #[arg(long, value_name = "FILE|-")]
+        from: Option<String>,
+    },
     /// Return structured review findings to the same worker session; the third request parks.
     Rework {
         wave: String,
@@ -5902,6 +5919,16 @@ worktree_root = ".flux/fleet/worktrees"
                 summary,
             },
         ),
+        FleetAction::Review { wave, item, from } => fleet_review(
+            command,
+            root,
+            state,
+            ReviewInput {
+                wave,
+                item: item.as_deref(),
+                from: from.as_deref(),
+            },
+        ),
         FleetAction::Rework {
             wave,
             item,
@@ -6244,6 +6271,10 @@ fn fleet_action_dispatches(action: &FleetAction) -> bool {
         FleetAction::Run { .. }
             | FleetAction::Spawn { .. }
             | FleetAction::Task { .. }
+            // C-587: review admits a fresh reviewer and runs its turn, so it is dispatch like any
+            // other and a quiesced fleet must refuse it rather than start a model call into a
+            // binary that is about to be replaced.
+            | FleetAction::Review { .. }
             // C-631: a tick's last phase sends workers at the schedule, so a quiesced fleet must
             // refuse the driver itself rather than let each tick walk into the dispatch it wraps.
             | FleetAction::Drive { .. }
@@ -6265,6 +6296,7 @@ fn fleet_action_mutates(action: &FleetAction) -> bool {
             | FleetAction::Spawn { .. }
             | FleetAction::Run { .. }
             | FleetAction::Handoff { .. }
+            | FleetAction::Review { .. }
             | FleetAction::Rework { .. }
             | FleetAction::Integrate { .. }
             | FleetAction::Task { .. }
@@ -6440,6 +6472,8 @@ fn fleet_operations() -> &'static [&'static str] {
         "spawn",
         "run",
         "handoff",
+        // Review DISPATCHES: it admits a fresh read-only agent and runs its turn.
+        "review",
         "rework",
         "integrate",
         "task",
@@ -6551,7 +6585,7 @@ fn board_skill() -> String {
 }
 
 fn fleet_skill() -> String {
-    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, or deploys. `apply` accepts a green candidate and pins it with a tag; `promote` is the only operation that writes a member's local canonical branch.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet apply WAVE --if-revision REV --output json\nflux fleet promote --dry-run --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet promote` is the last mile: per member, in the order `depends_on` declares, it accumulates the accepted candidates its canonical ref lacks, merges and gates them in a throwaway worktree, and advances the local branch by a compare-and-swap ref update — a conflicting candidate is left out and named, a red gate anywhere leaves every member's branch untouched, and a member whose `canonical_ref` is remote-tracking is refused because only a push could move it. `[promote] threshold` in `.flux/fleet.toml` sets how many accepted candidates a member accumulates first; it defaults to `1`. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
+    format!("---\nname: flux-fleet\ndescription: Coordinate one durable main agent and its bounded local Flux workers.\n---\n\n# Flux fleet\n\nStart with `flux fleet schema --output json`; JSON is the agent API. Every fleet has exactly one `main` coordinator. Send requirements and agent follow-ups to its intake; it orchestrates execution against the Board-owned schedule. `.flux/board.toml` is planning configuration, `.flux/fleet.toml` is execution configuration, and only `.flux/fleet/state.json` plus events are mutable runtime state. Inspect schedule and status before dispatch. Fleet never pushes, releases, or deploys. `apply` accepts a green candidate and pins it with a tag; `promote` is the only operation that writes a member's local canonical branch.\n\n```sh\nflux fleet validate --output json\nflux fleet goal list --output json\nflux fleet ingest \"Implement the next ready story\" --source user --output json\nflux fleet schedule --output json\nflux fleet status --output json\nflux fleet run repo/C-1 --idempotency-key KEY --output json\nflux fleet drive --tick --output json\nflux fleet message WORKER \"review findings available\" --wait delivered --output json\nflux fleet inspect activity --limit 100 --output json\nflux fleet resume --output json\nflux fleet review WAVE --output json\nflux fleet apply WAVE --if-revision REV --output json\nflux fleet promote --dry-run --output json\n```\n\nReplace `KEY`, `WORKER`, `WAVE`, and `REV` with values returned by the preceding JSON calls. `flux fleet promote` is the last mile: per member, in the order `depends_on` declares, it accumulates the accepted candidates its canonical ref lacks, merges and gates them in a throwaway worktree, and advances the local branch by a compare-and-swap ref update — a conflicting candidate is left out and named, a red gate anywhere leaves every member's branch untouched, and a member whose `canonical_ref` is remote-tracking is refused because only a push could move it. `[promote] threshold` in `.flux/fleet.toml` sets how many accepted candidates a member accumulates first; it defaults to `1`. `flux fleet drive --tick` runs one unattended tick — report, advance, accumulate, dispatch — and `--loop` repeats it on an interval under a single-instance guard; its dispatch fails closed when `board reconcile` cannot be read, so a story whose work is already present is withheld and named instead of dispatched again. Every candidate is examined by a fresh read-only agent that is not its writer before it may be integrated: `flux fleet review WAVE` records a typed PASS/REWORK verdict with structured findings over the exact handoff commit, and a review that could not run records `examined: false` rather than a pass. Keep one writer/worktree per story, at most ten stories per configured wave, two same-session rework rounds, and one final gate per dispatched wave instance. Use maintenance `task` in read-only mode unless a ready story authorizes writes. Before installing a new Flux binary run `flux fleet quiesce --output json`: it stops dispatch durably and fails while any worker turn is still in flight, and `flux fleet resume` lifts it. Installed Flux: {}.\n", env!("CARGO_PKG_VERSION"))
 }
 
 fn skill_json(name: &str, markdown: &str, family: &str) -> Value {
@@ -16768,6 +16802,19 @@ fn drive_one_tick(
     )?;
     let tick = state.drive.clone().unwrap_or_default().ticks;
 
+    // C-587, and after the advance phase for a reason: that phase is what produces `handoffs-ready`,
+    // so this is the first point at which a candidate is finished enough to be examined — and it is
+    // still before dispatch, so nothing downstream can reach integration holding an unexamined one.
+    let (reviewed, review_warnings) = if command.dry_run {
+        (Vec::new(), Vec::new())
+    } else {
+        drive_review_phase(command, root)
+    };
+    warnings.extend(review_warnings);
+    if let Ok(latest) = read_fleet_state(root) {
+        state = latest;
+    }
+
     // Dispatch last, and never from the plan's stale view: the phases above moved the very waves
     // whose claims decide what is dispatchable.
     let (items, reclaimed_by_wave) = drive_dispatch_after_release(&state, &plan.dispatch);
@@ -16832,6 +16879,7 @@ fn drive_one_tick(
         },
         "advanced": advanced,
         "reconstructed": reconstructed,
+        "reviewed": reviewed,
         // What was written, not what was proposed: `plan.released` is the candidate set and this is
         // the set that survived the compare-and-set.
         "released": released,
@@ -16839,9 +16887,10 @@ fn drive_one_tick(
     });
     Ok((
         format!(
-            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s)",
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), reviewed {} wave(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s)",
             advanced.len(),
             reconstructed.len(),
+            reviewed.len(),
             released.len(),
             dispatch["items"].as_array().map_or(0, Vec::len),
             dispatch["withheld"].as_array().map_or(0, Vec::len),
@@ -18522,6 +18571,1129 @@ fn fleet_rework(
     ))
 }
 
+// ---------------------------------------------------------------------------
+// C-587 — every candidate is examined by an agent that is not its author.
+//
+// Until this existed, nothing adversarial ever read a Fleet candidate. `fleet rework` took a
+// `--reviewer` STRING, so "reviewer" named a field a finding could cite and never an agent anyone
+// dispatched; `.flux/fleet.toml` bound the `review` task kind to the read-only research loop and no
+// code path ever selected it. A candidate therefore carried exactly one piece of evidence into the
+// repository gate — the claim of the writer that produced it — and `integrate` spent the longest
+// operation in the pipeline on that claim alone.
+// ---------------------------------------------------------------------------
+
+/// The record a review produces, and the document an external reviewer submits. One schema, so an
+/// externally produced review is validated by exactly the same code as a dispatched one.
+const FLEET_REVIEW_SCHEMA: &str = "flux.fleet-review/v1";
+/// What the dispatched reviewer is given — and the only thing it is given.
+const FLEET_REVIEW_PACKET_SCHEMA: &str = "flux.fleet-review-packet/v1";
+/// The Fleet task kind whose `loop_policy` binding selects the reviewer's loop.
+const FLEET_REVIEW_TASK_KIND: &str = "review";
+/// The reviewer's ceiling. Read, and nothing else: an agent that can edit the code it judges is not
+/// a reviewer, and `mode = read-only` is what [`normalize_worker_capabilities_in`] enforces it with.
+const REVIEW_CAPABILITIES: [&str; 1] = ["read"];
+/// Largest normalized diff a review packet may carry.
+///
+/// A packet that does not fit is not silently shortened into something that reads complete. The
+/// guarded process port caps a child's captured output at 1 MiB, so anything at or above this budget
+/// is reported as incomplete WITHOUT claiming to know how much is missing.
+const REVIEW_DIFF_BUDGET_BYTES: usize = 512 * 1024;
+/// How many consecutive times the host re-dispatches a review that examined nothing before it stops
+/// and records `attention` instead. A retry loop with no bound is a tick cost with no end.
+const REVIEW_ATTEMPT_LIMIT: u64 = 3;
+
+/// The closed vocabularies a finding is written in, so findings can be counted and routed rather
+/// than read. Anything outside them is malformed, and malformed never becomes a pass.
+const REVIEW_CATEGORIES: [&str; 7] = [
+    "contract",
+    "correctness",
+    "safety",
+    "evidence",
+    "scope",
+    "regression",
+    "maintainability",
+];
+const REVIEW_SEVERITIES: [&str; 3] = ["blocker", "major", "minor"];
+const REVIEW_CONFIDENCES: [&str; 3] = ["high", "medium", "low"];
+
+struct ReviewInput<'a> {
+    wave: &'a str,
+    item: Option<&'a str>,
+    from: Option<&'a str>,
+}
+
+/// One candidate under review: the exact range, resolved from the wave's own record.
+struct ReviewCandidate<'a> {
+    wave: &'a str,
+    item: &'a str,
+    repository: &'a str,
+    /// The checkout whose object database holds both ends of the range. The repository source root
+    /// is preferred over the story worktree because the worktree moves on after a rework and the
+    /// range must stay resolvable.
+    source: PathBuf,
+    base: String,
+    commit: String,
+    writer: Option<String>,
+    writer_session: Option<String>,
+}
+
+/// One attempt at obtaining a verdict for one candidate.
+#[derive(Clone, Copy)]
+struct ReviewAttempt<'a> {
+    candidate: &'a ReviewCandidate<'a>,
+    packet: &'a Value,
+    attempt: u64,
+    /// A typed document an external reviewer already produced, instead of dispatching one.
+    external: Option<&'a Value>,
+}
+
+/// What actually happened to a candidate, in the shape the record stores it.
+struct ReviewOutcome {
+    /// Why this record is what it is: `reviewed`, `not-run`, `incomplete-context`, `failed`,
+    /// `attention`.
+    state: &'static str,
+    verdict: &'static str,
+    /// **The field the whole story turns on.** A clean review and a review that never happened both
+    /// carry zero findings; without this they serialize identically and "nobody looked" reads as
+    /// "nothing was wrong".
+    examined: bool,
+    reason: Option<String>,
+    findings: Vec<Value>,
+    reviewer: Value,
+}
+
+/// Why this candidate may not be integrated, or `None` when an agent that is not its author examined
+/// the exact commit being handed off and passed it.
+///
+/// Fails closed at every branch. The phrase `independent review` appears in all of them, so the
+/// refusal is greppable out of a wave that reported nothing else.
+fn candidate_review_refusal(story: &Value) -> Option<String> {
+    let Some(commit) = story["handoff"]["commit"].as_str() else {
+        return Some("has no accepted handoff commit for an independent review to examine".into());
+    };
+    let review = &story["review"];
+    let Some(reviewed) = review["reviewed_commit"].as_str() else {
+        return Some(format!("has no independent review of {commit}"));
+    };
+    if reviewed != commit {
+        return Some(format!(
+            "has a stale independent review: it examined {reviewed}, not the handoff commit {commit}"
+        ));
+    }
+    if review["examined"].as_bool() != Some(true) {
+        return Some(format!(
+            "has an independent review of {commit} that never examined it ({}{})",
+            review["state"].as_str().unwrap_or("unknown"),
+            review["reason"]
+                .as_str()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default(),
+        ));
+    }
+    match review["verdict"].as_str() {
+        Some("PASS") => None,
+        verdict => Some(format!(
+            "independent review of {commit} returned {}",
+            verdict.unwrap_or("no verdict")
+        )),
+    }
+}
+
+/// Whether this candidate still owes the wave a review the host has not already obtained.
+///
+/// A verdict already reached for this exact commit is never re-litigated, whatever it said — the
+/// point of recording it is that it does not have to be paid for twice.
+fn candidate_awaits_review(story: &Value) -> bool {
+    if story["status"].as_str() != Some("handoff-accepted") {
+        return false;
+    }
+    let Some(commit) = story["handoff"]["commit"].as_str() else {
+        return false;
+    };
+    let review = &story["review"];
+    if review["reviewed_commit"].as_str() == Some(commit)
+        && review["examined"].as_bool() == Some(true)
+    {
+        return false;
+    }
+    story["review_attempts"].as_u64().unwrap_or(0) < REVIEW_ATTEMPT_LIMIT
+}
+
+/// The body of one `## Heading` section, up to the next heading at the same or a higher level.
+fn markdown_section(body: &str, heading: &str) -> Option<String> {
+    let mut collected: Option<Vec<&str>> = None;
+    for line in body.lines() {
+        let trimmed = line.trim_end();
+        if let Some(rest) = trimmed.strip_prefix("## ") {
+            if rest.trim().eq_ignore_ascii_case(heading) {
+                collected = Some(Vec::new());
+                continue;
+            }
+            if collected.is_some() {
+                break;
+            }
+        }
+        if trimmed.starts_with("# ") && collected.is_some() {
+            break;
+        }
+        if let Some(lines) = collected.as_mut() {
+            lines.push(trimmed);
+        }
+    }
+    let text = collected?.join("\n").trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The story's Goal and Acceptance as they stood AT the reviewed commit.
+///
+/// Read out of the commit rather than off disk. The worktree moves on — a rework advances it within
+/// minutes — and a reviewer judging a candidate against a contract that candidate never saw is
+/// judging the wrong thing.
+fn story_contract_at(source: &Path, commit: &str, item: &str) -> Option<Value> {
+    let id = item.rsplit('/').next().unwrap_or(item);
+    let listing = git_output(
+        source,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            commit,
+            RECONCILE_BOARD_PREFIX,
+        ],
+    )?;
+    let path = listing.lines().find(|candidate| {
+        candidate
+            .strip_prefix(RECONCILE_BOARD_PREFIX)
+            .is_some_and(|name| name == format!("{id}.md") || name.starts_with(&format!("{id}-")))
+    })?;
+    let body = git_output(source, &["show", &format!("{commit}:{path}")])?;
+    let prose = story_prose(&body);
+    let acceptance = markdown_section(prose, "Acceptance")?;
+    Some(json!({
+        "path": path,
+        "goal": markdown_section(prose, "Goal"),
+        "acceptance": acceptance,
+    }))
+}
+
+/// Build the only thing a dispatched reviewer is given.
+///
+/// Every field is host-derived: the write set comes from the range rather than the writer's claim,
+/// the contract comes from the commit rather than the writer's summary, and there is no writer
+/// conversation, no fleet goal and no arbitrary repository file in it at all.
+fn review_packet(candidate: &ReviewCandidate<'_>) -> Value {
+    let range = format!("{}..{}", candidate.base, candidate.commit);
+    let diff = guarded_git(
+        &candidate.source,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--find-renames",
+            "--unified=3",
+            &range,
+        ],
+    )
+    .ok()
+    .filter(|output| output.exit_code == 0)
+    .map(|output| output.stdout);
+    let shortstat = git_output(&candidate.source, &["diff", "--shortstat", &range]);
+    let write_set = diff_write_set(&candidate.source, &candidate.base, &candidate.commit).ok();
+    let contract = story_contract_at(&candidate.source, &candidate.commit, candidate.item);
+    // What the reviewer would actually be shown.
+    //
+    // `redact` is deliberately blunt: one credential pattern anywhere collapses the WHOLE string.
+    // That is right for an error message and catastrophic for a diff — a candidate that merely
+    // mentions `api_key`, or touches `.env.example` or a `.pem`, arrives as the ten characters
+    // `[redacted]`. Judging completeness on the RAW diff would then mark that packet whole, and a
+    // reviewer handed nothing could return PASS over a change no one ever saw. So completeness is
+    // judged on the redacted form, which is the only form that reaches the model.
+    let shown = diff.as_deref().map(redact);
+    // Named rather than merely absent, because "incomplete" is acted on and a reason nobody recorded
+    // is a reason nobody can fix.
+    let incomplete_reason = if diff.is_none() {
+        Some("the diff could not be read from the repository checkout")
+    } else if shown.as_deref() == Some("[redacted]") {
+        Some(
+            "the diff carries a credential pattern, so it cannot be shown to a model without \
+             redacting all of it",
+        )
+    } else if shown
+        .as_deref()
+        .is_some_and(|shown| shown.len() >= REVIEW_DIFF_BUDGET_BYTES)
+    {
+        // At or above the budget the guarded port's own 1 MiB capture cap may also have clipped it,
+        // so this reports that the packet is short WITHOUT pretending to know by how much.
+        Some("the diff exceeds the reviewable packet budget")
+    } else if contract.is_none() {
+        Some("no story contract is present at the reviewed commit")
+    } else if write_set.is_none() {
+        Some("the write set could not be observed from the range")
+    } else {
+        None
+    };
+    json!({
+        "schema": FLEET_REVIEW_PACKET_SCHEMA,
+        "wave": candidate.wave,
+        "board_ref": candidate.item,
+        "repository": candidate.repository,
+        "base_commit": candidate.base,
+        "candidate_commit": candidate.commit,
+        // Over the raw range, so the candidate's identity is the candidate's, not the redaction's.
+        "diff_digest": diff.as_deref().map(flux_lang::runtime::sha256_hex),
+        "diff_bytes": diff.as_ref().map(String::len),
+        "shortstat": shortstat,
+        "write_set": write_set,
+        "story": contract,
+        "diff": shown,
+        "complete": incomplete_reason.is_none(),
+        "incomplete_reason": incomplete_reason,
+    })
+}
+
+/// The packet-input strict-review protocol.
+///
+/// Deliberately says what the reviewer may NOT do as loudly as what it must: it holds no operation
+/// that could edit anything, so an instruction to "fix" what it finds would only produce a turn that
+/// fails. Only the story's own writer repairs, through the rework budget.
+fn reviewer_instructions() -> String {
+    format!(
+        "You are an independent reviewer in a Flux Fleet. You did not write this change and you \
+         cannot modify it: you hold read operations only, and the story's own writer is the only \
+         agent that may apply a finding.\n\n\
+         Your entire input is one `{FLEET_REVIEW_PACKET_SCHEMA}` packet: the story's Goal and \
+         Acceptance as they stood at the reviewed commit, the exact normalized diff, the \
+         host-observed write set, and the candidate/base identities. Judge the diff against that \
+         contract and against the repository's declared invariants. Do not ask for more context and \
+         do not speculate about code the packet does not contain — if the packet is insufficient to \
+         judge an acceptance item, that is itself a finding in the `evidence` category.\n\n\
+         Return exactly one fenced ```json block and nothing else that parses as JSON:\n\n\
+         ```json\n\
+         {{\"schema\": \"{FLEET_REVIEW_SCHEMA}\", \"verdict\": \"PASS\", \"findings\": []}}\n\
+         ```\n\n\
+         `verdict` is `PASS` or `REWORK`. `PASS` carries zero findings and means every Acceptance \
+         item is satisfied by this diff and no invariant is crossed. `REWORK` carries at least one \
+         finding. You cannot park, cancel or accept work; the host owns the rework budget.\n\n\
+         Every finding is an object with:\n\
+         - `category`: one of {REVIEW_CATEGORIES:?}\n\
+         - `severity`: one of {REVIEW_SEVERITIES:?}\n\
+         - `confidence`: one of {REVIEW_CONFIDENCES:?}\n\
+         - `component`: the file or module the finding is about\n\
+         - `evidence`: exactly one of {{\"path\": \"repo/relative/path\", \"line\": N}}, \
+         {{\"command\": \"...\"}} or {{\"invariant\": \"...\"}}\n\
+         - `detail`: one sentence naming what is wrong and what would satisfy the contract\n\n\
+         Cite evidence; never paste the diff back."
+    )
+}
+
+/// Pull the single `flux.fleet-review/v1` document out of a reviewer's answer.
+///
+/// Deterministic and total: whole-answer JSON, then the last fenced block that parses, then the
+/// outermost brace span. Anything else yields `None`, which is a refusal — never a pass.
+fn extract_review_document(text: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        return Some(value);
+    }
+    let mut found = None;
+    let mut rest = text;
+    while let Some(open) = rest.find("```") {
+        let after = &rest[open + 3..];
+        let Some(newline) = after.find('\n') else {
+            break;
+        };
+        let body_start = newline + 1;
+        let Some(close) = after[body_start..].find("```") else {
+            break;
+        };
+        if let Ok(value) =
+            serde_json::from_str::<Value>(after[body_start..body_start + close].trim())
+        {
+            found = Some(value);
+        }
+        rest = &after[body_start + close + 3..];
+    }
+    if found.is_some() {
+        return found;
+    }
+    let open = text.find('{')?;
+    let close = text.rfind('}')?;
+    serde_json::from_str::<Value>(text.get(open..=close)?).ok()
+}
+
+/// Validate one finding against the closed vocabularies and bind it to a single piece of evidence.
+///
+/// `source` separates model assessment from host-derived fact and is set here, never read from the
+/// document — a reviewer cannot promote its own opinion to something the host observed.
+fn review_finding(raw: &Value, source: &str) -> Result<Value> {
+    let vocabulary = |name: &str, allowed: &[&str]| -> Result<String> {
+        let value = raw[name]
+            .as_str()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        if !allowed.contains(&value.as_str()) {
+            bail!("input/schema: review finding {name} must be one of {allowed:?}, found {value:?}")
+        }
+        Ok(value)
+    };
+    let category = vocabulary("category", &REVIEW_CATEGORIES)?;
+    let severity = vocabulary("severity", &REVIEW_SEVERITIES)?;
+    let confidence = vocabulary("confidence", &REVIEW_CONFIDENCES)?;
+    let component = raw["component"].as_str().unwrap_or_default().trim();
+    if component.is_empty() {
+        bail!("input/schema: review finding must name the affected component")
+    }
+    let detail = raw["detail"].as_str().unwrap_or_default().trim();
+    if detail.is_empty() {
+        bail!("input/schema: review finding must carry a detail")
+    }
+    let evidence = &raw["evidence"];
+    let mut finding = json!({
+        "category": category,
+        "severity": severity,
+        "confidence": confidence,
+        "component": redact(component),
+        "detail": redact(detail),
+        "source": source,
+    });
+    if let (Some(path), Some(line)) = (evidence["path"].as_str(), evidence["line"].as_u64()) {
+        if line == 0 {
+            bail!("input/schema: review finding line must be a positive integer")
+        }
+        let path = normalize_write_set(&[path.to_string()])?
+            .pop()
+            .context("input/schema: review finding path is empty")?;
+        finding["kind"] = json!("path-line");
+        finding["path"] = json!(path);
+        finding["line"] = json!(line);
+    } else if let Some(command) = evidence["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+    {
+        finding["kind"] = json!("command-output");
+        finding["command"] = json!(redact(command));
+    } else if let Some(invariant) = evidence["invariant"]
+        .as_str()
+        .map(str::trim)
+        .filter(|invariant| !invariant.is_empty())
+    {
+        finding["kind"] = json!("invariant");
+        finding["invariant"] = json!(redact(invariant));
+    } else {
+        bail!(
+            "input/schema: review finding evidence must cite {{path,line}}, {{command}} or {{invariant}}"
+        )
+    }
+    Ok(finding)
+}
+
+/// Read a typed verdict out of a review document, refusing everything that is not one.
+///
+/// A `PASS` carrying findings is malformed rather than generously reinterpreted: the two fields
+/// disagree, and the safe reading of a disagreement is that the document cannot be trusted.
+fn parse_review_document(document: &Value, source: &str) -> Result<(&'static str, Vec<Value>)> {
+    if document["schema"].as_str() != Some(FLEET_REVIEW_SCHEMA) {
+        bail!("input/schema: a review document must declare schema {FLEET_REVIEW_SCHEMA}")
+    }
+    let verdict = match document["verdict"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "PASS" => "PASS",
+        "REWORK" => "REWORK",
+        other => bail!("input/schema: review verdict must be PASS or REWORK, found {other:?}"),
+    };
+    let raw = document["findings"].as_array().cloned().unwrap_or_default();
+    let findings = raw
+        .iter()
+        .map(|finding| review_finding(finding, source))
+        .collect::<Result<Vec<_>>>()?;
+    if verdict == "PASS" && !findings.is_empty() {
+        bail!("input/schema: a PASS review cannot carry findings")
+    }
+    if verdict == "REWORK" && findings.is_empty() {
+        bail!("input/schema: a REWORK review must carry at least one finding")
+    }
+    Ok((verdict, findings))
+}
+
+/// Project structured findings onto the three shapes [`fleet_rework`] already accepts, so review
+/// consumes the existing budget rather than inventing a second one beside it.
+fn rework_inputs_from_findings(findings: &[Value]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut commands = Vec::new();
+    let mut invariants = Vec::new();
+    for finding in findings {
+        let label = format!(
+            "[{}/{}] {}",
+            finding["severity"].as_str().unwrap_or("major"),
+            finding["category"].as_str().unwrap_or("correctness"),
+            finding["detail"].as_str().unwrap_or("(no detail)"),
+        );
+        match finding["kind"].as_str() {
+            Some("path-line") => paths.push(format!(
+                "{}:{}:{label}",
+                finding["path"].as_str().unwrap_or_default(),
+                finding["line"].as_u64().unwrap_or(1),
+            )),
+            Some("command-output") => commands.push(format!(
+                "{}: {label}",
+                finding["command"].as_str().unwrap_or_default()
+            )),
+            _ => invariants.push(format!(
+                "{}: {label}",
+                finding["invariant"]
+                    .as_str()
+                    .or_else(|| finding["component"].as_str())
+                    .unwrap_or("invariant"),
+            )),
+        }
+    }
+    (paths, commands, invariants)
+}
+
+/// The durable receipt: who looked, at what, under which loop, and what they concluded.
+fn review_receipt(
+    candidate: &ReviewCandidate<'_>,
+    packet: &Value,
+    attempt: u64,
+    outcome: &ReviewOutcome,
+) -> Value {
+    let mut counts = BTreeMap::new();
+    for finding in &outcome.findings {
+        *counts
+            .entry(finding["severity"].as_str().unwrap_or("major").to_string())
+            .or_insert(0u64) += 1;
+    }
+    json!({
+        "schema": FLEET_REVIEW_SCHEMA,
+        "wave": candidate.wave,
+        "board_ref": candidate.item,
+        "repository": candidate.repository,
+        "base_commit": candidate.base,
+        "reviewed_commit": candidate.commit,
+        "candidate_digest": packet["diff_digest"],
+        "attempt": attempt,
+        "max_attempts": REVIEW_ATTEMPT_LIMIT,
+        "reviewer": outcome.reviewer,
+        // Recorded so independence is a property of the record, not of a comment.
+        "writer": candidate.writer,
+        "writer_session": candidate.writer_session,
+        "state": outcome.state,
+        "verdict": outcome.verdict,
+        "examined": outcome.examined,
+        "reason": outcome.reason,
+        "findings": outcome.findings,
+        "finding_counts": counts,
+        "packet": {
+            "schema": packet["schema"],
+            "complete": packet["complete"],
+            "diff_bytes": packet["diff_bytes"],
+            "shortstat": packet["shortstat"],
+            "story_contract": packet["story"]["path"],
+            "write_set": packet["write_set"],
+        },
+    })
+}
+
+/// Admit the fresh, read-only agent that examines one candidate.
+///
+/// Deliberately NOT routed through [`fleet_spawn`]. The ceiling below is the entire point of the
+/// story and is pinned here rather than inherited from whatever template or ad-hoc default a
+/// workspace happens to configure — and the reviewer's workspace root is a per-candidate sandbox
+/// holding only its packet, so it cannot read fleet state, the writer's transcript, or any
+/// repository checkout.
+fn admit_candidate_reviewer(
+    root: &Path,
+    config: &FleetConfig,
+    state: &mut FleetState,
+    candidate: &ReviewCandidate<'_>,
+    attempt: u64,
+    packet: &Value,
+) -> Result<String> {
+    let mut id = format!(
+        "review-{}-{}-{attempt}",
+        safe_ref_segment(candidate.wave),
+        safe_ref_segment(candidate.item),
+    );
+    // A re-review of a candidate whose verdict was already reached reuses the attempt number, and a
+    // reviewer is never resumed — so disambiguate rather than refuse. Refusing here would have
+    // turned an operator's explicit second look into a recorded review failure.
+    if state.agents.contains_key(&id) {
+        id = format!("{id}-{}", state.revision + 1);
+    }
+    if candidate.writer.as_deref() == Some(id.as_str()) {
+        bail!("permission: a story's writer cannot be its reviewer")
+    }
+    let loop_binding = resolve_fleet_loop_binding(root, config, FLEET_REVIEW_TASK_KIND)?;
+    let sandbox_relative = format!(
+        ".flux/fleet/reviews/{}/{}/{attempt}",
+        safe_ref_segment(candidate.wave),
+        safe_ref_segment(candidate.item),
+    );
+    // Written through the guarded port, which creates the sandbox on the way. It must exist before
+    // the loop snapshot below can be confined to it.
+    guarded_system(root)?
+        .write_file_atomic(
+            &format!("{sandbox_relative}/packet.json"),
+            &serde_json::to_string_pretty(packet)?,
+        )
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let sandbox = confined_root(root)?.join(&sandbox_relative);
+    let loop_dir = format!(".flux/fleet/agents/{}", safe_ref_segment(&id));
+    let loop_source = format!("{loop_dir}/agent-loop.flux");
+    let loop_binding_receipt = format!("{loop_dir}/agent-loop-binding.json");
+    snapshot_fleet_loop_binding(&sandbox, &loop_binding, &loop_source, &loop_binding_receipt)?;
+    let capabilities = REVIEW_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect::<Vec<_>>();
+    let (capabilities, operations) = normalize_worker_capabilities_in(
+        FleetTaskMode::ReadOnly,
+        &capabilities,
+        FLEET_REVIEW_TASK_KIND,
+        Some(&sandbox),
+    )?;
+    validate_loop_capability_compatibility(&loop_binding, &operations)?;
+    let fences = normalize_fences(vec![".git/**".to_string()]);
+    let read_roots: Vec<PathBuf> = Vec::new();
+    let capability_set = capability_set_manifest(
+        FleetTaskMode::ReadOnly,
+        &capabilities,
+        &operations,
+        &sandbox,
+        &read_roots,
+        &fences,
+    );
+    state.revision += 1;
+    let registration = json!({
+        "schema": "flux.fleet-agent-registration/v1",
+        "id": id,
+        "parent": "main",
+        "role": "reviewer",
+        "task_kind": FLEET_REVIEW_TASK_KIND,
+        "template": Value::Null,
+        "ephemeral": true,
+        "transport": "flux-local",
+        "model": config.main.model,
+        "mode": FleetTaskMode::ReadOnly,
+        "board_ref": candidate.item,
+        "instructions": reviewer_instructions(),
+        "instructions_source": Value::Null,
+        "capabilities": capabilities,
+        "fences": fences,
+        "writable_root": display_path(&sandbox),
+        "read_roots": Vec::<String>::new(),
+        "capability_set": capability_set,
+        "loop_binding": loop_binding.metadata(),
+        "loop_source": loop_source,
+        "loop_binding_receipt": loop_binding_receipt,
+        "status": "admitted",
+        "assignment": {
+            "wave": candidate.wave,
+            "board_ref": candidate.item,
+            "worktree": display_path(&sandbox),
+            "reviewed_commit": candidate.commit,
+        },
+        "lease": {"generation": state.revision, "holder": id, "status": "active"},
+        "created_by": "host",
+    });
+    state.agents.insert(id.clone(), registration);
+    Ok(id)
+}
+
+/// Read an external reviewer's typed document from a file or standard input.
+fn read_review_document(path: &str) -> Result<Value> {
+    let text = if path == "-" {
+        let mut buffer = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)
+            .context("input/schema: review document could not be read from stdin")?;
+        buffer
+    } else {
+        fs::read_to_string(path)
+            .with_context(|| format!("not-found: review document {path} could not be read"))?
+    };
+    extract_review_document(&text)
+        .with_context(|| format!("input/schema: {path} holds no {FLEET_REVIEW_SCHEMA} document"))
+}
+
+/// The reasons a reviewer is never dispatched at all, and what the record says instead.
+///
+/// Kept whole and pure so the fail-closed table is one readable thing rather than four early
+/// returns scattered through a function that also runs a model. Every arm returns
+/// `examined: false` — nothing here looked at the candidate, and the record must not imply it did.
+fn review_refused_before_dispatch(
+    running: bool,
+    candidate: &ReviewCandidate<'_>,
+    packet: &Value,
+    attempt: u64,
+) -> Option<ReviewOutcome> {
+    let blocked = |state: &'static str, reason: String| ReviewOutcome {
+        state,
+        verdict: "BLOCKED",
+        examined: false,
+        reason: Some(reason),
+        findings: Vec::new(),
+        reviewer: Value::Null,
+    };
+    if !running {
+        return Some(blocked(
+            "not-run",
+            "the main coordinator is stopped, so no reviewer could be dispatched".into(),
+        ));
+    }
+    if packet["story"]["acceptance"].as_str().is_none() {
+        return Some(blocked(
+            "not-run",
+            format!(
+                "no story contract for {} is present at {}, so there is nothing to review against",
+                candidate.item, candidate.commit
+            ),
+        ));
+    }
+    if packet["complete"].as_bool() != Some(true) {
+        // NOT a refusal that wedges the wave. A candidate that cannot be examined is itself a
+        // finding, and routing it as one spends the rework budget and terminates in the host's PARK
+        // rather than in a deadlock only an operator can clear.
+        let detail = format!(
+            "this candidate cannot be examined: {}{}. Split it, or remove what forces the redaction, \
+             so a reviewer can judge it against its acceptance",
+            packet["incomplete_reason"]
+                .as_str()
+                .unwrap_or("the review packet is incomplete"),
+            packet["shortstat"]
+                .as_str()
+                .map(|shortstat| format!(" ({shortstat})"))
+                .unwrap_or_default(),
+        );
+        return Some(ReviewOutcome {
+            state: "incomplete-context",
+            verdict: "REWORK",
+            examined: false,
+            reason: Some("the review packet is incomplete".into()),
+            findings: vec![json!({
+                "kind": "invariant",
+                "category": "evidence",
+                "severity": "blocker",
+                "confidence": "high",
+                "component": candidate.item,
+                "invariant": "a candidate must fit a reviewable packet",
+                "detail": detail,
+                // Host-derived, and labelled so. No model asserted this.
+                "source": "host",
+            })],
+            reviewer: json!({"id": Value::Null, "source": "host", "session": Value::Null}),
+        });
+    }
+    if attempt > REVIEW_ATTEMPT_LIMIT {
+        return Some(blocked(
+            "attention",
+            format!(
+                "{REVIEW_ATTEMPT_LIMIT} reviews of {} examined nothing; this candidate needs an operator",
+                candidate.commit
+            ),
+        ));
+    }
+    None
+}
+
+/// Obtain a verdict for one candidate: dispatch a fresh reviewer, or accept an external one.
+///
+/// Every branch that could not obtain a model assessment returns `examined: false`. That is the
+/// invariant the integration gate depends on — no path through here can produce a `PASS` that
+/// nothing actually looked at.
+fn review_candidate(
+    command: &FleetCommand,
+    root: &Path,
+    config: &FleetConfig,
+    state: &mut FleetState,
+    review: &ReviewAttempt<'_>,
+) -> ReviewOutcome {
+    let ReviewAttempt {
+        candidate,
+        packet,
+        attempt,
+        external,
+    } = *review;
+    let blocked = |state: &'static str, reason: String| ReviewOutcome {
+        state,
+        verdict: "BLOCKED",
+        examined: false,
+        reason: Some(reason),
+        findings: Vec::new(),
+        reviewer: Value::Null,
+    };
+
+    if let Some(document) = external {
+        let reviewer = document["reviewer"].as_str().unwrap_or_default().trim();
+        return match parse_review_document(document, "reviewer") {
+            Ok((verdict, findings)) => ReviewOutcome {
+                state: "reviewed",
+                verdict,
+                examined: true,
+                reason: None,
+                findings,
+                reviewer: json!({
+                    "id": reviewer,
+                    "source": "external",
+                    "session": Value::Null,
+                    "model": Value::Null,
+                    "loop": Value::Null,
+                }),
+            },
+            Err(error) => blocked("failed", redact(&error.to_string())),
+        };
+    }
+
+    if let Some(outcome) = review_refused_before_dispatch(state.running, candidate, packet, attempt)
+    {
+        return outcome;
+    }
+
+    let reviewer = match admit_candidate_reviewer(root, config, state, candidate, attempt, packet) {
+        Ok(reviewer) => reviewer,
+        Err(error) => return blocked("failed", redact(&error.to_string())),
+    };
+    let request = format!(
+        "Review this candidate. Your entire input is the packet below.\n\n{}",
+        serde_json::to_string_pretty(packet).unwrap_or_else(|error| error.to_string()),
+    );
+    let spec = match addressed_turn_spec(root, state, &reviewer, request) {
+        Ok(spec) => spec,
+        Err(error) => return blocked("failed", redact(&error.to_string())),
+    };
+    let model = spec.model.clone();
+    let receipt = match execute_and_record_agent_turn(command, root, state, spec, None) {
+        Ok(receipt) => receipt,
+        Err(error) => return blocked("failed", redact(&error.to_string())),
+    };
+    let identity = json!({
+        "id": reviewer,
+        "source": "agent",
+        "session": receipt["session"],
+        "model": model,
+        "loop": loop_binding_summary(&receipt["loop_binding"]),
+    });
+    let answer = receipt["answer"].as_str().unwrap_or_default();
+    let Some(document) = extract_review_document(answer) else {
+        return ReviewOutcome {
+            reviewer: identity,
+            ..blocked(
+                "failed",
+                format!("reviewer {reviewer} returned no {FLEET_REVIEW_SCHEMA} document"),
+            )
+        };
+    };
+    match parse_review_document(&document, "reviewer") {
+        Ok((verdict, findings)) => ReviewOutcome {
+            state: "reviewed",
+            verdict,
+            examined: true,
+            reason: None,
+            findings,
+            reviewer: identity,
+        },
+        Err(error) => ReviewOutcome {
+            reviewer: identity,
+            ..blocked("failed", redact(&error.to_string()))
+        },
+    }
+}
+
+fn fleet_review(
+    command: &FleetCommand,
+    root: &Path,
+    mut state: FleetState,
+    input: ReviewInput<'_>,
+) -> Result<(String, Value, Vec<String>, u64)> {
+    let config = read_fleet_config(root)?;
+    let wave = state
+        .waves
+        .get(input.wave)
+        .cloned()
+        .with_context(|| format!("not-found: wave {}", input.wave))?;
+    if !matches!(
+        wave["status"].as_str(),
+        Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+    ) {
+        bail!("conflict/precondition: review is only available before integration")
+    }
+    let external = match input.from {
+        Some(path) => Some(read_review_document(path)?),
+        None => None,
+    };
+    let mut selected = Vec::new();
+    if let Some(item) = input.item {
+        validate_board_refs(&[item.to_string()])?;
+        selected.push(wave_story_indices(&wave, item)?);
+    } else {
+        if external.is_some() {
+            bail!("input/schema: --from reviews exactly one candidate; name it with --item")
+        }
+        for (repository_index, repository) in wave["topology"]["repositories"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (story_index, story) in repository["stories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .enumerate()
+            {
+                if candidate_awaits_review(story) {
+                    selected.push((repository_index, story_index));
+                }
+            }
+        }
+    }
+
+    let mut reviews = Vec::new();
+    let mut warnings = Vec::new();
+    for (repository_index, story_index) in selected {
+        // Re-read per candidate rather than working off the snapshot taken above. Reviewing one
+        // story routes findings through `fleet_rework`, which can park the whole wave — and the next
+        // candidate must not then be reviewed against a wave that has already stopped.
+        let wave = state
+            .waves
+            .get(input.wave)
+            .cloned()
+            .with_context(|| format!("not-found: wave {}", input.wave))?;
+        if !matches!(
+            wave["status"].as_str(),
+            Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+        ) {
+            warnings.push(format!(
+                "{} stopped being reviewable ({}) before every candidate was examined",
+                input.wave,
+                wave["status"].as_str().unwrap_or("unknown"),
+            ));
+            break;
+        }
+        let repository = &wave["topology"]["repositories"][repository_index];
+        let story = &repository["stories"][story_index];
+        let item = story["board_ref"]
+            .as_str()
+            .context("validation/gate: wave story has no board ref")?
+            .to_string();
+        let handoff = &story["handoff"];
+        if handoff["status"].as_str() != Some("accepted") {
+            bail!("conflict/precondition: {item} has no accepted handoff to review")
+        }
+        let commit = handoff["commit"]
+            .as_str()
+            .context("validation/gate: accepted handoff has no commit")?
+            .to_string();
+        let writer = handoff["worker"].as_str().map(str::to_string);
+        let writer_session = handoff["session"].as_str().map(str::to_string);
+        // An external document names its own reviewer, and that name is checked against the story's
+        // writer BEFORE anything is recorded. This is the whole difference between an escape hatch
+        // and a bypass: the agent that produced the candidate can never clear it.
+        if let Some(document) = external.as_ref() {
+            let reviewer = document["reviewer"].as_str().unwrap_or_default().trim();
+            if reviewer.is_empty() {
+                bail!("input/schema: an external review must name its reviewer")
+            }
+            if Some(reviewer) == writer.as_deref() || Some(reviewer) == writer_session.as_deref() {
+                bail!(
+                    "permission: {reviewer} wrote {item}; a writer cannot review its own candidate"
+                )
+            }
+            let reviewed = document["reviewed_commit"].as_str().unwrap_or_default();
+            if reviewed != commit {
+                bail!(
+                    "conflict/precondition: this review examined {reviewed}, not the accepted handoff commit {commit}"
+                )
+            }
+        }
+        let candidate = ReviewCandidate {
+            wave: input.wave,
+            item: &item,
+            repository: repository["id"].as_str().unwrap_or("default"),
+            source: repository["source_root"]
+                .as_str()
+                .or_else(|| story["worktree"].as_str())
+                .map(PathBuf::from)
+                .context("validation/gate: wave repository has no checkout to read the range in")?,
+            base: story["base_commit"]
+                .as_str()
+                .context("validation/gate: story assignment has no base commit")?
+                .to_string(),
+            commit,
+            writer,
+            writer_session,
+        };
+        let packet = review_packet(&candidate);
+        let attempt = story["review_attempts"].as_u64().unwrap_or(0) + 1;
+        let review = ReviewAttempt {
+            candidate: &candidate,
+            packet: &packet,
+            attempt,
+            external: external.as_ref(),
+        };
+        let outcome = review_candidate(command, root, &config, &mut state, &review);
+        let mut receipt = review_receipt(&candidate, &packet, attempt, &outcome);
+        // A review that examined the candidate ends the retry run, whatever its verdict: the bound
+        // exists for reviews that looked at nothing, not for ones that found something.
+        let attempts_after = if outcome.examined { 0 } else { attempt };
+        let recorded = receipt.clone();
+        let wave_id = input.wave.to_string();
+        persist_delta_mutation(
+            command,
+            root,
+            &mut state,
+            "story.review.recorded",
+            recorded.clone(),
+            move |state| {
+                let record = state
+                    .waves
+                    .get_mut(&wave_id)
+                    .with_context(|| format!("not-found: wave {wave_id}"))?;
+                let story = &mut record["topology"]["repositories"][repository_index]["stories"]
+                    [story_index];
+                if !story["review_receipts"].is_array() {
+                    story["review_receipts"] = json!([]);
+                }
+                story["review_receipts"]
+                    .as_array_mut()
+                    .expect("review receipts is an array")
+                    .push(recorded.clone());
+                story["review"] = recorded.clone();
+                story["review_attempts"] = json!(attempts_after);
+                Ok(())
+            },
+        )?;
+
+        if outcome.verdict == "REWORK" {
+            let (paths, command_outputs, invariants) =
+                rework_inputs_from_findings(&outcome.findings);
+            let reviewer = receipt["reviewer"]["id"]
+                .as_str()
+                .filter(|reviewer| !reviewer.is_empty())
+                .unwrap_or("independent-review")
+                .to_string();
+            let current = read_fleet_state(root).unwrap_or_else(|_| state.clone());
+            match fleet_rework(
+                command,
+                root,
+                current,
+                ReworkInput {
+                    wave: input.wave,
+                    item: &item,
+                    reviewer: &reviewer,
+                    reviewed_commit: &candidate.commit,
+                    paths: &paths,
+                    command_outputs: &command_outputs,
+                    invariants: &invariants,
+                },
+            ) {
+                Ok((_, rework, _, _)) => {
+                    receipt["rework"] = json!({
+                        "decision": rework["decision"],
+                        "attempt": rework["attempt"],
+                        "max_attempts": rework["max_attempts"],
+                        "ack": rework["ack"],
+                    });
+                }
+                Err(error) => {
+                    let message = redact(&error.to_string());
+                    warnings.push(format!("{item} findings could not be delivered: {message}"));
+                    receipt["rework"] = json!({"error": message});
+                }
+            }
+            if let Ok(latest) = read_fleet_state(root) {
+                state = latest;
+            }
+        }
+        reviews.push(receipt);
+    }
+
+    let examined = reviews
+        .iter()
+        .filter(|review| review["examined"] == json!(true))
+        .count();
+    let passed = reviews
+        .iter()
+        .filter(|review| review["verdict"] == json!("PASS"))
+        .count();
+    Ok((
+        format!(
+            "{}: {} candidate(s) reviewed, {examined} examined, {passed} passed",
+            input.wave,
+            reviews.len()
+        ),
+        json!({
+            "schema": "flux.fleet-review-report/v1",
+            "wave": input.wave,
+            "reviews": reviews,
+        }),
+        warnings,
+        state.revision,
+    ))
+}
+
+/// Review every candidate the tick just made ready, with nobody watching.
+///
+/// Runs after the advance phase — which is what produces `handoffs-ready` — and before dispatch, so
+/// no wave can reach integration holding an unexamined candidate. It can never fail the tick: a
+/// review that could not run leaves its recorded refusal and is reported.
+fn drive_review_phase(command: &FleetCommand, root: &Path) -> (Vec<Value>, Vec<String>) {
+    let mut reviewed = Vec::new();
+    let mut warnings = Vec::new();
+    let Ok(state) = read_fleet_state(root) else {
+        return (reviewed, warnings);
+    };
+    let waves = state
+        .waves
+        .iter()
+        .filter(|(_, wave)| {
+            matches!(
+                wave["status"].as_str(),
+                Some("accepted" | "awaiting-handoffs" | "handoffs-ready")
+            )
+        })
+        .filter(|(_, wave)| {
+            wave["topology"]["repositories"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|repository| repository["stories"].as_array().into_iter().flatten())
+                .any(candidate_awaits_review)
+        })
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    for wave in waves {
+        let Ok(current) = read_fleet_state(root) else {
+            break;
+        };
+        match fleet_review(
+            command,
+            root,
+            current,
+            ReviewInput {
+                wave: &wave,
+                item: None,
+                from: None,
+            },
+        ) {
+            Ok((_, data, mut review_warnings, _)) => {
+                warnings.append(&mut review_warnings);
+                reviewed.push(json!({"wave": wave, "reviews": data["reviews"]}));
+            }
+            Err(error) => warnings.push(format!(
+                "{wave} could not be reviewed: {}",
+                redact(&error.to_string())
+            )),
+        }
+    }
+    (reviewed, warnings)
+}
+
 fn integration_order(root: &Path, selected: &[String]) -> Result<Vec<String>> {
     let stories = if root.join(".flux/board.toml").is_file() {
         workspace_stories(root)?
@@ -18713,6 +19885,14 @@ fn integrate_wave(
             || handoff["status"].as_str() != Some("accepted")
         {
             bail!("conflict/precondition: {item} has no accepted handoff")
+        }
+        // C-587: the writer's own claim is not evidence. A candidate reaches the repository gate —
+        // the longest operation in the pipeline — only after an agent that is not its author examined
+        // this exact commit and passed it. `candidate_review_refusal` fails closed: no review, a
+        // review of some other commit, and a review that never got to look are all refusals, and each
+        // says which it is.
+        if let Some(reason) = candidate_review_refusal(story) {
+            bail!("conflict/precondition: {item} {reason}")
         }
         let worker = handoff["worker"]
             .as_str()
@@ -21295,6 +22475,479 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    fn story_with_accepted_handoff(commit: &str) -> Value {
+        json!({
+            "board_ref": "flux/C-1",
+            "status": "handoff-accepted",
+            "handoff": {
+                "status": "accepted",
+                "commit": commit,
+                "worker": "wave-1-worker-1",
+                "session": "s-1",
+            },
+        })
+    }
+
+    /// C-587 — the distinction the whole story exists for.
+    ///
+    /// "The reviewer looked and found nothing" and "nothing looked" both carry zero findings. Read
+    /// `findings` alone and they are the same row, which is precisely how an absent review comes to
+    /// read as a clean one. They are separated by `examined`, and only one of them opens the gate.
+    #[test]
+    fn a_clean_review_and_a_review_that_never_looked_are_different_records() {
+        let commit = "a".repeat(40);
+        let other = "b".repeat(40);
+        let mut story = story_with_accepted_handoff(&commit);
+
+        let unreviewed = candidate_review_refusal(&story).expect("no review is a refusal");
+        assert!(unreviewed.contains("no independent review"), "{unreviewed}");
+
+        story["review"] = json!({
+            "reviewed_commit": commit, "state": "reviewed",
+            "verdict": "PASS", "examined": true, "findings": [],
+        });
+        assert_eq!(candidate_review_refusal(&story), None);
+        assert!(
+            !candidate_awaits_review(&story),
+            "a reached verdict is not re-paid for"
+        );
+
+        // Same commit, same empty `findings`, opposite meaning.
+        story["review"] = json!({
+            "reviewed_commit": commit, "state": "failed",
+            "verdict": "BLOCKED", "examined": false, "findings": [],
+            "reason": "the reviewer returned no document",
+        });
+        let unexamined =
+            candidate_review_refusal(&story).expect("an unexamined candidate is refused");
+        assert!(unexamined.contains("never examined it"), "{unexamined}");
+        assert!(
+            unexamined.contains("the reviewer returned no document"),
+            "the refusal must carry why nothing looked: {unexamined}"
+        );
+
+        story["review"] = json!({
+            "reviewed_commit": other, "state": "reviewed",
+            "verdict": "PASS", "examined": true, "findings": [],
+        });
+        let stale =
+            candidate_review_refusal(&story).expect("a pass over another commit is refused");
+        assert!(stale.contains("stale independent review"), "{stale}");
+        assert!(
+            candidate_awaits_review(&story),
+            "a moved candidate owes a new review"
+        );
+
+        // Findings are not advisory.
+        story["review"] = json!({
+            "reviewed_commit": commit, "state": "reviewed",
+            "verdict": "REWORK", "examined": true, "findings": [{"severity": "blocker"}],
+        });
+        let reworked = candidate_review_refusal(&story).expect("REWORK does not integrate");
+        assert!(reworked.contains("returned REWORK"), "{reworked}");
+
+        // The retry run is bounded, so a review that never examines anything stops costing a tick.
+        story["review"] = json!({"reviewed_commit": other, "examined": false});
+        story["review_attempts"] = json!(REVIEW_ATTEMPT_LIMIT);
+        assert!(!candidate_awaits_review(&story), "retries are bounded");
+    }
+
+    fn review_fixture(label: &str) -> std::path::PathBuf {
+        let root = reclaim_test_dir(label);
+        fs::create_dir_all(root.join(".flux/fleet/loops")).expect("fixture loops");
+        fs::write(
+            root.join(".flux/fleet.toml"),
+            "schema = \"flux.fleet/v1\"\n\n[loop_profiles.review]\nrevision = \"1\"\nsource = \".flux/fleet/loops/review.flux\"\nentry = \"review\"\n\n[loop_policy]\nreview = \"review\"\n",
+        )
+        .expect("fixture config");
+        fs::write(
+            root.join(".flux/fleet/loops/review.flux"),
+            "flow review -> string\n  $turn = ai_segment({ goal: \"review the packet\", tools: [\"read\"], max_rounds: 4, current_turn: true })\n  return $turn.result\n",
+        )
+        .expect("fixture loop");
+        root
+    }
+
+    /// The reviewer is a different agent from the writer, and it holds nothing that could change
+    /// what it is judging. AGENTS.md states the rule directly — "Read-only review may inspect the
+    /// exact commit; only the story owner applies findings" — and this is the mechanism.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_reviewer_is_a_fresh_agent_that_cannot_edit_what_it_judges() {
+        let root = review_fixture("reviewer-ceiling");
+        let config = read_fleet_config(&root).expect("fixture fleet config");
+        let mut state = FleetState {
+            running: true,
+            ..FleetState::default()
+        };
+        let candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: root.clone(),
+            base: "b".repeat(40),
+            commit: "a".repeat(40),
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let packet = json!({"schema": FLEET_REVIEW_PACKET_SCHEMA, "complete": true});
+
+        let id = admit_candidate_reviewer(&root, &config, &mut state, &candidate, 1, &packet)
+            .expect("the reviewer is admitted");
+
+        let reviewer = &state.agents[&id];
+        assert_ne!(
+            id, "wave-1-worker-1",
+            "the writer cannot be its own reviewer"
+        );
+        assert_eq!(reviewer["role"], json!("reviewer"));
+        assert_eq!(reviewer["mode"], json!("read-only"));
+        assert_eq!(reviewer["board_ref"], json!("flux/C-1"));
+        // Fresh. A reviewer resuming the writer's session would BE the writer, holding its whole
+        // conversation and every justification it already talked itself into.
+        assert!(reviewer["session"].is_null(), "{reviewer}");
+        assert!(reviewer["runtime_session"].is_null(), "{reviewer}");
+        assert_eq!(reviewer["capabilities"], json!(["read"]));
+        // No repository root at all: its workspace is the packet sandbox, so it cannot reach fleet
+        // state, the writer's transcript, or any checkout.
+        assert_eq!(reviewer["read_roots"], json!([]));
+        let sandbox = reviewer["writable_root"].as_str().expect("a writable root");
+        assert!(sandbox.contains(".flux/fleet/reviews/"), "{sandbox}");
+        assert!(
+            std::path::Path::new(sandbox).join("packet.json").is_file(),
+            "the packet is the reviewer's only input and must be on disk at {sandbox}"
+        );
+
+        // The ceiling the admission resolved. `read-only` mode is what enforces it, and this is the
+        // list a turn would actually be launched with.
+        let (_, operations) = normalize_worker_capabilities_in(
+            FleetTaskMode::ReadOnly,
+            &[REVIEW_CAPABILITIES[0].to_string()],
+            FLEET_REVIEW_TASK_KIND,
+            Some(&root),
+        )
+        .expect("the reviewer ceiling resolves");
+        for forbidden in [
+            "write",
+            "edit",
+            "append",
+            "patch",
+            "bash",
+            "proc.run",
+            "git_stage",
+            "git_commit",
+        ] {
+            assert!(
+                !operations.iter().any(|operation| operation == forbidden),
+                "a reviewer must not hold {forbidden}: {operations:?}"
+            );
+        }
+        assert!(operations.iter().any(|operation| operation == "read"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Findings are written in closed vocabularies and bound to evidence, so a finding can be
+    /// counted and routed rather than read — and they land in the rework budget that already exists
+    /// rather than a second one beside it.
+    #[test]
+    fn review_findings_are_structured_evidence_and_route_into_the_rework_budget() {
+        let document = json!({
+            "schema": FLEET_REVIEW_SCHEMA,
+            "verdict": "REWORK",
+            "findings": [
+                {"category":"contract","severity":"blocker","confidence":"high",
+                 "component":"crates/x/src/y.rs","evidence":{"path":"crates/x/src/y.rs","line":42},
+                 "detail":"acceptance item two is not implemented"},
+                {"category":"evidence","severity":"major","confidence":"medium",
+                 "component":"tests","evidence":{"command":"cargo test -p x"},
+                 "detail":"the cited argv matches no test"},
+                {"category":"safety","severity":"blocker","confidence":"high",
+                 "component":"flux-system","evidence":{"invariant":"all process IO goes through flux-system"},
+                 "detail":"a raw Command bypasses the guarded port"},
+            ],
+        });
+
+        let (verdict, findings) =
+            parse_review_document(&document, "reviewer").expect("a typed REWORK");
+
+        assert_eq!(verdict, "REWORK");
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0]["kind"], json!("path-line"));
+        assert_eq!(findings[0]["line"], json!(42));
+        assert_eq!(findings[0]["severity"], json!("blocker"));
+        // Set by the host, never read from the document: a reviewer cannot promote its own opinion
+        // into something the host observed.
+        assert_eq!(findings[0]["source"], json!("reviewer"));
+        assert_eq!(findings[1]["kind"], json!("command-output"));
+        assert_eq!(findings[2]["kind"], json!("invariant"));
+
+        let (paths, commands, invariants) = rework_inputs_from_findings(&findings);
+        assert_eq!(paths.len(), 1, "{paths:?}");
+        assert!(
+            paths[0].starts_with("crates/x/src/y.rs:42:[blocker/contract]"),
+            "a finding must reach the writer as PATH:LINE:DETAIL: {paths:?}"
+        );
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(invariants.len(), 1, "{invariants:?}");
+
+        // The vocabularies are closed. An invented severity is malformed, not quietly downgraded.
+        let invented = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict": "REWORK", "findings": [
+            {"category":"contract","severity":"catastrophic","confidence":"high","component":"x",
+             "evidence":{"invariant":"i"},"detail":"d"}]});
+        assert!(parse_review_document(&invented, "reviewer").is_err());
+
+        // A finding nothing can be checked against is not a finding.
+        let unevidenced = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict": "REWORK", "findings": [
+            {"category":"contract","severity":"blocker","confidence":"high","component":"x",
+             "evidence":{},"detail":"it feels wrong"}]});
+        assert!(parse_review_document(&unevidenced, "reviewer").is_err());
+    }
+
+    /// Every way a review document can fail to say something, and none of them says PASS.
+    #[test]
+    fn a_review_document_that_cannot_be_read_is_never_a_pass() {
+        let finding = json!({"category":"contract","severity":"minor","confidence":"low",
+                             "component":"x","evidence":{"invariant":"i"},"detail":"d"});
+
+        // The two fields disagree; the safe reading of a disagreement is that neither is trustworthy.
+        let passing_with_findings =
+            json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"PASS", "findings":[finding]});
+        assert!(parse_review_document(&passing_with_findings, "reviewer").is_err());
+
+        let empty_rework =
+            json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"REWORK", "findings":[]});
+        assert!(parse_review_document(&empty_rework, "reviewer").is_err());
+
+        // The reviewer's vocabulary is PASS and REWORK. It cannot park a wave: a model that can end
+        // work unilaterally is not bounded by the host's rework budget at all.
+        let parked = json!({"schema": FLEET_REVIEW_SCHEMA, "verdict":"PARK", "findings":[]});
+        assert!(parse_review_document(&parked, "reviewer").is_err());
+
+        let wrong_schema = json!({"schema": "something/v1", "verdict":"PASS", "findings":[]});
+        assert!(parse_review_document(&wrong_schema, "reviewer").is_err());
+
+        // A reviewer that narrates around its verdict has still reviewed; one that only narrates
+        // has not, and must not be read as approval.
+        let narrated = "I checked each acceptance item.\n\n```json\n{\"schema\":\"flux.fleet-review/v1\",\"verdict\":\"PASS\",\"findings\":[]}\n```\n";
+        let document = extract_review_document(narrated).expect("a fenced verdict is found");
+        assert_eq!(
+            parse_review_document(&document, "reviewer")
+                .expect("a typed PASS")
+                .0,
+            "PASS"
+        );
+        assert!(extract_review_document("Looks good to me!").is_none());
+    }
+
+    /// The reasons a reviewer is never dispatched, and what each one records instead.
+    #[test]
+    fn an_unreviewable_candidate_is_a_host_finding_and_never_a_silent_pass() {
+        let candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: std::path::PathBuf::from("/nonexistent"),
+            base: "b".repeat(40),
+            commit: "a".repeat(40),
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let complete = json!({"complete": true, "story": {"acceptance": "- [ ] ship"}});
+
+        assert!(
+            review_refused_before_dispatch(true, &candidate, &complete, 1).is_none(),
+            "a complete packet on a running fleet is dispatched, not refused"
+        );
+
+        let stopped = review_refused_before_dispatch(false, &candidate, &complete, 1)
+            .expect("a stopped fleet cannot review");
+        assert_eq!(stopped.verdict, "BLOCKED");
+        assert!(!stopped.examined);
+
+        let no_contract = json!({"complete": true, "story": Value::Null});
+        let missing = review_refused_before_dispatch(true, &candidate, &no_contract, 1)
+            .expect("there is nothing to review against");
+        assert_eq!(missing.state, "not-run");
+        assert_eq!(missing.verdict, "BLOCKED");
+        assert!(!missing.examined);
+
+        // An unreviewably large candidate becomes a REWORK the budget can spend, carrying a finding
+        // the HOST derived — so it terminates in the host's park rather than a deadlock only an
+        // operator can clear.
+        let oversized = json!({
+            "complete": false,
+            "story": {"acceptance": "- [ ] ship"},
+            "shortstat": "900 files changed, 120000 insertions(+)",
+        });
+        let unreviewable = review_refused_before_dispatch(true, &candidate, &oversized, 1)
+            .expect("an incomplete packet is never dispatched as if it were whole");
+        assert_eq!(unreviewable.state, "incomplete-context");
+        assert_eq!(unreviewable.verdict, "REWORK");
+        assert!(!unreviewable.examined, "nothing read this candidate");
+        assert_eq!(unreviewable.findings[0]["source"], json!("host"));
+        assert!(
+            unreviewable.findings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("900 files changed")),
+            "{:?}",
+            unreviewable.findings
+        );
+
+        let exhausted =
+            review_refused_before_dispatch(true, &candidate, &complete, REVIEW_ATTEMPT_LIMIT + 1)
+                .expect("the retry run is bounded");
+        assert_eq!(exhausted.state, "attention");
+        assert_eq!(exhausted.verdict, "BLOCKED");
+        assert!(!exhausted.examined);
+    }
+
+    /// The reviewer judges the contract the candidate was written against, read out of the candidate
+    /// itself. A worktree moves on within minutes of a rework, and a review against a contract the
+    /// commit never saw is a review of the wrong thing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_review_packet_carries_the_contract_as_it_stood_at_the_reviewed_commit() {
+        let root = reclaim_test_dir("review-contract");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Goal\n\nShip the thing.\n\n## Acceptance\n\n- [ ] it ships\n\n## Notes\n\nnot the contract\n",
+        )
+        .expect("write story");
+        guarded_git(&root, &["add", "."]).expect("add");
+        guarded_git(&root, &["commit", "-m", "contract"]).expect("commit");
+        let commit = git_output(&root, &["rev-parse", "HEAD"]).expect("commit sha");
+
+        // The worktree moves on, exactly as a rework would move it.
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Acceptance\n\n- [ ] something else entirely\n",
+        )
+        .expect("rewrite story");
+
+        let contract =
+            story_contract_at(&root, &commit, "flux/C-1").expect("the contract is in the commit");
+
+        assert_eq!(contract["path"], json!("docs/stories/C-1-first.md"));
+        assert_eq!(contract["goal"], json!("Ship the thing."));
+        assert_eq!(contract["acceptance"], json!("- [ ] it ships"));
+        assert!(
+            !contract["acceptance"]
+                .as_str()
+                .unwrap()
+                .contains("not the contract"),
+            "a section stops at the next heading: {contract}"
+        );
+        assert!(
+            story_contract_at(&root, &commit, "flux/C-404").is_none(),
+            "an absent contract is absent, never an empty one that reads as satisfied"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// A diff that cannot be shown to a model is not a diff the model reviewed.
+    ///
+    /// `redact` is blunt by design: one credential pattern anywhere collapses the WHOLE string to
+    /// `[redacted]`. Judging the packet on the raw diff would therefore mark a packet whole whose
+    /// `diff` field is ten characters long — and a reviewer handed nothing could return PASS over a
+    /// change no one saw. Found by reading this diff back, not by a failing gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_diff_that_cannot_be_shown_is_an_incomplete_packet_not_a_silent_pass() {
+        let root = reclaim_test_dir("review-redaction");
+        for argv in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.email", "test@example.invalid"],
+            vec!["config", "user.name", "test"],
+        ] {
+            guarded_git(&root, &argv).expect("git setup");
+        }
+        fs::create_dir_all(root.join("docs/stories")).expect("stories dir");
+        fs::write(
+            root.join("docs/stories/C-1-first.md"),
+            "---\nid: C-1\n---\n\n# First\n\n## Acceptance\n\n- [ ] it ships\n",
+        )
+        .expect("write story");
+        fs::write(root.join("base.txt"), "base\n").expect("write base");
+        guarded_git(&root, &["add", "."]).expect("add");
+        guarded_git(&root, &["commit", "-m", "base"]).expect("commit base");
+        let base = git_output(&root, &["rev-parse", "HEAD"]).expect("base sha");
+
+        // Ordinary work first: the packet is whole and would be dispatched.
+        fs::write(root.join("clean.rs"), "// nothing sensitive\n").expect("write clean");
+        guarded_git(&root, &["add", "."]).expect("add clean");
+        guarded_git(&root, &["commit", "-m", "clean"]).expect("commit clean");
+        let clean_commit = git_output(&root, &["rev-parse", "HEAD"]).expect("clean sha");
+        let mut candidate = ReviewCandidate {
+            wave: "wave-1",
+            item: "flux/C-1",
+            repository: "flux",
+            source: root.clone(),
+            base: base.clone(),
+            commit: clean_commit,
+            writer: Some("wave-1-worker-1".into()),
+            writer_session: Some("s-1".into()),
+        };
+        let clean = review_packet(&candidate);
+        assert_eq!(clean["complete"], json!(true), "{clean}");
+        assert!(
+            clean["diff"].as_str().unwrap().contains("clean.rs"),
+            "{clean}"
+        );
+        assert!(
+            review_refused_before_dispatch(true, &candidate, &clean, 1).is_none(),
+            "an ordinary candidate is dispatched"
+        );
+
+        // Now a line that trips the redactor.
+        fs::write(root.join("config.rs"), "let api_key = read_env();\n").expect("write secretish");
+        guarded_git(&root, &["add", "."]).expect("add secretish");
+        guarded_git(&root, &["commit", "-m", "config"]).expect("commit secretish");
+        candidate.commit = git_output(&root, &["rev-parse", "HEAD"]).expect("secretish sha");
+
+        let packet = review_packet(&candidate);
+
+        assert_eq!(
+            packet["diff"],
+            json!("[redacted]"),
+            "the redactor is expected to collapse this whole diff"
+        );
+        assert_eq!(
+            packet["complete"],
+            json!(false),
+            "a packet whose diff is one redaction marker is not complete: {packet}"
+        );
+        assert!(
+            packet["incomplete_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("credential pattern")),
+            "{packet}"
+        );
+        // The candidate's identity still comes from the real range, not from the redaction.
+        assert_ne!(packet["diff_digest"], clean["diff_digest"]);
+
+        let outcome = review_refused_before_dispatch(true, &candidate, &packet, 1)
+            .expect("an unshowable diff is never dispatched as if it were whole");
+        assert_eq!(outcome.verdict, "REWORK");
+        assert!(!outcome.examined, "no model saw this candidate");
+        assert_eq!(outcome.findings[0]["source"], json!("host"));
+        assert!(
+            outcome.findings[0]["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("credential pattern")),
+            "{:?}",
+            outcome.findings
+        );
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not

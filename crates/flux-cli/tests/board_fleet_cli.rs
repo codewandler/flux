@@ -259,6 +259,49 @@ fn submit_result_handoff(root: &PathBuf, commit: &str) -> serde_json::Value {
     serde_json::from_slice(&handoff.stdout).unwrap()
 }
 
+/// Record an independent PASS over one exact candidate, the way a dispatched reviewer would.
+///
+/// C-587 gates integration on a review by an agent that is not the story's writer, so every fixture
+/// that integrates now has to have been examined by one. These fixtures run offline against no
+/// provider, so they submit the reviewer's typed document through `--from` — the same parser, the
+/// same closed vocabularies, and the same refusal of a reviewer that is the story's own writer.
+fn record_passing_review(root: &PathBuf, wave: &str, item: &str, commit: &str) {
+    let document = root.join(format!("review-{item}-{commit}.json").replace('/', "-"));
+    fs::write(
+        &document,
+        serde_json::to_string(&serde_json::json!({
+            "schema": "flux.fleet-review/v1",
+            "reviewer": "fixture-reviewer",
+            "reviewed_commit": commit,
+            "verdict": "PASS",
+            "findings": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reviewed = flux(
+        root,
+        &[
+            "fleet",
+            "review",
+            wave,
+            "--item",
+            item,
+            "--from",
+            document.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        reviewed.status.success(),
+        "review of {item}@{commit} failed: {} {}",
+        String::from_utf8_lossy(&reviewed.stdout),
+        String::from_utf8_lossy(&reviewed.stderr)
+    );
+    fs::remove_file(&document).ok();
+}
+
 #[test]
 fn board_and_fleet_skills_are_valid_small_agent_skills() {
     let root = fixture("skills");
@@ -425,6 +468,7 @@ fn every_board_and_fleet_skill_example_executes_against_an_offline_fixture() {
                 "{}",
                 String::from_utf8_lossy(&handoff.stdout)
             );
+            record_passing_review(&fleet_root, &wave, "repo/C-1", &commit);
             let integrated = flux(
                 &fleet_root,
                 &["fleet", "integrate", &wave, "--output", "json"],
@@ -2179,6 +2223,7 @@ fn fleet_verifies_handoff_runs_one_final_gate_and_applies_only_explicitly() {
     assert_eq!(handoff["data"]["failing_before"]["success"], false);
     assert_eq!(handoff["data"]["passing_after"]["success"], true);
 
+    record_passing_review(&root, "wave-2", "repo/C-1", &commit);
     let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
     assert!(
         integrated.status.success(),
@@ -2326,6 +2371,7 @@ fn fleet_combined_only_failure_runs_the_final_gate_once_and_preserves_candidate(
             "{}",
             String::from_utf8_lossy(&handoff.stdout)
         );
+        record_passing_review(&root, "wave-2", &item, &commit);
     }
 
     let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
@@ -3167,6 +3213,7 @@ fn a_derived_artifact_is_regenerated_on_the_candidate_before_the_gate() {
         String::from_utf8_lossy(&handoff.stdout)
     );
 
+    record_passing_review(&root, "wave-2", "repo/C-1", &commit);
     let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
     assert!(
         integrated.status.success(),
@@ -3257,6 +3304,7 @@ fn a_story_that_made_several_commits_integrates_all_of_them() {
         String::from_utf8_lossy(&handoff.stdout)
     );
 
+    record_passing_review(&root, "wave-2", "repo/C-1", &cited);
     let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
     assert!(
         integrated.status.success(),
@@ -3505,6 +3553,7 @@ fn two_stories_sharing_one_file_integrate_when_their_commits_combine() {
             "{}",
             String::from_utf8_lossy(&handoff.stdout)
         );
+        record_passing_review(&root, "wave-2", &item, &commit);
     }
 
     let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
@@ -3628,6 +3677,176 @@ fn fleet_rework_stays_with_one_session_twice_and_the_third_request_parks() {
         !integration.status.success(),
         "parked work cannot integrate"
     );
+}
+
+/// C-587 (failing first): the whole gap in one test.
+///
+/// Nothing adversarial ever looked at a Fleet candidate. `"reviewer"` appeared once in the entire
+/// fleet command — as a *string a rework may cite* — and `.flux/fleet.toml` pointed the `review` task
+/// kind at the read-only research loop, which no code path ever selected. So the only evidence a
+/// candidate carried into integration was its own writer's claim, and the repository gate was spent on
+/// it before anyone but the author had read a line.
+#[test]
+fn fleet_integrate_refuses_a_candidate_no_independent_reviewer_examined() {
+    let (root, story) = one_story_wave("review-gate");
+    let commit = commit_result(&story, "first attempt");
+    let handoff = submit_result_handoff(&root, &commit);
+    let writer = handoff["data"]["worker"].as_str().unwrap().to_string();
+
+    let unreviewed = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        !unreviewed.status.success(),
+        "an unreviewed candidate must never reach the gate: stdout={} stderr={}",
+        String::from_utf8_lossy(&unreviewed.stdout),
+        String::from_utf8_lossy(&unreviewed.stderr)
+    );
+    let unreviewed: serde_json::Value = serde_json::from_slice(&unreviewed.stdout).unwrap();
+    assert!(
+        unreviewed["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("independent review")),
+        "the refusal must name what is missing: {unreviewed}"
+    );
+
+    // The writer cannot clear its own candidate, whatever it puts in the file.
+    let self_review = root.join("self-review.json");
+    fs::write(
+        &self_review,
+        serde_json::to_string(&serde_json::json!({
+            "schema": "flux.fleet-review/v1",
+            "reviewer": writer,
+            "reviewed_commit": commit,
+            "verdict": "PASS",
+            "findings": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let refused = flux(
+        &root,
+        &[
+            "fleet",
+            "review",
+            "wave-2",
+            "--item",
+            "repo/C-1",
+            "--from",
+            self_review.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        !refused.status.success(),
+        "a writer reviewing itself is not review: {}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+
+    // A review that names findings routes the story back to its writer rather than to the gate.
+    let rework_review = root.join("rework-review.json");
+    fs::write(
+        &rework_review,
+        serde_json::to_string(&serde_json::json!({
+            "schema": "flux.fleet-review/v1",
+            "reviewer": "reviewer-1",
+            "reviewed_commit": commit,
+            "verdict": "REWORK",
+            "findings": [{
+                "category": "contract",
+                "severity": "blocker",
+                "confidence": "high",
+                "component": "result.txt",
+                "evidence": {"path": "result.txt", "line": 1},
+                "detail": "the acceptance item is not satisfied by this line",
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let reworked = flux(
+        &root,
+        &[
+            "fleet",
+            "review",
+            "wave-2",
+            "--item",
+            "repo/C-1",
+            "--from",
+            rework_review.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        reworked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reworked.stdout)
+    );
+    let reworked: serde_json::Value = serde_json::from_slice(&reworked.stdout).unwrap();
+    assert_eq!(reworked["data"]["reviews"][0]["verdict"], "REWORK");
+    assert_eq!(reworked["data"]["reviews"][0]["state"], "reviewed");
+    assert_eq!(
+        reworked["data"]["reviews"][0]["rework"]["decision"],
+        "REWORK"
+    );
+    let still_refused = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        !still_refused.status.success(),
+        "findings are not advisory: {}",
+        String::from_utf8_lossy(&still_refused.stdout)
+    );
+
+    // The repair, and the independent PASS over the exact repaired commit, is what unblocks the gate.
+    let repaired = commit_result(&story, "second attempt");
+    submit_result_handoff(&root, &repaired);
+    let pass_review = root.join("pass-review.json");
+    fs::write(
+        &pass_review,
+        serde_json::to_string(&serde_json::json!({
+            "schema": "flux.fleet-review/v1",
+            "reviewer": "reviewer-1",
+            "reviewed_commit": repaired,
+            "verdict": "PASS",
+            "findings": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let passed = flux(
+        &root,
+        &[
+            "fleet",
+            "review",
+            "wave-2",
+            "--item",
+            "repo/C-1",
+            "--from",
+            pass_review.to_str().unwrap(),
+            "--output",
+            "json",
+        ],
+    );
+    assert!(
+        passed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&passed.stdout)
+    );
+    let passed: serde_json::Value = serde_json::from_slice(&passed.stdout).unwrap();
+    assert_eq!(passed["data"]["reviews"][0]["verdict"], "PASS");
+    // A clean review and a review that never happened are different records, not both "no findings".
+    assert_eq!(passed["data"]["reviews"][0]["examined"], true);
+    assert_eq!(passed["data"]["reviews"][0]["reviewed_commit"], repaired);
+
+    let integrated = flux(&root, &["fleet", "integrate", "wave-2", "--output", "json"]);
+    assert!(
+        integrated.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&integrated.stdout),
+        String::from_utf8_lossy(&integrated.stderr)
+    );
+    let integrated: serde_json::Value = serde_json::from_slice(&integrated.stdout).unwrap();
+    assert_eq!(integrated["data"]["status"], "green");
+    fs::remove_dir_all(root).ok();
 }
 
 /// C-631 (R-10, failing first): harvest before the pause. A worker that commits its deliverable and
