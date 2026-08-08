@@ -5708,10 +5708,14 @@ worktree_root = ".flux/fleet/worktrees"
                 // state — so the wave waited for a human who, on the night this was found, was not
                 // there. Recording now, from the worktrees the turns just finished in, is what makes a
                 // wave able to advance on its own.
-                let handoffs = record_provisional_handoffs(&mut state, &wave);
+                let handoffs = record_turn_handoffs(&mut state, &wave);
                 let handed_off = handoffs
                     .iter()
                     .filter(|report| report["recorded"] == json!(true))
+                    .count();
+                let verified = handoffs
+                    .iter()
+                    .filter(|report| report["verified"] == json!(true))
                     .count();
                 if let Some(record) = state.waves.get_mut(&wave) {
                     let outstanding = record["topology"]["repositories"]
@@ -5731,7 +5735,7 @@ worktree_root = ".flux/fleet/worktrees"
                     });
                     record["agent_turns"] = json!(receipts);
                     record["agent_errors"] = json!(errors);
-                    record["provisional_handoffs"] = json!(handoffs);
+                    record["turn_handoffs"] = json!(handoffs);
                 }
                 state.revision += 1;
                 persist_fleet_mutation(
@@ -5754,7 +5758,8 @@ worktree_root = ".flux/fleet/worktrees"
                 }
                 return Ok((
                     format!(
-                        "{wave} agents completed; {handed_off} of {} handed off provisionally",
+                        "{wave} agents completed; {handed_off} of {} handed off, {verified} with \
+                         verified targeted validation",
                         handoffs.len()
                     ),
                     json!({"wave": wave, "items": selected, "agents": admitted_workers, "ack": "completed", "topology": topology, "receipts": receipts, "handoffs": handoffs}),
@@ -14931,7 +14936,7 @@ fn park_wave(
         // were parked as failures, and a human dug the commits out days later. The delta is recomputed
         // on every attempt, so a retry rebuilds this report rather than double-counting it.
         harvested.clear();
-        harvested.extend(record_provisional_handoffs(state, wave_id));
+        harvested.extend(record_turn_handoffs(state, wave_id));
         let wave = state
             .waves
             .get_mut(wave_id)
@@ -15701,6 +15706,8 @@ struct DrivePlan {
     advance: Vec<String>,
     /// Waves with outstanding stories whose finished turns can still be reconstructed into handoffs.
     reconstruct: Vec<String>,
+    /// C-730: waves that have earned their integrator and do not already have one running.
+    integrate: Vec<String>,
     /// C-724: claims this tick releases because the wave holding them has no live supervisor.
     released: Vec<Value>,
     /// Items this tick will send workers at.
@@ -15744,6 +15751,75 @@ fn drive_wave_next_status(wave: &Value) -> Option<&'static str> {
         .iter()
         .all(|story| story["status"].as_str() == Some("handoff-accepted"))
         .then_some("handoffs-ready")
+}
+
+/// Is this wave's integrator already running?
+///
+/// Integration resets the integration worktree it cherry-picks into, so a second integrator sent
+/// over a live first is not a duplicate report — it is two processes rewriting the same checkout.
+fn wave_has_live_integrator(state: &FleetState, wave_id: &str) -> bool {
+    state.agents.values().any(|agent| {
+        agent["task_kind"].as_str() == Some(FLEET_INTEGRATION_TASK_KIND)
+            && agent["assignment"]["wave"].as_str() == Some(wave_id)
+            && matches!(worker_activity(agent), WorkerActivity::Active)
+    })
+}
+
+/// How many integrator turns one wave may be given before the driver stops paying for them.
+///
+/// A successful integration moves the wave off `handoffs-ready` (to `green`, `red` or `conflict`),
+/// which is what normally ends this. But a turn that *completes without calling* `fleet.integrate`
+/// leaves the wave exactly where it was — and the tick would then re-dispatch it, and the next one
+/// again, spending a model turn per tick forever on a wave that is not moving. Deliberately the same
+/// small number as `max_rework`: the second attempt is a retry, the third is a loop.
+const MAX_INTEGRATOR_ATTEMPTS_PER_WAVE: u64 = 2;
+
+fn wave_integrator_attempts(wave: &Value) -> u64 {
+    wave["integrator_attempts"].as_u64().unwrap_or(0)
+}
+
+/// Waves that have earned their integrator and do not already have one.
+///
+/// C-730. `handoffs-ready` was where a wave went to stop: `drive_wave_next_status` moved it there
+/// and nothing ever read that state again. `.flux/fleet.toml` declares an `integrator` role and an
+/// `integration` loop profile pointing at `wave-integration.flux`, and the string `integrator`
+/// appeared nowhere in this crate — the role and its loop were configuration the driver could not
+/// dispatch, so every wave whose writers finished waited for a human to type `flux fleet integrate`.
+fn drive_integration_targets(state: &FleetState) -> Vec<String> {
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| wave["status"].as_str() == Some("handoffs-ready"))
+        .filter(|(_, wave)| wave_integrator_attempts(wave) < MAX_INTEGRATOR_ATTEMPTS_PER_WAVE)
+        .filter(|(id, _)| !wave_has_live_integrator(state, id))
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+/// Waves that have earned an integrator and spent every attempt at one without moving.
+///
+/// Reported rather than merely skipped. A wave that silently stops being dispatched is
+/// indistinguishable from one nobody ever looked at, and "the driver quietly gave up" is precisely
+/// the failure this epic is removing from the pipeline.
+fn drive_integration_exhausted(state: &FleetState) -> Vec<Value> {
+    state
+        .waves
+        .iter()
+        .filter(|(_, wave)| wave["status"].as_str() == Some("handoffs-ready"))
+        .filter(|(_, wave)| wave_integrator_attempts(wave) >= MAX_INTEGRATOR_ATTEMPTS_PER_WAVE)
+        .map(|(id, wave)| {
+            json!({
+                "wave": id,
+                "dispatched": false,
+                "attempts": wave_integrator_attempts(wave),
+                "reason": format!(
+                    "wave {id} has spent its {MAX_INTEGRATOR_ATTEMPTS_PER_WAVE} integrator \
+                     attempt(s) and is still awaiting integration; `flux fleet integrate {id}` is \
+                     the deterministic host verb that assembles it"
+                ),
+            })
+        })
+        .collect()
 }
 
 /// What a tick would decide on, rendered as one stable value.
@@ -16283,6 +16359,11 @@ fn drive_tick_plan(
             plan.reconstruct.push(id.clone());
         }
     }
+    // C-730. Computed from the pre-tick state, so this names the waves that were ALREADY sitting at
+    // `handoffs-ready` when the tick began. A wave `plan.advance` moves there during this tick is
+    // picked up from current state after the mutation, exactly as dispatch is — a plan is a decision
+    // about what it read, not a prediction of what it is about to write.
+    plan.integrate = drive_integration_targets(state);
 
     let active = state
         .agents
@@ -16375,6 +16456,147 @@ fn drive_tick_plan(
         }
     }
     plan
+}
+
+/// The request a dispatched integrator is given. Deliberately narrow: its ceiling is two operations,
+/// and the only one that does anything is `fleet.integrate` on this exact wave.
+fn wave_integrator_request(wave_id: &str) -> String {
+    format!(
+        "Assemble wave {wave_id} and stop. Every story in it holds an accepted handoff. Call \
+         `fleet.integrate` for {wave_id} exactly once, then report the candidate and the gate \
+         verdict it returned. Do not merge to a canonical branch, do not push, do not publish, do \
+         not transition a Board item, and do not dispatch further work — a green gate is where your \
+         authority ends."
+    )
+}
+
+/// Dispatch the configured `integrator` role at a wave whose stories have all handed off.
+///
+/// C-730. The whole ceiling for this already existed — `NATIVE_INTEGRATOR_OPERATIONS`,
+/// `AgentTurnSpec::fleet_integrator`, `--native-fleet-integrator` — and nothing ever built the agent
+/// that uses it. This admits one from the template that declares the `integration` task kind, which
+/// is what routes it through `loop_policy.integration` to the configured `wave-integration.flux`.
+///
+/// It is admitted at the FLEET ROOT, not in the wave's integration worktree. The native integrator
+/// catalogue is constructed from the child process's cwd and refuses unless that cwd holds
+/// `.flux/fleet.toml`; a repository checkout does not, so an integrator placed in the integration
+/// worktree could never start. `integrate_wave` reaches the wave's worktrees on its own, and the
+/// template's `.flux/fleet/**` fence is what keeps a root-rooted writer off the ledger.
+fn dispatch_wave_integrator(command: &FleetCommand, root: &Path, wave_id: &str) -> Result<Value> {
+    let config = read_fleet_config(root)?;
+    let template = config
+        .agent_templates
+        .iter()
+        .find(|template| template.task_kind == FLEET_INTEGRATION_TASK_KIND)
+        .with_context(|| {
+            format!(
+                "not-found: no agent template declares the {FLEET_INTEGRATION_TASK_KIND} task kind, \
+                 so wave {wave_id} has no integrator to dispatch"
+            )
+        })?;
+    // Resolve and parse the loop before anything is written: a Fleet task never falls back to the
+    // general adaptive harness, and an invalid profile must not reach a model call.
+    let loop_binding = resolve_fleet_loop_binding(root, &config, &template.task_kind)?;
+    let instructions =
+        read_configured_instructions(root, &template.instructions, "wave-integrator instructions")?;
+    if instructions.trim().is_empty() {
+        bail!("input/schema: wave-integrator instructions cannot be empty")
+    }
+    let mode = template.mode;
+    let (capabilities, operations) = normalize_worker_capabilities_in(
+        mode,
+        &template.capabilities,
+        &template.task_kind,
+        Some(root),
+    )?;
+    validate_loop_capability_compatibility(&loop_binding, &operations)?;
+    let fences = normalize_fences(template.fences.iter().cloned());
+    let read_roots = config
+        .repositories
+        .iter()
+        .map(|repository| repository_root(root, repository))
+        .collect::<Result<Vec<_>>>()?;
+    let capability_set =
+        capability_set_manifest(mode, &capabilities, &operations, root, &read_roots, &fences);
+
+    let id = format!("{wave_id}-integrator");
+    let loop_dir = format!(".flux/fleet/agents/{}", safe_ref_segment(&id));
+    let loop_source = format!("{loop_dir}/agent-loop.flux");
+    let loop_binding_receipt = format!("{loop_dir}/agent-loop-binding.json");
+    if command.dry_run {
+        return Ok(json!({
+            "wave": wave_id,
+            "agent": id,
+            "role": template.role,
+            "task_kind": template.task_kind,
+            "loop_binding": loop_binding.metadata(),
+            "dispatched": false,
+            "dry_run": true,
+        }));
+    }
+    snapshot_fleet_loop_binding(root, &loop_binding, &loop_source, &loop_binding_receipt)?;
+
+    // Re-read: the mutation that advanced this wave has already landed, and an integrator record
+    // written onto a stale snapshot would lose the compare-and-set along with every sibling write.
+    let mut state = read_fleet_state(root)?;
+    state.revision += 1;
+    // Counted BEFORE the turn runs, and persisted with the admission. A turn that dies mid-flight
+    // still spent an attempt, and a counter incremented afterwards would never record the attempts
+    // that fail hardest.
+    let attempts = state.waves.get(wave_id).map_or(0, wave_integrator_attempts) + 1;
+    if let Some(wave) = state.waves.get_mut(wave_id) {
+        wave["integrator_attempts"] = json!(attempts);
+    }
+    let registration = json!({
+        "schema": "flux.fleet-agent-registration/v1",
+        "id": id,
+        "role": template.role,
+        "task_kind": template.task_kind,
+        "parent": "main",
+        "created_by": "drive",
+        "status": "accepted",
+        "transport": "flux-local",
+        "session": format!("{wave_id}-integrator-session"),
+        // No `worktree`: `addressed_turn_spec` falls back to the fleet root, which is the only place
+        // the native integrator catalogue can be constructed.
+        "assignment": {"wave": wave_id},
+        "template": template.id,
+        "model": template.model,
+        "mode": mode,
+        "instructions": redact(&instructions),
+        "capabilities": capabilities,
+        "fences": fences,
+        "writable_root": display_path(root),
+        "read_roots": read_roots.iter().map(|root| display_path(root)).collect::<Vec<_>>(),
+        "capability_set": capability_set,
+        "loop_binding": loop_binding.metadata(),
+        "loop_source": loop_source,
+        "loop_binding_receipt": loop_binding_receipt,
+    });
+    state.agents.insert(id.clone(), registration.clone());
+    persist_fleet_mutation(
+        command,
+        root,
+        &state,
+        "wave.integrator.admitted",
+        json!({"wave": wave_id, "agent": id, "role": template.role, "attempt": attempts, "loop_binding": loop_binding.metadata()}),
+    )?;
+    let spec = addressed_turn_spec(root, &state, &id, wave_integrator_request(wave_id))?;
+    let receipt = execute_and_record_agent_turn(command, root, &mut state, spec, None)?;
+    // Report the wave's status as it now READS, not as the turn claimed. `fleet.integrate` is
+    // host-side and durable, so the record is the artifact — and this whole epic exists because
+    // reports were being written from intent.
+    let observed = read_fleet_state(root)?;
+    Ok(json!({
+        "wave": wave_id,
+        "agent": id,
+        "role": template.role,
+        "task_kind": template.task_kind,
+        "dispatched": true,
+        "attempt": attempts,
+        "wave_status": observed.waves.get(wave_id).map(|wave| wave["status"].clone()),
+        "session": receipt["session"].clone(),
+    }))
 }
 
 /// Read `board reconcile` the way the board CLI reads it, so the driver and an operator see the
@@ -16538,7 +16760,8 @@ fn drive_one_tick(
         && plan.dispatch.is_empty()
         && plan.advance.is_empty()
         && plan.reconstruct.is_empty()
-        && plan.released.is_empty();
+        && plan.released.is_empty()
+        && plan.integrate.is_empty();
 
     let reconstruct = plan.reconstruct.clone();
     let fingerprint = plan.fingerprint.clone();
@@ -16549,6 +16772,7 @@ fn drive_one_tick(
         "fingerprint": fingerprint,
         "advance": plan.advance,
         "reconstruct": plan.reconstruct,
+        "integrate": plan.integrate,
         "release": plan.released,
         "dispatch": plan.dispatch,
         "withheld": plan.withheld,
@@ -16569,13 +16793,35 @@ fn drive_one_tick(
             reconstructed.clear();
             released.clear();
             for wave in &reconstruct {
-                let reports = record_provisional_handoffs(state, wave);
+                let reports = record_turn_handoffs(state, wave);
                 let recorded = reports
                     .iter()
                     .filter(|report| report["recorded"] == json!(true))
                     .count();
                 if recorded > 0 {
-                    reconstructed.push(json!({"wave": wave, "recorded": recorded}));
+                    // C-730: which of them carry evidence, and the reason each unverified one does
+                    // not. A bare count reads identically for a verified handoff and an empty claim,
+                    // which is the ambiguity this epic exists to remove.
+                    let verified = reports
+                        .iter()
+                        .filter(|report| report["verified"] == json!(true))
+                        .count();
+                    reconstructed.push(json!({
+                        "wave": wave,
+                        "recorded": recorded,
+                        "verified": verified,
+                        "unverified": reports
+                            .iter()
+                            .filter(|report| {
+                                report["recorded"] == json!(true)
+                                    && report["verified"] != json!(true)
+                            })
+                            .map(|report| json!({
+                                "item": report["item"].clone(),
+                                "reason": report["reason"].clone(),
+                            }))
+                            .collect::<Vec<_>>(),
+                    }));
                 }
             }
             for (id, wave) in state.waves.iter_mut() {
@@ -16653,6 +16899,40 @@ fn drive_one_tick(
             }
         }
     }
+    // C-730, and last for a reason. Integration is the longest operation in the pipeline, so putting
+    // it ahead of dispatch would make every writer wait on one wave's gate. Its targets are read from
+    // CURRENT state rather than `plan.integrate`, because the advance phase above is what creates
+    // most of them — a wave that reached `handoffs-ready` in this very tick must not wait for the
+    // next one to be noticed.
+    //
+    // Deliberately NOT gated on `!command.dry_run`. b90e1f4c's lesson: a dry run that
+    // short-circuits cannot answer the question it exists to answer. `dispatch_wave_integrator`
+    // resolves the template, the loop profile and the whole capability ceiling before its own
+    // dry-run return, so a dry tick reports exactly which waves it would integrate — and still
+    // writes nothing.
+    let mut integration = Vec::new();
+    let current = read_fleet_state(root)?;
+    integration.extend(drive_integration_exhausted(&current));
+    for wave in drive_integration_targets(&current) {
+        match dispatch_wave_integrator(command, root, &wave) {
+            Ok(record) => integration.push(record),
+            Err(error) => {
+                // Same contract as a failed dispatch: a fact to report, never a reason to lose a
+                // tick that already recorded handoffs.
+                let message = redact(&error.to_string());
+                warnings.push(format!("integrator dispatch failed for {wave}: {message}"));
+                integration.push(json!({"wave": wave, "dispatched": false, "error": message}));
+                // A dry run reports the refusal; it does not journal it.
+                if !command.dry_run {
+                    append_fleet_event(
+                        root,
+                        "fleet.drive.integrator-failed",
+                        json!({"wave": wave, "error": message}),
+                    )?;
+                }
+            }
+        }
+    }
     let revision = read_fleet_state(root)?.revision;
     let data = json!({
         "schema": DRIVE_TICK_SCHEMA,
@@ -16671,16 +16951,21 @@ fn drive_one_tick(
         // the set that survived the compare-and-set.
         "released": released,
         "dispatch": dispatch,
+        "integration": integration,
     });
     Ok((
         format!(
-            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s)",
+            "tick {tick}: advanced {} wave(s), reconstructed {} handoff set(s), released {} abandoned claim(s), dispatched {} item(s), withheld {}, overrode {} unverified withhold(s), integrated {} wave(s)",
             advanced.len(),
             reconstructed.len(),
             released.len(),
             dispatch["items"].as_array().map_or(0, Vec::len),
             dispatch["withheld"].as_array().map_or(0, Vec::len),
             dispatch["released"].as_array().map_or(0, Vec::len),
+            integration
+                .iter()
+                .filter(|record| record["dispatched"] == json!(true))
+                .count(),
         ),
         data,
         warnings,
@@ -17773,15 +18058,147 @@ fn run_typed_argv(worktree: &Path, argv: &[String]) -> Result<Value> {
     }))
 }
 
+/// Run one story's targeted validation at both ends and judge the result.
+///
+/// C-730 extracted this from `fleet_handoff` for the same reason `verify_story_commit` was extracted
+/// before it: a handoff recorded when a turn ends must be judged by the SAME rules as one an
+/// operator types, and two copies of these rules would drift. This is the half that was still
+/// missing — the automatic path proved the git facts and then recorded `test_argv: []`, so every
+/// unattended handoff was evidence-free by construction.
+///
+/// The two runs and the verdict on them. `Err` is reserved for an argv that could not be *executed*;
+/// a run that executed and was then judged against is a `refusal` carrying both records, because the
+/// automatic path has to record WHY it withheld verification and re-running to find out would cost a
+/// second pair of compiles.
+struct TargetedValidation {
+    before: Value,
+    /// `Null` when the pre-state already refused, which is where the operator path stops too.
+    after: Value,
+    refusal: Option<String>,
+}
+
+fn run_targeted_validation(
+    base_worktree: &Path,
+    story_worktree: &Path,
+    argv: &[String],
+) -> Result<TargetedValidation> {
+    let before = run_typed_argv(base_worktree, argv)?;
+    if before["success"].as_bool() != Some(false) && !ran_no_tests(&before) {
+        return Ok(TargetedValidation {
+            before,
+            after: Value::Null,
+            refusal: Some(
+                "validation/gate: failing-before validation unexpectedly passed on the pinned base"
+                    .into(),
+            ),
+        });
+    }
+    let after = run_typed_argv(story_worktree, argv)?;
+    if after["success"].as_bool() != Some(true) {
+        return Ok(TargetedValidation {
+            before,
+            after,
+            refusal: Some(
+                "validation/gate: passing-after validation failed at the returned commit".into(),
+            ),
+        });
+    }
+    // A test-first commit adds its test, so the SAME argv matches nothing at the pinned base — and a
+    // runner that filters to zero tests reports success (`cargo test <new name>` prints
+    // "0 passed; 0 failed; N filtered out" and exits 0). Demanding a non-zero exit there rejects the
+    // normal TDD shape outright, which is why no commit in this pipeline could ever be handed off.
+    //
+    // "Nothing ran at base, and the same argv runs and passes at the commit" IS failing-first
+    // evidence: the absence of the test is the pre-state. It is only accepted together with the
+    // passing-after check above and the requirement that the commit actually ran tests — so a typo'd
+    // or non-existent test name still fails, because it would match nothing at the commit either.
+    let refusal = (ran_no_tests(&before) && ran_no_tests(&after)).then(|| {
+        "validation/gate: targeted validation matched no test at the base or the commit — cite an \
+         argv that actually runs the failing-first test"
+            .to_string()
+    });
+    Ok(TargetedValidation {
+        before,
+        after,
+        refusal,
+    })
+}
+
+/// [`run_targeted_validation`] for the caller that must refuse rather than record: the operator's
+/// `flux fleet handoff`, whose whole contract is that an unproven claim does not become a handoff.
+fn targeted_validation_evidence(
+    base_worktree: &Path,
+    story_worktree: &Path,
+    argv: &[String],
+) -> Result<(Value, Value)> {
+    let validation = run_targeted_validation(base_worktree, story_worktree, argv)?;
+    if let Some(refusal) = validation.refusal {
+        bail!("{refusal}")
+    }
+    Ok((validation.before, validation.after))
+}
+
+/// Where a story's pre-state is measured.
+///
+/// The wave's `verify` checkout is pinned to the base and never written to. Waves dispatched before
+/// it existed fall back to the integration worktree, which is how this was always done — wrong, but
+/// no worse for them than it already was.
+fn story_base_worktree(repository: &Value) -> Option<PathBuf> {
+    repository["verify"]["worktree"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir())
+        .or_else(|| {
+            repository["integration"]["worktree"]
+                .as_str()
+                .map(PathBuf::from)
+        })
+}
+
+/// The targeted validation argv a finished worker actually ran, recovered from its own turn.
+///
+/// A turn that has ended cannot be asked to cite anything, but it does not have to be: every typed
+/// tool call it made is already in the receipt Fleet stored. The story's failing-first test is the
+/// `cargo_test` call that NAMES it, so a call carrying a `filter` wins, then one naming a `package`.
+///
+/// An untargeted `cargo test --workspace` is deliberately not accepted as targeted evidence. It is
+/// the integrator's gate wearing a worker's clothes: re-running it at both ends, per story, would
+/// cost more than the gate it is standing in for and would still prove nothing about *this* story.
+fn worker_recorded_test_argv(agent: &Value) -> Option<Vec<String>> {
+    let calls = agent["last_turn"]["events"]
+        .as_array()?
+        .iter()
+        .filter(|event| {
+            event["type"].as_str() == Some("tool_call")
+                && event["name"].as_str() == Some("cargo_test")
+        })
+        .map(|event| &event["input"])
+        .collect::<Vec<_>>();
+    let targeted = calls
+        .iter()
+        .rev()
+        .find(|input| {
+            input["filter"]
+                .as_str()
+                .is_some_and(|f| !f.trim().is_empty())
+        })
+        .or_else(|| {
+            calls.iter().rev().find(|input| {
+                input["package"]
+                    .as_str()
+                    .is_some_and(|p| !p.trim().is_empty())
+            })
+        })?;
+    Some(flux_tools::cargo::cargo_test_argv(targeted))
+}
+
 /// Verify that a commit really is what a story worktree delivered, and return its observed write set.
 ///
-/// Extracted so the operator-driven handoff and the provisional one recorded when a turn ends
-/// (`C-670`) prove the *same* git facts. Two copies would drift, and the copy that drifted would be
-/// the automatic one — the one nobody reads until a wave has already been assembled from it.
+/// Extracted so the operator-driven handoff and the one recorded when a turn ends (`C-670`) prove
+/// the *same* git facts. Two copies would drift, and the copy that drifted would be the automatic
+/// one — the one nobody reads until a wave has already been assembled from it.
 ///
-/// This is deliberately only the git half. Targeted validation evidence is the operator's claim and
-/// stays in `fleet_handoff`, which is exactly what makes a provisional record weaker and why it is
-/// marked as such rather than quietly presented as the same thing.
+/// This is only the git half; [`targeted_validation_evidence`] is the other, and both paths run both.
 fn verify_story_commit(
     worktree: &Path,
     branch: &str,
@@ -17827,15 +18244,29 @@ fn verify_story_commit(
 /// accepted. So a turn ended, the wave sat in `awaiting-handoffs`, and only a human could move it.
 /// Ten workers once ended their turns and left nine commits the fleet never recorded.
 ///
-/// What is recorded here is **provisional**: the git facts are proved by the same
-/// [`verify_story_commit`] the operator path uses, but there is no targeted validation evidence,
-/// because a turn that has already ended cannot be asked to cite the argv it ran. That is why the
-/// entry says so. Integration still runs the repository's full gate, which is what actually decides
-/// whether the wave is green — a provisional handoff moves work forward, it does not bless it.
+/// C-730. What is recorded here is **verified wherever it can be**. The git facts are proved by the
+/// same [`verify_story_commit`] the operator path uses, and the targeted validation is proved by the
+/// same [`targeted_validation_evidence`] — re-run here, not believed. "A turn that has ended cannot
+/// be asked to cite the argv it ran" was true of the model and false of the record: every typed tool
+/// call it made is in the receipt, so [`worker_recorded_test_argv`] recovers the argv and this runs
+/// it at the pinned base and at the delivered commit.
+///
+/// Three outcomes, and each says which it is:
+///
+///  - the argv ran and the evidence held: `verified: true`, with both runs attached;
+///  - the argv ran and the evidence did not hold: `verified: false` and the refusal itself is the
+///    recorded `unverified_reason`;
+///  - the worker cited no targeted test: `verified: false` and an explicit `no_failing_test_reason`,
+///    the same shape `flux fleet handoff --no-failing-test-reason` already models.
+///
+/// An empty `test_argv` with no stated reason is exactly the claim-backed-by-nothing this epic
+/// exists to remove, so it is never written. Integration still runs the repository's full gate,
+/// which is what actually decides whether the wave is green.
 ///
 /// This can never fail the wave. Every refusal becomes a recorded reason on the story, because a
-/// wave that dies during bookkeeping is strictly worse than one that reports what it could not do.
-fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Value> {
+/// wave that dies during bookkeeping is strictly worse than one that reports what it could not do —
+/// and a wave that cannot advance without an operator is the defect this whole path exists to fix.
+fn record_turn_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Value> {
     let Some(record) = state.waves.get(wave_id).cloned() else {
         return Vec::new();
     };
@@ -17891,7 +18322,9 @@ fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Val
                     continue;
                 }
             };
-            let entry = json!({
+            // The evidence half. Everything below is derived from what the worker itself did, and
+            // never from what the record wishes it had done.
+            let mut entry = json!({
                 "schema": "flux.fleet-handoff/v1",
                 "board_ref": item,
                 "worker": worker,
@@ -17905,8 +18338,56 @@ fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Val
                 "passing_after": Value::Null,
                 "summary": "recorded from the worker's worktree when its turn ended",
                 "status": "accepted",
-                "provisional": true,
+                "verified": false,
             });
+            match worker_recorded_test_argv(agent) {
+                None => {
+                    entry["no_failing_test_reason"] = json!(
+                        "the worker's turn recorded no targeted test call, so this handoff carries \
+                         no targeted validation evidence; integration's full gate is the only check \
+                         this story has had"
+                    );
+                }
+                Some(argv) => {
+                    entry["test_argv"] = json!(argv);
+                    // No pinned base checkout means no measurable pre-state. Say that, rather than
+                    // measuring the pre-state somewhere it is not.
+                    match story_base_worktree(repository) {
+                        None => {
+                            entry["unverified_reason"] = json!(
+                                "the wave has no pinned base checkout, so the failing-before \
+                                 pre-state could not be measured"
+                            );
+                        }
+                        Some(base_worktree) => {
+                            match run_targeted_validation(&base_worktree, &worktree_path, &argv) {
+                                // Both runs are attached either way. A refusal that cannot be
+                                // inspected is just a different way of saying nothing.
+                                Ok(validation) => {
+                                    entry["failing_before"] = validation.before;
+                                    entry["passing_after"] = validation.after;
+                                    match validation.refusal {
+                                        Some(refusal) => {
+                                            entry["unverified_reason"] = json!(redact(&refusal));
+                                        }
+                                        None => {
+                                            entry["verified"] = json!(true);
+                                            entry["summary"] = json!(
+                                                "verified from the worker's own targeted validation \
+                                                 when its turn ended"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    entry["unverified_reason"] = json!(redact(&error.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let entry = entry;
             if let Some(story) = state.waves.get_mut(wave_id).and_then(|record| {
                 record["topology"]["repositories"]
                     .get_mut(repository_index)
@@ -17925,9 +18406,22 @@ fn record_provisional_handoffs(state: &mut FleetState, wave_id: &str) -> Vec<Val
                 agent["status"] = json!("handoff-accepted");
                 agent["commit"] = json!(commit);
             }
-            reports.push(
-                json!({"item": item, "worker": worker, "recorded": true, "commit": commit, "write_set": entry["write_set"]}),
-            );
+            // The verdict travels with the report, so a tick can say which handoffs it verified and
+            // which it merely recorded. A count alone reads the same for both.
+            reports.push(json!({
+                "item": item,
+                "worker": worker,
+                "recorded": true,
+                "commit": commit,
+                "write_set": entry["write_set"],
+                "verified": entry["verified"],
+                "test_argv": entry["test_argv"],
+                "reason": entry
+                    .get("unverified_reason")
+                    .or_else(|| entry.get("no_failing_test_reason"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
+            }));
         }
     }
     reports
@@ -18035,36 +18529,15 @@ fn fleet_handoff(
         .map(PathBuf::from)
         .filter(|path| path.is_dir())
         .unwrap_or_else(|| integration_worktree.clone());
-    let before = if documentation_only {
-        Value::Null
-    } else {
-        let evidence = run_typed_argv(&base_worktree, input.test_argv)?;
-        if evidence["success"].as_bool() != Some(false) && !ran_no_tests(&evidence) {
-            bail!(
-                "validation/gate: failing-before validation unexpectedly passed on the pinned base"
-            )
+    let (before, after) = if documentation_only {
+        let after = run_typed_argv(&worktree, input.test_argv)?;
+        if after["success"].as_bool() != Some(true) {
+            bail!("validation/gate: passing-after validation failed at the returned commit")
         }
-        evidence
+        (Value::Null, after)
+    } else {
+        targeted_validation_evidence(&base_worktree, &worktree, input.test_argv)?
     };
-    let after = run_typed_argv(&worktree, input.test_argv)?;
-    if after["success"].as_bool() != Some(true) {
-        bail!("validation/gate: passing-after validation failed at the returned commit")
-    }
-    // A test-first commit adds its test, so the SAME argv matches nothing at the pinned base — and a
-    // runner that filters to zero tests reports success (`cargo test <new name>` prints
-    // "0 passed; 0 failed; N filtered out" and exits 0). Demanding a non-zero exit there rejects the
-    // normal TDD shape outright, which is why no commit in this pipeline could ever be handed off.
-    //
-    // "Nothing ran at base, and the same argv runs and passes at the commit" IS failing-first
-    // evidence: the absence of the test is the pre-state. It is only accepted together with the
-    // passing-after check above and the requirement that the commit actually ran tests — so a typo'd
-    // or non-existent test name still fails, because it would match nothing at the commit either.
-    if !documentation_only && ran_no_tests(&before) && ran_no_tests(&after) {
-        bail!(
-            "validation/gate: targeted validation matched no test at the base or the commit — cite \
-             an argv that actually runs the failing-first test"
-        )
-    }
     // Same exclusion as the pre-handoff check: Fleet's own loop-binding snapshot is not something the
     // validation run produced. Fixing only the earlier check moved this refusal later rather than
     // removing it — wave-346's `exchange/X-138` passed the first gate and failed here on the identical
@@ -20234,17 +20707,23 @@ mod tests {
         let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-auto");
         let mut state = wave_with_one_story(&worktree, &branch, &base);
 
-        let reports = record_provisional_handoffs(&mut state, "wave-1");
+        let reports = record_turn_handoffs(&mut state, "wave-1");
 
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
         assert_eq!(reports[0]["commit"], json!(commit));
         let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
         assert_eq!(story["status"], json!("handoff-accepted"));
-        // Distinguishable from an operator-verified handoff: it proved the commit, not the tests.
-        assert_eq!(story["handoff"]["provisional"], json!(true));
         assert_eq!(story["handoff"]["write_set"], json!(["delivered.rs"]));
+        // C-730: this worker's fixture cites no test, so the record must say WHY it is unverified
+        // rather than present an empty argv as if the field were merely absent.
+        assert_eq!(story["handoff"]["verified"], json!(false));
         assert_eq!(story["handoff"]["test_argv"], json!([]));
+        assert!(
+            story["handoff"]["no_failing_test_reason"].is_string(),
+            "{:?}",
+            story["handoff"]
+        );
         assert_eq!(
             state.agents["wave-1-worker-1"]["status"],
             json!("handoff-accepted")
@@ -20260,7 +20739,7 @@ mod tests {
         guarded_git(&worktree, &["reset", "--hard", &base]).expect("rewind to base");
         let mut state = wave_with_one_story(&worktree, &branch, &base);
 
-        let reports = record_provisional_handoffs(&mut state, "wave-1");
+        let reports = record_turn_handoffs(&mut state, "wave-1");
 
         assert_eq!(reports[0]["recorded"], json!(false), "{reports:?}");
         assert!(
@@ -20313,6 +20792,215 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// C-730: a turn that cited no targeted test must SAY so, not carry an empty argv that reads
+    /// like an absent field.
+    ///
+    /// The old record wrote `test_argv: []`, `failing_before: null`, `passing_after: null` and a
+    /// `provisional: true` flag, which is indistinguishable from a handoff whose evidence was simply
+    /// never written down. `flux fleet handoff` already models the honest form for a change that
+    /// legitimately has no failing test — `--no-failing-test-reason` — and an automatic handoff owes
+    /// the same explicitness.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_that_cited_no_test_records_the_reason_rather_than_an_empty_claim() {
+        let (worktree, branch, base, _) = story_worktree_with_a_commit("handoff-no-evidence");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+        // A real turn that read and wrote, and never ran a targeted test.
+        state.agents.get_mut("wave-1-worker-1").expect("worker")["last_turn"] = json!({
+            "events": [
+                {"type": "tool_call", "name": "read", "input": {"path": "src/lib.rs"}},
+                {"type": "tool_call", "name": "git_commit", "input": {"message": "deliver"}},
+                {"type": "turn_end", "outcome": "ok"},
+            ],
+        });
+
+        let reports = record_turn_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
+        assert_eq!(reports[0]["verified"], json!(false), "{reports:?}");
+        let handoff =
+            &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0]["handoff"];
+        assert_eq!(handoff["verified"], json!(false), "{handoff:?}");
+        assert_eq!(handoff["test_argv"], json!([]), "{handoff:?}");
+        assert!(
+            handoff["no_failing_test_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no targeted test")),
+            "the handoff must name why it has no evidence: {handoff:?}"
+        );
+        std::fs::remove_dir_all(&worktree).ok();
+    }
+
+    /// C-730: where the worker DID run a targeted test, that argv is the handoff's evidence — and it
+    /// is re-run rather than believed.
+    ///
+    /// The scratch worktree is not a Cargo workspace, so the cited argv fails at both ends. That is
+    /// the point: the recorded evidence is a real run with a real exit code, the refusal is the
+    /// handoff's recorded reason, and nothing is invented to fill the gap. A wave is never failed by
+    /// this — integration's full gate is what decides — so the story still advances.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_hands_off_the_validation_argv_it_ran_and_records_the_real_result() {
+        let (worktree, branch, base, commit) = story_worktree_with_a_commit("handoff-evidence");
+        let mut state = wave_with_one_story(&worktree, &branch, &base);
+        // The pinned base checkout the pre-state is measured in. Without one there is nothing to
+        // measure against, and the handoff says exactly that instead — a different honest answer,
+        // but not the one this test is about.
+        let verify = reclaim_test_dir("handoff-evidence-base");
+        state.waves.get_mut("wave-1").expect("wave")["topology"]["repositories"][0]["verify"] =
+            json!({"worktree": verify.display().to_string()});
+        state.agents.get_mut("wave-1-worker-1").expect("worker")["last_turn"] = json!({
+            "events": [
+                // An untargeted sweep is not targeted evidence, and re-running the whole workspace
+                // twice per story would cost more than the gate it is standing in for.
+                {"type": "tool_call", "name": "cargo_test", "input": {}},
+                {"type": "tool_call", "name": "cargo_test",
+                 "input": {"package": "flux-cli", "filter": "a_named_failing_first_test"}},
+                {"type": "turn_end", "outcome": "ok"},
+            ],
+        });
+
+        let reports = record_turn_handoffs(&mut state, "wave-1");
+
+        assert_eq!(reports[0]["recorded"], json!(true), "{reports:?}");
+        let handoff =
+            &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0]["handoff"];
+        assert_eq!(handoff["commit"], json!(commit));
+        assert_eq!(
+            handoff["test_argv"],
+            json!([
+                "cargo",
+                "test",
+                "-p",
+                "flux-cli",
+                "--",
+                "a_named_failing_first_test"
+            ]),
+            "the targeted call the worker made is the argv: {handoff:?}"
+        );
+        // A real run, not a placeholder: the pre-state was measured and it carries its own argv.
+        assert_eq!(
+            handoff["failing_before"]["argv"], handoff["test_argv"],
+            "{handoff:?}"
+        );
+        assert_eq!(handoff["failing_before"]["success"], json!(false));
+        assert_eq!(handoff["verified"], json!(false), "{handoff:?}");
+        assert!(
+            handoff["unverified_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("passing-after")),
+            "the refusal itself must be the recorded reason: {handoff:?}"
+        );
+        // Never fatal: the wave still moves, and the gate is what blesses it.
+        let story = &state.waves["wave-1"]["topology"]["repositories"][0]["stories"][0];
+        assert_eq!(story["status"], json!("handoff-accepted"));
+        std::fs::remove_dir_all(&worktree).ok();
+        std::fs::remove_dir_all(&verify).ok();
+    }
+
+    /// C-730: `handoffs-ready` was a terminus under drive alone.
+    ///
+    /// `.flux/fleet.toml` declares an `integrator` role and an `integration` loop profile, and the
+    /// string `integrator` appeared nowhere in `flux-cli`: the role and `wave-integration.flux` were
+    /// dead configuration no tick ever dispatched, so every wave whose writers finished sat at
+    /// `handoffs-ready` waiting for a human to type `flux fleet integrate`.
+    #[test]
+    fn drive_dispatches_an_integrator_for_a_wave_whose_stories_all_handed_off() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "handoffs-ready",
+                "items": ["flux/C-1"],
+                "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+            }),
+        );
+
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&[]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+
+        assert_eq!(plan.integrate, vec!["wave-1".to_string()]);
+    }
+
+    /// One integrator per wave. Integration is the longest operation in the pipeline and it resets
+    /// the integration worktree it works in, so a second one dispatched over a live first is not a
+    /// duplicate report — it is two processes cherry-picking into the same checkout.
+    #[test]
+    fn drive_does_not_dispatch_a_second_integrator_over_a_live_one() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "handoffs-ready",
+                "items": ["flux/C-1"],
+                "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+            }),
+        );
+        state.agents.insert(
+            "wave-1-integrator".into(),
+            json!({
+                "id": "wave-1-integrator",
+                "role": "integrator",
+                "task_kind": "integration",
+                "status": "working",
+                "supervisor_pid": std::process::id(),
+                "assignment": {"wave": "wave-1"},
+            }),
+        );
+
+        let plan = drive_tick_plan(
+            &state,
+            &drive_fixture_schedule(&[]),
+            Some(&json!({"findings": []})),
+            3,
+        );
+
+        assert!(plan.integrate.is_empty(), "{:?}", plan.integrate);
+    }
+
+    /// A wave that spent its attempts stops being dispatched at — and SAYS so.
+    ///
+    /// A successful integration moves the wave off `handoffs-ready`, which normally ends this. A
+    /// turn that completes without ever calling `fleet.integrate` does not, and an unbounded
+    /// retry would then spend one model turn per tick forever on a wave that is not moving.
+    /// Silently skipping it would be worse than the loop: a wave nothing dispatches at reads
+    /// exactly like a wave nobody ever looked at.
+    #[test]
+    fn drive_stops_paying_for_integrator_turns_and_reports_the_wave_it_gave_up_on() {
+        let mut state = drive_fixture_state();
+        state.waves.insert(
+            "wave-1".into(),
+            json!({
+                "status": "handoffs-ready",
+                "items": ["flux/C-1"],
+                "integrator_attempts": MAX_INTEGRATOR_ATTEMPTS_PER_WAVE,
+                "topology": {"repositories": [{"stories": [{"status": "handoff-accepted"}]}]},
+            }),
+        );
+
+        assert!(drive_integration_targets(&state).is_empty());
+        let exhausted = drive_integration_exhausted(&state);
+        assert_eq!(exhausted.len(), 1, "{exhausted:?}");
+        assert_eq!(exhausted[0]["wave"], json!("wave-1"));
+        assert!(
+            exhausted[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("fleet integrate wave-1")),
+            "the report must name the verb that finishes it: {exhausted:?}"
+        );
+
+        // One attempt short of the cap is still dispatched: the second try is a retry, not a loop.
+        state.waves.get_mut("wave-1").expect("wave")["integrator_attempts"] =
+            json!(MAX_INTEGRATOR_ATTEMPTS_PER_WAVE - 1);
+        assert_eq!(
+            drive_integration_targets(&state),
+            vec!["wave-1".to_string()]
+        );
+        assert!(drive_integration_exhausted(&state).is_empty());
     }
 
     /// A unique scratch directory; `flux-cli` carries no `tempfile` dev-dependency and one test is not
