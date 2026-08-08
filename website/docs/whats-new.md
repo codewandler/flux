@@ -12,6 +12,8 @@ This is the same customer changelog embedded in the binary. From a terminal, use
 <!-- BEGIN generated:whats-new -->
 ## [Unreleased]
 
+## [0.59.1] - 2026-08-08
+
 ### New
 
 - **`flux ops --explore` browses every operation flux can run.** Operations are the things flux actually
