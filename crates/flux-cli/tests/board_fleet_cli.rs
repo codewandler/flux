@@ -5129,3 +5129,101 @@ fn fleet_quiesce_stops_dispatch_and_refuses_to_confirm_while_a_worker_is_in_flig
     );
     fs::remove_dir_all(root).ok();
 }
+
+/// C-742: an epic is one entity — a resolvable document with its own contract and a derived
+/// completion.
+///
+/// Three claims in one fixture, because they are one defect. `epic:` was free text with only an
+/// emptiness filter on it, so a slug pointing at nothing was silently accepted while `design:` — the
+/// field beside it — has always been resolved and errored on. An epic therefore had no id, no
+/// status and no criteria anywhere, and "is this epic finished" was a question no board read could
+/// answer.
+#[test]
+fn board_check_resolves_epic_slugs_and_derives_epic_completion_from_its_members() {
+    let root = fixture("epic-entity");
+    fs::create_dir_all(root.join("docs/epics")).unwrap();
+    fs::write(
+        root.join("docs/epics/verified-delivery.md"),
+        "---\nid: E-1\ntitle: Delivery is verified\n---\n\n# Delivery is verified\n\n## Success criteria\n\n- [x] A dispatched wave reports the sha it landed.\n- [ ] The reviewer refuses a claim with no artifact.\n\n## Exit criteria\n\n- [ ] Every story carrying `epic: verified-delivery` is `done`.\n",
+    )
+    .unwrap();
+    for (id, status, epic) in [
+        ("C-1", "done", "verified-delivery"),
+        ("C-2", "ready", "verified-delivery"),
+    ] {
+        fs::write(
+            root.join(format!("docs/stories/{id}-member.md")),
+            format!(
+                "---\nid: {id}\ntitle: Member {id}\nstatus: {status}\npriority: 1\nepic: {epic}\n---\n\n# Member {id}\n\n## Acceptance\n\n- [ ] done\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    // A named epic that exists is not an error, and its completion is computed rather than declared:
+    // the document above states no status at all.
+    let checked = board_json(&root, &["board", "check", "--output", "json"]);
+    assert_eq!(checked["data"]["valid"], true, "{checked}");
+    let epics = board_json(&root, &["board", "epics", "--output", "json"]);
+    let epic = &epics["data"]["epics"][0];
+    assert_eq!(epic["id"], "E-1", "{epics}");
+    assert_eq!(epic["slug"], "verified-delivery", "{epics}");
+    assert_eq!(epic["stories"]["done"], 1, "{epics}");
+    assert_eq!(epic["stories"]["total"], 2, "{epics}");
+    assert_eq!(epic["status"], "in-progress", "{epics}");
+    assert_eq!(epic["criteria"]["done"], 1, "{epics}");
+    assert_eq!(epic["criteria"]["total"], 3, "{epics}");
+
+    // Tick the last member and the epic is done — derived from its members, never asserted.
+    fs::write(
+        root.join("docs/stories/C-2-member.md"),
+        "---\nid: C-2\ntitle: Member C-2\nstatus: done\npriority: 1\nepic: verified-delivery\n---\n\n# Member C-2\n\n## Acceptance\n\n- [x] done\n",
+    )
+    .unwrap();
+    let epics = board_json(&root, &["board", "epics", "--output", "json"]);
+    assert_eq!(epics["data"]["epics"][0]["status"], "done", "{epics}");
+
+    // A slug that resolves to no document is an error, the way a missing design already is.
+    fs::write(
+        root.join("docs/stories/C-3-orphan.md"),
+        "---\nid: C-3\ntitle: Orphan\nstatus: backlog\nepic: no-such-epic\n---\n\n# Orphan\n\n## Acceptance\n\n- [ ] done\n",
+    )
+    .unwrap();
+    let output = flux(&root, &["board", "check", "--output", "json"]);
+    assert!(
+        !output.status.success(),
+        "a story naming a nonexistent epic passed check: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("C-3") && combined.contains("no-such-epic"),
+        "the failure did not name the story and its dangling epic: {combined}"
+    );
+    fs::remove_file(root.join("docs/stories/C-3-orphan.md")).unwrap();
+
+    // And an epic does not get to declare that it is finished. The trackers this replaces sat at
+    // `status: backlog` with every member done, which is why a declared status is refused rather
+    // than ignored — an ignored field drifts silently, exactly as that one did.
+    fs::write(
+        root.join("docs/epics/verified-delivery.md"),
+        "---\nid: E-1\ntitle: Delivery is verified\nstatus: backlog\n---\n\n# Delivery is verified\n\n## Success criteria\n\n- [x] A dispatched wave reports the sha it landed.\n\n## Exit criteria\n\n- [ ] Every story carrying `epic: verified-delivery` is `done`.\n",
+    )
+    .unwrap();
+    let output = flux(&root, &["board", "check", "--output", "json"]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success() && combined.contains("derived from its members"),
+        "an epic asserted its own status and check accepted it: {combined}"
+    );
+    fs::remove_dir_all(root).ok();
+}

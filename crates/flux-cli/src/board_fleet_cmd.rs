@@ -660,6 +660,12 @@ pub(super) enum BoardAction {
         #[arg(long)]
         note: Option<String>,
     },
+    /// Report every epic with the completion derived from its member stories.
+    Epics {
+        /// Report one epic by slug instead of all of them.
+        #[arg(long)]
+        slug: Option<String>,
+    },
     /// Update common planning metadata.
     Update {
         id: String,
@@ -4513,6 +4519,7 @@ fn run_session_board_action(
         // "nothing drifted" from a backend that could not have seen drift.
         BoardAction::Call { .. }
         | BoardAction::Commit { .. }
+        | BoardAction::Epics { .. }
         | BoardAction::Reconcile
         | BoardAction::Render
         | BoardAction::Sync
@@ -4739,6 +4746,7 @@ fn run_board_action(
                 note: note.as_deref(),
             },
         ),
+        BoardAction::Epics { slug } => epics_report(root, slug.as_deref()),
         BoardAction::Update {
             id,
             title,
@@ -6233,6 +6241,7 @@ fn board_operations() -> &'static [&'static str] {
         "query",
         "next",
         "create",
+        "epics",
         "update",
         "transition",
         "start",
@@ -6572,8 +6581,8 @@ fn fleet_operations() -> &'static [&'static str] {
 fn family_schema(family: &str, operations: &[&str]) -> Value {
     let read_only = if family == "board" {
         &[
-            "list", "show", "items", "get", "query", "next", "check", "graph", "stats", "schema",
-            "skill",
+            "list", "show", "items", "get", "query", "next", "check", "epics", "graph", "stats",
+            "schema", "skill",
         ][..]
     } else {
         &[
@@ -7510,6 +7519,14 @@ fn render_grouped(root: &Path, stories: &[Story]) -> Vec<String> {
 }
 
 fn epic_title(root: &Path, slug: &str) -> String {
+    // C-742: the epic document is the entity, so its own title wins. The design fallback stays for a
+    // board mid-migration, and the slug fallback stays because a heading is still owed either way.
+    if let Ok(text) = fs::read_to_string(root.join(EPIC_ROOT).join(format!("{slug}.md"))) {
+        let title = parse_frontmatter(&text).get("title").cloned();
+        if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
+            return title;
+        }
+    }
     if let Ok(text) = fs::read_to_string(root.join("docs/designs").join(format!("{slug}.md"))) {
         if let Some(title) = text
             .lines()
@@ -7547,7 +7564,9 @@ fn epic_title(root: &Path, slug: &str) -> String {
 }
 
 fn epic_blurb(root: &Path, slug: &str) -> Option<String> {
-    let text = fs::read_to_string(root.join("docs/designs").join(format!("{slug}.md"))).ok()?;
+    let text = fs::read_to_string(root.join(EPIC_ROOT).join(format!("{slug}.md")))
+        .or_else(|_| fs::read_to_string(root.join("docs/designs").join(format!("{slug}.md"))))
+        .ok()?;
     let mut why = false;
     for line in text.lines() {
         let trimmed = line.trim();
@@ -7604,18 +7623,23 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
         tasks_total += total;
         task_schema |= has_heading(&story.body, "Tasks");
     }
-    let epics = stories
+    // C-742: count the epics that exist, not the distinct strings some story happened to type. The
+    // old form counted a typo as an epic and, because `all()` is vacuously true, counted an epic with
+    // no members as complete.
+    let registry = read_epics(root);
+    let epics = if registry.is_empty() {
+        stories
+            .iter()
+            .filter_map(|s| s.epic.as_ref())
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            .len()
+    } else {
+        registry.len()
+    };
+    let epic_done = registry
         .iter()
-        .filter_map(|s| s.epic.as_ref())
-        .collect::<BTreeSet<_>>();
-    let epic_done = epics
-        .iter()
-        .filter(|epic| {
-            stories
-                .iter()
-                .filter(|s| s.epic.as_ref() == Some(epic))
-                .all(|s| s.status == "done")
-        })
+        .filter(|epic| epic_progress(epic, &stories)["status"] == "done")
         .count();
     let workspace = command.scope() == BoardScopeArg::Workspace && command.board.is_none();
     let documents = document_counts(command, root);
@@ -7708,7 +7732,7 @@ fn stats(command: &BoardCommand, root: &Path, history: bool, since: Option<&str>
         (Value::Null, Value::Null, Value::Null)
     };
     Ok(json!({
-        "schema": "flux.board-stats/v1", "epics": ratio(epic_done, epics.len()),
+        "schema": "flux.board-stats/v1", "epics": ratio(epic_done, epics),
         "stories": ratio(stories_done, stories.len()), "tasks": tasks,
         "criteria": ratio(criteria_done, criteria_total), "acceptance_criteria": ratio(criteria_done, criteria_total),
         "implementation": ratio(stories_done, stories.len()), "status": status,
@@ -8260,12 +8284,30 @@ fn create_item(
     }
     let (dir, prefix) = match kind {
         CreateKind::Story => (root.join("docs/stories"), "C"),
-        CreateKind::Epic => (root.join("docs/designs"), "E"),
+        CreateKind::Epic => (root.join(EPIC_ROOT), "E"),
         CreateKind::Design => (root.join("docs/designs"), "D"),
     };
-    let id = id
-        .map(str::to_string)
-        .unwrap_or_else(|| allocate_id(root, prefix));
+    let id = id.map(str::to_string).unwrap_or_else(|| {
+        // C-742: an epic's id used to be allocated from the *story* files, which never contain one,
+        // so every epic ever created was handed `E-1` — and then dropped, because the design document
+        // it wrote had no frontmatter to put it in. Allocate from the epics that exist.
+        if kind == CreateKind::Epic {
+            format!(
+                "E-{}",
+                read_epics(root)
+                    .iter()
+                    .filter_map(|epic| epic
+                        .id
+                        .strip_prefix("E-")
+                        .and_then(|n| n.parse::<u64>().ok()))
+                    .max()
+                    .unwrap_or(0)
+                    + 1
+            )
+        } else {
+            allocate_id(root, prefix)
+        }
+    });
     let slug = title
         .to_ascii_lowercase()
         .chars()
@@ -8291,7 +8333,15 @@ fn create_item(
             design.map(|value| format!("design: {value}\n")).unwrap_or_default(),
             note.map(|value| format!("note: {}\n", yaml_quote(value))).unwrap_or_default(),
         ),
-        CreateKind::Epic => format!("# Design — {title}\n\n## Why\n\n\n## Approach\n\n\n## Stories\n\n"),
+        // C-742: an epic is an entity, so it is authored with the three things an entity needs — an
+        // id that survives, a contract that can be measured, and an exit rule. Its status is
+        // deliberately absent: `flux board epics` derives it from the stories carrying this slug.
+        CreateKind::Epic => format!(
+            "---\nid: {id}\ntitle: {}\n{}{}---\n\n# {title}\n\n## Why\n\n\n## Success criteria\n\n- [ ] {EPIC_UNAUTHORED_MARKER} A measurable outcome this epic delivers, not a restatement of its stories.\n\n## Exit criteria\n\n- [ ] Every story carrying `epic: {slug}` is `done`.\n- [ ] Every success criterion above is ticked.\n",
+            yaml_quote(title),
+            if pillar.trim().is_empty() { String::new() } else { format!("pillar: {}\n", yaml_quote(pillar)) },
+            design.map(|value| format!("design: {value}\n")).unwrap_or_default(),
+        ),
         CreateKind::Design => format!("# {title}\n\n## Why\n\n\n## Approach\n\n"),
     };
     if !command.dry_run {
@@ -8513,7 +8563,7 @@ fn document_label(root: &Path, path: &str) -> String {
 /// planning document that exists on disk and nowhere a board read can resolve it.
 ///
 /// Both spellings of each singleton are listed because the board itself reads either.
-const BOARD_DOCUMENT_ROOTS: [&str; 10] = [
+const BOARD_DOCUMENT_ROOTS: [&str; 11] = [
     "ROADMAP.md",
     "VISION.md",
     "decisions",
@@ -8521,6 +8571,7 @@ const BOARD_DOCUMENT_ROOTS: [&str; 10] = [
     "docs/VISION.md",
     "docs/decisions",
     "docs/designs",
+    "docs/epics",
     "docs/roadmap.md",
     "docs/stories",
     "docs/vision.md",
@@ -8759,6 +8810,287 @@ fn resolve_story_design(root: &Path, design: &str) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+/// Where an epic's own document lives. One directory, one file per slug, nothing else in it.
+///
+/// C-742: an epic used to be three things at once — a free-text `epic:` string that resolved to
+/// nothing, a `create --kind epic` design document with no frontmatter whose allocated `E-` id was
+/// discarded on the way out, and a story file that was an epic only by the `-epic` in its name. The
+/// slug stays as the *reference* every story already carries; this directory holds the thing it now
+/// refers to. A separate root rather than a marker inside `docs/designs` because that directory
+/// holds designs for stories too, and "an epic is the subset of designs that happens to carry
+/// frontmatter" is the same undecidability being removed.
+const EPIC_ROOT: &str = "docs/epics";
+
+/// The marker a migrated epic carries where its success criteria still have to be written.
+///
+/// Seeded rather than invented: 137 slugs were in use when resolution was turned on and most had no
+/// document to lift a contract from. A greppable admission that `check` counts is honest; a fabricated
+/// criterion that reads as authored is not, and would make `board epics` report a contract nobody
+/// agreed to.
+const EPIC_UNAUTHORED_MARKER: &str = "[NEEDS AUTHORING]";
+
+/// An epic: one entity, with an id, a contract, and a completion nobody is allowed to assert.
+#[derive(Clone, Debug, Serialize)]
+struct Epic {
+    id: String,
+    slug: String,
+    title: String,
+    file: String,
+    design: Option<String>,
+    /// The story that used to be this epic's tracker by naming convention, kept as a recorded
+    /// mapping rather than deleted — it is where the epic's history was written down.
+    tracker: Option<String>,
+    /// Read only so `check` can refuse it. An epic that states its own status is the defect.
+    #[serde(skip)]
+    declared_status: Option<String>,
+    #[serde(skip)]
+    body: String,
+}
+
+/// Every epic document under `docs/epics`, in slug order.
+///
+/// Absent directory is an empty registry, not an error: a board that has never grouped a story under
+/// an epic has nothing to read, and `check` still reports every `epic:` in use as unresolvable.
+fn read_epics(root: &Path) -> Vec<Epic> {
+    let dir = root.join(EPIC_ROOT);
+    let mut names = fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().and_then(|e| e.file_name().into_string().ok()))
+        .filter(|name| name.ends_with(".md") && !name.starts_with('_') && name != "README.md")
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+        .into_iter()
+        .filter_map(|name| {
+            let body = fs::read_to_string(dir.join(&name)).ok()?;
+            let fm = parse_frontmatter(&body);
+            let slug = name.trim_end_matches(".md").to_string();
+            Some(Epic {
+                id: fm.get("id").cloned().unwrap_or_default(),
+                title: fm.get("title").cloned().unwrap_or_default(),
+                file: format!("{EPIC_ROOT}/{name}"),
+                design: fm
+                    .get("design")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned(),
+                tracker: fm
+                    .get("tracker")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned(),
+                declared_status: fm
+                    .get("status")
+                    .filter(|value| !value.trim().is_empty())
+                    .cloned(),
+                slug,
+                body,
+            })
+        })
+        .collect()
+}
+
+/// Resolve a story's `epic:` the way `resolve_story_design` resolves its `design:`.
+///
+/// A slug, not a path: `epic:` has always been a bare grouping key on 991 stories and rewriting them
+/// into paths would be churn with no reader. Confinement is therefore structural — a slug carrying a
+/// separator or a traversal segment cannot name a file outside `docs/epics` because it is refused
+/// before it reaches the filesystem.
+fn resolve_story_epic(root: &Path, slug: &str) -> Result<PathBuf> {
+    if slug.is_empty()
+        || !slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        || slug.contains("..")
+    {
+        bail!("input/schema: an epic slug is a bare name, not a path: {slug}")
+    }
+    let candidate = root.join(EPIC_ROOT).join(format!("{slug}.md"));
+    if !candidate.is_file() {
+        bail!("not-found: epic at {}", display_path(&candidate))
+    }
+    Ok(candidate)
+}
+
+/// One epic's derived state: who its members are, how far they have got, and therefore what it is.
+///
+/// Nothing here is read from the epic document. That is the point — the old epic trackers asserted
+/// `status: backlog` while every member was `done`, and a status that can disagree with its own
+/// members is not evidence of anything.
+fn epic_progress(epic: &Epic, stories: &[Story]) -> Value {
+    let members = stories
+        .iter()
+        .filter(|story| story.epic.as_deref() == Some(epic.slug.as_str()))
+        .collect::<Vec<_>>();
+    let count = |state: &str| members.iter().filter(|s| s.status == state).count();
+    let (done, total) = (count("done"), members.len());
+    let status = if total == 0 {
+        "backlog"
+    } else if done == total {
+        "done"
+    } else if count("in-progress") > 0 || done > 0 {
+        "in-progress"
+    } else if count("ready") > 0 {
+        "ready"
+    } else if count("blocked") > 0 {
+        "blocked"
+    } else {
+        "backlog"
+    };
+    let (success_done, _, success_total) = checkbox_counts(&epic.body, "Success criteria");
+    let (exit_done, _, exit_total) = checkbox_counts(&epic.body, "Exit criteria");
+    json!({
+        "id": epic.id, "slug": epic.slug, "title": epic.title, "file": epic.file,
+        "design": epic.design, "tracker": epic.tracker, "status": status,
+        "stories": ratio(done, total),
+        "criteria": ratio(success_done + exit_done, success_total + exit_total),
+        "success_criteria": ratio(success_done, success_total),
+        "exit_criteria": ratio(exit_done, exit_total),
+        "contract_authored": !epic.body.contains(EPIC_UNAUTHORED_MARKER),
+        "members": members.iter().map(|s| json!({"id": s.id, "status": s.status})).collect::<Vec<_>>(),
+    })
+}
+
+/// `flux board epics` — the derived answer to "is this epic finished", which nothing could answer.
+fn epics_report(
+    root: &Path,
+    slug: Option<&str>,
+) -> Result<(String, Value, Vec<String>, Option<String>)> {
+    let stories = read_stories(root)?;
+    let epics = read_epics(root);
+    if let Some(slug) = slug {
+        if !epics.iter().any(|epic| epic.slug == slug) {
+            bail!("not-found: no epic {slug} under {EPIC_ROOT}")
+        }
+    }
+    let selected = epics
+        .iter()
+        .filter(|epic| slug.is_none_or(|slug| epic.slug == slug))
+        .map(|epic| epic_progress(epic, &stories))
+        .collect::<Vec<_>>();
+    let (complete, reported) = (
+        selected
+            .iter()
+            .filter(|epic| epic["status"] == "done")
+            .count(),
+        selected.len(),
+    );
+    let human = selected
+        .iter()
+        .map(|epic| {
+            format!(
+                "{} {} — {} ({}/{} stories)",
+                epic["id"].as_str().unwrap_or_default(),
+                epic["slug"].as_str().unwrap_or_default(),
+                epic["status"].as_str().unwrap_or_default(),
+                epic["stories"]["done"],
+                epic["stories"]["total"],
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok((
+        if human.is_empty() {
+            "no epics".into()
+        } else {
+            human
+        },
+        json!({
+            "schema": "flux.board-epics/v1",
+            "epics": selected,
+            "complete": ratio(complete, reported),
+        }),
+        vec![],
+        None,
+    ))
+}
+
+/// Everything `check` refuses about epics, collected so the epic rules read as one contract.
+///
+/// Appends to `errors`/`warnings` rather than returning, because a board's findings are reported
+/// together — a caller fixing a dangling slug wants to see the malformed epic in the same run.
+fn check_epics(
+    root: &Path,
+    stories: &[Story],
+    errors: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let epics = read_epics(root);
+    let mut ids = BTreeSet::new();
+    for epic in &epics {
+        if epic.id.is_empty() || epic.title.is_empty() {
+            errors.push(format!("epic {} has no id or no title", epic.slug));
+            continue;
+        }
+        if !epic.id.starts_with("E-") {
+            errors.push(format!(
+                "epic {} carries id {} — an epic id is prefixed E-",
+                epic.slug, epic.id
+            ));
+        }
+        if !ids.insert(epic.id.clone()) {
+            errors.push(format!("duplicate epic id {}", epic.id));
+        }
+        if let Some(story) = stories.iter().find(|story| story.id == epic.id) {
+            errors.push(format!(
+                "epic {} claims id {} which story {} already holds",
+                epic.slug, epic.id, story.file
+            ));
+        }
+        // The measurable half of the contract. Without both, an epic is the bag of stories it was.
+        for section in ["Success criteria", "Exit criteria"] {
+            if !has_heading(&epic.body, section) {
+                errors.push(format!("epic {} has no ## {section}", epic.slug));
+            } else if checkbox_counts(&epic.body, section).2 == 0 {
+                errors.push(format!(
+                    "epic {} states no {}",
+                    epic.slug,
+                    section.to_ascii_lowercase()
+                ));
+            }
+        }
+        // An epic does not get to say whether it is finished; `epic_progress` says. A declared status
+        // is refused rather than ignored, because a field the board silently discards is exactly how
+        // 58 trackers came to sit at `backlog` with all their members done.
+        if let Some(declared) = &epic.declared_status {
+            errors.push(format!(
+                "epic {} declares status '{declared}' — an epic's completion is derived from its members, not asserted",
+                epic.slug
+            ));
+        }
+        if let Some(tracker) = &epic.tracker {
+            if !stories.iter().any(|story| story.id == *tracker) {
+                errors.push(format!(
+                    "epic {} names missing tracker {tracker}",
+                    epic.slug
+                ));
+            }
+        }
+        if let Some(design) = &epic.design {
+            if resolve_story_design(root, design).is_err() {
+                errors.push(format!("epic {} links missing design {design}", epic.slug));
+            }
+        }
+    }
+    let unauthored = epics
+        .iter()
+        .filter(|epic| epic.body.contains(EPIC_UNAUTHORED_MARKER))
+        .map(|epic| epic.slug.as_str())
+        .collect::<Vec<_>>();
+    if !unauthored.is_empty() {
+        warnings.push(format!(
+            "{} epic(s) carry success criteria still marked {EPIC_UNAUTHORED_MARKER}: {}{}",
+            unauthored.len(),
+            unauthored
+                .iter()
+                .take(5)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", "),
+            if unauthored.len() > 5 { ", …" } else { "" }
+        ));
+    }
+}
+
 fn check_board(root: &Path) -> Result<(String, Value, Vec<String>, Option<String>)> {
     check_board_with_known_dependencies(root, None)
 }
@@ -8793,7 +9125,16 @@ fn check_board_with_known_dependencies(
                 errors.push(format!("{} links missing design {design}", story.id));
             }
         }
+        // C-742: `epic:` resolves, the way `design:` beside it always has. It used to pass through
+        // an emptiness filter and nothing else, so 28 slugs named no document at all and the board
+        // grouped 143 stories under headings derived from a slug nobody had ever written down.
+        if let Some(epic) = story.epic.as_deref() {
+            if resolve_story_epic(root, epic).is_err() {
+                errors.push(format!("{} names missing epic {epic}", story.id));
+            }
+        }
     }
+    check_epics(root, &stories, &mut errors, &mut warnings);
     let decisions = decision_records(&root.join("docs/decisions"))?;
     let mut decision_ids = BTreeSet::new();
     for decision in &decisions {
