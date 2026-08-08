@@ -122,28 +122,6 @@ FLUX_TEST_SANDBOX_BACKEND=1 cargo test -p flux-cli --test sandbox_backend
 The `plugins/` directory is a separate workspace. If touched, run its checks with
 `--manifest-path plugins/Cargo.toml`, including `cargo fmt --check`.
 
-### Building several worktrees at once
-
-**Never share one `CARGO_TARGET_DIR` between worktrees of this repository.** Every worktree hashes
-to the same Cargo metadata, so each one builds a crate to the same artifact path. Concurrent
-worktrees then overwrite and reuse each other's output: Cargo reports `Finished` without compiling
-the change under test, and a gate passes against a sibling's binary. A green run that never built
-your code is worse than no run, and this failure is silent.
-
-Give every concurrent worktree its own target directory. To keep that affordable, disable debug
-info — this is the difference between tens of gigabytes per worktree and a few:
-
-```bash
-CARGO_TARGET_DIR=<per-worktree dir> CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 \
-  scripts/release-full-gate.sh
-```
-
-A full workspace target directory is tens of gigabytes. Check free space before fanning out
-parallel work, and budget for one directory per concurrent worktree. The cheapest reclaim is an
-idle worktree's `target/`: it is ignored build output, never source. Confirm `git status
---porcelain` reports no uncommitted source in that worktree first, and never remove a target
-directory a build is using.
-
 Golden regeneration is armed only by `FLUX_UPDATE_GOLDEN=1`; regeneration intentionally fails after
 writing. Review the diff, then rerun with the variable unset to verify. Never hand-edit generated
 Flux-Lang node-kind or prelude tables.
